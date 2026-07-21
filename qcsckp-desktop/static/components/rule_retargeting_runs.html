@@ -1,0 +1,2103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>追投记录</title>
+    <script src="../js/tailwindcss.js"></script>
+    <script src="../js/lucide.js"></script>
+    <script src="../js/messagebox.js"></script>
+    <link rel="stylesheet" href="../css/rule_retargeting_runs_modals.css" />
+    <style>
+        /*
+         * 与 rule_retargeting.html 保持一致：
+         * - 画布 = .page-shell 同款渐变
+         * - 大卡片 = .rr-section（rgba(30,41,59,.35) + 内高光细边）
+         */
+        :root {
+            --runs-accent: #3b82f6;
+            --runs-accent-hover: #2563eb;
+            --runs-muted: #94a3b8;
+            --runs-text: #e2e8f0;
+        }
+        html { color-scheme: dark; }
+        /* 与父页 #tabPaneRuns 圆角卡片一致；勿设 min-height:100%，否则 iframe 被拉高后 body 撑满会产生底部死区与高度回传偏大 */
+        html, body {
+            margin: 0;
+            background: rgba(30, 41, 59, 0.35);
+        }
+        body.runs-page {
+            overflow-x: auto;
+            overflow-y: visible;
+            box-sizing: border-box;
+            color: var(--runs-text);
+            scrollbar-width: thin;
+            scrollbar-color: rgba(71, 85, 105, 0.8) rgba(15, 23, 42, 0.2);
+        }
+        body.runs-page::-webkit-scrollbar { width: 8px; height: 8px; }
+        body.runs-page::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.35); }
+        body.runs-page::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, #475569, #334155);
+            border-radius: 8px;
+        }
+        .runs-shell {
+            max-width: 100%;
+            margin: 0;
+            /* 与 rr-section 同量级：主体与圆角卡片边缘留白 */
+            padding: 0.85rem 1rem 1rem;
+            box-sizing: border-box;
+        }
+        @media (min-width: 640px) {
+            .runs-shell {
+                padding: 1rem 1.25rem 1.1rem;
+            }
+        }
+        /* 圆角与描边由父页 iframe 容器承担，此处只做内容区 */
+        .runs-card {
+            background: transparent;
+            border-radius: 0;
+            box-shadow: none;
+            overflow: visible;
+        }
+        .runs-filters {
+            background: transparent;
+            padding: 0.9rem 1rem 1rem;
+            overflow: visible;
+        }
+        .runs-filter-row {
+            display: flex;
+            flex-wrap: nowrap;
+            align-items: flex-end;
+            gap: 0.75rem 1rem;
+            min-width: 0;
+            overflow: visible;
+        }
+        .runs-filter-fields {
+            display: flex;
+            flex-wrap: nowrap;
+            align-items: flex-end;
+            gap: 0.75rem 1rem;
+            min-width: 0;
+            flex: 1 1 auto;
+        }
+        .runs-field {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            min-width: 0;
+        }
+        .runs-field > span {
+            font-size: 0.7rem;
+            color: var(--runs-muted);
+            font-weight: 500;
+            letter-spacing: 0.02em;
+        }
+        .runs-field--grow {
+            flex: 1 1 10rem;
+            min-width: 8rem;
+        }
+        /* 搜索：固定偏短宽度，不占满整行 */
+        .runs-field--search {
+            flex: 0 1 14rem;
+            min-width: 10rem;
+            max-width: 16rem;
+        }
+        .runs-field--mid {
+            flex: 0 1 9rem;
+            min-width: 7rem;
+        }
+        .runs-field--sm {
+            flex: 0 0 auto;
+        }
+        .runs-filter-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding-bottom: 0.1rem;
+            flex-shrink: 0;
+            margin-left: auto;
+        }
+        /* 与 rule_retargeting .rr-input 同系，略小字号 */
+        .rr-input {
+            margin-top: 0;
+            border-radius: 0.625rem;
+            background: rgba(15, 23, 42, 0.65);
+            padding: 0.45rem 0.65rem;
+            font-size: 0.75rem;
+            color: #f8fafc;
+            outline: none;
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-input::placeholder {
+            color: #64748b;
+        }
+        .rr-input:focus {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2), 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        .btn-ghost {
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            background: rgba(30, 41, 59, 0.55);
+            color: var(--runs-text);
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .btn-ghost:hover:not(:disabled) {
+            background: rgba(51, 65, 85, 0.65);
+            border-color: rgba(100, 116, 139, 0.55);
+        }
+        .btn-ghost:disabled {
+            opacity: 0.4;
+        }
+        .btn-primary {
+            background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+            border: 1px solid rgba(59, 130, 246, 0.35);
+            color: #fff;
+            font-weight: 500;
+            transition: filter 0.15s;
+        }
+        .btn-primary:hover {
+            filter: brightness(1.06);
+        }
+        /* 仅横向滚动：overflow-x:auto 时若纵向为 visible，多数浏览器会把纵向也算成 auto，出现「无内容却竖条」 */
+        .runs-table-scroll {
+            overflow-x: auto;
+            overflow-y: hidden;
+            background: transparent;
+        }
+        .runs-table-scroll::-webkit-scrollbar {
+            height: 6px;
+        }
+        .runs-table-scroll::-webkit-scrollbar-thumb {
+            background: #2a3142;
+            border-radius: 4px;
+        }
+        .runs-table {
+            width: 100%;
+            min-width: 900px;
+            text-align: left;
+            border-collapse: collapse;
+            border: none;
+        }
+        .runs-table thead th {
+            border: 0;
+            border-bottom: 1px solid rgba(71, 85, 105, 0.55);
+            padding: 0.65rem 0.75rem;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: none;
+            letter-spacing: 0.02em;
+            background: transparent;
+            white-space: nowrap;
+            /* 表头统一灰白，避免列列不同色 */
+            color: #94a3b8;
+        }
+        /* 表格正文：默认中性字色，少用彩色块 */
+        .runs-cell-plain {
+            font-size: 0.7rem;
+            line-height: 1.4;
+            color: #cbd5e1;
+        }
+        /* 状态：仅字色，无标签底 */
+        .runs-st-ok {
+            color: #34d399;
+            font-weight: 500;
+            font-size: 0.7rem;
+        }
+        .runs-st-err {
+            color: #f87171;
+            font-weight: 500;
+            font-size: 0.7rem;
+        }
+        /* 操作列：与 dashboard 类似的轻量 tag 色条区分 */
+        .runs-btn-op {
+            display: inline-flex;
+            align-items: center;
+            font-size: 0.65rem;
+            line-height: 1.2;
+            padding: 0.22rem 0.5rem;
+            border-radius: 0.35rem;
+            border: 1px solid;
+            cursor: pointer;
+            transition: background 0.12s, border-color 0.12s, color 0.12s, filter 0.12s;
+        }
+        .runs-btn-op:hover {
+            filter: brightness(1.08);
+        }
+        .runs-btn-op--detail {
+            border-color: rgba(56, 189, 248, 0.45);
+            background: rgba(14, 165, 233, 0.12);
+            color: #bae6fd;
+        }
+        .runs-btn-op--trig {
+            border-color: rgba(251, 191, 36, 0.55);
+            background: transparent;
+            color: #fde68a;
+        }
+        .runs-btn-op--trig:hover {
+            background: rgba(245, 158, 11, 0.16);
+        }
+        /* 素材信息：紫色描边（与详情底栏、外挂 CSS 一致） */
+        .runs-btn-op--query {
+            border-color: rgba(167, 139, 250, 0.5);
+            background: transparent;
+            color: #ddd6fe;
+        }
+        .runs-btn-op--query:hover {
+            background: rgba(139, 92, 246, 0.14);
+        }
+        .runs-material-name {
+            cursor: pointer;
+            color: #f8fafc;
+            font-weight: 500;
+            font-size: 0.75rem;
+            line-height: 1.35;
+            word-break: break-all;
+            transition: color 0.12s;
+        }
+        .runs-material-name:hover {
+            color: #7dd3fc;
+        }
+        /* 仅「优化目标」列：字色区分（无标签底） */
+        .runs-col-txt {
+            font-size: 0.7rem;
+            line-height: 1.4;
+            font-weight: 500;
+        }
+        .runs-col-og-net { color: #0ea5e9; }
+        .runs-col-og-live { color: #22d3ee; }
+        .runs-col-og-other { color: #cbd5e1; }
+        .runs-table tbody td {
+            border: 0;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.42);
+            padding: 0.55rem 0.75rem;
+            vertical-align: top;
+        }
+        .runs-table tbody tr {
+            transition: background 0.12s ease;
+        }
+        .runs-table tbody tr:hover {
+            background: rgba(255, 255, 255, 0.035);
+        }
+        .runs-pagination {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem 0.95rem;
+            background: transparent;
+            color: var(--runs-muted);
+            font-size: 0.7rem;
+            overflow: visible;
+        }
+        .runs-pagination .tabular-nums {
+            color: var(--runs-text);
+        }
+        #emptyHint {
+            padding: 2.5rem 1rem;
+            text-align: center;
+            color: var(--runs-muted);
+            background: transparent;
+        }
+        .modal-overlay { background: rgba(2, 6, 23, 0.72); backdrop-filter: blur(4px); }
+        /* 自定义下拉：面板在 .rr-dd 内 absolute，避免 iframe/fixed 参照系不一致导致与触发器错位 */
+        .rr-dd {
+            position: relative;
+            display: inline-block;
+            vertical-align: middle;
+            max-width: 100%;
+            z-index: 1;
+        }
+        .rr-dd.rr-dd-open {
+            z-index: 10050;
+        }
+        .rr-dd-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.4rem;
+            min-height: 2rem;
+            padding: 0.35rem 0.55rem 0.35rem 0.65rem;
+            border-radius: 0.5rem;
+            background: rgba(15, 23, 42, 0.88);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            font-size: 0.75rem;
+            line-height: 1.25;
+            color: #e2e8f0;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-dd-trigger:hover { border-color: rgba(71, 85, 105, 0.9); }
+        .rr-dd.rr-dd-open .rr-dd-trigger {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+        }
+        .rr-dd-label { min-width: 0; flex: 1; }
+        .rr-dd-chevron { transition: transform 0.2s ease; }
+        .rr-dd.rr-dd-open .rr-dd-chevron { transform: rotate(180deg); }
+        /* 底部「每页」向上展开：关闭时箭头朝上，打开时朝下指向面板 */
+        .rr-dd--dropup:not(.rr-dd-open) .rr-dd-chevron { transform: rotate(180deg); }
+        .rr-dd--dropup.rr-dd-open .rr-dd-chevron { transform: rotate(0deg); }
+        .rr-dd-panel {
+            position: absolute;
+            left: 0;
+            top: calc(100% + 4px);
+            min-width: 100%;
+            width: max-content;
+            max-width: min(420px, calc(100vw - 16px));
+            box-sizing: border-box;
+            z-index: 10051;
+            border-radius: 0.5rem;
+            background: #1e293b;
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            box-shadow: 0 12px 48px -8px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(0, 0, 0, 0.25);
+            padding: 0.3rem;
+            max-height: 15rem;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #475569 #1e293b;
+        }
+        .rr-dd--dropup .rr-dd-panel {
+            top: auto;
+            bottom: calc(100% + 4px);
+        }
+        .rr-dd-panel::-webkit-scrollbar { width: 5px; }
+        .rr-dd-panel::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .rr-dd-opt {
+            display: block;
+            width: 100%;
+            border-radius: 0.35rem;
+            border: none;
+            background: transparent;
+            color: #e2e8f0;
+            cursor: pointer;
+            text-align: left;
+            font-size: 0.75rem;
+            line-height: 1.35;
+            padding: 0.5rem 0.6rem;
+            transition: background 0.1s;
+        }
+        .rr-dd-opt:hover { background: rgba(59, 130, 246, 0.14); }
+        .rr-dd-opt.rr-dd-opt--active {
+            background: rgba(59, 130, 246, 0.2);
+            color: #fff;
+        }
+        .rr-dd--sm .rr-dd-trigger { min-height: 1.85rem; padding: 0.28rem 0.45rem 0.28rem 0.5rem; font-size: 0.7rem; }
+        .rr-dd--sm .rr-dd-opt { font-size: 0.7rem; padding: 0.4rem 0.5rem; }
+        .runs-dd-mount { width: 100%; position: relative; overflow: visible; }
+        .runs-dd-mount--page { width: auto; min-width: 4rem; }
+        #runsToast {
+            z-index: 10060;
+        }
+    </style>
+</head>
+<body class="runs-page text-xs antialiased">
+    <!-- 与 dashboard.html 一致的复制成功提示 -->
+    <div id="runsToast" class="fixed top-4 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-2 rounded-lg shadow-lg border border-slate-600 opacity-0 transition-opacity duration-300 pointer-events-none">
+        <div class="flex items-center gap-2">
+            <i data-lucide="check-circle" class="w-4 h-4 text-emerald-400"></i>
+            <span id="runsToastMessage">复制成功</span>
+        </div>
+    </div>
+    <div class="runs-shell">
+        <div class="runs-card">
+            <div class="runs-filters">
+                <div class="runs-filter-row">
+                    <div class="runs-filter-fields">
+                        <label class="runs-field runs-field--search">
+                            <span>搜索</span>
+                            <input type="text" id="fQ" class="rr-input w-full" placeholder="素材 ID / 素材名称" autocomplete="off" />
+                        </label>
+                        <label class="runs-field runs-field--sm">
+                            <span>状态</span>
+                            <div id="mountStatus" class="runs-dd-mount min-w-[6.5rem] w-full sm:w-auto"></div>
+                        </label>
+                        <label class="runs-field runs-field--sm">
+                            <span>追投方式</span>
+                            <div id="mountRetMethod" class="runs-dd-mount min-w-[7.5rem] w-full sm:w-auto"></div>
+                        </label>
+                    </div>
+                    <div class="runs-filter-actions">
+                        <button type="button" id="btnSearch" class="btn-primary px-4 py-1.5 rounded-lg text-xs">查询</button>
+                        <button type="button" id="btnReset" class="btn-ghost px-4 py-1.5 rounded-lg text-xs">重置</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="runs-table-scroll">
+                <table class="runs-table">
+                    <thead>
+                        <tr>
+                            <th>素材 ID</th>
+                            <th>素材名称</th>
+                            <th>素材类型</th>
+                            <th>状态</th>
+                            <th>追投方式</th>
+                            <th>优化目标</th>
+                            <th>调控 ID</th>
+                            <th>返回消息</th>
+                            <th>开始时间</th>
+                            <th>结束时间</th>
+                            <th class="text-center">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbodyRows"></tbody>
+                </table>
+                <div id="emptyHint" class="hidden">暂无数据</div>
+            </div>
+
+            <div class="runs-pagination">
+                <span id="pageInfo">共 0 条</span>
+                <div class="flex flex-wrap items-center gap-2">
+                    <label class="flex items-center gap-1.5">
+                        <span>每页</span>
+                        <div id="mountPageSize" class="runs-dd-mount runs-dd-mount--page"></div>
+                    </label>
+                    <!-- 与 dashboard.html updatePagination 一致：< 1 2 3 … 末页 > -->
+                    <div id="paginationLinks" class="flex items-center gap-1 flex-wrap justify-end"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 弹窗：追投参数（脚本可将节点挂到父页 body，以铺满整个应用窗口，避免被 iframe/overflow 裁剪） -->
+    <div id="modalRet" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-4 modal-overlay">
+        <div class="runs-modal-detail-panel bg-slate-900 border border-slate-600/50 rounded-2xl max-w-5xl w-full max-h-[90vh] flex flex-col shadow-2xl ring-1 ring-slate-700/40 overflow-hidden">
+            <div class="flex-shrink-0 flex items-start justify-between gap-3 px-4 py-3.5 sm:px-6 border-b border-slate-700/50 bg-gradient-to-b from-slate-950/90 to-slate-900/70">
+                <div class="min-w-0">
+                    <h2 class="text-lg sm:text-xl font-semibold text-white tracking-tight">追投详情</h2>
+                    <p class="text-xs sm:text-sm text-slate-500 mt-1 leading-relaxed">素材与执行结果 · 调控任务</p>
+                </div>
+                <button type="button" class="modal-close flex-shrink-0 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/80 p-1.5 transition-colors" data-close="modalRet" aria-label="关闭"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+            <div id="modalRetBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-5 sm:py-6 text-slate-300 text-base space-y-5"></div>
+            <div id="modalRetFooter" class="flex-shrink-0 flex flex-wrap items-center justify-end gap-2 px-4 sm:px-6 py-3.5">
+                <button type="button" class="runs-btn-op runs-btn-op--trig" data-runs-jump="trig">触发条件</button>
+                <button type="button" class="runs-btn-op runs-btn-op--query" data-runs-jump="query">素材信息</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 弹窗：触发快照（与追投详情同量级宽度，便于阅读多行条件） -->
+    <div id="modalTrig" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-5 modal-overlay">
+        <!-- overflow-hidden：与 rounded-2xl 配套，避免头部渐变/底边在圆角处挤出「两个角」 -->
+        <div class="bg-slate-900 border border-slate-600/60 rounded-2xl max-w-5xl w-full max-h-[90vh] min-h-0 flex flex-col shadow-2xl ring-1 ring-slate-700/35 overflow-hidden">
+            <div class="flex-shrink-0 flex items-center justify-between gap-3 px-5 pt-5 pb-3.5 sm:px-6 sm:pt-5 sm:pb-4 border-b border-slate-700/60 bg-gradient-to-b from-slate-950/80 to-slate-900/60">
+                <div class="min-w-0 flex items-center gap-2 flex-wrap">
+                    <h2 class="text-lg font-semibold text-white tracking-tight">触发条件</h2>
+                    <span id="modalTrigStrategyBadge" class="inline-flex items-center shrink-0"></span>
+                </div>
+                <button type="button" class="modal-close text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800/80" data-close="modalTrig"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div id="modalTrigBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 text-slate-300 text-base space-y-4"></div>
+        </div>
+    </div>
+
+    <!-- 弹窗：查询上下文 / 素材信息 -->
+    <div id="modalQuery" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-5 modal-overlay">
+        <div class="bg-slate-900 border border-slate-600/60 rounded-2xl max-w-5xl w-full max-h-[90vh] min-h-0 flex flex-col shadow-2xl ring-1 ring-slate-700/35 overflow-hidden">
+            <div class="flex-shrink-0 flex items-center justify-between px-5 pt-5 pb-3.5 sm:px-6 sm:pt-5 sm:pb-4 border-b border-slate-700/60 bg-gradient-to-b from-slate-950/80 to-slate-900/60">
+                <h2 class="text-lg font-semibold text-white tracking-tight">素材信息</h2>
+                <button type="button" class="modal-close text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800/80" data-close="modalQuery"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div id="modalQueryBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 text-slate-300 text-base"></div>
+        </div>
+    </div>
+
+    <script>
+        function getPywebviewApi() {
+            try {
+                if (window.top && window.top.pywebviewAPI) return window.top.pywebviewAPI;
+            } catch (e) {}
+            try {
+                if (window.parent && window.parent !== window && window.parent.pywebviewAPI) return window.parent.pywebviewAPI;
+            } catch (e) {}
+            if (window.pywebview && window.pywebview.api) return window.pywebview.api;
+            return null;
+        }
+
+        /** 嵌入 rule_retargeting.html 的 iframe 时，fixed 仍受 iframe/overflow 裁剪；将弹窗挂到父 document.body 以铺满整个应用视口 */
+        var _runsModalOwnerDoc = null;
+        /**
+         * 父页在 file:// / pywebview 下可能加载不到相对路径的 link，弹窗移到父 DOM 后无 .runs-detail-* 样式。
+         * 用 iframe 内已解析的绝对 URL（或按当前页推导）向父页再注入一份同文件 stylesheet。
+         */
+        function runsInjectModalStylesInParent() {
+            if (window.parent === window) return;
+            try {
+                var pd = window.parent.document;
+                if (!pd.head || pd.getElementById('runs-modal-styles-injected')) return;
+                var href = null;
+                var linkEl = document.querySelector('link[href*="rule_retargeting_runs_modals"]');
+                if (linkEl && linkEl.href) {
+                    href = linkEl.href;
+                } else {
+                    try {
+                        href = new URL('../css/rule_retargeting_runs_modals.css', window.location.href).href;
+                    } catch (e2) {}
+                }
+                if (!href) return;
+                var clone = pd.createElement('link');
+                clone.rel = 'stylesheet';
+                clone.href = href;
+                clone.id = 'runs-modal-styles-injected';
+                pd.head.appendChild(clone);
+            } catch (e) {}
+        }
+        function runsLiftModalsToParent() {
+            if (window.parent === window) return;
+            try {
+                runsInjectModalStylesInParent();
+                var pd = window.parent.document;
+                if (!pd.body) return;
+                ['modalRet', 'modalTrig', 'modalQuery'].forEach(function (mid) {
+                    var el = document.getElementById(mid);
+                    if (el && el.parentNode !== pd.body) {
+                        pd.body.appendChild(el);
+                    }
+                });
+                _runsModalOwnerDoc = pd;
+            } catch (e) {
+                _runsModalOwnerDoc = null;
+            }
+        }
+        function runsEl(id) {
+            if (_runsModalOwnerDoc) {
+                return _runsModalOwnerDoc.getElementById(id);
+            }
+            return document.getElementById(id);
+        }
+        function runsLucideRefresh() {
+            try {
+                if (_runsModalOwnerDoc && window.parent && window.parent.lucide && window.parent.lucide.createIcons) {
+                    window.parent.lucide.createIcons();
+                }
+            } catch (e) {}
+            if (typeof lucide !== 'undefined' && lucide.createIcons) {
+                lucide.createIcons();
+            }
+        }
+        function runsBindModalUi() {
+            ['modalRet', 'modalTrig', 'modalQuery'].forEach(function (mid) {
+                var root = runsEl(mid);
+                if (!root) return;
+                root.querySelectorAll('.modal-close').forEach(function (b) {
+                    b.addEventListener('click', function () {
+                        closeModal(b.getAttribute('data-close'));
+                    });
+                });
+                root.addEventListener('click', function (e) {
+                    if (e.target === root) {
+                        closeModal(mid);
+                    }
+                });
+            });
+            var retRoot = runsEl('modalRet');
+            if (retRoot) {
+                retRoot.addEventListener('click', function (e) {
+                    var jump = e.target.closest && e.target.closest('[data-runs-jump]');
+                    if (!jump) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var jk = jump.getAttribute('data-runs-jump');
+                    if (jk === 'trig' || jk === 'query') {
+                        runsOpenSubModalFromDetail(jk);
+                    }
+                });
+            }
+        }
+
+        /** 打开详情后由 renderRetargetingDetailModal 写入，供底部「触发条件 / 素材信息」跳转 */
+        var runsLastRetargetingDetail = null;
+
+        function runsOpenSubModalFromDetail(kind) {
+            var d = runsLastRetargetingDetail;
+            if (!d || typeof d !== 'object') {
+                var hm = '暂无详情数据，请从列表重新打开「详情」';
+                if (window.MessageBox && MessageBox.alert) MessageBox.alert(hm);
+                else alert(hm);
+                return;
+            }
+            try {
+                if (kind === 'trig') {
+                    var raw = d.trigger_snapshot_json || '{}';
+                    renderTriggerModal(JSON.parse(raw));
+                    runsSetModalTrigStrategyBadge(d.strategy_name);
+                    closeModal('modalRet');
+                    openModal('modalTrig');
+                } else if (kind === 'query') {
+                    var rawQ = d.query_snapshot_json || '{}';
+                    renderQueryModal(JSON.parse(rawQ));
+                    closeModal('modalRet');
+                    openModal('modalQuery');
+                }
+            } catch (err) {
+                var ex = 'JSON 解析失败: ' + err;
+                if (window.MessageBox && MessageBox.alert) MessageBox.alert(ex);
+                else alert(ex);
+            }
+        }
+
+        /** 与 dashboard.html 列配置一致（918-935） */
+        const DASHBOARD_MATERIAL_COLUMNS = [
+            { key: 'createTime', label: '创建时间' },
+            { key: 'currentCost', label: '整体消耗' },
+            { key: 'velocity', label: '时段流速' },
+            { key: 'estimatedEcpm', label: '预估ECPM' },
+            { key: 'maxCostTime', label: '最新入库时间' },
+            { key: 'minCostTime', label: '周期内起始数据入库时间' },
+            { key: 'netRoi', label: '净成交ROI' },
+            { key: 'netAmount', label: '净成交金额' },
+            { key: 'overallPayRoi', label: '整体支付ROI' },
+            { key: 'overallAmount', label: '整体成交金额' },
+            { key: 'hourRefundRate', label: '1h退款率' },
+            { key: 'netSettleRate', label: '净成交结算率' },
+            { key: 'netOrderCount', label: '净成交订单数' },
+            { key: 'overallOrderCount', label: '整体成交订单数' },
+            { key: 'overallShowCount', label: '整体展现次数' },
+            { key: 'overallClickCount', label: '整体点击次数' },
+            { key: 'overallCtr', label: '整体点击率' },
+            { key: 'overallConversionRate', label: '整体转化率' },
+        ];
+
+        function materialFieldValue(row, colKey) {
+            if (!row || typeof row !== 'object') return '';
+            if (colKey === 'velocity') {
+                const v = row.velocity;
+                if (v !== undefined && v !== null && v !== '') return v;
+                return row.costDiff;
+            }
+            if (colKey === 'maxCostTime') {
+                const v = row.maxCostTime;
+                if (v !== undefined && v !== null && v !== '') return v;
+                return row.periodEndTime;
+            }
+            if (colKey === 'minCostTime') {
+                const v = row.minCostTime;
+                if (v !== undefined && v !== null && v !== '') return v;
+                return row.periodStartTime;
+            }
+            return row[colKey];
+        }
+
+        function fmtVal(v) {
+            if (v === null || v === undefined) return '—';
+            if (typeof v === 'object') return JSON.stringify(v);
+            return String(v);
+        }
+
+        /** 与 dashboard.html 表格、飞书 Webhook 一致：以下字段为百分数展示（数值已为 0～100 口径） */
+        var DASHBOARD_RATE_PERCENT_KEYS = {
+            hourRefundRate: true,
+            netSettleRate: true,
+            overallCtr: true,
+            overallConversionRate: true,
+        };
+        function fmtMaterialMetricCell(colKey, raw) {
+            if (!DASHBOARD_RATE_PERCENT_KEYS[colKey]) return fmtVal(raw);
+            if (raw === null || raw === undefined || raw === '') return '—';
+            var n = parseFloat(String(raw).replace(/%/g, '').trim());
+            if (!Number.isFinite(n)) return fmtVal(raw);
+            var s = n % 1 === 0 ? String(Math.floor(n)) : n.toFixed(2).replace(/\.?0+$/, '');
+            return s + '%';
+        }
+
+        const RUNS_STATUS_ITEMS = [
+            { value: '', label: '全部' },
+            { value: '1', label: '成功' },
+            { value: '-1', label: '失败' },
+        ];
+        const RUNS_METHOD_ITEMS = [
+            { value: '', label: '全部' },
+            { value: 'volume', label: '放量追投' },
+            { value: 'cost_control', label: '控成本追投' },
+        ];
+        const RUNS_PAGE_ITEMS = [
+            { value: '10', label: '10' },
+            { value: '20', label: '20' },
+            { value: '50', label: '50' },
+            { value: '100', label: '100' },
+        ];
+
+        let _runsRrDdGlobalsBound = false;
+        function rrCloseAllDropdowns() {
+            document.querySelectorAll('.rr-dd.rr-dd-open').forEach(function (wrap) {
+                const panel = wrap._rrPanel;
+                wrap.classList.remove('rr-dd-open');
+                if (panel && !panel.hidden) {
+                    panel.hidden = true;
+                }
+            });
+        }
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s;
+            return d.innerHTML;
+        }
+        function ensureRrDdGlobalClose() {
+            if (_runsRrDdGlobalsBound) return;
+            _runsRrDdGlobalsBound = true;
+            document.addEventListener(
+                'click',
+                function (e) {
+                    if (e.target.closest && e.target.closest('.rr-dd')) return;
+                    rrCloseAllDropdowns();
+                },
+                true
+            );
+            window.addEventListener('scroll', rrCloseAllDropdowns, { passive: true });
+            window.addEventListener('resize', rrCloseAllDropdowns);
+        }
+        /**
+         * @param {{value:string,label:string}[]} items
+         * @param {string} value
+         * @param {{widthClass?:string,sm?:boolean,dropUp?:boolean,onChange?:function}} options
+         */
+        function createCustomDropdown(items, value, options) {
+            const opt = options || {};
+            const wrap = document.createElement('div');
+            wrap.className =
+                'rr-dd ' +
+                (opt.sm ? 'rr-dd--sm ' : '') +
+                (opt.widthClass || '') +
+                (opt.dropUp ? ' rr-dd--dropup' : '');
+
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.value = value;
+
+            const cur = items.find(function (x) { return x.value === value; }) || items[0];
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'rr-dd-trigger';
+            btn.innerHTML =
+                '<span class="rr-dd-label">' +
+                escapeHtml(cur.label) +
+                '</span><i data-lucide="chevron-down" class="rr-dd-chevron w-3.5 h-3.5 shrink-0 opacity-70"></i>';
+
+            const panel = document.createElement('div');
+            panel.className = 'rr-dd-panel';
+            panel.hidden = true;
+            panel.setAttribute('role', 'listbox');
+
+            items.forEach(function (item) {
+                const ob = document.createElement('button');
+                ob.type = 'button';
+                ob.className = 'rr-dd-opt' + (item.value === value ? ' rr-dd-opt--active' : '');
+                ob.textContent = item.label;
+                ob.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    hidden.value = item.value;
+                    const lab = btn.querySelector('.rr-dd-label');
+                    if (lab) lab.textContent = item.label;
+                    panel.querySelectorAll('.rr-dd-opt').forEach(function (el) {
+                        el.classList.toggle('rr-dd-opt--active', el === ob);
+                    });
+                    rrCloseAllDropdowns();
+                    if (typeof opt.onChange === 'function') opt.onChange(item.value);
+                });
+                panel.appendChild(ob);
+            });
+
+            wrap._rrPanel = panel;
+
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                ensureRrDdGlobalClose();
+                const wasOpen = wrap.classList.contains('rr-dd-open');
+                rrCloseAllDropdowns();
+                if (wasOpen) return;
+                panel.hidden = false;
+                wrap.classList.add('rr-dd-open');
+                lucide.createIcons();
+            });
+
+            wrap.appendChild(hidden);
+            wrap.appendChild(btn);
+            wrap.appendChild(panel);
+            return wrap;
+        }
+
+        function mountRunsFilterDropdowns() {
+            const ms = document.getElementById('mountStatus');
+            const mm = document.getElementById('mountRetMethod');
+            if (!ms || !mm) return;
+            rrCloseAllDropdowns();
+            ms.innerHTML = '';
+            mm.innerHTML = '';
+            const dd1 = createCustomDropdown(RUNS_STATUS_ITEMS, '', {
+                sm: true,
+                widthClass: 'w-full',
+                onChange: function () { page = 1; loadList(); },
+            });
+            dd1.querySelector('input[type="hidden"]').id = 'fStatus';
+            ms.appendChild(dd1);
+            const dd2 = createCustomDropdown(RUNS_METHOD_ITEMS, '', {
+                sm: true,
+                widthClass: 'w-full',
+                onChange: function () { page = 1; loadList(); },
+            });
+            dd2.querySelector('input[type="hidden"]').id = 'fRetMethod';
+            mm.appendChild(dd2);
+            lucide.createIcons();
+        }
+
+        function mountRunsPageSizeDropdown() {
+            const mp = document.getElementById('mountPageSize');
+            if (!mp) return;
+            rrCloseAllDropdowns();
+            mp.innerHTML = '';
+            const dd = createCustomDropdown(RUNS_PAGE_ITEMS, '50', {
+                sm: true,
+                widthClass: 'w-full',
+                dropUp: true,
+                onChange: function () { page = 1; loadList(); },
+            });
+            dd.querySelector('input[type="hidden"]').id = 'pageSize';
+            mp.appendChild(dd);
+            lucide.createIcons();
+        }
+
+        let page = 1;
+        let total = 0;
+        let pageSize = 50;
+
+        function runsTotalPages() {
+            return Math.max(1, Math.ceil(total / pageSize));
+        }
+
+        function runsGoToPage(p) {
+            var tp = runsTotalPages();
+            if (p < 1 || p > tp) return;
+            page = p;
+            loadList();
+        }
+
+        /** 与 dashboard.html updatePagination 同步：< 1 2 3 … xx > */
+        function runsUpdatePagination() {
+            var paginationLinks = document.getElementById('paginationLinks');
+            if (!paginationLinks) return;
+            if (total === 0) {
+                paginationLinks.innerHTML = '';
+                return;
+            }
+            var totalPages = runsTotalPages();
+            var currentPage = page;
+            var html = '';
+            var btnBase = 'px-2.5 py-1 text-xs rounded transition-colors';
+            var numBase = 'px-2.5 py-1 text-xs text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors';
+            var numCur = 'px-2.5 py-1 text-xs bg-blue-500 text-white rounded font-medium';
+
+            if (currentPage > 1) {
+                html +=
+                    '<button type="button" data-runs-page="' +
+                    (currentPage - 1) +
+                    '" class="' +
+                    btnBase +
+                    ' text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 border border-slate-600" title="上一页">' +
+                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>' +
+                    '</button>';
+            } else {
+                html +=
+                    '<button type="button" class="' +
+                    btnBase +
+                    ' text-slate-600 bg-slate-800 border border-slate-700 cursor-not-allowed" disabled>' +
+                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>' +
+                    '</button>';
+            }
+
+            if (totalPages <= 7) {
+                var j;
+                for (j = 1; j <= totalPages; j++) {
+                    if (j === currentPage) {
+                        html += '<span class="' + numCur + '">' + j + '</span>';
+                    } else {
+                        html +=
+                            '<button type="button" data-runs-page="' +
+                            j +
+                            '" class="' +
+                            numBase +
+                            '">' +
+                            j +
+                            '</button>';
+                    }
+                }
+            } else {
+                if (currentPage <= 4) {
+                    for (j = 1; j <= 5; j++) {
+                        if (j === currentPage) {
+                            html += '<span class="' + numCur + '">' + j + '</span>';
+                        } else {
+                            html +=
+                                '<button type="button" data-runs-page="' +
+                                j +
+                                '" class="' +
+                                numBase +
+                                '">' +
+                                j +
+                                '</button>';
+                        }
+                    }
+                    html += '<span class="px-1 text-slate-500">...</span>';
+                    html +=
+                        '<button type="button" data-runs-page="' +
+                        totalPages +
+                        '" class="' +
+                        numBase +
+                        '">' +
+                        totalPages +
+                        '</button>';
+                } else if (currentPage >= totalPages - 3) {
+                    html += '<button type="button" data-runs-page="1" class="' + numBase + '">1</button>';
+                    html += '<span class="px-1 text-slate-500">...</span>';
+                    for (j = totalPages - 4; j <= totalPages; j++) {
+                        if (j === currentPage) {
+                            html += '<span class="' + numCur + '">' + j + '</span>';
+                        } else {
+                            html +=
+                                '<button type="button" data-runs-page="' +
+                                j +
+                                '" class="' +
+                                numBase +
+                                '">' +
+                                j +
+                                '</button>';
+                        }
+                    }
+                } else {
+                    html += '<button type="button" data-runs-page="1" class="' + numBase + '">1</button>';
+                    html += '<span class="px-1 text-slate-500">...</span>';
+                    for (j = currentPage - 2; j <= currentPage + 2; j++) {
+                        if (j === currentPage) {
+                            html += '<span class="' + numCur + '">' + j + '</span>';
+                        } else {
+                            html +=
+                                '<button type="button" data-runs-page="' +
+                                j +
+                                '" class="' +
+                                numBase +
+                                '">' +
+                                j +
+                                '</button>';
+                        }
+                    }
+                    html += '<span class="px-1 text-slate-500">...</span>';
+                    html +=
+                        '<button type="button" data-runs-page="' +
+                        totalPages +
+                        '" class="' +
+                        numBase +
+                        '">' +
+                        totalPages +
+                        '</button>';
+                }
+            }
+
+            if (currentPage < totalPages) {
+                html +=
+                    '<button type="button" data-runs-page="' +
+                    (currentPage + 1) +
+                    '" class="' +
+                    btnBase +
+                    ' text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 border border-slate-600" title="下一页">' +
+                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>' +
+                    '</button>';
+            } else {
+                html +=
+                    '<button type="button" class="' +
+                    btnBase +
+                    ' text-slate-600 bg-slate-800 border border-slate-700 cursor-not-allowed" disabled>' +
+                    '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>' +
+                    '</button>';
+            }
+
+            paginationLinks.innerHTML = html;
+        }
+
+        function notifyParentHeight() {
+            try {
+                var shell = document.querySelector('.runs-shell');
+                var h = 0;
+                if (shell) {
+                    var r = shell.getBoundingClientRect();
+                    h = Math.ceil(r.bottom + (window.pageYOffset || document.documentElement.scrollTop || 0));
+                }
+                if (h <= 0) {
+                    h = Math.max(
+                        document.documentElement.scrollHeight || 0,
+                        document.body.scrollHeight || 0
+                    );
+                }
+                if (h > 0 && window.parent && window.parent !== window) {
+                    window.parent.postMessage({ type: 'retargetingRunsHeight', height: h }, '*');
+                }
+            } catch (e) {}
+        }
+
+        const RUNS_STEP_LABELS = {
+            validate: '校验',
+            build_url: '构建链接',
+            browser: '打开浏览器',
+            switch_to_video_tab: '切视频 Tab',
+            search_material: '搜索素材',
+            fill_or_submit: '填写/提交',
+            submit_api: '提交接口',
+            done: '完成',
+            exception: '异常',
+        };
+        const RUNS_OG_LABELS = {
+            net_roi: '净成交 ROI',
+            live_room: '直播间成交',
+        };
+        /** 与 rule_retargeting.html METRICS / OPS 一致，触发条件弹窗用人话展示 */
+        const RUNS_TRIG_METRIC_LABELS = {
+            costDiff: '素材流速（时段流速）',
+            currentCost: '整体消耗',
+            estimatedEcpm: '预估ECPM',
+            netRoi: '净成交ROI',
+            netAmount: '净成交金额',
+            overallPayRoi: '整体支付ROI',
+            overallAmount: '整体成交金额',
+            hourRefundRate: '1h退款率',
+            netSettleRate: '净成交结算率',
+            netOrderCount: '净成交订单数',
+            overallOrderCount: '整体成交订单数',
+            overallShowCount: '整体展现次数',
+            overallClickCount: '整体点击次数',
+            overallCtr: '整体点击率',
+            overallConversionRate: '整体转化率',
+        };
+        const RUNS_TRIG_OP_LABELS = {
+            gt: '大于',
+            gte: '大于或等于',
+            lt: '小于',
+            lte: '小于或等于',
+            eq: '等于',
+        };
+        function runsTrigMetricLabel(key) {
+            var k = String(key == null ? '' : key).trim();
+            return RUNS_TRIG_METRIC_LABELS[k] || k;
+        }
+        function runsTrigOpLabel(op) {
+            var o = String(op == null ? '' : op).trim().toLowerCase();
+            return RUNS_TRIG_OP_LABELS[o] || String(op || '—');
+        }
+        function runsTrigGroupCombineText(gc) {
+            var x = String(gc == null ? '' : gc).trim().toLowerCase();
+            if (x === 'or') return '满足下面任意一组条件即可';
+            if (x === 'and') return '需要同时满足下面全部组条件';
+            return String(gc || '—');
+        }
+        function runsTrigJoinText(j) {
+            var x = String(j == null ? '' : j).trim().toLowerCase();
+            if (x === 'and') return '本组内全部条件需同时满足';
+            if (x === 'or') return '本组内满足任一条件即可';
+            return String(j || '—');
+        }
+        function buildTriggerConfigSection(cfg) {
+            if (!cfg || typeof cfg !== 'object') return '';
+            var gcText = runsTrigGroupCombineText(cfg.group_combine);
+            var groups = cfg.groups || [];
+            var parts = [];
+            parts.push('<div class="runs-trig-panel rounded-xl border border-slate-600/45 bg-slate-950/50 overflow-hidden">');
+            parts.push(
+                '<div class="px-4 py-2.5 border-b border-slate-700/55 bg-slate-900/70"><span class="text-sm font-semibold text-slate-100">触发规则</span></div>'
+            );
+            parts.push('<div class="p-4 space-y-4 text-sm">');
+            parts.push(
+                '<p class="text-slate-300 text-[13px] leading-relaxed"><span class="text-slate-500">多组关系：</span>' +
+                    esc(gcText) +
+                    '</p>'
+            );
+            if (!groups.length) {
+                parts.push('<p class="text-slate-500 text-[13px]">暂无具体条件</p>');
+            }
+            groups.forEach(function (g, gi) {
+                var joinText = runsTrigJoinText(g.join);
+                parts.push('<div class="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">');
+                parts.push(
+                    '<div class="text-xs font-semibold text-amber-400/95 mb-1">条件组 ' +
+                        (gi + 1) +
+                        '</div>'
+                );
+                parts.push(
+                    '<p class="text-[11px] text-slate-500 mb-2 leading-relaxed">' + esc(joinText) + '</p>'
+                );
+                parts.push('<ul class="space-y-2">');
+                (g.conditions || []).forEach(function (c) {
+                    var ml = runsTrigMetricLabel(c.metric);
+                    var ol = runsTrigOpLabel(c.op);
+                    var vl = esc(fmtVal(c.value));
+                    parts.push(
+                        '<li class="rounded-md border border-slate-700/40 bg-slate-950/60 px-3 py-2.5 text-[13px] leading-snug">' +
+                            '<span class="text-slate-100">' +
+                            esc(ml) +
+                            '</span> ' +
+                            '<span class="text-slate-500">需要</span> ' +
+                            '<span class="text-sky-300">' +
+                            esc(ol) +
+                            '</span> ' +
+                            '<span class="text-slate-500">阈值</span> ' +
+                            '<span class="text-white font-semibold tabular-nums">' +
+                            vl +
+                            '</span>' +
+                            '</li>'
+                    );
+                });
+                parts.push('</ul></div>');
+            });
+            parts.push('</div></div>');
+            return parts.join('');
+        }
+        function buildTriggerEvaluationSection(ev) {
+            if (!ev || typeof ev !== 'object') return '';
+            var passed = !!ev.passed;
+            var badge = passed
+                ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/35">通过</span>'
+                : '<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-rose-500/15 text-rose-400 border border-rose-500/35">未通过</span>';
+            var parts = [];
+            parts.push(
+                '<div class="runs-trig-panel rounded-xl border border-slate-600/45 bg-slate-950/50 overflow-hidden mt-4">'
+            );
+            parts.push(
+                '<div class="px-4 py-2.5 border-b border-slate-700/55 bg-slate-900/70 flex flex-wrap items-center justify-between gap-2">' +
+                    '<span class="text-sm font-semibold text-slate-100">本次求值结果</span>' +
+                    badge +
+                    '</div>'
+            );
+            parts.push('<div class="p-4 space-y-3">');
+            (ev.groups || []).forEach(function (g, gi) {
+                var gp = g.passed;
+                var st = gp
+                    ? '<span class="text-emerald-400 text-xs font-medium">本组已满足</span>'
+                    : '<span class="text-rose-400 text-xs font-medium">本组未满足</span>';
+                parts.push('<div class="rounded-lg border border-slate-700/60 bg-slate-900/35 p-3">');
+                parts.push(
+                    '<div class="flex flex-wrap items-center gap-2 mb-2 text-xs"><span class="text-slate-400">条件组 ' +
+                        (gi + 1) +
+                        '</span>' +
+                        st +
+                        '</div>'
+                );
+                parts.push('<ul class="space-y-2">');
+                (g.conditions || []).forEach(function (c) {
+                    var ml = runsTrigMetricLabel(c.metric);
+                    var ol = runsTrigOpLabel(c.op);
+                    var ok = c.passed;
+                    var mark = ok
+                        ? '<span class="text-emerald-400 font-semibold">满足</span>'
+                        : '<span class="text-rose-400 font-semibold">不满足</span>';
+                    parts.push(
+                        '<li class="rounded-md border border-slate-700/35 bg-slate-950/55 px-3 py-2.5 text-[13px]">' +
+                            '<div class="text-slate-100 mb-1.5">' +
+                            esc(ml) +
+                            '</div>' +
+                            '<div class="text-[12px] text-slate-400 flex flex-wrap items-center gap-x-3 gap-y-1 leading-relaxed">' +
+                            '<span>要求「<span class="text-slate-300">' +
+                            esc(ol) +
+                            '</span>」阈值 <span class="text-slate-200 tabular-nums">' +
+                            esc(fmtVal(c.threshold)) +
+                            '</span></span>' +
+                            '<span>本素材实际 <span class="text-slate-200 tabular-nums">' +
+                            esc(fmtVal(c.actual)) +
+                            '</span></span>' +
+                            '<span class="text-slate-600">·</span>' +
+                            mark +
+                            '</div></li>'
+                    );
+                });
+                parts.push('</ul></div>');
+            });
+            parts.push('</div></div>');
+            return parts.join('');
+        }
+        /** 与 dashboard.html 中 videoTypeMap 一致（键用于 tag 配色，短标签见 runsVideoTypeTagHtml） */
+        const VIDEO_TYPE_KEYS = {
+            1: '全部',
+            2: '自选投放视频',
+            3: '智能优选视频',
+            4: 'AIGC动态创意',
+        };
+        /** 非数字或别名字符串 → dashboard 键名 */
+        const VIDEO_TYPE_ALIAS = {
+            '自选投放': '自选投放视频',
+            '自选投放视频': '自选投放视频',
+            '智能优选': '智能优选视频',
+            '智能优选视频': '智能优选视频',
+            'AIGC动态创意': 'AIGC动态创意',
+            '全部': '全部',
+        };
+        function esc(s) {
+            return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function runsAttrEscape(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        }
+
+        /** 与 dashboard.html copyToClipboard / showToast 一致，支持自定义提示文案 */
+        function showRunsToast(message) {
+            var toast = document.getElementById('runsToast');
+            var toastMessage = document.getElementById('runsToastMessage');
+            if (!toast || !toastMessage) return;
+            toastMessage.textContent = message;
+            toast.classList.remove('opacity-0');
+            toast.classList.add('opacity-100');
+            if (typeof lucide !== 'undefined' && lucide.createIcons) lucide.createIcons();
+            setTimeout(function () {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('opacity-0');
+            }, 2000);
+        }
+
+        function copyRunsFallback(text, msg) {
+            var textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                showRunsToast(msg);
+            } catch (err) {
+                showRunsToast('复制失败');
+            }
+            document.body.removeChild(textarea);
+        }
+
+        function copyRunsToClipboard(text, message) {
+            var msg = message || '已复制到剪贴板';
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(
+                    function () {
+                        showRunsToast(msg);
+                    },
+                    function () {
+                        copyRunsFallback(text, msg);
+                    }
+                );
+            } else {
+                copyRunsFallback(text, msg);
+            }
+        }
+
+        /** 与 dashboard.html maskMaterialTitle 一致 */
+        function maskMaterialTitle(raw) {
+            var gap = ' * ';
+            if (raw == null || raw === '') return '';
+            var s = String(raw);
+            var extIdx = s.toLowerCase().lastIndexOf('.mp4');
+            if (extIdx === -1) {
+                if (s.length <= 2) return s;
+                return s[0] + gap + s[s.length - 1];
+            }
+            var ext = s.slice(extIdx);
+            var stem = s.slice(0, extIdx);
+            var tailParen = stem.match(/^(.)(.+)(\([^)]*\))$/);
+            if (tailParen) {
+                return tailParen[1] + gap + tailParen[3] + ext;
+            }
+            if (stem.length <= 1) return stem + ext;
+            return stem[0] + gap + stem[stem.length - 1] + ext;
+        }
+
+        function runsMaterialNameCell(name) {
+            var full = String(name == null ? '' : name);
+            if (!full.trim()) {
+                return '<td class="p-2"><span class="runs-empty">—</span></td>';
+            }
+            var masked = maskMaterialTitle(full);
+            return (
+                '<td class="p-2 max-w-[14rem] align-top">' +
+                '<span class="runs-material-name" data-full="' +
+                runsAttrEscape(full) +
+                '" data-expanded="0" title="' +
+                runsAttrEscape(full) +
+                '">' +
+                esc(masked) +
+                '</span></td>'
+            );
+        }
+
+        /** 素材 ID / 调控 ID：有值则可点击复制，无值显示 — */
+        function runsCopyIdCell(raw, toastMsg) {
+            var t = raw == null ? '' : String(raw).trim();
+            if (!t) {
+                return '<td class="p-2"><span class="runs-empty">—</span></td>';
+            }
+            return (
+                '<td class="p-2 max-w-[9rem] truncate align-top">' +
+                '<button type="button" class="runs-copy" data-copy="' +
+                runsAttrEscape(t) +
+                '" data-toast="' +
+                runsAttrEscape(toastMsg) +
+                '">' +
+                esc(t) +
+                '</button></td>'
+            );
+        }
+
+        /** 列表「返回消息」列，对应 pmc_retargeting_run.message；超过 10 字显示前 10 字 + …，完整内容在 title */
+        function runsReturnMessageCell(msg) {
+            var raw = msg == null ? '' : String(msg).trim();
+            if (!raw) {
+                return '<td class="p-2 align-top"><span class="runs-empty">—</span></td>';
+            }
+            var maxLen = 10;
+            var truncated = raw.length > maxLen ? raw.slice(0, maxLen) + '...' : raw;
+            return (
+                '<td class="p-2 align-top max-w-[9rem]">' +
+                '<div class="runs-cell-plain leading-relaxed" title="' +
+                runsAttrEscape(raw) +
+                '">' +
+                esc(truncated) +
+                '</div></td>'
+            );
+        }
+
+        function runsFmtStatus(st) {
+            if (st === 1) return '<span class="runs-st-ok">成功</span>';
+            return '<span class="runs-st-err">失败</span>';
+        }
+
+        function runsFmtMethod(m) {
+            const v = String(m == null ? '' : m).trim().toLowerCase();
+            if (!v) return '<span class="runs-empty">—</span>';
+            if (v === 'volume') {
+                return (
+                    '<span class="inline-flex items-center px-1.5 py-0.5 bg-sky-500/20 text-sky-400 text-[10px] rounded border border-sky-500/30 leading-none">' +
+                    '放量追投</span>'
+                );
+            }
+            if (v === 'cost_control') {
+                return (
+                    '<span class="inline-flex items-center px-1.5 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded border border-amber-500/30 leading-none">' +
+                    '控成本追投</span>'
+                );
+            }
+            return (
+                '<span class="inline-flex items-center px-1.5 py-0.5 bg-slate-500/20 text-slate-300 text-[10px] rounded border border-slate-500/30 leading-none">' +
+                esc(String(m)) +
+                '</span>'
+            );
+        }
+
+        function runsFmtOg(g) {
+            const raw = String(g == null ? '' : g).trim();
+            if (!raw) return '<span class="runs-empty">—</span>';
+            const key = raw.toLowerCase();
+            const mapped = RUNS_OG_LABELS[key];
+            const label = mapped ? mapped : raw;
+            var cls = 'runs-col-txt runs-col-og-other';
+            if (key === 'net_roi') cls = 'runs-col-txt runs-col-og-net';
+            else if (key === 'live_room') cls = 'runs-col-txt runs-col-og-live';
+            return '<span class="' + cls + '">' + esc(label) + '</span>';
+        }
+
+        function runsFmtDurationMs(ms) {
+            if (ms == null || ms === '') return '<span class="runs-empty">—</span>';
+            var n = Number(ms);
+            if (Number.isNaN(n) || n < 0) return esc(String(ms));
+            if (n < 1000) return esc(String(n) + ' ms');
+            var s = Math.floor(n / 1000);
+            if (s < 60) return esc(s + ' s');
+            var m = Math.floor(s / 60);
+            var rs = s % 60;
+            if (m < 60) return esc(m + 'm ' + rs + 's');
+            var h = Math.floor(m / 60);
+            var rm = m % 60;
+            return esc(h + 'h ' + rm + 'm');
+        }
+
+        function runsFmtStrategyName(raw) {
+            if (raw != null && String(raw).trim() !== '') return String(raw).trim();
+            return '策略 1';
+        }
+
+        function runsStrategyNameTagHtml(raw) {
+            var t = runsFmtStrategyName(raw);
+            return (
+                '<span class="inline-flex items-center shrink-0 px-2 py-0.5 rounded-md text-xs font-medium ' +
+                'bg-sky-500/15 text-sky-300 border border-sky-500/25">' +
+                esc(t) +
+                '</span>'
+            );
+        }
+
+        /** 弹窗可能已挂到父 document，须用 runsEl 才能命中 #modalTrigStrategyBadge */
+        function runsSetModalTrigStrategyBadge(raw) {
+            var el = runsEl('modalTrigStrategyBadge');
+            if (el) {
+                el.innerHTML = runsStrategyNameTagHtml(raw);
+            }
+        }
+
+        function runsDetailWrap(title, innerHtml, strategyNameRaw) {
+            var hd =
+                '<div class="runs-detail-card-hd flex flex-wrap items-center gap-x-2 gap-y-1">' +
+                '<span>' +
+                esc(title) +
+                '</span>';
+            if (arguments.length >= 3) {
+                hd += runsStrategyNameTagHtml(strategyNameRaw);
+            }
+            hd += '</div>';
+            return (
+                '<div class="runs-detail-card">' +
+                hd +
+                '<div class="p-4 sm:p-5">' +
+                innerHtml +
+                '</div></div>'
+            );
+        }
+
+        function runsDetailBodyOnly(innerHtml) {
+            return (
+                '<div class="runs-detail-card runs-detail-card--body-only">' +
+                '<div class="runs-detail-card-body">' +
+                innerHtml +
+                '</div></div>'
+            );
+        }
+
+        function runsDetailCell(lbl, valueHtml) {
+            return (
+                '<div class="runs-detail-cell">' +
+                '<div class="runs-detail-lbl">' +
+                esc(lbl) +
+                '</div>' +
+                '<div class="runs-detail-val">' +
+                valueHtml +
+                '</div></div>'
+            );
+        }
+
+        function runsDetailCopyInline(raw, toastMsg) {
+            var t = raw == null ? '' : String(raw).trim();
+            if (!t) return '<span class="runs-empty">—</span>';
+            return (
+                '<button type="button" class="runs-copy runs-copy--modal" data-copy="' +
+                runsAttrEscape(t) +
+                '" data-toast="' +
+                runsAttrEscape(toastMsg) +
+                '">' +
+                esc(t) +
+                '</button>'
+            );
+        }
+
+        function runsFmtTriggerSource(ts) {
+            var v = String(ts == null ? '' : ts).trim().toLowerCase();
+            if (!v || v === 'scheduler') {
+                return (
+                    '<span class="runs-detail-tri">自动追投 <span class="runs-detail-tri-meta">(scheduler)</span></span>'
+                );
+            }
+            if (v === 'manual' || v === 'manual_immediate') {
+                return (
+                    '<span class="runs-detail-tri">即刻追投 <span class="runs-detail-tri-meta">(manual)</span></span>'
+                );
+            }
+            return '<span class="runs-detail-tri">' + esc(String(ts)) + '</span>';
+        }
+
+        function runsFmtStatusDetail(st) {
+            if (st === 1) {
+                return '<span class="runs-detail-st-txt runs-detail-st-txt--ok">成功</span>';
+            }
+            return '<span class="runs-detail-st-txt runs-detail-st-txt--err">失败</span>';
+        }
+
+        function runsFmtStepDetail(step) {
+            const raw = String(step == null ? '' : step).trim();
+            if (!raw) return '<span class="runs-empty">—</span>';
+            const key = raw.toLowerCase();
+            const mapped = RUNS_STEP_LABELS[key];
+            const label = mapped ? mapped : raw;
+            return '<span class="runs-detail-step-pill">' + esc(label) + '</span>';
+        }
+
+        function runsFmtMethodDetail(m) {
+            const v = String(m == null ? '' : m).trim().toLowerCase();
+            if (!v) return '<span class="runs-empty">—</span>';
+            if (v === 'volume') {
+                return '<span class="runs-detail-tag-m runs-detail-tag-m--vol">放量追投</span>';
+            }
+            if (v === 'cost_control') {
+                return '<span class="runs-detail-tag-m runs-detail-tag-m--cc">控成本追投</span>';
+            }
+            return '<span class="runs-detail-tag-m runs-detail-tag-m--unk">' + esc(String(m)) + '</span>';
+        }
+
+        function runsFmtOgDetail(g) {
+            const raw = String(g == null ? '' : g).trim();
+            if (!raw) {
+                return '<span class="runs-detail-og runs-detail-og--empty">—</span>';
+            }
+            const key = raw.toLowerCase();
+            const mapped = RUNS_OG_LABELS[key];
+            const label = mapped ? mapped : raw;
+            var cls = 'runs-detail-og runs-detail-og--other';
+            if (key === 'net_roi') cls = 'runs-detail-og runs-detail-og--net';
+            else if (key === 'live_room') cls = 'runs-detail-og runs-detail-og--live';
+            return '<span class="' + cls + '">' + esc(label) + '</span>';
+        }
+
+        function buildRunsDetailMainGrid(d) {
+            var msgText = d.message && String(d.message).trim() ? String(d.message) : '';
+            var msgHtml = msgText
+                ? '<span class="runs-detail-msg">' + esc(msgText) + '</span>'
+                : '<span class="runs-empty">—</span>';
+            var det = d.detail && String(d.detail).trim() ? String(d.detail).trim() : '';
+            var errBlock = '';
+            if (det) {
+                errBlock =
+                    '<div class="runs-detail-error-banner">' +
+                    '<div class="runs-detail-error-hd"><i data-lucide="alert-triangle" class="w-3.5 h-3.5 shrink-0"></i> 错误详情</div>' +
+                    '<div class="runs-detail-error-body">' +
+                    esc(det) +
+                    '</div></div>';
+            }
+            var inner =
+                '<div class="runs-detail-main">' +
+                '<div class="runs-detail-row">' +
+                runsDetailCell('素材 ID', runsDetailCopyInline(d.material_id, '素材ID已复制到剪贴板')) +
+                runsDetailCell('素材名称', '<span class="runs-detail-name-wrap">' + esc(String(d.material_name || '—')) + '</span>') +
+                runsDetailCell('素材类型', runsFmtVideoTypeModal(d.video_type)) +
+                '</div>' +
+                '<div class="runs-detail-row">' +
+                runsDetailCell('状态', runsFmtStatusDetail(d.status)) +
+                runsDetailCell('阶段', runsFmtStepDetail(d.step)) +
+                runsDetailCell('返回消息', msgHtml) +
+                '</div>' +
+                '<div class="runs-detail-row">' +
+                runsDetailCell('追投方式', runsFmtMethodDetail(d.retargeting_method)) +
+                runsDetailCell('优化目标', runsFmtOgDetail(d.optimization_goal)) +
+                runsDetailCell('调控 ID', runsDetailCopyInline(d.regulate_task_id, '调控ID已复制到剪贴板')) +
+                '</div>' +
+                '<div class="runs-detail-row">' +
+                runsDetailCell(
+                    '开始时间',
+                    '<span class="runs-detail-mono">' + esc(String(d.started_at || '—')) + '</span>'
+                ) +
+                runsDetailCell(
+                    '结束时间',
+                    '<span class="runs-detail-mono">' + esc(String(d.ended_at || '—')) + '</span>'
+                ) +
+                runsDetailCell('触发方式', runsFmtTriggerSource(d.trigger_source)) +
+                '</div>' +
+                (errBlock ? errBlock : '') +
+                '</div>';
+            return runsDetailBodyOnly(inner);
+        }
+
+        function runsDetailTaskLine(label, valueHtml) {
+            return (
+                '<div class="runs-detail-task-line">' +
+                '<span class="runs-detail-task-k">' +
+                esc(label) +
+                '</span>' +
+                '<span class="runs-detail-task-v">' +
+                valueHtml +
+                '</span></div>'
+            );
+        }
+
+        /**
+         * 调控任务：大卡片内按行展示；预算/时长等随追投方式与优化目标变化。
+         */
+        function buildControlTaskBlock(obj, meta) {
+            const m = meta || {};
+            const strat = m.strategy_name;
+            if (!obj || typeof obj !== 'object') {
+                return runsDetailWrap('调控任务', '<p class="text-rose-400 text-sm">无法解析参数</p>', strat);
+            }
+            const method = String(m.retargeting_method || obj.method || '').trim().toLowerCase();
+            const ogRow = String(m.optimization_goal || '').trim().toLowerCase();
+            const lines = [];
+
+            lines.push(runsDetailTaskLine('追投方式', runsFmtMethodDetail(method)));
+            lines.push(runsDetailTaskLine('优化目标', runsFmtOgDetail(m.optimization_goal)));
+
+            if (method === 'volume' && obj.volume && typeof obj.volume === 'object') {
+                const v = obj.volume;
+                if (v.total_budget_yuan != null && v.total_budget_yuan !== '') {
+                    lines.push(runsDetailTaskLine('调控总预算（元）', esc(fmtVal(v.total_budget_yuan))));
+                }
+                if (v.duration_hours != null && v.duration_hours !== '') {
+                    lines.push(runsDetailTaskLine('调控时长（小时）', esc(fmtVal(v.duration_hours))));
+                }
+            } else if (method === 'cost_control') {
+                const cc = obj.cost_control && typeof obj.cost_control === 'object' ? obj.cost_control : {};
+                const ccOg = String(cc.optimization_goal || ogRow || 'net_roi').trim().toLowerCase();
+                if (ccOg === 'net_roi' && cc.net_roi && typeof cc.net_roi === 'object') {
+                    const nr = cc.net_roi;
+                    if (nr.daily_budget_yuan != null && nr.daily_budget_yuan !== '') {
+                        lines.push(runsDetailTaskLine('调控日预算（元）', esc(fmtVal(nr.daily_budget_yuan))));
+                    }
+                    if (nr.net_roi_target != null && nr.net_roi_target !== '') {
+                        lines.push(runsDetailTaskLine('净成交ROI目标', esc(fmtVal(nr.net_roi_target))));
+                    }
+                } else if (ccOg === 'live_room' && cc.live_room && typeof cc.live_room === 'object') {
+                    const lr = cc.live_room;
+                    if (lr.daily_budget_yuan != null && lr.daily_budget_yuan !== '') {
+                        lines.push(runsDetailTaskLine('调控日预算（元）', esc(fmtVal(lr.daily_budget_yuan))));
+                    }
+                    if (lr.bid_per_conversion_yuan != null && lr.bid_per_conversion_yuan !== '') {
+                        lines.push(runsDetailTaskLine('我的出价（元/成交）', esc(fmtVal(lr.bid_per_conversion_yuan))));
+                    }
+                } else {
+                    lines.push(
+                        '<p class="runs-detail-task-muted py-1">未找到与当前优化目标匹配的参数块（净成交 ROI / 直播间成交）</p>'
+                    );
+                }
+            } else if (method) {
+                lines.push(
+                    '<p class="runs-detail-task-muted py-1">未知追投方式：<span class="text-slate-300">' +
+                    esc(String(obj.method || '')) +
+                    '</span></p>'
+                );
+            }
+
+            if (obj.task_name_suffix != null && String(obj.task_name_suffix).trim() !== '') {
+                lines.push(runsDetailTaskLine('任务名称后缀', esc(String(obj.task_name_suffix))));
+            }
+
+            return runsDetailWrap('调控任务', '<div class="runs-detail-task-inner">' + lines.join('') + '</div>', strat);
+        }
+
+        function renderRetargetingDetailModal(d) {
+            runsLastRetargetingDetail = d;
+            const el = runsEl('modalRetBody');
+            if (!el) return;
+            const blocks = [];
+            blocks.push(buildRunsDetailMainGrid(d));
+
+            var obj = null;
+            try {
+                obj = JSON.parse(d.retargeting_json || '{}');
+            } catch (e) {
+                obj = null;
+            }
+            if (obj) {
+                blocks.push(
+                    buildControlTaskBlock(obj, {
+                        retargeting_method: d.retargeting_method,
+                        optimization_goal: d.optimization_goal,
+                        strategy_name: d.strategy_name,
+                    })
+                );
+            } else {
+                blocks.push(
+                    runsDetailWrap(
+                        '调控任务',
+                        '<p class="text-rose-400/95 text-sm">无法解析参数或内容为空</p>',
+                        d.strategy_name
+                    )
+                );
+            }
+
+            el.innerHTML = blocks.join('');
+            runsLucideRefresh();
+        }
+
+        /** 与 dashboard.html renderTable 内 videoTypeTagMap 一致 */
+        function runsVideoTypeTagHtml(videoTypeKey, sizeClass) {
+            const sc = sizeClass || 'text-[10px]';
+            const videoTypeTagMap = {
+                'AIGC动态创意': { bg: 'bg-purple-500/20', text: 'text-purple-400', border: 'border-purple-500/30', label: 'AIGC' },
+                '自选投放视频': { bg: 'bg-blue-500/20', text: 'text-blue-400', border: 'border-blue-500/30', label: '自选投放' },
+                '智能优选视频': { bg: 'bg-emerald-500/20', text: 'text-emerald-400', border: 'border-emerald-500/30', label: '智能优选' },
+                '全部': { bg: 'bg-amber-500/20', text: 'text-amber-400', border: 'border-amber-500/30', label: '全部' },
+            };
+            const tagInfo = videoTypeTagMap[videoTypeKey];
+            if (tagInfo) {
+                return (
+                    '<span class="inline-flex items-center px-1.5 py-0.5 ' +
+                    tagInfo.bg +
+                    ' ' +
+                    tagInfo.text +
+                    ' ' +
+                    sc +
+                    ' rounded border ' +
+                    tagInfo.border +
+                    ' leading-none">' +
+                    tagInfo.label +
+                    '</span>'
+                );
+            }
+            return (
+                '<span class="inline-flex items-center px-1.5 py-0.5 bg-slate-500/20 text-slate-300 ' +
+                sc +
+                ' rounded border border-slate-500/30 leading-none">' +
+                esc(String(videoTypeKey)) +
+                '</span>'
+            );
+        }
+
+        function runsFmtVideoType(v) {
+            if (v === null || v === undefined || v === '') {
+                return '<span class="runs-empty">—</span>';
+            }
+            const n = Number(v);
+            let key;
+            if (!Number.isNaN(n) && String(v).trim() !== '') {
+                key = VIDEO_TYPE_KEYS[n] || '其他';
+            } else {
+                const s = String(v).trim();
+                key = VIDEO_TYPE_ALIAS[s] || s;
+            }
+            return runsVideoTypeTagHtml(key);
+        }
+
+        /** 详情弹窗用：略大的素材类型标签 */
+        function runsFmtVideoTypeModal(v) {
+            if (v === null || v === undefined || v === '') {
+                return '<span class="runs-empty">—</span>';
+            }
+            const n = Number(v);
+            let key;
+            if (!Number.isNaN(n) && String(v).trim() !== '') {
+                key = VIDEO_TYPE_KEYS[n] || '其他';
+            } else {
+                const s = String(v).trim();
+                key = VIDEO_TYPE_ALIAS[s] || s;
+            }
+            return runsVideoTypeTagHtml(key, 'text-xs');
+        }
+
+        async function loadList() {
+            const api = getPywebviewApi();
+            const tbody = document.getElementById('tbodyRows');
+            const emptyHint = document.getElementById('emptyHint');
+            if (!api || !api.listRetargetingRuns) {
+                tbody.innerHTML = '';
+                var pl0 = document.getElementById('paginationLinks');
+                if (pl0) pl0.innerHTML = '';
+                emptyHint.classList.remove('hidden');
+                emptyHint.textContent = '无法连接本地 API（请在应用内打开本页）';
+                setTimeout(notifyParentHeight, 0);
+                return;
+            }
+            pageSize = parseInt(document.getElementById('pageSize').value, 10) || 50;
+            const q = document.getElementById('fQ').value.trim();
+            const retMethod = document.getElementById('fRetMethod').value.trim();
+            const st = document.getElementById('fStatus').value;
+
+            const res = await api.listRetargetingRuns(null, null, q || null, retMethod || null, st === '' ? null : st, page, pageSize);
+            if (!res || !res.success) {
+                tbody.innerHTML = '';
+                var pl1 = document.getElementById('paginationLinks');
+                if (pl1) pl1.innerHTML = '';
+                emptyHint.classList.remove('hidden');
+                emptyHint.textContent = (res && res.message) ? res.message : '加载失败';
+                setTimeout(notifyParentHeight, 0);
+                return;
+            }
+            total = res.total || 0;
+            const items = res.items || [];
+            document.getElementById('pageInfo').textContent = '共 ' + total + ' 条';
+            const tp = Math.max(1, Math.ceil(total / pageSize));
+            if (total > 0 && page > tp) {
+                page = tp;
+                return loadList();
+            }
+            runsUpdatePagination();
+
+            if (!items.length) {
+                tbody.innerHTML = '';
+                emptyHint.classList.remove('hidden');
+                emptyHint.textContent = '暂无数据';
+                setTimeout(notifyParentHeight, 0);
+                requestAnimationFrame(notifyParentHeight);
+                return;
+            }
+            emptyHint.classList.add('hidden');
+
+            tbody.innerHTML = items.map(function (r) {
+                return '<tr>' +
+                    runsCopyIdCell(r.material_id, '素材ID已复制到剪贴板') +
+                    runsMaterialNameCell(r.material_name) +
+                    '<td class="p-2">' + runsFmtVideoType(r.video_type) + '</td>' +
+                    '<td class="p-2">' + runsFmtStatus(r.status) + '</td>' +
+                    '<td class="p-2">' + runsFmtMethod(r.retargeting_method) + '</td>' +
+                    '<td class="p-2">' + runsFmtOg(r.optimization_goal) + '</td>' +
+                    runsCopyIdCell(r.regulate_task_id, '调控ID已复制到剪贴板') +
+                    runsReturnMessageCell(r.message) +
+                    '<td class="p-2 whitespace-nowrap font-mono text-[11px] text-slate-400">' + esc(r.started_at) + '</td>' +
+                    '<td class="p-2 whitespace-nowrap font-mono text-[11px] text-slate-400">' + esc(r.ended_at) + '</td>' +
+                    '<td class="p-2 text-center whitespace-nowrap">' +
+                    '<button type="button" class="runs-btn-op runs-btn-op--detail mr-1 btn-json" data-id="' + r.id + '" data-kind="detail">详情</button>' +
+                    '<button type="button" class="runs-btn-op runs-btn-op--trig mr-1 btn-json" data-id="' + r.id + '" data-kind="trig">触发条件</button>' +
+                    '<button type="button" class="runs-btn-op runs-btn-op--query btn-json" data-id="' + r.id + '" data-kind="query">素材信息</button>' +
+                    '</td></tr>';
+            }).join('');
+            setTimeout(notifyParentHeight, 0);
+            requestAnimationFrame(notifyParentHeight);
+        }
+
+        /** 父页 rule_retargeting.html 切换到「追投记录」 tab 时调用，重新拉取列表（保留当前筛选与页码） */
+        window.refreshRetargetingRunsList = loadList;
+
+        function runsImmediateTriggerPlaceholderHtml() {
+            return (
+                '<div class="flex flex-col items-center justify-center py-14 px-6 min-h-[220px] text-center">' +
+                '<div class="rounded-2xl bg-slate-800/70 p-6 mb-5 ring-1 ring-amber-500/25 shadow-lg">' +
+                '<i data-lucide="zap" class="w-20 h-20 text-amber-400/95 mx-auto"></i>' +
+                '</div>' +
+                '<p class="text-lg font-semibold text-white tracking-tight">即刻追投</p>' +
+                '<p class="text-sm text-slate-400 mt-2 max-w-sm">无触发条件</p>' +
+                '<p class="text-[11px] text-slate-600 mt-1.5">手动发起，不依赖规则监测条件</p>' +
+                '</div>'
+            );
+        }
+
+        function renderTriggerModal(obj) {
+            const el = runsEl('modalTrigBody');
+            if (!el) return;
+            if (!obj || typeof obj !== 'object') {
+                el.innerHTML = '<p class="text-rose-400">无法解析 JSON</p>';
+                return;
+            }
+            if (obj.source === 'manual' && !obj.trigger_config) {
+                el.innerHTML = runsImmediateTriggerPlaceholderHtml();
+                runsLucideRefresh();
+                return;
+            }
+            const blocks = [];
+            if (obj.trigger_config) {
+                blocks.push(buildTriggerConfigSection(obj.trigger_config));
+            }
+            const ev = obj.evaluation;
+            if (ev && typeof ev === 'object') {
+                blocks.push(buildTriggerEvaluationSection(ev));
+            }
+            el.innerHTML = blocks.join('') || '<p class="text-slate-500">无数据</p>';
+            runsLucideRefresh();
+        }
+
+        function renderQueryModal(obj) {
+            const el = runsEl('modalQueryBody');
+            if (!el) return;
+            if (!obj || typeof obj !== 'object') {
+                el.innerHTML = '<p class="text-rose-400">无法解析 JSON</p>';
+                return;
+            }
+            const row = obj.material_row;
+            var queryAtStr = '';
+            if (obj.query_at !== undefined && obj.query_at !== null && String(obj.query_at).trim() !== '') {
+                queryAtStr = esc(String(obj.query_at));
+            }
+            var queryPeriodStr = '';
+            if (obj.period_label !== undefined && obj.period_label !== null && String(obj.period_label).trim() !== '') {
+                queryPeriodStr = esc(String(obj.period_label));
+            } else if (obj.query_period !== undefined && obj.query_period !== null && String(obj.query_period).trim() !== '') {
+                queryPeriodStr = esc(String(obj.query_period));
+            }
+            var topStrip =
+                '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">' +
+                '<div class="rounded-xl border border-slate-700/55 bg-slate-950/55 px-4 py-3.5 shadow-inner">' +
+                '<div class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">查询时间</div>' +
+                '<div class="text-[15px] text-slate-100 font-mono tabular-nums leading-snug">' +
+                (queryAtStr || '<span class="text-slate-600">—</span>') +
+                '</div></div>' +
+                '<div class="rounded-xl border border-slate-700/55 bg-slate-950/55 px-4 py-3.5 shadow-inner">' +
+                '<div class="text-[11px] font-semibold uppercase tracking-wide text-slate-500 mb-1.5">查询的周期</div>' +
+                '<div class="text-[15px] text-slate-100 font-semibold tabular-nums leading-snug">' +
+                (queryPeriodStr || '<span class="text-slate-600">—</span>') +
+                '</div></div></div>';
+
+            var summary = '';
+            var metricsTable = '';
+            if (row && typeof row === 'object') {
+                var mid = row.id != null ? esc(String(row.id)) : '—';
+                var mtitle = row.title != null ? esc(String(row.title)) : '—';
+                var createTimeVal = '—';
+                var ct = materialFieldValue(row, 'createTime');
+                if (ct !== undefined && ct !== null && String(ct).trim() !== '') {
+                    createTimeVal = esc(fmtVal(ct));
+                }
+                summary =
+                    '<div class="rounded-xl border border-slate-600/45 bg-gradient-to-b from-slate-900/80 to-slate-950/60 overflow-hidden mb-5">' +
+                    '<div class="px-4 py-2.5 border-b border-slate-700/50 bg-slate-900/70">' +
+                    '<span class="text-xs font-semibold text-slate-200 tracking-wide">素材摘要</span>' +
+                    '</div>' +
+                    '<div class="p-4 sm:p-5 text-sm">' +
+                    '<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 sm:gap-3 sm:items-start">' +
+                    '<div class="min-w-0">' +
+                    '<div class="text-[11px] text-slate-500 mb-1">素材 ID</div>' +
+                    '<div class="text-slate-100 font-mono text-[13px] break-all leading-relaxed">' +
+                    mid +
+                    '</div></div>' +
+                    '<div class="min-w-0">' +
+                    '<div class="text-[11px] text-slate-500 mb-1">素材名称</div>' +
+                    '<div class="text-slate-100 break-words leading-relaxed">' +
+                    mtitle +
+                    '</div></div>' +
+                    '<div class="min-w-0">' +
+                    '<div class="text-[11px] text-slate-500 mb-1">创建时间</div>' +
+                    '<div class="text-slate-100 font-mono text-[13px] tabular-nums leading-relaxed">' +
+                    createTimeVal +
+                    '</div></div>' +
+                    '</div></div></div>';
+
+                var metricRows = DASHBOARD_MATERIAL_COLUMNS.filter(function (col) {
+                    return col.key !== 'createTime';
+                })
+                    .map(function (col) {
+                        var val = materialFieldValue(row, col.key);
+                        return (
+                            '<tr class="border-b border-slate-800/70 last:border-0">' +
+                            '<td class="py-2.5 pr-4 text-slate-400 text-[13px] whitespace-nowrap align-top w-[40%] sm:w-[38%]">' +
+                            esc(col.label) +
+                            '</td>' +
+                            '<td class="py-2.5 text-slate-100 text-[13px] break-all align-top tabular-nums">' +
+                            esc(fmtMaterialMetricCell(col.key, val)) +
+                            '</td></tr>'
+                        );
+                    })
+                    .join('');
+                metricsTable =
+                    '<div class="rounded-xl border border-slate-700/50 bg-slate-950/35 overflow-hidden">' +
+                    '<div class="px-4 py-2.5 border-b border-slate-700/50 bg-slate-900/55">' +
+                    '<span class="text-xs font-semibold text-slate-200">指标明细</span>' +
+                    '</div>' +
+                    '<div class="px-2 sm:px-4 py-2 overflow-x-auto">' +
+                    '<table class="w-full min-w-[280px] border-collapse">' +
+                    metricRows +
+                    '</table></div></div>';
+            } else {
+                var emptyMsg =
+                    obj.note === '即刻追投'
+                        ? '即刻追投 · 本地库暂无该素材快照（历史记录可能未保存素材行）'
+                        : '暂无素材行数据';
+                metricsTable =
+                    '<div class="rounded-xl border border-dashed border-slate-700/60 bg-slate-950/30 px-4 py-6 text-center text-sm text-slate-500">' +
+                    esc(emptyMsg) +
+                    '</div>';
+            }
+
+            el.innerHTML = topStrip + summary + metricsTable;
+            runsLucideRefresh();
+        }
+
+        function openModal(id) {
+            var node = runsEl(id);
+            if (node) {
+                node.classList.remove('hidden');
+                runsLucideRefresh();
+            }
+        }
+        function closeModal(id) {
+            var node = runsEl(id);
+            if (node) node.classList.add('hidden');
+        }
+
+        document.addEventListener(
+            'click',
+            function (e) {
+                var t = e.target;
+                var el = t && t.nodeType === 1 ? t : t && t.parentElement;
+                var copyBtn = el && el.closest ? el.closest('.runs-copy') : null;
+                if (!copyBtn) return;
+                e.preventDefault();
+                e.stopPropagation();
+                var txt = copyBtn.getAttribute('data-copy');
+                if (!txt) return;
+                var toast = copyBtn.getAttribute('data-toast') || '已复制到剪贴板';
+                copyRunsToClipboard(txt, toast);
+            },
+            true
+        );
+
+        document.getElementById('tbodyRows').addEventListener('click', async function (e) {
+            const nameEl = e.target.closest && e.target.closest('.runs-material-name');
+            if (nameEl) {
+                e.preventDefault();
+                var full = nameEl.getAttribute('data-full') || '';
+                var expanded = nameEl.getAttribute('data-expanded') === '1';
+                if (expanded) {
+                    nameEl.textContent = maskMaterialTitle(full);
+                    nameEl.setAttribute('data-expanded', '0');
+                    nameEl.setAttribute('title', full);
+                } else {
+                    nameEl.textContent = full;
+                    nameEl.setAttribute('data-expanded', '1');
+                    nameEl.removeAttribute('title');
+                }
+                setTimeout(notifyParentHeight, 0);
+                requestAnimationFrame(notifyParentHeight);
+                return;
+            }
+            const btn = e.target.closest('.btn-json');
+            if (!btn) return;
+            const rid = parseInt(btn.getAttribute('data-id'), 10);
+            const kind = btn.getAttribute('data-kind');
+            const api = getPywebviewApi();
+            if (!api || !api.getRetargetingRunDetail) return;
+            const res = await api.getRetargetingRunDetail(rid);
+            if (!res || !res.success || !res.data) {
+                var em = (res && res.message) || '加载失败';
+                if (window.MessageBox && MessageBox.alert) MessageBox.alert(em);
+                else alert(em);
+                return;
+            }
+            const d = res.data;
+            try {
+                if (kind === 'detail') {
+                    renderRetargetingDetailModal(d);
+                    openModal('modalRet');
+                } else if (kind === 'trig') {
+                    const raw = d.trigger_snapshot_json || '{}';
+                    renderTriggerModal(JSON.parse(raw));
+                    runsSetModalTrigStrategyBadge(d.strategy_name);
+                    openModal('modalTrig');
+                } else if (kind === 'query') {
+                    const raw = d.query_snapshot_json || '{}';
+                    renderQueryModal(JSON.parse(raw));
+                    openModal('modalQuery');
+                }
+            } catch (err) {
+                var ex = 'JSON 解析失败: ' + err;
+                if (window.MessageBox && MessageBox.alert) MessageBox.alert(ex);
+                else alert(ex);
+            }
+        });
+
+        runsLiftModalsToParent();
+        runsBindModalUi();
+
+        document.getElementById('btnSearch').addEventListener('click', function () { page = 1; loadList(); });
+        document.getElementById('btnReset').addEventListener('click', function () {
+            document.getElementById('fQ').value = '';
+            mountRunsFilterDropdowns();
+            page = 1;
+            loadList();
+        });
+        document.getElementById('paginationLinks').addEventListener('click', function (e) {
+            var btn = e.target.closest && e.target.closest('[data-runs-page]');
+            if (!btn) return;
+            e.preventDefault();
+            var p = parseInt(btn.getAttribute('data-runs-page'), 10);
+            if (isNaN(p)) return;
+            runsGoToPage(p);
+        });
+
+        mountRunsPageSizeDropdown();
+        mountRunsFilterDropdowns();
+        loadList();
+        runsLucideRefresh();
+        window.addEventListener('load', function () { notifyParentHeight(); });
+        var _runsNotifyResizeT = null;
+        window.addEventListener('resize', function () {
+            if (_runsNotifyResizeT) clearTimeout(_runsNotifyResizeT);
+            _runsNotifyResizeT = setTimeout(notifyParentHeight, 80);
+        });
+    </script>
+</body>
+</html>

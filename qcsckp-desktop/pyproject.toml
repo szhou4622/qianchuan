@@ -1,0 +1,22 @@
+[project]
+name = "qianchuan-promotion-crawl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "auto-py-to-exe>=2.50.0",
+    "baseopensdk",
+    "pillow>=12.1.1",
+    "playwright>=1.58.0",
+    "psutil>=7.2.2",
+    "pymysql>=1.1.2",
+    "pystray>=0.19.5",
+    "python-dotenv>=1.2.2",
+    "pywebview>=6.1",
+    "pywin32>=311",
+    "screeninfo>=0.8.1",
+]
+
+[tool.uv.sources]
+baseopensdk = { url = "https://lf3-static.bytednsdoc.com/obj/eden-cn/lmeh7phbozvhoz/base-open-sdk/baseopensdk-0.0.13-py3-none-any.whl" }

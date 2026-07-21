@@ -1,0 +1,1772 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>千川素材消耗流速监控大屏</title>
+    <script src="/js/tailwindcss.js"></script>
+    <script src="/js/lucide.js"></script>
+    <script src="/js/echarts.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: #0B1120;
+            color: #E2E8F0;
+        }
+
+        /* 内部区域滚动条美化 */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #475569;
+        }
+
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        .text-glow {
+            text-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+        }
+
+        /* 控制宽度：最长约「¥1222.23 万」量级，字号再稍微大一点儿 */
+        .latest-crawl-num {
+            font-size: clamp(1.25rem, 2.8vw, 1.75rem);
+            line-height: 1.2;
+            letter-spacing: -0.02em;
+            max-width: 100%;
+        }
+
+        .row-highlight {
+            animation: pulse-border 2s infinite;
+        }
+
+        @keyframes pulse-border {
+            0% { box-shadow: inset 0 0 0 1px rgba(234, 179, 8, 0); }
+            50% { box-shadow: inset 0 0 0 1px rgba(234, 179, 8, 0.5); background: rgba(234, 179, 8, 0.05); }
+            100% { box-shadow: inset 0 0 0 1px rgba(234, 179, 8, 0); }
+        }
+
+    </style>
+</head>
+<body class="h-screen w-screen overflow-hidden flex flex-col p-4 gap-4">
+    <!-- DASHBOARD_PAGE_INIT -->
+
+    <!-- 顶栏：切换广告主 ID -->
+    <header class="flex-none flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 rounded-xl border border-slate-700/50 bg-slate-900/50 backdrop-blur-sm shadow-sm">
+        <div class="flex items-center gap-3 min-w-0 flex-1">
+            <span class="text-sm text-slate-400 shrink-0 whitespace-nowrap">广告主 ID</span>
+            <select id="dashboardAadvidSelect" title="切换广告主" class="max-w-[min(100%,24rem)] min-w-[12rem] flex-1 rounded-lg border border-slate-600 bg-slate-800/90 px-3 py-2 text-sm font-mono text-white shadow-inner focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500/40 disabled:opacity-50">
+            </select>
+        </div>
+        <div class="flex items-center gap-4 text-xs shrink-0">
+            <a href="/" class="text-slate-500 hover:text-sky-400 transition-colors">首页</a>
+            <a href="/logout.php" class="text-slate-500 hover:text-slate-300 transition-colors">退出</a>
+        </div>
+    </header>
+
+    <!-- Toast 提示 -->
+    <div id="toast" class="fixed top-4 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-2 rounded-lg shadow-lg border border-slate-600 z-50 opacity-0 transition-opacity duration-300 pointer-events-none">
+        <div class="flex items-center gap-2">
+            <i data-lucide="check-circle" class="w-4 h-4 text-emerald-400"></i>
+            <span id="toastMessage">复制成功</span>
+        </div>
+    </div>
+
+    <!-- 主要内容区域 (填满剩余高度) -->
+    <main class="flex-1 flex flex-col lg:flex-row gap-4 min-h-0">
+
+        <!-- 左侧：图表区 (增加宽度比例) -->
+        <aside class="flex-none w-full lg:w-[28%] flex flex-col gap-4 min-h-0">
+            <!-- 素材消耗曲线 -->
+            <div class="glass-panel rounded-xl p-4 flex flex-col flex-1 min-h-0">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-base font-semibold text-white flex items-center gap-2">
+                        <i data-lucide="trending-up" class="w-4 h-4 text-blue-400"></i> 素材消耗曲线
+                        <span id="selectedMaterialId" class="text-xs text-slate-400 font-mono ml-2"></span>
+                    </h2>
+                    <button id="clearSelection" class="hidden text-xs text-slate-400 hover:text-white transition-colors">清除选择</button>
+                </div>
+                <div id="lineChart" class="flex-1 w-full min-h-0">
+                    <div id="lineChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                        <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                        <span class="text-sm">点击右侧素材查看消耗曲线</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 整体支付ROI曲线 -->
+            <div class="glass-panel rounded-xl p-4 flex flex-col flex-1 min-h-0">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-base font-semibold text-white flex items-center gap-2">
+                        <i data-lucide="activity" class="w-4 h-4 text-emerald-400"></i> 整体支付ROI曲线
+                        <span id="selectedMaterialIdPayRoi" class="text-xs text-slate-400 font-mono ml-2"></span>
+                    </h2>
+                </div>
+                <div id="payRoiChart" class="flex-1 w-full min-h-0">
+                    <div id="payRoiChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                        <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                        <span class="text-sm">点击右侧素材查看曲线</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 整体成交金额曲线 -->
+            <div class="glass-panel rounded-xl p-4 flex flex-col flex-1 min-h-0">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-base font-semibold text-white flex items-center gap-2">
+                        <i data-lucide="dollar-sign" class="w-4 h-4 text-amber-400"></i> 整体成交金额曲线
+                        <span id="selectedMaterialIdAmount" class="text-xs text-slate-400 font-mono ml-2"></span>
+                    </h2>
+                </div>
+                <div id="amountChart" class="flex-1 w-full min-h-0">
+                    <div id="amountChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                        <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                        <span class="text-sm">点击右侧素材查看曲线</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 消耗占比饼图 + 最新采集消耗总和 -->
+            <div class="glass-panel rounded-xl p-4 flex flex-col flex-1 min-h-0">
+                <div class="flex flex-col sm:flex-row sm:items-stretch gap-3 flex-1 min-h-0">
+                    <!-- 左：Top20 饼图 -->
+                    <div class="flex flex-col flex-1 min-w-0 min-h-[168px]">
+                        <h2 class="text-sm font-semibold text-white flex items-center gap-2 mb-2 shrink-0">
+                            <i data-lucide="pie-chart" class="w-4 h-4 text-emerald-400"></i> Top 20 消耗占比
+                        </h2>
+                        <div id="pieChart" class="flex-1 w-full min-h-[140px]"></div>
+                    </div>
+                    <div class="hidden sm:block w-px bg-gradient-to-b from-transparent via-slate-600/80 to-transparent shrink-0 self-stretch min-h-[120px]"></div>
+                    <!-- 右：素材消耗总和（布局与左侧 Top20 一致） -->
+                    <div class="flex flex-col flex-1 min-w-0 min-h-[168px]">
+                        <h2 class="text-sm font-semibold text-white flex items-center gap-2 mb-2 shrink-0">
+                            <i data-lucide="circle-dollar-sign" class="w-4 h-4 text-cyan-400"></i> 整体消耗总和
+                        </h2>
+                        <div class="flex-1 flex flex-col items-center justify-center min-h-[120px] gap-2">
+                            <div id="latestCrawlCostValue" class="latest-crawl-num font-mono font-bold text-cyan-300 text-glow tabular-nums text-center w-full">--</div>
+                            <p id="latestCrawlCostMeta" class="text-[11px] text-slate-500 text-center w-full mt-1">总统计 0 条素材</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- 右侧：核心数据表格 (核心操作区，可内部滚动) -->
+        <section class="flex-1 glass-panel rounded-xl flex flex-col min-h-0 overflow-hidden relative border-blue-500/20">
+            <!-- 列表顶部栏 -->
+            <div class="flex-none p-3 border-b border-slate-700/50 flex items-center gap-3 bg-slate-800/30">
+                <h2 class="text-lg font-semibold text-white flex items-center gap-2 shrink-0">
+                    <i data-lucide="list-video" class="w-5 h-5 text-blue-400"></i> 实时消耗流速榜单
+                </h2>
+                <!-- 本地账户标注（便于区分多账户大屏） -->
+                <div class="relative flex items-center gap-1.5 flex-1 min-w-0 pl-3 ml-1 border-l border-slate-600/50">
+                    <span id="accountLabelDisplay" class="text-sm truncate min-w-0 text-slate-400" title="">未自定义标注账户名称</span>
+                    <button type="button" id="accountLabelEditBtn" class="p-1 rounded shrink-0 text-slate-500 hover:text-sky-400 hover:bg-slate-700/60 transition-colors focus:outline-none focus:ring-1 focus:ring-sky-500/50" aria-label="编辑账户名称标注">
+                        <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                    </button>
+                    <div id="accountLabelEditor" class="hidden absolute left-0 top-full mt-2 z-[120] w-[min(100%,22rem)] rounded-lg border border-slate-600 bg-slate-800 p-3 shadow-xl">
+                        <label for="accountLabelInput" class="block text-xs text-slate-400 mb-1.5">账户名称</label>
+                        <input type="text" id="accountLabelInput" maxlength="120" autocomplete="off" class="w-full rounded-md border border-slate-600 bg-slate-900/80 px-2.5 py-1.5 text-sm text-white placeholder-slate-500 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500/40" placeholder="输入任意标注，留空则恢复默认" />
+                        <div class="mt-2 flex justify-end gap-2">
+                            <button type="button" id="accountLabelCancelBtn" class="rounded px-3 py-1 text-xs text-slate-400 hover:bg-slate-700 hover:text-white transition-colors">取消</button>
+                            <button type="button" id="accountLabelSaveBtn" class="rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 transition-colors">保存</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-4 ml-auto shrink-0">
+                    <!-- 素材名称脱敏（纯图标，默认闭眼=脱敏） -->
+                    <button type="button" id="toggleMaskNames" class="p-1 -m-0.5 rounded shrink-0 border-0 bg-transparent shadow-none text-slate-400 hover:text-slate-200 transition-colors focus:outline-none" title="显示完整素材名称" aria-pressed="true" aria-label="切换素材名称脱敏">
+                        <i data-lucide="eye-off" class="w-4 h-4"></i>
+                    </button>
+
+                    <!-- 流速周期 -->
+                    <div class="flex items-center gap-2 bg-slate-800/80 rounded-lg px-3 py-1.5 border border-slate-700">
+                        <span class="text-sm text-slate-400">流速周期:</span>
+                        <span class="text-sm text-white font-medium">1小时</span>
+                    </div>
+
+                    <!-- 字段配置 -->
+                    <div class="relative">
+                        <button id="columnToggle" class="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg px-3 py-1.5 border border-slate-700 transition-colors">
+                            <i data-lucide="settings-2" class="w-4 h-4 text-slate-400"></i>
+                            <span class="text-sm text-slate-300">字段配置</span>
+                        </button>
+                        <div id="columnDropdown" class="hidden absolute right-0 top-full mt-2 bg-slate-800 border border-slate-600 rounded-lg shadow-xl z-[100] w-56">
+                            <div class="p-3 border-b border-slate-700">
+                                <span class="text-sm text-slate-300 font-medium">显示字段</span>
+                            </div>
+                            <div id="columnList" class="p-2 max-h-64 overflow-y-auto custom-scrollbar">
+                                <!-- 字段选项由JS生成 -->
+                            </div>
+                            <div class="p-2 border-t border-slate-700 flex justify-between">
+                                <button id="resetColumns" class="text-xs text-slate-400 hover:text-white transition-colors">恢复默认</button>
+                                <button id="saveColumns" class="text-xs bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded transition-colors">保存</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 状态指示 -->
+                    <div class="flex items-center gap-3 text-sm text-slate-400">
+                        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-rose-500 shadow-[0_0_5px_#f43f5e]"></span> 强烈建议追投</span>
+                        <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-blue-500"></span> 正常跑量</span>
+                    </div>
+
+                    <!-- 时间 -->
+                    <div class="text-lg font-mono font-bold text-white" id="clock">00:00:00</div>
+                </div>
+            </div>
+            
+            <!-- 表格可滚动，底部分页条固定在面板底部（不参与列表滚动） -->
+            <div class="flex-1 flex flex-col min-h-0">
+                <div class="flex-1 overflow-y-auto custom-scrollbar min-h-0">
+                <table class="w-full text-left border-collapse relative">
+                    <thead class="sticky top-0 z-10 bg-slate-900/95 backdrop-blur-sm shadow-md">
+                        <tr class="text-slate-400 text-sm uppercase tracking-wider">
+                            <th class="p-3 font-medium" data-col="material">素材信息</th>
+                            <th class="p-3 font-medium" data-col="createTime">创建时间</th>
+                            <th class="p-3 font-medium cursor-pointer hover:text-white" data-col="currentCost" onclick="sortTable('currentCost')">整体消耗(元) <span class="sort-icon" data-sort="currentCost"></span></th>
+                            <th class="p-3 font-medium text-rose-400 cursor-pointer hover:text-white" id="th-velocity" data-col="velocity" onclick="sortTable('costDiff')">时段流速 <span class="sort-icon" data-sort="costDiff"></span></th>
+                            <th class="p-3 font-medium text-cyan-400 cursor-pointer hover:text-white" id="th-estimated-ecpm" data-col="estimatedEcpm" onclick="sortTable('estimatedEcpm')">预估ECPM <span class="sort-icon" data-sort="estimatedEcpm"></span></th>
+                            <th class="p-3 font-medium text-emerald-400" data-col="maxCostTime">最新入库时间</th>
+                            <th class="p-3 font-medium text-amber-400" data-col="minCostTime">周期内起始数据入库时间</th>
+                            <th class="p-3 font-medium cursor-pointer hover:text-white" data-col="netRoi" onclick="sortTable('netRoi')">净成交ROI <span class="sort-icon" data-sort="netRoi"></span></th>
+                            <th class="p-3 font-medium cursor-pointer hover:text-white" data-col="netAmount" onclick="sortTable('netAmount')">净成交金额 <span class="sort-icon" data-sort="netAmount"></span></th>
+                            <th class="p-3 font-medium cursor-pointer hover:text-white" data-col="overallPayRoi" onclick="sortTable('overallPayRoi')">整体支付ROI <span class="sort-icon" data-sort="overallPayRoi"></span></th>
+                            <th class="p-3 font-medium cursor-pointer hover:text-white" data-col="overallAmount" onclick="sortTable('overallAmount')">整体成交金额 <span class="sort-icon" data-sort="overallAmount"></span></th>
+                            <th class="p-3 font-medium" data-col="hourRefundRate">1h退款率</th>
+                            <th class="p-3 font-medium" data-col="netSettleRate">净成交结算率</th>
+                            <th class="p-3 font-medium" data-col="netOrderCount">净成交订单数</th>
+                            <th class="p-3 font-medium" data-col="overallOrderCount">整体成交订单数</th>
+                            <th class="p-3 font-medium" data-col="overallShowCount">整体展现次数</th>
+                            <th class="p-3 font-medium" data-col="overallClickCount">整体点击次数</th>
+                            <th class="p-3 font-medium" data-col="overallCtr">整体点击率</th>
+                            <th class="p-3 font-medium" data-col="overallConversionRate">整体转化率</th>
+                        </tr>
+                    </thead>
+                    <tbody id="materialTable" class="text-sm divide-y divide-slate-800/50">
+                        <!-- 数据行由JS动态生成 -->
+                    </tbody>
+                </table>
+                </div>
+                <!-- 分页 -->
+                <div id="paginationContainer" hidden class="flex-none shrink-0 p-3 border-t border-slate-700/50 flex justify-between items-center bg-slate-900/95 backdrop-blur-sm">
+                    <!-- 左下角：共xx条 -->
+                    <div class="text-sm text-slate-400">
+                        共 <span id="totalCount" class="text-white font-medium">0</span> 条数据
+                    </div>
+                    <!-- 右下角：每页xx条 + 分页 -->
+                    <div class="flex items-center gap-4">
+                        <div class="flex items-center gap-2">
+                            <span class="text-sm text-slate-400">每页</span>
+                            <!-- 自定义下拉选择器 -->
+                            <div class="relative" id="pageSizeWrapper">
+                                <button type="button" id="pageSizeBtn" class="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 rounded px-3 py-1.5 text-sm text-white cursor-pointer border border-slate-600 focus:outline-none focus:border-blue-500 transition-colors" onclick="togglePageSizeDropdown()">
+                                    <span id="pageSizeLabel">50</span>
+                                    <svg id="pageSizeArrow" class="w-4 h-4 text-slate-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+                                    </svg>
+                                </button>
+                                <div id="pageSizeDropdown" class="hidden absolute bottom-full mb-1 left-0 right-0 bg-slate-800 border border-slate-600 rounded-lg shadow-xl py-1 z-50">
+                                    <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="selectPageSize(10)">10</button>
+                                    <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="selectPageSize(20)">20</button>
+                                    <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="selectPageSize(50)">50</button>
+                                    <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="selectPageSize(100)">100</button>
+                                </div>
+                            </div>
+                            <span class="text-sm text-slate-400">条</span>
+                        </div>
+                        <!-- 分页按钮 -->
+                        <div class="flex items-center gap-1" id="paginationLinks">
+                            <!-- 分页链接由JS生成 -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <script src="/js/dashboard_bridge.js"></script>
+    <script>
+        // 排序字段标签映射
+        const SORT_LABELS = {
+            'currentCost': '整体消耗(元)',
+            'costDiff': '时段流速',
+            'estimatedEcpm': '预估ECPM',
+            'overallPayRoi': '整体支付ROI',
+            'overallAmount': '整体成交金额',
+            'netRoi': '净成交ROI',
+            'netAmount': '净成交金额'
+        };
+
+        const ACCOUNT_LABEL_DEFAULT = '未自定义标注账户名称';
+        /** 与后端 data/dashboard_account_label.json 同步，不再使用 localStorage */
+        let _accountLabelRaw = '';
+
+        function getAccountLabelDisplayText() {
+            const t = String(_accountLabelRaw || '').trim();
+            return t === '' ? ACCOUNT_LABEL_DEFAULT : t;
+        }
+
+        function getAccountLabelRawForEdit() {
+            return String(_accountLabelRaw || '');
+        }
+
+        function accountLabelHasCustom() {
+            return String(_accountLabelRaw || '').trim() !== '';
+        }
+
+        function applyAccountLabelToUI() {
+            const el = document.getElementById('accountLabelDisplay');
+            if (!el) return;
+            const text = getAccountLabelDisplayText();
+            el.textContent = text;
+            el.title = text;
+            const custom = accountLabelHasCustom();
+            el.classList.toggle('text-slate-400', !custom);
+            el.classList.toggle('text-slate-100', custom);
+        }
+
+        function openAccountLabelEditor() {
+            const panel = document.getElementById('accountLabelEditor');
+            const input = document.getElementById('accountLabelInput');
+            if (!panel || !input) return;
+            panel.classList.remove('hidden');
+            input.value = getAccountLabelRawForEdit().trim();
+            input.focus();
+            input.select();
+        }
+
+        function closeAccountLabelEditor() {
+            const panel = document.getElementById('accountLabelEditor');
+            if (panel) panel.classList.add('hidden');
+        }
+
+        async function saveAccountLabelFromEditor() {
+            const input = document.getElementById('accountLabelInput');
+            if (!input) return;
+            const v = String(input.value).trim();
+            const api = await waitForAPI();
+            if (!api || !api.setDashboardAccountLabel) {
+                showToast('保存失败：接口未就绪');
+                return;
+            }
+            try {
+                const r = await api.setDashboardAccountLabel(v);
+                if (!r || !r.success) {
+                    showToast((r && r.message) || '保存失败');
+                    return;
+                }
+                _accountLabelRaw = (r.label != null) ? String(r.label) : v;
+                applyAccountLabelToUI();
+                closeAccountLabelEditor();
+                showToast('账户标注已保存');
+            } catch (e) {
+                console.error(e);
+                showToast('保存失败');
+            }
+        }
+
+        function initAccountLabelUI() {
+            applyAccountLabelToUI();
+            const editBtn = document.getElementById('accountLabelEditBtn');
+            const saveBtn = document.getElementById('accountLabelSaveBtn');
+            const cancelBtn = document.getElementById('accountLabelCancelBtn');
+            const input = document.getElementById('accountLabelInput');
+            const panel = document.getElementById('accountLabelEditor');
+            const accountWrap = editBtn ? editBtn.closest('.relative') : null;
+
+            if (editBtn) {
+                editBtn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    if (panel && panel.classList.contains('hidden')) openAccountLabelEditor();
+                    else closeAccountLabelEditor();
+                });
+            }
+            if (saveBtn) saveBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                saveAccountLabelFromEditor();
+            });
+            if (cancelBtn) cancelBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                closeAccountLabelEditor();
+            });
+            if (input) {
+                input.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        saveAccountLabelFromEditor();
+                    } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        closeAccountLabelEditor();
+                    }
+                });
+            }
+            document.addEventListener('click', function (e) {
+                if (!panel || panel.classList.contains('hidden')) return;
+                if (accountWrap && !accountWrap.contains(e.target)) closeAccountLabelEditor();
+            });
+            refreshAccountLabelFromBackend();
+        }
+
+        // 更新排序图标
+        function updateSortIcons() {
+            document.querySelectorAll('.sort-icon').forEach(el => {
+                const sortKey = el.dataset.sort;
+                if (sortKey === currentSortBy) {
+                    el.textContent = currentSortOrder === 'desc' ? '▼' : '▲';
+                } else {
+                    el.textContent = '';
+                }
+            });
+            // 更新表头标题显示
+            const velocityTh = document.getElementById('th-velocity');
+            if (velocityTh && currentSortBy === 'costDiff') {
+                const orderIcon = currentSortOrder === 'desc' ? '▼' : '▲';
+                velocityTh.innerHTML = `时段流速 <span class="sort-icon" data-sort="costDiff">${orderIcon}</span>`;
+            }
+        }
+
+        // 排序表格
+        function sortTable(field) {
+            if (currentSortBy === field) {
+                // 切换排序方向
+                currentSortOrder = currentSortOrder === 'desc' ? 'asc' : 'desc';
+            } else {
+                currentSortBy = field;
+                currentSortOrder = 'desc';
+            }
+            currentPage = 1; // 排序时回到第一页
+            updateSortIcons();
+            queryAndUpdateData();
+        }
+
+        // 跳转到指定页
+        function goToPage(page) {
+            if (page < 1 || page > totalPages) return;
+            currentPage = page;
+            updatePagination();
+            queryAndUpdateData();
+        }
+
+        // 更改每页数量
+        function changePageSize(size) {
+            currentPageSize = parseInt(size);
+            currentPage = 1;
+            // 更新按钮显示
+            document.getElementById('pageSizeLabel').textContent = size;
+            queryAndUpdateData();
+        }
+
+        // 切换下拉菜单显示
+        function togglePageSizeDropdown() {
+            const dropdown = document.getElementById('pageSizeDropdown');
+            const arrow = document.getElementById('pageSizeArrow');
+            const isHidden = dropdown.classList.contains('hidden');
+            dropdown.classList.toggle('hidden');
+            if (isHidden) {
+                arrow.classList.add('rotate-180');
+            } else {
+                arrow.classList.remove('rotate-180');
+            }
+        }
+
+        // 选择每页数量
+        function selectPageSize(size) {
+            changePageSize(size);
+            document.getElementById('pageSizeDropdown').classList.add('hidden');
+            document.getElementById('pageSizeArrow').classList.remove('rotate-180');
+        }
+
+        // 点击其他地方关闭下拉菜单
+        document.addEventListener('click', function(e) {
+            const wrapper = document.getElementById('pageSizeWrapper');
+            const dropdown = document.getElementById('pageSizeDropdown');
+            if (wrapper && !wrapper.contains(e.target)) {
+                dropdown.classList.add('hidden');
+                document.getElementById('pageSizeArrow').classList.remove('rotate-180');
+            }
+        });
+
+        // 更新分页状态（生成 < 1 2 3 ... xx > 样式）
+        function updatePagination() {
+            // 使用后端返回的 total
+            const total = window.totalDataCount || 0;
+            document.getElementById('totalCount').textContent = total;
+
+            // 如果数据为空，隐藏分页组件（有数据时再显示）
+            const paginationContainer = document.getElementById('paginationContainer');
+            if (total === 0) {
+                paginationContainer.setAttribute('hidden', '');
+                return;
+            }
+            paginationContainer.removeAttribute('hidden');
+
+            // 生成页码链接
+            const paginationLinks = document.getElementById('paginationLinks');
+            let html = '';
+
+            // 上一页按钮
+            if (currentPage > 1) {
+                html += `<button onclick="goToPage(${currentPage - 1})" class="px-2 py-1 text-sm text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 rounded border border-slate-600 transition-colors" title="上一页">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+                </button>`;
+            } else {
+                html += `<button class="px-2 py-1 text-sm text-slate-600 bg-slate-800 rounded border border-slate-700 cursor-not-allowed" disabled>
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+                </button>`;
+            }
+
+            // 页码逻辑：1 2 3 ... xx
+            if (totalPages <= 7) {
+                // 总页数小于7，显示所有页码
+                for (let i = 1; i <= totalPages; i++) {
+                    if (i === currentPage) {
+                        html += `<button class="px-3 py-1 text-sm bg-blue-500 text-white rounded font-medium">${i}</button>`;
+                    } else {
+                        html += `<button onclick="goToPage(${i})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${i}</button>`;
+                    }
+                }
+            } else {
+                // 总页数大于7，显示省略号
+                if (currentPage <= 4) {
+                    // 前4页：1 2 3 4 5 ... xx
+                    for (let i = 1; i <= 5; i++) {
+                        if (i === currentPage) {
+                            html += `<button class="px-3 py-1 text-sm bg-blue-500 text-white rounded font-medium">${i}</button>`;
+                        } else {
+                            html += `<button onclick="goToPage(${i})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${i}</button>`;
+                        }
+                    }
+                    html += `<span class="px-1 text-slate-500">...</span>`;
+                    html += `<button onclick="goToPage(${totalPages})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${totalPages}</button>`;
+                } else if (currentPage >= totalPages - 3) {
+                    // 后4页：1 ... xx 22 23 24 25
+                    html += `<button onclick="goToPage(1)" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">1</button>`;
+                    html += `<span class="px-1 text-slate-500">...</span>`;
+                    for (let i = totalPages - 4; i <= totalPages; i++) {
+                        if (i === currentPage) {
+                            html += `<button class="px-3 py-1 text-sm bg-blue-500 text-white rounded font-medium">${i}</button>`;
+                        } else {
+                            html += `<button onclick="goToPage(${i})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${i}</button>`;
+                        }
+                    }
+                } else {
+                    // 中间：1 ... 5 6 7 8 9 ... xx
+                    html += `<button onclick="goToPage(1)" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">1</button>`;
+                    html += `<span class="px-1 text-slate-500">...</span>`;
+                    for (let i = currentPage - 2; i <= currentPage + 2; i++) {
+                        if (i === currentPage) {
+                            html += `<button class="px-3 py-1 text-sm bg-blue-500 text-white rounded font-medium">${i}</button>`;
+                        } else {
+                            html += `<button onclick="goToPage(${i})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${i}</button>`;
+                        }
+                    }
+                    html += `<span class="px-1 text-slate-500">...</span>`;
+                    html += `<button onclick="goToPage(${totalPages})" class="px-3 py-1 text-sm text-slate-400 hover:text-white hover:bg-slate-700 rounded transition-colors">${totalPages}</button>`;
+                }
+            }
+
+            // 下一页按钮
+            if (currentPage < totalPages) {
+                html += `<button onclick="goToPage(${currentPage + 1})" class="px-2 py-1 text-sm text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 rounded border border-slate-600 transition-colors" title="下一页">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+                </button>`;
+            } else {
+                html += `<button class="px-2 py-1 text-sm text-slate-600 bg-slate-800 rounded border border-slate-700 cursor-not-allowed" disabled>
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+                </button>`;
+            }
+
+            paginationLinks.innerHTML = html;
+        }
+
+        // 初始化 Lucide 图标
+        lucide.createIcons();
+        initAccountLabelUI();
+
+        // 复制到剪贴板功能
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(function() {
+                showToast('素材ID已复制到剪贴板');
+            }, function() {
+                // 兼容旧版浏览器
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try {
+                    document.execCommand('copy');
+                    showToast('素材ID已复制到剪贴板');
+                } catch (err) {
+                    showToast('复制失败');
+                }
+                document.body.removeChild(textarea);
+            });
+        }
+
+        // 显示Toast提示
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toastMessage');
+            toastMessage.textContent = message;
+            toast.classList.remove('opacity-0');
+            toast.classList.add('opacity-100');
+
+            setTimeout(function() {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('opacity-0');
+            }, 2000);
+        }
+
+        function initDashboardAadvidSwitcher() {
+            const cfg = window.__DASHBOARD_PAGE_INIT__;
+            const sel = document.getElementById('dashboardAadvidSelect');
+            if (!cfg || !sel || !Array.isArray(cfg.aadvids)) return;
+            sel.innerHTML = '';
+            if (cfg.aadvids.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = '暂无可用广告主';
+                sel.appendChild(opt);
+                sel.disabled = true;
+                return;
+            }
+            for (let i = 0; i < cfg.aadvids.length; i++) {
+                const sid = String(cfg.aadvids[i]);
+                const opt = document.createElement('option');
+                opt.value = sid;
+                opt.textContent = sid;
+                if (sid === String(cfg.currentAadvid)) opt.selected = true;
+                sel.appendChild(opt);
+            }
+            sel.addEventListener('change', async function () {
+                const v = sel.value;
+                if (v === '' || v === String(cfg.currentAadvid)) return;
+                sel.disabled = true;
+                try {
+                    const r = await fetch('/switch_aadvid.php', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+                        body: JSON.stringify({ aadvid: v, _csrf: cfg.csrf }),
+                        credentials: 'same-origin'
+                    });
+                    const j = await r.json().catch(function () { return {}; });
+                    if (j && j.success) {
+                        window.location.reload();
+                        return;
+                    }
+                    showToast((j && j.message) ? j.message : '切换失败');
+                    sel.value = String(cfg.currentAadvid);
+                } catch (e) {
+                    showToast('网络错误');
+                    sel.value = String(cfg.currentAadvid);
+                } finally {
+                    sel.disabled = false;
+                }
+            });
+        }
+
+        /** 素材名称脱敏：含 .mp4 时若主文件名以 (…) 结尾则为 首字符+**+括号段+.mp4（如 7**(7).mp4），否则为首字符+**+末字符+.mp4；无 .mp4 时为 首字符+**+末字符 */
+        function maskMaterialTitle(raw) {
+            const gap = ' * ';
+            if (raw == null || raw === '') return '';
+            const s = String(raw);
+            const extIdx = s.toLowerCase().lastIndexOf('.mp4');
+            if (extIdx === -1) {
+                if (s.length <= 2) return s;
+                return s[0] + gap + s[s.length - 1];
+            }
+            const ext = s.slice(extIdx);
+            const stem = s.slice(0, extIdx);
+            const tailParen = stem.match(/^(.)(.+)(\([^)]*\))$/);
+            if (tailParen) {
+                return tailParen[1] + gap + tailParen[3] + ext;
+            }
+            if (stem.length <= 1) return stem + ext;
+            return stem[0] + gap + stem[stem.length - 1] + ext;
+        }
+
+        const MASK_NAMES_STORAGE_KEY = 'dashboard-mask-material-names';
+        // 未存过 key 时默认脱敏（闭眼）；'1'=脱敏 '0'=显示全名
+        let maskMaterialNames = (function() {
+            const v = localStorage.getItem(MASK_NAMES_STORAGE_KEY);
+            if (v === null) return true;
+            return v === '1';
+        })();
+
+        function getMaterialDisplayTitle(item) {
+            return maskMaterialNames ? maskMaterialTitle(item.title) : item.title;
+        }
+
+        function updateMaskToggleUi() {
+            const btn = document.getElementById('toggleMaskNames');
+            if (!btn) return;
+            btn.setAttribute('aria-pressed', maskMaterialNames ? 'true' : 'false');
+            btn.title = maskMaterialNames ? '显示完整素材名称' : '素材名称脱敏显示';
+            const iconName = maskMaterialNames ? 'eye-off' : 'eye';
+            btn.innerHTML = `<i data-lucide="${iconName}" class="w-4 h-4"></i>`;
+            lucide.createIcons();
+        }
+
+        updateMaskToggleUi();
+
+        // 时钟逻辑（只显示时分秒）
+        function updateClock() {
+            const now = new Date();
+            const hours = String(now.getHours()).padStart(2, '0');
+            const minutes = String(now.getMinutes()).padStart(2, '0');
+            const seconds = String(now.getSeconds()).padStart(2, '0');
+            document.getElementById('clock').textContent = `${hours}:${minutes}:${seconds}`;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // ==================== Web：waitForAPI 由 /js/dashboard_bridge.js 提供 ====================
+
+        async function refreshAccountLabelFromBackend() {
+            const api = await waitForAPI();
+            if (!api || !api.getDashboardAccountLabel) {
+                return;
+            }
+            try {
+                const r = await api.getDashboardAccountLabel();
+                if (r && r.success) {
+                    _accountLabelRaw = (r.label != null) ? String(r.label) : '';
+                } else if (r && r.message) {
+                    showToast(r.message);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+            applyAccountLabelToUI();
+        }
+
+        // 当前周期设置，默认 1h
+        let currentPeriod = "1h";
+
+        // 排序和分页状态
+        let currentSortBy = "costDiff";
+        let currentSortOrder = "desc";
+        let currentPage = 1;
+        let currentPageSize = 50;
+        let totalPages = 1;
+
+        // ==================== 刷新间隔（统一配置） ====================
+        // 三处刷新统一使用同一个固定间隔：
+        // - 表格数据刷新（getTableData）
+        // - Top20 饼图刷新（随表格渲染）
+        // - 折线图轮询刷新（getMaterialHistoryRecent）
+        const REFRESH_MS = 10000;
+
+        // 流速颜色配置
+        const VELOCITY_CONFIG = {
+            negative: 'text-yellow-400',   // 小于0：黄色
+            normal: 'text-blue-500',        // 0-100：蓝色（正常跑量）
+            hot: 'text-rose-400',           // 大于100：红色（追投）
+            threshold: 100                   // 流速阈值
+        }; 
+
+        // 使用 pywebview js_api 获取素材列表（后端分页返回当前页数据）
+        async function fetchMaterials() {
+            try {
+                // 等待 API 初始化
+                const api = await waitForAPI();
+                if (!api) {
+                    console.error('pywebview API 未初始化');
+                    return [];
+                }
+                // 调用 Python 端的 getTableData 方法（后端分页）
+                const result = await api.getTableData(currentPeriod, currentSortBy, currentSortOrder, currentPage, currentPageSize);
+                if (result.success && result.data) {
+                    // 更新分页信息
+                    window.totalDataCount = result.total || 0;
+                    totalPages = result.totalPages || 1;
+
+                    // 将后端字段转换为前端需要的格式
+                    return result.data.map(mat => {
+                        const id = String(mat.id ?? mat.material_id ?? '');
+                        const title = mat.title ?? mat.video_name ?? '未命名';
+                        const isAigc = (mat.isAigc ?? (mat.lego_source === 1)) ? true : false;
+
+                        // get_table_data (DashboardApi) 返回 videoType 为数字
+                        const videoTypeRaw = mat.videoType ?? mat.video_type;
+                        const videoTypeNum = (videoTypeRaw === null || videoTypeRaw === undefined || videoTypeRaw === '')
+                            ? null
+                            : Number(videoTypeRaw);
+                        const videoTypeMap = {
+                            1: '全部',
+                            2: '自选投放视频',
+                            3: '智能优选视频',
+                            4: 'AIGC动态创意'
+                        };
+                        const videoType = videoTypeNum !== null ? (videoTypeMap[videoTypeNum] ?? '其他') : (mat.videoTypeText ?? '其他');
+
+                        const createTime = mat.createTime ?? mat.video_create_time ?? '';
+                        const costDiff = Number(mat.costDiff ?? mat.stat_cost_diff ?? 0) || 0;
+
+                        const maxCostTimeRaw = mat.periodEndTime ?? mat.period_end_time ?? null;
+                        const minCostTimeRaw = mat.periodStartTime ?? mat.period_start_time ?? null;
+                        const maxCostTime = maxCostTimeRaw ? String(maxCostTimeRaw).replace(' ', '\n') : null;
+                        const minCostTime = minCostTimeRaw ? String(minCostTimeRaw).replace(' ', '\n') : null;
+
+                        const currentCost = mat.currentCost ?? mat.stat_cost ?? 0;
+
+                        return {
+                            id,
+                            title,
+                            isAigc,
+                            videoType,
+                            createTime,
+                            velocity: costDiff,
+                            maxCostTime,
+                            minCostTime,
+                            currentCost,
+                            netRoi: Number(mat.netRoi ?? 0) || 0,
+                            netAmount: Number(mat.netAmount ?? 0) || 0,
+                            hourRefundRate: Number(mat.hourRefundRate ?? 0) || 0,
+                            overallPayRoi: Number(mat.overallPayRoi ?? 0) || 0,
+                            overallAmount: Number(mat.overallAmount ?? 0) || 0,
+                            netSettleRate: Number(mat.netSettleRate ?? 0) || 0,
+                            netOrderCount: Number(mat.netOrderCount ?? 0) || 0,
+                            overallOrderCount: Number(mat.overallOrderCount ?? mat.overall_order_count ?? 0) || 0,
+                            overallShowCount: Number(mat.overallShowCount ?? mat.overall_show_count ?? 0) || 0,
+                            overallClickCount: Number(mat.overallClickCount ?? mat.overall_click_count ?? 0) || 0,
+                            overallCtr: Number(mat.overallCtr ?? mat.overall_ctr ?? 0) || 0,
+                            overallConversionRate: Number(mat.overallConversionRate ?? mat.overall_conversion_rate ?? 0) || 0,
+                            estimatedEcpm: (mat.estimatedEcpm !== undefined && mat.estimatedEcpm !== null)
+                                ? Number(mat.estimatedEcpm)
+                                : null,
+                            historyData: Array.isArray(mat.historyData) ? mat.historyData : [],
+                        };
+                    });
+                }
+                return [];
+            } catch (e) {
+                console.error('获取素材列表失败:', e);
+                return [];
+            }
+        }
+
+        // 获取 Top20 消耗数据（饼图专用）
+        async function fetchTop20ByCost(hours = 1) {
+            try {
+                const api = await waitForAPI();
+                if (!api || !api.getTop20ByCost) {
+                    console.error('pywebview API 或 getTop20ByCost 方法未就绪');
+                    return [];
+                }
+                const result = await api.getTop20ByCost(hours);
+                if (result.success && result.data) {
+                    return result.data.map(mat => ({
+                        id: String(mat.id ?? mat.material_id ?? ''),
+                        title: mat.title ?? mat.video_name ?? '未命名',
+                        currentCost: Number(mat.currentCost ?? mat.stat_cost ?? 0) || 0
+                    }));
+                }
+                return [];
+            } catch (e) {
+                console.error('获取 Top20 数据失败:', e);
+                return [];
+            }
+        }
+
+        /** 与 Top20 相同时间窗：最近一批入库（按分钟聚合）的 stat_cost 总和 */
+        async function fetchLatestCrawlCostSum(hours = 1) {
+            try {
+                const api = await waitForAPI();
+                if (!api || !api.getLatestCrawlCostSum) {
+                    console.error('pywebview API 或 getLatestCrawlCostSum 未就绪');
+                    return null;
+                }
+                const result = await api.getLatestCrawlCostSum(hours);
+                if (result && result.success) {
+                    return {
+                        totalCost: Number(result.totalCost ?? 0) || 0,
+                        rowCount: Number(result.rowCount ?? 0) || 0,
+                        batchMinuteKey: result.batchMinuteKey ?? null,
+                        latestCreatedAt: result.latestCreatedAt ?? null
+                    };
+                }
+                return null;
+            } catch (e) {
+                console.error('获取最新采集消耗总和失败:', e);
+                return null;
+            }
+        }
+
+        /** 金额展示：≥1 亿用「亿」，≥1 万用「万」，否则原样两位小数（最长约 ¥1222.23 万） */
+        function formatYuanCompact(yuan) {
+            const n = Number(yuan);
+            if (!Number.isFinite(n)) return '--';
+            if (n >= 1e8) {
+                return '¥' + (n / 1e8).toFixed(2) + ' 亿';
+            }
+            if (n >= 1e4) {
+                return '¥' + (n / 1e4).toFixed(2) + ' 万';
+            }
+            return '¥' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        async function updateLatestCrawlCostDisplay(hours = 1) {
+            const valEl = document.getElementById('latestCrawlCostValue');
+            const metaEl = document.getElementById('latestCrawlCostMeta');
+            if (!valEl || !metaEl) return;
+
+            const data = await fetchLatestCrawlCostSum(hours);
+            const countLabel = (n) => `总统计 ${n} 条素材`;
+
+            if (!data) {
+                valEl.textContent = '--';
+                metaEl.textContent = countLabel(0);
+                return;
+            }
+            metaEl.textContent = countLabel(data.rowCount);
+            if (data.rowCount === 0) {
+                valEl.textContent = formatYuanCompact(0);
+                return;
+            }
+            valEl.textContent = formatYuanCompact(data.totalCost);
+        }
+
+        // ================= 字段配置 =================
+        // 所有可用字段
+        const allColumns = [
+            { key: 'createTime', label: '创建时间', default: true },
+            { key: 'currentCost', label: '整体消耗', default: true },
+            { key: 'velocity', label: '时段流速', default: true },
+            { key: 'estimatedEcpm', label: '预估ECPM', default: true },
+            { key: 'maxCostTime', label: '最新入库时间', default: true },
+            { key: 'minCostTime', label: '周期内起始数据入库时间', default: true },
+            { key: 'netRoi', label: '净成交ROI', default: false },
+            { key: 'netAmount', label: '净成交金额', default: false },
+            { key: 'overallPayRoi', label: '整体支付ROI', default: true },
+            { key: 'overallAmount', label: '整体成交金额', default: true },
+            { key: 'hourRefundRate', label: '1h退款率', default: false },
+            { key: 'netSettleRate', label: '净成交结算率', default: false },
+            { key: 'netOrderCount', label: '净成交订单数', default: false },
+            { key: 'overallOrderCount', label: '整体成交订单数', default: false },
+            { key: 'overallShowCount', label: '整体展现次数', default: false },
+            { key: 'overallClickCount', label: '整体点击次数', default: false },
+            { key: 'overallCtr', label: '整体点击率', default: false },
+            { key: 'overallConversionRate', label: '整体转化率', default: false }
+        ];
+
+        // 默认配置
+        const defaultColumnConfig = {};
+        allColumns.forEach(col => { defaultColumnConfig[col.key] = col.default; });
+
+        // 从 localStorage 读取配置
+        function getColumnConfig() {
+            const saved = localStorage.getItem('dashboard-column-config');
+            if (saved) {
+                try {
+                    return { ...defaultColumnConfig, ...JSON.parse(saved) };
+                } catch (e) {
+                    return { ...defaultColumnConfig };
+                }
+            }
+            return { ...defaultColumnConfig };
+        }
+
+        // 保存配置到 localStorage
+        function saveColumnConfig(config) {
+            localStorage.setItem('dashboard-column-config', JSON.stringify(config));
+        }
+
+        // 初始化字段配置下拉菜单
+        function initColumnConfig() {
+            const config = getColumnConfig();
+            const listEl = document.getElementById('columnList');
+            listEl.innerHTML = '';
+
+            allColumns.forEach(col => {
+                const checked = config[col.key] ? 'checked' : '';
+                const div = document.createElement('div');
+                div.className = 'flex items-center gap-2 py-1 px-2 hover:bg-slate-700/50 rounded cursor-pointer';
+                div.innerHTML = `
+                    <input type="checkbox" class="column-checkbox" data-key="${col.key}" ${checked} class="w-4 h-4 rounded bg-slate-700 border-slate-600 text-blue-500 focus:ring-blue-500">
+                    <span class="text-sm text-slate-300">${col.label}</span>
+                `;
+                div.querySelector('input').addEventListener('change', function() {
+                    config[this.dataset.key] = this.checked;
+                });
+                listEl.appendChild(div);
+            });
+        }
+
+        // 切换下拉菜单显示
+        document.getElementById('columnToggle').addEventListener('click', function(e) {
+            e.stopPropagation();
+            document.getElementById('columnDropdown').classList.toggle('hidden');
+        });
+
+        // 点击其他地方关闭下拉菜单
+        document.addEventListener('click', function(e) {
+            const dropdown = document.getElementById('columnDropdown');
+            if (!dropdown.contains(e.target) && !document.getElementById('columnToggle').contains(e.target)) {
+                dropdown.classList.add('hidden');
+            }
+        });
+
+        // 保存配置
+        document.getElementById('saveColumns').addEventListener('click', function() {
+            const checkboxes = document.querySelectorAll('.column-checkbox');
+            const config = {};
+            checkboxes.forEach(cb => { config[cb.dataset.key] = cb.checked; });
+            saveColumnConfig(config);
+            document.getElementById('columnDropdown').classList.add('hidden');
+            renderTable(processData());
+            showToast('字段配置已保存');
+        });
+
+        // 恢复默认
+        document.getElementById('resetColumns').addEventListener('click', function() {
+            const config = { ...defaultColumnConfig };
+            saveColumnConfig(config);
+            initColumnConfig();
+            renderTable(processData());
+            showToast('已恢复默认配置');
+        });
+
+        // 全局状态
+        let materials = [];
+        let selectedMaterial = null;
+        let isLoadingData = true; 
+
+        // 计算并排序数据（后端已按请求的排序字段返回数据，前端直接使用）
+        function processData() {
+            // 后端已按 currentSortBy 和 currentSortOrder 排序，无需前端再排序
+            return materials;
+        }
+
+        // 渲染表格
+        function renderTable(data) {
+            const tbody = document.getElementById('materialTable');
+            tbody.innerHTML = '';
+
+            data.forEach((item, index) => {
+                // 流速颜色逻辑
+                const velocityValue = parseFloat(item.velocity) || 0;
+                let velocityColorClass;
+                if (velocityValue < 0) {
+                    velocityColorClass = VELOCITY_CONFIG.negative;
+                } else if (velocityValue <= VELOCITY_CONFIG.threshold) {
+                    velocityColorClass = VELOCITY_CONFIG.normal;
+                } else {
+                    velocityColorClass = VELOCITY_CONFIG.hot;
+                }
+
+                const row = document.createElement('tr');
+                const isSelected = selectedMaterial && selectedMaterial.id === item.id;
+                // 注意：table 的 <tr> 左边框在不同浏览器/渲染器下可能不生效
+                // 选中竖条改为加在第一列 <td> 上，保证每行都稳定显示
+                row.className = `hover:bg-slate-800/80 transition-colors cursor-pointer ${velocityValue > VELOCITY_CONFIG.threshold ? 'row-highlight bg-rose-950/10' : ''} ${isSelected ? 'bg-blue-900/30' : ''}`;
+                row.onclick = function() { selectMaterial(item); };
+
+                // 视频类型标签
+                const videoTypeTagMap = {
+                    'AIGC动态创意': { bg: 'bg-purple-500/20', text: 'text-purple-400', border: 'border-purple-500/30', label: 'AIGC' },
+                    '自选投放视频': { bg: 'bg-blue-500/20', text: 'text-blue-400', border: 'border-blue-500/30', label: '自选投放' },
+                    '智能优选视频': { bg: 'bg-emerald-500/20', text: 'text-emerald-400', border: 'border-emerald-500/30', label: '智能优选' },
+                    '全部': { bg: 'bg-amber-500/20', text: 'text-amber-400', border: 'border-amber-500/30', label: '全部' }
+                };
+                const tagInfo = videoTypeTagMap[item.videoType] || { bg: 'bg-slate-500/20', text: 'text-slate-300', border: 'border-slate-500/30', label: '其他' };
+                const tagStr = `<span class="px-1.5 py-0.5 ${tagInfo.bg} ${tagInfo.text} text-[10px] rounded border ${tagInfo.border} flex-none leading-none">${tagInfo.label}</span>`;
+
+                const netRoiClass = parseFloat(item.netRoi) >= 2 ? 'text-rose-400 font-bold' : (parseFloat(item.netRoi) >= 1 ? 'text-emerald-400' : 'text-slate-500');
+                const refundRateClass = parseFloat(item.hourRefundRate) > 10 ? 'text-rose-400' : (parseFloat(item.hourRefundRate) > 5 ? 'text-yellow-400' : 'text-emerald-400');
+
+                const materialCellClass = `p-2 border-b border-slate-800/50 ${isSelected ? 'border-l-2 border-l-blue-500' : ''}`;
+                const displayTitle = getMaterialDisplayTitle(item);
+                const titleAttr = displayTitle.replace(/"/g, '&quot;');
+
+                row.innerHTML = `
+                    <td class="${materialCellClass}" data-col="material">
+                        <div class="flex flex-col max-w-[140px] xl:max-w-[200px]">
+                            <div class="text-white font-medium text-xs truncate" title="${titleAttr}">
+                                ${displayTitle}
+                            </div>
+                            <div class="text-[10px] text-slate-500 font-mono truncate flex items-center gap-1">
+                                <span class="cursor-pointer hover:text-blue-400 transition-colors font-mono text-[10px]" onclick="copyToClipboard('${item.id}')" title="点击复制ID">${item.id}</span>
+                                ${tagStr}
+                            </div>
+                        </div>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="createTime">
+                        <span class="text-slate-400 text-xs">${item.createTime}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="currentCost">
+                        <span class="text-slate-200 font-mono text-xs">¥${item.currentCost.toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="velocity">
+                        <div class="flex flex-col">
+                            <span class="font-mono font-bold text-sm ${velocityColorClass}">
+                                ¥${item.velocity.toFixed(2)}
+                            </span>
+                        </div>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="estimatedEcpm">
+                        <span class="text-cyan-300 font-mono text-xs">${item.estimatedEcpm != null && Number.isFinite(Number(item.estimatedEcpm)) ? Number(item.estimatedEcpm).toFixed(2) : '--'}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="maxCostTime">
+                        <span class="text-emerald-400 font-mono text-xs">${item.maxCostTime || '-'}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="minCostTime">
+                        <span class="text-amber-400 font-mono text-xs">${item.minCostTime || '-'}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="netRoi">
+                        <span class="font-mono ${netRoiClass} text-xs">${item.netRoi}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="netAmount">
+                        <span class="text-slate-300 font-mono text-xs">¥${item.netAmount.toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallPayRoi">
+                        <span class="text-slate-300 font-mono text-xs">${item.overallPayRoi}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallAmount">
+                        <span class="text-slate-300 font-mono text-xs">¥${item.overallAmount.toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="hourRefundRate">
+                        <span class="font-mono ${refundRateClass} text-xs">${item.hourRefundRate}%</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="netSettleRate">
+                        <span class="text-slate-300 font-mono text-xs">${item.netSettleRate}%</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="netOrderCount">
+                        <span class="text-slate-300 font-mono text-xs">${item.netOrderCount}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallOrderCount">
+                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallOrderCount || 0).toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallShowCount">
+                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallShowCount || 0).toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallClickCount">
+                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallClickCount || 0).toLocaleString()}</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallCtr">
+                        <span class="text-slate-300 font-mono text-xs">${item.overallCtr}%</span>
+                    </td>
+                    <td class="p-2 border-b border-slate-800/50" data-col="overallConversionRate">
+                        <span class="text-slate-300 font-mono text-xs">${item.overallConversionRate}%</span>
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+
+            lucide.createIcons();
+
+            // 固定显示1小时
+            // 显示当前周期
+            const periodText = currentPeriod === '1h' ? '1小时' : (currentPeriod === '15m' ? '15分钟' : currentPeriod);
+            document.getElementById('th-velocity').innerHTML = `时段流速 (${periodText}) <span class="sort-icon" data-sort="costDiff">${currentSortBy === 'costDiff' ? (currentSortOrder === 'desc' ? '▼' : '▲') : ''}</span>`;
+
+            // 根据配置显示/隐藏列
+            updateColumnVisibility();
+
+            // 更新分页信息（使用后端返回的 total，不自己计算）
+            updatePagination();
+        }
+
+        // 更新列的显示/隐藏
+        function updateColumnVisibility() {
+            const config = getColumnConfig();
+            const table = document.querySelector('table');
+
+            // 更新表头
+            const headers = table.querySelectorAll('thead th');
+            headers.forEach(th => {
+                const col = th.dataset.col;
+                if (col && col !== 'material') {
+                    if (config[col]) {
+                        th.classList.remove('hidden');
+                    } else {
+                        th.classList.add('hidden');
+                    }
+                }
+            });
+
+            // 更新表格行
+            const rows = table.querySelectorAll('tbody tr');
+            rows.forEach(row => {
+                const cells = row.querySelectorAll('td');
+                cells.forEach(td => {
+                    const col = td.dataset.col;
+                    if (col && col !== 'material') {
+                        if (config[col]) {
+                            td.classList.remove('hidden');
+                        } else {
+                            td.classList.add('hidden');
+                        }
+                    }
+                });
+            });
+        }
+
+        // ================= 素材消耗曲线折线图 =================
+        let lineChartInstance = null;
+        let payRoiChartInstance = null;
+        let amountChartInstance = null;
+        let historyPollTimer = null;
+        let historyActiveMaterialId = null;
+        let historyRequestToken = 0;
+        const HISTORY_LIMIT = 200;
+        const HISTORY_POLL_MS = REFRESH_MS;
+
+        function selectMaterial(item) {
+            selectedMaterial = item;
+            const mid = String(item.id ?? '');
+            document.getElementById('selectedMaterialId').textContent = `ID: ${mid}`;
+            document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${mid}`;
+            document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${mid}`;
+            renderTable(processData()); // 重新渲染表格以更新选中状态
+            startHistoryPolling(mid);
+        }
+
+        function stopHistoryPolling() {
+            if (historyPollTimer) {
+                clearInterval(historyPollTimer);
+                historyPollTimer = null;
+            }
+            historyActiveMaterialId = null;
+            historyRequestToken++;
+        }
+
+        function startHistoryPolling(materialId) {
+            if (!materialId) return;
+            if (historyActiveMaterialId === materialId && historyPollTimer) return;
+
+            stopHistoryPolling();
+            historyActiveMaterialId = materialId;
+
+            // 立即拉一次
+            refreshHistoryOnce(materialId);
+
+            // 定时刷新
+            historyPollTimer = setInterval(() => {
+                refreshHistoryOnce(materialId);
+            }, HISTORY_POLL_MS);
+        }
+
+        async function refreshHistoryOnce(materialId) {
+            const token = ++historyRequestToken;
+            try {
+                const api = await waitForAPI();
+                if (!api || !api.getMaterialHistoryRecent) {
+                    return;
+                }
+                const res = await api.getMaterialHistoryRecent(materialId, HISTORY_LIMIT);
+                if (token !== historyRequestToken) return; // 已切换素材/停止
+                if (res && res.success && Array.isArray(res.data)) {
+                    const historyData = res.data;
+                    renderLineChart({ id: materialId, historyData });
+                    renderPayRoiLineChart(historyData);
+                    renderAmountLineChart(historyData);
+                }
+            } catch (e) {
+                // 保持静默，避免轮询刷屏；需要时可打开 console.error
+            }
+        }
+
+        function clearMaterialSelection() {
+            selectedMaterial = null;
+            stopHistoryPolling();
+            // 清空 DOM 前先销毁图表实例，否则实例仍绑定旧的 canvas，后续 setOption 看起来“没反应”
+            if (lineChartInstance) { lineChartInstance.dispose(); lineChartInstance = null; }
+            if (payRoiChartInstance) { payRoiChartInstance.dispose(); payRoiChartInstance = null; }
+            if (amountChartInstance) { amountChartInstance.dispose(); amountChartInstance = null; }
+            document.getElementById('selectedMaterialId').textContent = '';
+            document.getElementById('selectedMaterialIdPayRoi').textContent = '';
+            document.getElementById('selectedMaterialIdAmount').textContent = '';
+            document.getElementById('clearSelection').classList.add('hidden');
+            document.getElementById('lineChart').innerHTML = `
+                <div id="lineChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                    <span class="text-sm">点击右侧素材查看消耗曲线</span>
+                </div>
+            `;
+            document.getElementById('payRoiChart').innerHTML = `
+                <div id="payRoiChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                    <span class="text-sm">点击右侧素材查看曲线</span>
+                </div>
+            `;
+            document.getElementById('amountChart').innerHTML = `
+                <div id="amountChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
+                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
+                    <span class="text-sm">点击右侧素材查看曲线</span>
+                </div>
+            `;
+            lucide.createIcons();
+            renderTable(processData()); // 重新渲染表格以更新选中状态
+        }
+
+        function renderLineChart(item) {
+            const placeholder = document.getElementById('lineChartPlaceholder');
+            if (placeholder) {
+                placeholder.remove();
+            }
+            document.getElementById('clearSelection').classList.remove('hidden');
+
+            if (!lineChartInstance) {
+                lineChartInstance = echarts.init(document.getElementById('lineChart'), 'dark');
+            }
+
+            // 使用历史数据
+            const historyData = item.historyData || [];
+            const timePoints = historyData.map(d => d.time);
+            const costData = historyData.map(d => d.cost);
+
+            const option = {
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                    borderColor: '#334155',
+                    textStyle: { color: '#e2e8f0' },
+                    formatter: function(params) {
+                        const data = params[0];
+                        return `<div class="text-sm">时间: ${data.name}</div>
+                                <div class="font-bold text-white mt-1">消耗: ¥${data.value.toLocaleString()}</div>`;
+                    }
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: '30px',
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    boundaryGap: false,
+                    data: timePoints,
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 9,
+                        rotate: 45,
+                        interval: Math.floor(timePoints.length / 8) // 只显示部分标签
+                    },
+                    axisLine: { lineStyle: { color: '#334155' } }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 10,
+                        formatter: '¥{value}'
+                    },
+                    splitLine: { lineStyle: { color: '#1e293b', type: 'dashed' } }
+                },
+                series: [
+                    {
+                        name: '整体消耗',
+                        type: 'line',
+                        smooth: true,
+                        symbol: 'circle',
+                        symbolSize: 6,
+                        lineStyle: {
+                            width: 2,
+                            color: '#3b82f6'
+                        },
+                        itemStyle: {
+                            color: '#3b82f6'
+                        },
+                        areaStyle: {
+                            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                { offset: 0, color: 'rgba(59, 130, 246, 0.3)' },
+                                { offset: 1, color: 'rgba(59, 130, 246, 0.05)' }
+                            ])
+                        },
+                        data: costData
+                    }
+                ]
+            };
+
+            lineChartInstance.setOption(option);
+        }
+
+        function renderPayRoiLineChart(historyData) {
+            const placeholder = document.getElementById('payRoiChartPlaceholder');
+            if (placeholder) placeholder.remove();
+            document.getElementById('clearSelection').classList.remove('hidden');
+
+            if (!payRoiChartInstance) {
+                payRoiChartInstance = echarts.init(document.getElementById('payRoiChart'), 'dark');
+            }
+
+            const timePoints = historyData.map(d => d.time);
+            const roiData = historyData.map(d => Number(d.value ?? d.roi ?? 0) || 0);
+
+            const option = {
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                    borderColor: '#334155',
+                    textStyle: { color: '#e2e8f0' },
+                    formatter: function(params) {
+                        const data = params[0];
+                        return `<div class="text-sm">时间: ${data.name}</div>
+                                <div class="font-bold text-white mt-1">整体支付ROI: ${Number(data.value).toLocaleString()}</div>`;
+                    }
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: '30px',
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    boundaryGap: false,
+                    data: timePoints,
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 9,
+                        rotate: 45,
+                        interval: Math.floor(timePoints.length / 8)
+                    },
+                    axisLine: { lineStyle: { color: '#334155' } }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 10
+                    },
+                    splitLine: { lineStyle: { color: '#1e293b', type: 'dashed' } }
+                },
+                series: [
+                    {
+                        name: '整体支付ROI',
+                        type: 'line',
+                        smooth: true,
+                        symbol: 'circle',
+                        symbolSize: 6,
+                        lineStyle: { width: 2, color: '#10b981' },
+                        itemStyle: { color: '#10b981' },
+                        areaStyle: {
+                            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                { offset: 0, color: 'rgba(16, 185, 129, 0.3)' },
+                                { offset: 1, color: 'rgba(16, 185, 129, 0.05)' }
+                            ])
+                        },
+                        data: roiData
+                    }
+                ]
+            };
+
+            payRoiChartInstance.setOption(option);
+        }
+
+        function renderAmountLineChart(historyData) {
+            const placeholder = document.getElementById('amountChartPlaceholder');
+            if (placeholder) placeholder.remove();
+            document.getElementById('clearSelection').classList.remove('hidden');
+
+            if (!amountChartInstance) {
+                amountChartInstance = echarts.init(document.getElementById('amountChart'), 'dark');
+            }
+
+            const timePoints = historyData.map(d => d.time);
+            const amountData = historyData.map(d => Number(d.value ?? d.amount ?? 0) || 0);
+
+            const option = {
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                    borderColor: '#334155',
+                    textStyle: { color: '#e2e8f0' },
+                    formatter: function(params) {
+                        const data = params[0];
+                        return `<div class="text-sm">时间: ${data.name}</div>
+                                <div class="font-bold text-white mt-1">整体成交金额: ¥${Number(data.value).toLocaleString()}</div>`;
+                    }
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '3%',
+                    top: '30px',
+                    containLabel: true
+                },
+                xAxis: {
+                    type: 'category',
+                    boundaryGap: false,
+                    data: timePoints,
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 9,
+                        rotate: 45,
+                        interval: Math.floor(timePoints.length / 8)
+                    },
+                    axisLine: { lineStyle: { color: '#334155' } }
+                },
+                yAxis: {
+                    type: 'value',
+                    axisLabel: {
+                        color: '#94a3b8',
+                        fontSize: 10,
+                        formatter: '¥{value}'
+                    },
+                    splitLine: { lineStyle: { color: '#1e293b', type: 'dashed' } }
+                },
+                series: [
+                    {
+                        name: '整体成交金额',
+                        type: 'line',
+                        smooth: true,
+                        symbol: 'circle',
+                        symbolSize: 6,
+                        lineStyle: { width: 2, color: '#f59e0b' },
+                        itemStyle: { color: '#f59e0b' },
+                        areaStyle: {
+                            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                { offset: 0, color: 'rgba(245, 158, 11, 0.3)' },
+                                { offset: 1, color: 'rgba(245, 158, 11, 0.05)' }
+                            ])
+                        },
+                        data: amountData
+                    }
+                ]
+            };
+
+            amountChartInstance.setOption(option);
+        }
+
+        // 监听清除选择按钮
+        document.getElementById('clearSelection').addEventListener('click', function(e) {
+            e.stopPropagation();
+            clearMaterialSelection();
+        });
+
+        // 窗口大小变化时调整折线图
+        window.addEventListener('resize', () => {
+            if (lineChartInstance) lineChartInstance.resize();
+            if (payRoiChartInstance) payRoiChartInstance.resize();
+            if (amountChartInstance) amountChartInstance.resize();
+        });
+
+        // ================= 消耗占比饼图 (Top 20) =================
+        let pieChartInstance = null;
+        let pieChartData = []; // 缓存饼图数据
+
+        function buildPieDataFromTopList(topData) {
+            return topData.map(item => {
+                const label = getMaterialDisplayTitle({ title: item.title ?? '未命名' });
+                const short = label.length > 8 ? label.substring(0, 8) + '...' : label;
+                return {
+                    value: parseFloat((item.currentCost || 0).toFixed(2)),
+                    name: short,
+                    fullName: label
+                };
+            });
+        }
+
+        function refreshPieChartFromCache() {
+            if (!pieChartInstance || !pieChartData.length) return;
+            const pieData = buildPieDataFromTopList(pieChartData);
+            pieChartInstance.setOption({ series: [{ data: pieData }] });
+        }
+
+        async function renderPieChart() {
+            if (!pieChartInstance) {
+                pieChartInstance = echarts.init(document.getElementById('pieChart'), 'dark');
+            }
+
+            // 从后端 API 获取 Top20 数据
+            const topData = await fetchTop20ByCost(1);
+            pieChartData = topData;
+
+            const pieData = buildPieDataFromTopList(topData);
+
+            const option = {
+                backgroundColor: 'transparent',
+                tooltip: {
+                    trigger: 'item',
+                    formatter: function(params) {
+                        const showName = params.data && params.data.fullName != null ? params.data.fullName : params.name;
+                        return `<div class="text-sm">${showName}</div>
+                                <div class="font-bold text-white mt-1">
+                                  消耗: ¥${params.value.toLocaleString()} (${params.percent}%)
+                                </div>`;
+                    },
+                    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                    borderColor: '#334155',
+                    textStyle: { color: '#e2e8f0' }
+                },
+                color: [
+                    '#3b82f6', '#ec4899', '#f59e0b', '#10b981', '#8b5cf6',
+                    '#ef4444', '#14b8a6', '#f97316', '#6366f1', '#84cc16',
+                    '#06b6d4', '#d946ef', '#eab308', '#22c55e', '#a855f7'
+                ],
+                series: [
+                    {
+                        name: '最新消耗占比',
+                        type: 'pie',
+                        radius: ['45%', '75%'],
+                        center: ['50%', '50%'],
+                        avoidLabelOverlap: true,
+                        itemStyle: {
+                            borderRadius: 4,
+                            borderColor: '#0B1120',
+                            borderWidth: 2
+                        },
+                        label: {
+                            show: true,
+                            position: 'outside',
+                            formatter: '{b}\n{d}%',
+                            fontSize: 10,
+                            color: '#94a3b8',
+                            lineHeight: 14
+                        },
+                        emphasis: {
+                            label: {
+                                show: true,
+                                fontSize: 14,
+                                fontWeight: 'bold',
+                                formatter: '{b}\n{d}%',
+                                color: '#fff'
+                            },
+                            itemStyle: {
+                                shadowBlur: 10,
+                                shadowOffsetX: 0,
+                                shadowColor: 'rgba(0, 0, 0, 0.3)'
+                            }
+                        },
+                        labelLine: {
+                            show: true,
+                            length: 10,
+                            length2: 15,
+                            lineStyle: {
+                                color: '#64748b'
+                            }
+                        },
+                        data: pieData
+                    }
+                ]
+            };
+
+            pieChartInstance.setOption(option);
+            // 兜底：首次渲染/布局变化时强制 resize，避免容器初始高度为 0 导致空白
+            pieChartInstance.resize();
+
+            await updateLatestCrawlCostDisplay(1);
+        }
+
+        document.getElementById('toggleMaskNames').addEventListener('click', function(e) {
+            e.stopPropagation();
+            maskMaterialNames = !maskMaterialNames;
+            localStorage.setItem(MASK_NAMES_STORAGE_KEY, maskMaterialNames ? '1' : '0');
+            updateMaskToggleUi();
+            renderTable(processData());
+            refreshPieChartFromCache();
+        });
+
+        // 窗口大小适配
+        window.addEventListener('resize', () => {
+            if (pieChartInstance) pieChartInstance.resize();
+        });
+
+        // 初始化加载
+        // 异步初始化 - 从 API 加载数据
+        async function init() {
+            initColumnConfig();
+            updateSortIcons();
+
+            // 显示加载状态
+            document.getElementById('materialTable').innerHTML = '<tr><td colspan="20" class="p-4 text-center text-slate-400">正在加载数据...</td></tr>';
+
+            // 等待页面完全加载 + pywebview 注入
+            await new Promise(r => setTimeout(r, 500));
+
+            // 从 API 获取数据
+            console.log('[dashboard] calling getTableData...');
+            materials = await fetchMaterials();
+            isLoadingData = false;
+
+            const sortedData = processData();
+            // 默认选中第一条数据
+            if (sortedData.length > 0) {
+                selectedMaterial = sortedData[0];
+                document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+                document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${selectedMaterial.id}`;
+                document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${selectedMaterial.id}`;
+            }
+            renderTable(sortedData);
+            // 初始化默认选中第一条：同时启动折线图查询/轮询
+            if (selectedMaterial && selectedMaterial.id) {
+                startHistoryPolling(selectedMaterial.id);
+            }
+            // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
+            await renderPieChart();
+        }
+
+        // ================= 数据查询与计算逻辑 =================
+        // 表格数据由后端 getTableData 直接返回，这里不再做本地模拟/二次计算
+
+        // 主查询逻辑：异步重新从 API 获取数据
+        async function queryAndUpdateData() {
+            if (isLoadingData) return;
+
+            // 从 API 重新获取数据
+            const newMaterials = await fetchMaterials();
+
+            // 保持选中状态
+            const selectedId = selectedMaterial ? selectedMaterial.id : null;
+
+            // 合并数据（保留历史数据）
+            materials = newMaterials;
+
+            const sortedData = processData();
+
+            // 恢复选中状态
+            if (selectedId) {
+                const found = sortedData.find(m => m.id === selectedId);
+                if (found) {
+                    selectedMaterial = found;
+                    document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+                }
+            } else if (sortedData.length > 0) {
+                selectedMaterial = sortedData[0];
+                document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+            }
+
+            // 渲染表格
+            renderTable(materials);
+
+            // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
+            await renderPieChart();
+        }
+
+        // 每30秒执行一次数据刷新
+        setInterval(queryAndUpdateData, REFRESH_MS);
+
+        // 初始化首次加载
+        initDashboardAadvidSwitcher();
+        init();
+
+    </script>
+</body>
+</html>

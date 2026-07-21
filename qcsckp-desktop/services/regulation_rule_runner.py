@@ -1,0 +1,514 @@
+# -*- coding: utf-8 -*-
+"""
+规则化停投调度：按固定间隔（默认 10 分钟）从 pmc_roi2_assist_task（与 DashboardApi.get_roi2_assist_table_data 一致）
+拉取「ad_delivery_type=0 调控中、updated_at 近 N 分钟（默认 30，见 REGULATION_ASSIST_UPDATED_WITHIN_MINUTES；传 0 则仍按近 1 天）」任务，
+按 stat_cost_for_roi2_assist 降序；再按每条策略的 trigger（ROI2 调控指标）筛选，
+对任务执行暂停或删除（见 regulation_service）。写入 pmc_regulation_run（停投不做素材级限频）。
+多策略并行默认最多 3 路（环境变量 REGULATION_STRATEGY_PARALLEL）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from api.dashboard import DashboardApi
+from api.rule_regulation_config import (
+    build_trigger_evaluation_snapshot_roi2_assist,
+    evaluate_trigger_roi2_assist,
+    load_rule_regulation_config,
+)
+from config import CURRENT_VERSION
+from services.regulation_service import (
+    QianChuanRegulationStopService,
+    regulation_log_tag,
+)
+from utils.log import logger
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+DEFAULT_INTERVAL_SEC = 600
+MAX_STRATEGY_PARALLEL = 3
+_DASHBOARD_PAGE_SIZE = 500_000
+# 停投调度拉取调控任务时：仅处理「入库更新时间」近 N 分钟内有变动的行，减少对已停滞数据的重复跳过；0=沿用大屏默认（近 1 天）
+_DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
+
+
+def _assist_updated_within_minutes_from_env() -> Optional[int]:
+    e = os.environ.get("REGULATION_ASSIST_UPDATED_WITHIN_MINUTES", "").strip()
+    if e == "":
+        return _DEFAULT_ASSIST_UPDATED_WITHIN_MIN
+    try:
+        n = int(e)
+        if n <= 0:
+            return None
+        return min(n, 24 * 60)
+    except ValueError:
+        return _DEFAULT_ASSIST_UPDATED_WITHIN_MIN
+
+_assist_task_locks: Dict[str, asyncio.Lock] = {}
+_assist_task_locks_guard = asyncio.Lock()
+
+
+async def _lock_for_assist_task(aid: str) -> asyncio.Lock:
+    k = str(aid).strip() or "__empty__"
+    async with _assist_task_locks_guard:
+        if k not in _assist_task_locks:
+            _assist_task_locks[k] = asyncio.Lock()
+        return _assist_task_locks[k]
+
+
+def _beijing_now_str() -> str:
+    return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return "{}"
+
+
+def resolve_ad_id_for_aavid(db: SQLiteStore, aavid: str) -> Optional[str]:
+    rows = db.select(
+        table="pmc_ad_detail_basic",
+        fields="ad_id",
+        where="aadvid = ?",
+        params=(str(aavid).strip(),),
+        limit=1,
+    )
+    if not rows:
+        return None
+    v = rows[0].get("ad_id")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _task_name_from_assist_row(row: Dict[str, Any]) -> str:
+    """与 pmc_roi2_assist_task.task_name 一致。"""
+    if not isinstance(row, dict):
+        return ""
+    v = row.get("task_name")
+    if v is None:
+        return ""
+    s = str(v).strip()
+    return s[:512] if s else ""
+
+
+def _insert_regulation_run(
+    db: SQLiteStore,
+    *,
+    aavid: str,
+    ad_id: str,
+    task_name: str = "",
+    strategy_name: str = "",
+    assist_task_id: str = "",
+    stop_action: str = "",
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    status: int,
+    step: str,
+    message: str,
+    detail: str,
+    rule_full_json: str,
+    trigger_snapshot_json: str,
+    query_snapshot_json: str,
+    headless: bool,
+    browser_headless_rule: bool,
+    trigger_source: str = "scheduler",
+) -> None:
+    _sn = str(strategy_name or "").strip()[:128]
+    if not _sn or _sn == "?":
+        _sn = None
+    _tn = str(task_name or "").strip()
+    data: Dict[str, Any] = {
+        "aavid": aavid,
+        "ad_id": ad_id,
+        "assist_task_id": str(assist_task_id or "").strip() or None,
+        "task_name": _tn if _tn else None,
+        "strategy_name": _sn,
+        "stop_action": str(stop_action or "").strip()[:32] or None,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_ms": duration_ms,
+        "status": status,
+        "step": step,
+        "message": message[:2000] if message else "",
+        "detail": detail[:8000] if detail else "",
+        "rule_full_json": rule_full_json,
+        "trigger_snapshot_json": trigger_snapshot_json,
+        "query_snapshot_json": query_snapshot_json,
+        "headless": 1 if headless else 0,
+        "browser_headless_rule": 1 if browser_headless_rule else 0,
+        "trigger_source": (str(trigger_source or "scheduler").strip()[:64] or "scheduler"),
+        "app_version": CURRENT_VERSION,
+    }
+    db.insert(table="pmc_regulation_run", data=data)
+
+
+async def run_one_cycle(db: SQLiteStore) -> None:
+    _log_sched = regulation_log_tag(scheduler=True)
+    cfg = load_rule_regulation_config()
+    if not cfg.get("enabled"):
+        logger.info("%s 未启用 enabled，跳过本轮", _log_sched)
+        return
+
+    period = str(cfg.get("trigger_query_period") or "1h").strip() or "1h"
+    strategies = cfg.get("strategies")
+    if not isinstance(strategies, list) or not strategies:
+        logger.warning("%s strategies 为空", _log_sched)
+        return
+
+    rule_full_json = _json_dumps(cfg)
+
+    assist_uw_min = _assist_updated_within_minutes_from_env()
+    dash = DashboardApi()
+    resp = dash.get_roi2_assist_table_data(
+        sort_by="stat_cost_for_roi2_assist",
+        sort_order="desc",
+        page=1,
+        page_size=_DASHBOARD_PAGE_SIZE,
+        ad_delivery_type=0,
+        regulation_full_scan=True,
+        assist_updated_within_minutes=assist_uw_min,
+    )
+    if not resp.get("success"):
+        logger.warning("%s get_roi2_assist_table_data 失败: %s", _log_sched, resp.get("message"))
+        return
+
+    rows: List[Dict[str, Any]] = resp.get("data") or []
+
+    # 追投白名单：白名单中的调控任务自动跳过停投
+    whitelist = cfg.get("whitelist_assist_ids") or []
+    if whitelist:
+        whitelist_set = set(str(x).strip() for x in whitelist if str(x).strip())
+        filtered_rows: List[Dict[str, Any]] = []
+        skipped_ids: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            _aid = str(row.get("assist_task_id") or "").strip()
+            if _aid in whitelist_set:
+                skipped_ids.append(_aid)
+                continue
+            filtered_rows.append(row)
+        if skipped_ids:
+            logger.info(
+                "%s 追投白名单过滤：跳过 %s 个调控任务 (%s)",
+                _log_sched,
+                len(skipped_ids),
+                ",".join(skipped_ids),
+            )
+        rows = filtered_rows
+
+    query_at = _beijing_now_str()
+    assist_sort_by = resp.get("sortBy") or "stat_cost_for_roi2_assist"
+
+    max_p = MAX_STRATEGY_PARALLEL
+    try:
+        e = os.environ.get("REGULATION_STRATEGY_PARALLEL", "").strip()
+        if e.isdigit():
+            max_p = max(1, min(10, int(e)))
+    except Exception:
+        pass
+
+    _uw_log = f"updated_at近{assist_uw_min}分钟" if assist_uw_min else "updated_at近1天"
+    logger.info(
+        "%s 配置周期=%s 调控任务(ad_delivery_type=0,%s)=%s 策略数=%s 并行=%s",
+        _log_sched,
+        period,
+        _uw_log,
+        len(rows),
+        len(strategies),
+        min(max_p, len(strategies)),
+    )
+
+    sem = asyncio.Semaphore(max_p)
+    browser_rule = bool(cfg.get("browser_headless", True))
+
+    async def process_strategy(st: Dict[str, Any]) -> None:
+        async with sem:
+            trigger = st.get("trigger") or {}
+            if not isinstance(trigger, dict):
+                logger.warning("%s 策略 trigger 非法，跳过", _log_sched)
+                return
+
+            st_label = str(st.get("title") or st.get("id") or "?")[:64]
+            _tag = regulation_log_tag(strategy_title=st_label)
+            stop_action = str(st.get("regulation_stop_action") or "pause").strip().lower()
+            if stop_action not in ("pause", "delete"):
+                stop_action = "pause"
+
+            hit_rows: List[Dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if evaluate_trigger_roi2_assist(trigger, row):
+                    hit_rows.append(row)
+
+            logger.info("%s 命中调控任务数=%s", _tag, len(hit_rows))
+            if not hit_rows:
+                return
+
+            svc = QianChuanRegulationStopService.from_rule_file_dict(cfg)
+            headless_cfg = browser_rule
+            try:
+                for row in hit_rows:
+                    assist_raw = row.get("assist_task_id")
+                    assist_task_id = str(assist_raw).strip() if assist_raw is not None else ""
+                    task_name = _task_name_from_assist_row(row)
+                    aavid_raw = row.get("aadvid")
+                    aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
+
+                    eval_snap = build_trigger_evaluation_snapshot_roi2_assist(trigger, row)
+                    trigger_snap = _json_dumps(
+                        {
+                            "strategy_id": st.get("id"),
+                            "strategy_title": st.get("title"),
+                            "trigger_config": trigger,
+                            "evaluation": eval_snap,
+                        }
+                    )
+                    query_snap = _json_dumps(
+                        {
+                            "data_source": "pmc_roi2_assist_task",
+                            "trigger_query_period": period,
+                            "assist_updated_within_minutes": assist_uw_min,
+                            "sort_by": assist_sort_by,
+                            "query_at": query_at,
+                            "assist_task_total": resp.get("total"),
+                            "assist_row": row,
+                        }
+                    )
+
+                    if not assist_task_id:
+                        now = _beijing_now_str()
+                        _insert_regulation_run(
+                            db,
+                            aavid=aavid or "",
+                            ad_id="",
+                            task_name=task_name,
+                            strategy_name=st_label,
+                            assist_task_id="",
+                            stop_action=stop_action,
+                            started_at=now,
+                            ended_at=now,
+                            duration_ms=0,
+                            status=-1,
+                            step="validate",
+                            message="调控任务行缺少 assist_task_id，无法停投",
+                            detail="",
+                            rule_full_json=rule_full_json,
+                            trigger_snapshot_json=trigger_snap,
+                            query_snapshot_json=query_snap,
+                            headless=headless_cfg,
+                            browser_headless_rule=browser_rule,
+                        )
+                        logger.info("%s 跳过：无 assist_task_id", _tag)
+                        continue
+
+                    task_lock = await _lock_for_assist_task(assist_task_id)
+                    async with task_lock:
+                        ad_id = resolve_ad_id_for_aavid(db, aavid) if aavid else None
+                        if not ad_id:
+                            now = _beijing_now_str()
+                            _insert_regulation_run(
+                                db,
+                                aavid=aavid or "",
+                                ad_id="",
+                                task_name=task_name,
+                                strategy_name=st_label,
+                                assist_task_id=assist_task_id,
+                                stop_action=stop_action,
+                                started_at=now,
+                                ended_at=now,
+                                duration_ms=0,
+                                status=-1,
+                                step="resolve_ad_id",
+                                message="pmc_ad_detail_basic 中无该 aadvid 对应的 ad_id",
+                                detail="",
+                                rule_full_json=rule_full_json,
+                                trigger_snapshot_json=trigger_snap,
+                                query_snapshot_json=query_snap,
+                                headless=headless_cfg,
+                                browser_headless_rule=browser_rule,
+                            )
+                            continue
+
+                        try:
+                            aavid_int = int(str(aavid_raw).strip())
+                            ad_id_int = int(str(ad_id).strip())
+                        except (TypeError, ValueError):
+                            now = _beijing_now_str()
+                            _insert_regulation_run(
+                                db,
+                                aavid=aavid or "",
+                                ad_id=str(ad_id),
+                                task_name=task_name,
+                                strategy_name=st_label,
+                                assist_task_id=assist_task_id,
+                                stop_action=stop_action,
+                                started_at=now,
+                                ended_at=now,
+                                duration_ms=0,
+                                status=-1,
+                                step="validate",
+                                message="aavid 或 ad_id 无法转为整数",
+                                detail="",
+                                rule_full_json=rule_full_json,
+                                trigger_snapshot_json=trigger_snap,
+                                query_snapshot_json=query_snap,
+                                headless=headless_cfg,
+                                browser_headless_rule=browser_rule,
+                            )
+                            continue
+
+                        started_at = _beijing_now_str()
+                        t0 = time.time()
+                        try:
+                            result = await svc.run(
+                                aavid=aavid_int,
+                                ad_id=ad_id_int,
+                                assist_task_id=assist_task_id,
+                                stop_action=stop_action,
+                                strategy_title=st_label,
+                                reuse_session=False,
+                                close_session=False,
+                            )
+                        except Exception:
+                            ended_at = _beijing_now_str()
+                            dur = int((time.time() - t0) * 1000)
+                            _insert_regulation_run(
+                                db,
+                                aavid=str(aavid_int),
+                                ad_id=str(ad_id_int),
+                                task_name=task_name,
+                                strategy_name=st_label,
+                                assist_task_id=assist_task_id,
+                                stop_action=stop_action,
+                                started_at=started_at,
+                                ended_at=ended_at,
+                                duration_ms=dur,
+                                status=-1,
+                                step="exception",
+                                message="run 异常",
+                                detail=traceback.format_exc()[:8000],
+                                rule_full_json=rule_full_json,
+                                trigger_snapshot_json=trigger_snap,
+                                query_snapshot_json=query_snap,
+                                headless=headless_cfg,
+                                browser_headless_rule=browser_rule,
+                            )
+                            logger.exception("%s run 异常 assist_task_id=%s", _tag, assist_task_id)
+                            continue
+
+                        ended_at = _beijing_now_str()
+                        dur = int((time.time() - t0) * 1000)
+                        if result.step == "done_already_paused":
+                            st_ok = 2
+                        elif result.success:
+                            st_ok = 1
+                        else:
+                            st_ok = -1
+                        if result.step == "done_already_paused" or not result.success:
+                            detail = (result.detail or "")[:8000]
+                        else:
+                            detail = ""
+                        _insert_regulation_run(
+                            db,
+                            aavid=str(result.aavid or aavid_int),
+                            ad_id=str(result.ad_id or ad_id_int),
+                            task_name=task_name,
+                            strategy_name=st_label,
+                            assist_task_id=str(result.assist_task_id or assist_task_id),
+                            stop_action=str(result.stop_action or stop_action),
+                            started_at=started_at,
+                            ended_at=ended_at,
+                            duration_ms=dur,
+                            status=st_ok,
+                            step=result.step,
+                            message=result.message,
+                            detail=detail,
+                            rule_full_json=rule_full_json,
+                            trigger_snapshot_json=trigger_snap,
+                            query_snapshot_json=query_snap,
+                            headless=bool(result.headless),
+                            browser_headless_rule=browser_rule,
+                        )
+                        logger.info(
+                            "%s assist_task_id=%s success=%s step=%s",
+                            _tag,
+                            assist_task_id,
+                            result.success,
+                            result.step,
+                        )
+            finally:
+                await svc.close()
+
+    await asyncio.gather(*(process_strategy(st) for st in strategies))
+
+
+def _interval_sec() -> int:
+    try:
+        e = os.environ.get("REGULATION_RULE_INTERVAL_SEC", "").strip()
+        if e.isdigit():
+            return max(60, int(e))
+    except Exception:
+        pass
+    return DEFAULT_INTERVAL_SEC
+
+
+async def main_loop(interval_sec: Optional[int] = None) -> None:
+    sec = int(interval_sec) if interval_sec is not None else _interval_sec()
+    init_sqlite_schema()
+    db = SQLiteStore()
+    logger.info(
+        "%s 启动，间隔 %ss，版本 %s",
+        regulation_log_tag(scheduler=True),
+        sec,
+        CURRENT_VERSION,
+    )
+    while True:
+        try:
+            await run_one_cycle(db)
+        except Exception:
+            logger.exception("%s 本轮未捕获异常", regulation_log_tag(scheduler=True))
+        await asyncio.sleep(max(60, int(sec)))
+
+
+def _gui_background_target() -> None:
+    try:
+        asyncio.run(main_loop())
+    except Exception:
+        logger.exception("%s 后台线程异常退出", regulation_log_tag(scheduler=True))
+
+
+def start_regulation_rule_runner_background_thread() -> threading.Thread:
+    t = threading.Thread(
+        target=_gui_background_target,
+        name="regulation-rule-runner",
+        daemon=True,
+    )
+    t.start()
+    logger.info(
+        "%s 后台线程已启动（默认间隔 %ss，环境变量 REGULATION_RULE_INTERVAL_SEC 可覆盖，最低 60s）",
+        regulation_log_tag(scheduler=True),
+        _interval_sec(),
+    )
+    return t
+
+
+def main() -> None:
+    asyncio.run(main_loop())
+
+
+if __name__ == "__main__":
+    main()

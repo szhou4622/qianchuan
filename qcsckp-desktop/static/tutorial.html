@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>使用教程</title>
+    <script src="js/tailwindcss.js"></script>
+    <script src="js/lucide.js"></script>
+    <style>
+        html { color-scheme: dark; }
+        html, body { height: 100%; margin: 0; }
+        body {
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+        @keyframes tutorial-spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .tutorial-loading-icon {
+            animation: tutorial-spin 0.85s linear infinite;
+        }
+    </style>
+</head>
+<body class="h-full flex flex-col min-h-0">
+    <header class="flex-none flex items-center justify-between gap-3 px-4 py-2.5 border-b border-slate-700/80 bg-slate-900/50 backdrop-blur-sm shrink-0">
+        <span class="text-[13px] font-medium text-slate-400">使用教程</span>
+        <button type="button" id="btnOpenBrowser"
+                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-sky-500/45 bg-sky-500/10 text-sky-400 text-xs font-semibold hover:bg-sky-500/20 hover:border-sky-400/70 transition-colors">
+            <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+            浏览器打开
+        </button>
+    </header>
+
+    <!-- 主区域：先占满「加载占位」，就绪后换成 iframe（同一位置，不叠遮罩） -->
+    <main class="flex-1 min-h-0 flex flex-col bg-[#0f172a]">
+        <div id="tutorialLoading" class="flex-1 flex flex-col items-center justify-center px-6 text-center min-h-0">
+            <i data-lucide="loader-2" class="tutorial-loading-icon w-11 h-11 text-sky-400" aria-hidden="true"></i>
+            <p class="mt-5 text-sm font-medium text-slate-300">正在加载教程页面…</p>
+            <p class="mt-4 max-w-sm text-xs leading-relaxed text-slate-500">
+                内嵌预览可能存在兼容限制，建议点击右上角「<span class="text-slate-400">浏览器打开</span>」在系统浏览器中阅读，体验更佳。
+            </p>
+        </div>
+        <!-- 先 about:blank，避免同步写入飞书 URL 导致外层 index 的 iframe load 要等飞书（Windows WebView2 明显） -->
+        <iframe id="tutorialFrame"
+                src="about:blank"
+                class="hidden flex-1 w-full min-h-0 border-0 bg-slate-950/50"
+                title="飞书知识库 · 使用教程"></iframe>
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        const TUTORIAL_WIKI_URL = 'https://mcnhmlyyd69x.feishu.cn/wiki/FEX1wx1l0i3hdmkjxXVc8Ly4nMd';
+
+        function getApi() {
+            try {
+                if (window.top && window.top.pywebviewAPI) return window.top.pywebviewAPI;
+            } catch (_) {}
+            if (window.pywebview && window.pywebview.api) return window.pywebview.api;
+            return null;
+        }
+
+        async function openUrlInSystemBrowser(url) {
+            const u = url && String(url).trim();
+            if (!u) return;
+            try {
+                const api = getApi();
+                if (api && typeof api.openUrlInBrowser === 'function') {
+                    const r = await api.openUrlInBrowser(u);
+                    if (r && r.success) return;
+                }
+            } catch (e) {
+                console.warn('openUrlInBrowser', e);
+            }
+            try {
+                window.open(u, '_blank', 'noopener,noreferrer');
+            } catch (_) {}
+        }
+
+        document.getElementById('btnOpenBrowser').addEventListener('click', function () {
+            openUrlInSystemBrowser(TUTORIAL_WIKI_URL);
+        });
+
+        /**
+         * 必须在 tutorial.html 自身 window load 之后再赋飞书 URL。
+         * 若脚本一开始就改 frame.src，Chromium/WebView2 会让「外层 index 里指向本页的 iframe」的 load
+         * 一直等到飞书内嵌 iframe 完成，index 的全屏加载层就不会先消失。
+         */
+        function bootFeishuIframe() {
+            const frame = document.getElementById('tutorialFrame');
+            const loading = document.getElementById('tutorialLoading');
+            let settled = false;
+            let fallbackTimer = null;
+
+            function hideLoading() {
+                if (settled) return;
+                settled = true;
+                if (loading) loading.classList.add('hidden');
+                if (frame) frame.classList.remove('hidden');
+                try {
+                    frame.removeEventListener('load', onLoad);
+                } catch (_) {}
+                if (fallbackTimer) {
+                    clearTimeout(fallbackTimer);
+                    fallbackTimer = null;
+                }
+            }
+
+            function onLoad() {
+                hideLoading();
+            }
+
+            frame.addEventListener('load', onLoad);
+            fallbackTimer = setTimeout(hideLoading, 4000);
+            frame.src = TUTORIAL_WIKI_URL;
+        }
+
+        function scheduleBootFeishuIframe() {
+            setTimeout(bootFeishuIframe, 0);
+        }
+
+        if (document.readyState === 'complete') {
+            scheduleBootFeishuIframe();
+        } else {
+            window.addEventListener('load', scheduleBootFeishuIframe);
+        }
+    </script>
+</body>
+</html>

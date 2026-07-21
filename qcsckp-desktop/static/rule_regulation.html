@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>规则化停投</title>
+    <script src="js/tailwindcss.js"></script>
+    <script src="js/lucide.js"></script>
+    <script src="js/messagebox.js"></script>
+    <style>
+        html { color-scheme: dark; }
+        html, body { height: 100%; }
+        body { overflow: hidden; }
+        .page-shell {
+            background: radial-gradient(1200px 600px at 80% -10%, rgba(59, 130, 246, 0.08), transparent 55%),
+                        radial-gradient(900px 500px at -5% 30%, rgba(99, 102, 241, 0.06), transparent 50%),
+                        linear-gradient(180deg, #0f172a 0%, #0b1222 100%);
+        }
+        .tab-scroll {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(71, 85, 105, 0.8) rgba(15, 23, 42, 0.2);
+        }
+        .tab-scroll::-webkit-scrollbar { width: 7px; height: 7px; }
+        .tab-scroll::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.35); border-radius: 8px; }
+        .tab-scroll::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, #475569, #334155);
+            border-radius: 8px;
+            border: 2px solid rgba(15, 23, 42, 0.4);
+        }
+        .rr-header {
+            background: rgba(15, 23, 42, 0.72);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            box-shadow: 0 1px 0 rgba(148, 163, 184, 0.06), 0 8px 32px -12px rgba(0, 0, 0, 0.45);
+        }
+        .rr-header::after {
+            content: '';
+            position: absolute;
+            left: 0; right: 0; bottom: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.15), transparent);
+            pointer-events: none;
+        }
+        .rr-icon-wrap {
+            background: linear-gradient(145deg, rgba(99, 102, 241, 0.2), rgba(59, 130, 246, 0.12));
+            box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.12), inset 0 1px 0 rgba(255,255,255,0.06);
+        }
+        .rr-section {
+            border-radius: 1rem;
+            background: rgba(30, 41, 59, 0.35);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 0 1px rgba(148, 163, 184, 0.06);
+            padding: 1.25rem 1.35rem;
+        }
+        @media (min-width: 640px) {
+            .rr-section { padding: 1.35rem 1.5rem; }
+        }
+        .rr-section-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            color: #f1f5f9;
+        }
+        .rr-section-title i { opacity: 0.85; }
+        .rr-accent-bar {
+            width: 3px;
+            height: 14px;
+            border-radius: 9999px;
+            background: linear-gradient(180deg, #38bdf8, #6366f1);
+            flex-shrink: 0;
+        }
+        .rr-label { font-size: 0.75rem; font-weight: 500; color: #94a3b8; letter-spacing: 0.02em; }
+        .rr-input {
+            margin-top: 0.35rem;
+            width: 100%;
+            border-radius: 0.625rem;
+            background: rgba(15, 23, 42, 0.65);
+            padding: 0.5rem 0.75rem;
+            font-size: 0.875rem;
+            color: #f8fafc;
+            outline: none;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-input:focus {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2), 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        .rr-input--flush { margin-top: 0 !important; }
+        .rr-input::placeholder { color: #64748b; }
+        /* 自定义下拉：选项列表必须在 .rr-dd 内 absolute，否则会参与文档流、撑开下方表格区域高度 */
+        .rr-dd {
+            position: relative;
+            display: inline-block;
+            vertical-align: middle;
+            max-width: 100%;
+            z-index: 1;
+        }
+        .rr-dd.rr-dd-open {
+            z-index: 10050;
+        }
+        .rr-dd-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.4rem;
+            min-height: 2rem;
+            padding: 0.35rem 0.55rem 0.35rem 0.65rem;
+            border-radius: 0.5rem;
+            background: rgba(15, 23, 42, 0.88);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            font-size: 0.75rem;
+            line-height: 1.25;
+            color: #e2e8f0;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-dd-trigger:hover { border-color: rgba(71, 85, 105, 0.9); }
+        .rr-dd.rr-dd-open .rr-dd-trigger {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+        }
+        .rr-dd-label { min-width: 0; flex: 1; }
+        .rr-dd-chevron { transition: transform 0.2s ease; }
+        .rr-dd.rr-dd-open .rr-dd-chevron { transform: rotate(180deg); }
+        .rr-dd--dropup:not(.rr-dd-open) .rr-dd-chevron { transform: rotate(180deg); }
+        .rr-dd--dropup.rr-dd-open .rr-dd-chevron { transform: rotate(0deg); }
+        .rr-dd-panel {
+            position: absolute;
+            left: 0;
+            top: calc(100% + 4px);
+            min-width: 100%;
+            width: max-content;
+            max-width: min(420px, calc(100vw - 16px));
+            box-sizing: border-box;
+            z-index: 10051;
+            border-radius: 0.5rem;
+            background: #1e293b;
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            box-shadow: 0 12px 48px -8px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(0, 0, 0, 0.25);
+            padding: 0.3rem;
+            max-height: 15rem;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #475569 #1e293b;
+        }
+        .rr-dd--dropup .rr-dd-panel {
+            top: auto;
+            bottom: calc(100% + 4px);
+        }
+        .rr-dd-panel::-webkit-scrollbar { width: 5px; }
+        .rr-dd-panel::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .rr-dd-opt {
+            display: block;
+            width: 100%;
+            border-radius: 0.35rem;
+            border: none;
+            background: transparent;
+            color: #e2e8f0;
+            cursor: pointer;
+            text-align: left;
+            font-size: 0.75rem;
+            line-height: 1.35;
+            padding: 0.5rem 0.6rem;
+            transition: background 0.1s;
+        }
+        .rr-dd-opt:hover { background: rgba(59, 130, 246, 0.14); }
+        .rr-dd-opt.rr-dd-opt--active {
+            background: rgba(59, 130, 246, 0.2);
+            color: #fff;
+        }
+        .rr-dd--sm .rr-dd-trigger { min-height: 1.85rem; padding: 0.28rem 0.45rem 0.28rem 0.5rem; font-size: 0.7rem; }
+        .rr-dd--sm .rr-dd-opt { font-size: 0.7rem; padding: 0.4rem 0.5rem; }
+        .rr-dd-metric { flex: 0 0 auto; width: min(240px, 100%); max-width: 100%; }
+        .rr-dd-metric .rr-dd-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .rr-dd-op { flex: 0 0 auto; width: min(7.5rem, 100%); max-width: 100%; }
+        .rr-strategy-tab-inp {
+            border: 1px solid rgba(6, 182, 212, 0.45);
+            background: rgba(15, 23, 42, 0.92);
+            color: #cffafe;
+            outline: none;
+        }
+        .rr-strategy-tag {
+            display: inline-flex;
+            align-items: stretch;
+            gap: 0.125rem;
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }
+        .rr-strategy-tag-main {
+            flex: 1 1 auto;
+            min-width: 0;
+            border: none;
+            background: transparent;
+            font: inherit;
+            color: inherit;
+            text-align: left;
+            cursor: pointer;
+        }
+        .rr-strategy-tag-x {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 1.125rem;
+            margin-right: 0.125rem;
+            padding: 0 0.125rem;
+            border: none;
+            background: transparent;
+            color: rgba(148, 163, 184, 0.95);
+            cursor: pointer;
+        }
+        .rr-strategy-tag-x:hover { color: #fb7185; }
+        .seg-btn {
+            transition: transform 0.12s ease, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s;
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            background: rgba(30, 41, 59, 0.55);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+        }
+        .seg-btn:hover:not(.seg-btn-active) {
+            border-color: rgba(100, 116, 139, 0.7);
+            background: rgba(51, 65, 85, 0.45);
+        }
+        .seg-btn-active {
+            border-color: rgba(59, 130, 246, 0.65) !important;
+            background: linear-gradient(180deg, rgba(59, 130, 246, 0.22), rgba(59, 130, 246, 0.12)) !important;
+            color: #fff !important;
+            box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.12), inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .btn-ghost {
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            background: rgba(30, 41, 59, 0.55);
+            transition: background 0.15s, border-color 0.15s, transform 0.1s;
+        }
+        .btn-ghost:hover { background: rgba(51, 65, 85, 0.65); border-color: rgba(100, 116, 139, 0.55); }
+        .btn-primary {
+            background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+            box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset, 0 4px 14px -4px rgba(37, 99, 235, 0.55);
+            transition: filter 0.15s, transform 0.1s;
+        }
+        .btn-primary:hover { filter: brightness(1.06); }
+        .num-input::-webkit-outer-spin-button,
+        .num-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .num-input { -moz-appearance: textfield; appearance: textfield; }
+        .rr-field-err { font-size: 11px; line-height: 1.45; color: #f87171; margin-top: 0.35rem; }
+        .rr-input--invalid {
+            border-color: rgba(248, 113, 113, 0.85) !important;
+            background: rgba(127, 29, 29, 0.14) !important;
+        }
+        #rgConfigUnsavedHint:not(.hidden) {
+            font-weight: 700;
+            letter-spacing: 0.025em;
+            color: #f87171;
+            text-shadow: 0 0 10px rgba(248, 113, 113, 0.5);
+        }
+        /* 停投记录：与追投记录页同款表格/筛选（内联，避免 iframe） */
+        #tabPaneRegRuns .runs-filters { background: transparent; padding: 0.85rem 1rem 1rem; }
+        #tabPaneRegRuns .runs-filter-row {
+            display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.75rem 1rem; min-width: 0;
+        }
+        #tabPaneRegRuns .runs-filter-fields {
+            display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.75rem 1rem; flex: 1 1 auto; min-width: 0;
+        }
+        #tabPaneRegRuns .runs-field { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+        #tabPaneRegRuns .runs-field > span { font-size: 0.7rem; color: #94a3b8; font-weight: 500; }
+        #tabPaneRegRuns .runs-field--search { flex: 1 1 14rem; min-width: 10rem; max-width: 18rem; }
+        #tabPaneRegRuns .runs-field--sm { flex: 0 1 8rem; min-width: 6.5rem; }
+        #tabPaneRegRuns .runs-filter-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+        #tabPaneRegRuns .runs-table-scroll { overflow-x: auto; overflow-y: hidden; background: transparent; }
+        #tabPaneRegRuns .runs-table {
+            width: 100%; min-width: 1100px; text-align: left; border-collapse: collapse;
+        }
+        #tabPaneRegRuns .runs-table thead th {
+            border-bottom: 1px solid rgba(71, 85, 105, 0.55); padding: 0.65rem 0.75rem;
+            font-size: 0.7rem; font-weight: 600; color: #94a3b8; white-space: nowrap; background: transparent;
+        }
+        #tabPaneRegRuns .runs-table tbody td {
+            border-bottom: 1px solid rgba(51, 65, 85, 0.42); padding: 0.55rem 0.75rem;
+            font-size: 0.7rem; color: #cbd5e1; vertical-align: top;
+        }
+        #tabPaneRegRuns .runs-table tbody tr:hover { background: rgba(255, 255, 255, 0.035); }
+        #tabPaneRegRuns .runs-st-ok { color: #34d399; font-weight: 500; }
+        #tabPaneRegRuns .runs-st-err { color: #f87171; font-weight: 500; }
+        #tabPaneRegRuns .runs-st-skip { color: #fbbf24; font-weight: 500; }
+        #tabPaneRegRuns .runs-pagination {
+            display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+            gap: 0.75rem; padding: 0.75rem 1rem 0.95rem; font-size: 0.7rem; color: #94a3b8;
+        }
+        #tabPaneRegRuns .rr-input--runs {
+            margin-top: 0; border-radius: 0.625rem; background: rgba(15, 23, 42, 0.65);
+            padding: 0.45rem 0.65rem; font-size: 0.75rem; color: #f8fafc;
+            border: 1px solid rgba(51, 65, 85, 0.65);
+        }
+        #tabPaneRegRuns .rr-dd-mount {
+            position: relative;
+            overflow: visible;
+            min-width: 6.5rem;
+        }
+        #tabPaneRegRuns #rgRunsEmpty {
+            padding: 2.5rem 1rem; text-align: center; color: #64748b; background: transparent;
+        }
+        #rgRunsToast {
+            z-index: 10060;
+        }
+        .modal-overlay {
+            background: rgba(2, 6, 23, 0.72);
+            backdrop-filter: blur(4px);
+        }
+        #tabPaneRegRuns .runs-cell-plain {
+            font-size: 0.7rem;
+            line-height: 1.4;
+            color: #cbd5e1;
+        }
+        /* 执行详情弹窗底栏（与追投详情 #modalRetFooter 同款） */
+        #modalRunDetailFooter {
+            background: rgba(15, 23, 42, 0.88);
+            border-top: 1px solid rgba(51, 65, 85, 0.45);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }
+        #modalRunDetailFooter .runs-btn-op {
+            font-size: 0.8125rem;
+            font-weight: 600;
+            padding: 0.5rem 1.1rem;
+            min-height: 2.35rem;
+            border-radius: 0.5rem;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 2px rgba(0, 0, 0, 0.4);
+        }
+        #modalRunDetailFooter .runs-btn-op--trig {
+            border-color: rgba(251, 191, 36, 0.55);
+            background: linear-gradient(180deg, rgba(245, 158, 11, 0.22) 0%, rgba(180, 83, 9, 0.18) 100%);
+            color: #fef3c7;
+        }
+        #modalRunDetailFooter .runs-btn-op--query {
+            border-color: rgba(167, 139, 250, 0.55);
+            background: linear-gradient(180deg, rgba(139, 92, 246, 0.22) 0%, rgba(91, 33, 182, 0.2) 100%);
+            color: #ede9fe;
+        }
+        #modalRunDetailFooter .runs-btn-op:hover {
+            filter: brightness(1.12);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 10px rgba(0, 0, 0, 0.35);
+        }
+        #whitelistInput {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(71, 85, 105, 0.9) transparent;
+        }
+        #whitelistInput::-webkit-scrollbar { width: 4px; }
+        #whitelistInput::-webkit-scrollbar-thumb { background: rgba(71, 85, 105, 0.9); border-radius: 3px; }
+    </style>
+    <link rel="stylesheet" href="css/rule_retargeting_runs_modals.css" />
+</head>
+<body class="page-shell text-[#e2e8f0] h-full antialiased flex flex-col overflow-hidden">
+    <div class="flex flex-col flex-1 min-h-0">
+        <header class="rr-header relative flex-none shrink-0 z-10 px-3 sm:px-5 py-3.5 flex flex-wrap items-center justify-between gap-y-3 gap-x-4 border-b border-slate-700/30">
+            <div class="flex items-center gap-3.5 min-w-0">
+                <div class="rr-icon-wrap p-2.5 rounded-xl shrink-0">
+                    <i data-lucide="sliders-horizontal" class="w-5 h-5 text-sky-400"></i>
+                </div>
+                <div class="min-w-0">
+                    <div class="text-lg font-semibold text-white tracking-tight drop-shadow-sm">规则化停投</div>
+                    <div class="text-[11px] text-slate-500 mt-0.5 max-w-xl leading-relaxed">多策略 · 多条件组 · 监测达标触发停投（无执行次数限制）</div>
+                </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-3 sm:gap-4 shrink-0">
+                <div class="flex items-center gap-2 sm:gap-2.5 sm:border-r sm:border-slate-600/50 sm:pr-4">
+                    <span id="rgConfigUnsavedHint" class="hidden text-xs shrink-0 whitespace-nowrap" role="status">当前配置未保存</span>
+                    <span class="text-xs text-slate-400 whitespace-nowrap">启用规则化停投</span>
+                    <span id="enabledLabel" class="text-xs text-slate-500 shrink-0 tabular-nums min-w-[2.5rem]">关闭</span>
+                    <div class="relative h-6 w-11 shrink-0">
+                        <input type="checkbox" id="cfgEnabled" class="peer sr-only" />
+                        <div class="pointer-events-none absolute inset-0 h-6 w-11 rounded-full bg-slate-700/90 transition-colors peer-checked:bg-emerald-500 shadow-inner"></div>
+                        <div class="pointer-events-none absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow-md transition-transform peer-checked:translate-x-5"></div>
+                        <label for="cfgEnabled" class="absolute inset-0 z-10 cursor-pointer rounded-full"><span class="sr-only">启用规则化停投</span></label>
+                    </div>
+                </div>
+                <button type="button" id="btnManualRegStop"
+                        class="btn-ghost inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-slate-200 text-xs font-medium border border-rose-500/25">
+                    <i data-lucide="circle-pause" class="w-3.5 h-3.5 opacity-90 text-rose-400"></i> 手动停投
+                </button>
+                <button type="button" id="btnReload" class="btn-ghost inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-slate-200 text-xs font-medium">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5 opacity-90"></i> 重新加载
+                </button>
+                <button type="button" id="btnSave" class="btn-primary inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white text-xs font-semibold border border-blue-500/30">
+                    <i data-lucide="save" class="w-3.5 h-3.5 opacity-95"></i> 保存配置
+                </button>
+            </div>
+        </header>
+
+        <div
+            id="modalManualRegStop"
+            class="fixed inset-0 z-[10060] hidden flex items-center justify-center px-4 modal-overlay"
+            aria-hidden="true"
+        >
+            <div class="absolute inset-0" id="modalManualRegStopBackdrop" aria-hidden="true"></div>
+            <div
+                class="relative w-full max-w-lg rounded-2xl bg-slate-900 border border-slate-600/35 shadow-2xl max-h-[min(92vh,640px)] flex flex-col"
+                role="dialog"
+                aria-labelledby="modalManualRegTitle"
+            >
+                <div class="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-600/25 shrink-0">
+                    <div class="min-w-0 flex-1 pr-2">
+                        <h2 id="modalManualRegTitle" class="text-base font-semibold text-white tracking-tight">手动停投</h2>
+                        <p class="text-[11px] text-slate-500 mt-1.5 leading-snug">
+                            将打开可见浏览器并定位到调控任务，需用户自己<span class="font-semibold text-amber-400">手动点击「确定」</span>完成操作。
+                        </p>
+                    </div>
+                    <button
+                        type="button"
+                        id="btnManualRegClose"
+                        class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/80 shrink-0"
+                        aria-label="关闭"
+                    >
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+                <div class="px-5 py-4 space-y-4 overflow-y-auto flex-1 min-h-0">
+                    <div
+                        id="manualRegModalAlert"
+                        class="hidden rounded-lg px-3 py-2.5 text-xs leading-snug border border-slate-600/50 bg-slate-800/80 text-slate-200"
+                        role="alert"
+                        aria-live="polite"
+                    ></div>
+                    <label class="block">
+                        <span class="rr-label">调控任务 ID</span>
+                        <input type="text" id="mrgAssistId" autocomplete="off" class="rr-input w-full mt-1.5 font-mono text-sm" placeholder="请输入调控ID" />
+                    </label>
+                    <div>
+                        <div class="rr-label">停投方式</div>
+                        <div class="mt-2 flex flex-wrap gap-2.5">
+                            <button type="button" id="btnMrgPause" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200">暂停调控</button>
+                            <button type="button" id="btnMrgDelete" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200">删除任务</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center justify-end gap-2 px-5 py-3.5 border-t border-slate-600/25 shrink-0">
+                    <button type="button" id="btnManualRegCancel" class="btn-ghost px-4 py-2 rounded-lg text-xs text-slate-300">取消</button>
+                    <button type="button" id="btnManualRegSubmit" class="btn-primary px-4 py-2 rounded-lg text-xs font-semibold text-white border border-rose-500/35">开始</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-scroll px-3 sm:px-5 py-5 sm:py-6">
+            <div class="w-[80%] max-w-full mx-auto flex flex-col gap-4">
+                <div class="flex flex-wrap gap-2 shrink-0">
+                    <button type="button" id="tabBtnRegConfig" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200">停投配置</button>
+                    <button type="button" id="tabBtnRegRuns" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200">停投记录</button>
+                </div>
+
+                <div id="tabPaneRegConfig" class="flex flex-col gap-6">
+                <!-- 1 运行配置 -->
+                <section class="rr-section space-y-4">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="settings" class="w-4 h-4 text-sky-400/90"></i>
+                        运行配置
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <div class="rr-label">启用窗口模式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" id="btnHeadful" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200">显示</button>
+                            <button type="button" id="btnHeadless" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200">不显示</button>
+                        </div>
+                        <div class="text-[11px] text-slate-600 leading-relaxed max-w-xl pt-0.5 space-y-1">
+                            <div><span class="text-slate-500">显示：</span>执行时弹出可见浏览器窗口，便于观察与排错。</div>
+                            <div><span class="text-slate-500">不显示：</span>无头模式在后台运行，适合长期挂机。</div>
+                        </div>
+                        <div class="max-w-2xl pt-3 space-y-1.5">
+                            <div class="rr-label">浏览器程序路径（可选）</div>
+                            <p class="text-[11px] text-slate-600 leading-relaxed">指定自动化实际启动的浏览器可执行文件。留空或路径无效时，由程序在本机自动探测可用浏览器。</p>
+                            <input id="rgBrowserExecutable" type="text" autocomplete="off" spellcheck="false"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 font-mono"
+                                   placeholder="选填，完整路径" />
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 2 追投白名单 -->
+                <section class="rr-section space-y-4" id="sectionWhitelist">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="shield-check" class="w-4 h-4 text-emerald-400/90"></i>
+                        追投白名单
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-3">
+                        <p class="text-[11px] text-slate-600 leading-relaxed max-w-xl">
+                            白名单中的调控任务 ID 将被自动跳过停投，即使触发条件满足也不会执行暂停或删除，确保追投计划持续运行。
+                        </p>
+                        <div class="flex flex-wrap items-end gap-2">
+                            <textarea id="whitelistInput" autocomplete="off" spellcheck="false" rows="1"
+                                   class="rr-input w-72 max-w-full text-xs font-mono resize-none leading-4"
+                                   style="max-height: 88px;"
+                                   placeholder="请输入调控ID，支持多行输入（每行一个）"></textarea>
+                            <button type="button" id="btnAddWhitelist"
+                                    class="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-emerald-500/12 text-emerald-300 hover:bg-emerald-500/18 border border-emerald-500/20 transition-colors">
+                                <i data-lucide="plus" class="w-3.5 h-3.5"></i> 添加
+                            </button>
+                            <button type="button" id="btnClearWhitelistInput"
+                                    class="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-slate-700/40 text-slate-400 hover:text-slate-200 hover:bg-slate-700/60 border border-slate-600/30 transition-colors">
+                                <i data-lucide="eraser" class="w-3.5 h-3.5"></i> 清空
+                            </button>
+                        </div>
+                        <div id="whitelistTags" class="flex flex-wrap gap-2"></div>
+                    </div>
+                </section>
+
+                <div class="flex flex-col gap-2">
+                    <div id="strategyTabsBar" class="flex flex-wrap gap-2 shrink-0"></div>
+                    <p class="text-[11px] text-slate-600 leading-relaxed max-w-3xl">
+                        支持多条策略；每条策略一套「监测指标」；点选标签切换；双击可重命名。
+                    </p>
+                </div>
+
+                <!-- 3 监测指标 -->
+                <section class="rr-section space-y-3" id="sectionTriggerRegulation">
+                    <div class="flex flex-wrap items-center justify-between gap-2 gap-y-2">
+                        <div class="rr-section-title">
+                            <span class="rr-accent-bar" aria-hidden="true"></span>
+                            <i data-lucide="filter" class="w-4 h-4 text-violet-400/90"></i>
+                            监测指标（触发条件）
+                        </div>
+                        <button type="button" id="btnAddGroup"
+                            class="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-violet-500/12 text-violet-300 hover:bg-violet-500/18 border border-violet-500/20 transition-colors">
+                            <i data-lucide="plus" class="w-3.5 h-3.5"></i> 添加条件组
+                        </button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500 pl-[calc(0.5rem+3px)]">
+                        <span class="text-slate-500 shrink-0">多组之间</span>
+                        <div id="groupCombineMount" class="inline-block w-[min(300px,100%)] max-w-full shrink-0"></div>
+                    </div>
+                    <p class="text-[11px] text-slate-600 pl-[calc(0.5rem+3px)]">组内为「且」；指标键与素材大屏「调控数据」列一致。</p>
+                    <p id="errTriggerConditions" class="rr-field-err hidden pl-[calc(0.5rem+3px)]" role="alert"></p>
+                    <div id="triggerGroups" class="flex flex-col gap-4 mt-1 pl-0"></div>
+                </section>
+
+                <!-- 3 调控操作 -->
+                <section class="rr-section space-y-4" id="sectionRegulationActions">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="rocket" class="w-4 h-4 text-amber-400/90"></i>
+                        停投操作
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <div class="rr-label">停投执行方式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" id="btnStopActionPause" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200 inline-flex items-center gap-1.5">
+                                <i data-lucide="pause-circle" class="w-4 h-4 opacity-90 shrink-0"></i>
+                                暂停调控
+                            </button>
+                            <button type="button" id="btnStopActionDelete" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200 inline-flex items-center gap-1.5">
+                                <i data-lucide="trash-2" class="w-4 h-4 opacity-90 shrink-0"></i>
+                                删除任务
+                            </button>
+                        </div>
+                        <p class="text-[11px] text-slate-600 leading-relaxed max-w-xl pt-0.5">
+                            对应策略，条件满足时执行停投；仅针对「调控中」的素材执行停投，其余均跳过。
+                        </p>
+                    </div>
+                </section>
+
+                <p class="text-center text-[10px] text-slate-600 pb-2">千川素材看盘工具</p>
+                </div>
+
+                <div id="tabPaneRegRuns" class="hidden w-full">
+                    <section class="rr-section p-0 overflow-hidden border border-slate-600/20">
+                        <div class="runs-filters">
+                            <div class="runs-filter-row">
+                                <div class="runs-filter-fields">
+                                    <label class="runs-field runs-field--search">
+                                        <span>搜索</span>
+                                        <input type="text" id="rgRunsFQ" class="rr-input rr-input--runs w-full" placeholder="调控任务 ID / 任务名称 / 策略" autocomplete="off" />
+                                    </label>
+                                    <label class="runs-field runs-field--sm">
+                                        <span>状态</span>
+                                        <div id="rgMountStatus" class="rr-dd-mount w-full sm:w-auto"></div>
+                                    </label>
+                                    <label class="runs-field runs-field--sm">
+                                        <span>停投方式</span>
+                                        <div id="rgMountStop" class="rr-dd-mount w-full sm:w-auto"></div>
+                                    </label>
+                                </div>
+                                <div class="runs-filter-actions">
+                                    <button type="button" id="rgRunsBtnSearch" class="btn-primary px-4 py-1.5 rounded-lg text-xs">查询</button>
+                                    <button type="button" id="rgRunsBtnReset" class="btn-ghost px-4 py-1.5 rounded-lg text-xs">重置</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="runs-table-scroll">
+                            <table class="runs-table">
+                                <thead>
+                                    <tr>
+                                        <th>调控 ID</th>
+                                        <th>任务名称</th>
+                                        <th>状态</th>
+                                        <th>阶段</th>
+                                        <th>停投方式</th>
+                                        <th>返回消息</th>
+                                        <th>开始时间</th>
+                                        <th class="text-center">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="rgRunsTbody"></tbody>
+                            </table>
+                            <div id="rgRunsEmpty" class="hidden">暂无数据</div>
+                        </div>
+                        <div class="runs-pagination">
+                            <span id="rgRunsPageInfo">共 0 条</span>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <label class="flex items-center gap-1.5">
+                                    <span>每页</span>
+                                    <div id="rgMountPageSize" class="runs-dd-mount"></div>
+                                </label>
+                                <div id="rgRunsPaginationLinks" class="flex items-center gap-1 flex-wrap justify-end"></div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="rgRunsToast" class="fixed top-4 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-4 py-2 rounded-lg shadow-lg border border-slate-600 opacity-0 transition-opacity duration-300 pointer-events-none z-[10060]">
+        <div class="flex items-center gap-2">
+            <i data-lucide="check-circle" class="w-4 h-4 text-emerald-400"></i>
+            <span id="rgRunsToastMessage">复制成功</span>
+        </div>
+    </div>
+
+    <div id="modalTrig" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-5 modal-overlay">
+        <div class="bg-slate-900 border border-slate-600/60 rounded-2xl max-w-5xl w-full max-h-[90vh] min-h-0 flex flex-col shadow-2xl ring-1 ring-slate-700/35 overflow-hidden">
+            <div class="flex-shrink-0 flex items-center justify-between gap-3 px-5 pt-5 pb-3.5 sm:px-6 border-b border-slate-700/60 bg-gradient-to-b from-slate-950/80 to-slate-900/60">
+                <div class="min-w-0 flex items-center gap-2 flex-wrap">
+                    <h2 class="text-lg font-semibold text-white tracking-tight">触发条件</h2>
+                    <span id="modalTrigStrategyBadge" class="inline-flex items-center shrink-0"></span>
+                </div>
+                <button type="button" class="modal-close text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800/80" data-close="modalTrig"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div id="modalTrigBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 text-slate-300 text-base space-y-4"></div>
+        </div>
+    </div>
+
+    <div id="modalQuery" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-5 modal-overlay">
+        <div class="bg-slate-900 border border-slate-600/60 rounded-2xl max-w-5xl w-full max-h-[90vh] min-h-0 flex flex-col shadow-2xl ring-1 ring-slate-700/35 overflow-hidden">
+            <div class="flex-shrink-0 flex items-center justify-between px-5 pt-5 pb-3.5 sm:px-6 border-b border-slate-700/60 bg-gradient-to-b from-slate-950/80 to-slate-900/60">
+                <div class="flex items-baseline flex-wrap gap-x-2.5 gap-y-1 min-w-0 pr-3">
+                    <h2 class="text-lg font-semibold text-white tracking-tight shrink-0">任务信息</h2>
+                    <span id="modalQueryAt" class="text-xs text-slate-400 font-normal font-mono tabular-nums leading-snug"></span>
+                </div>
+                <button type="button" class="modal-close text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800/80" data-close="modalQuery"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div id="modalQueryBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 text-slate-300 text-base"></div>
+        </div>
+    </div>
+
+    <div id="modalRunDetail" class="hidden fixed inset-0 z-[10050] flex items-center justify-center p-3 sm:p-5 modal-overlay">
+        <div class="bg-slate-900 border border-slate-600/60 rounded-2xl max-w-5xl w-full max-h-[90vh] min-h-0 flex flex-col shadow-2xl ring-1 ring-slate-700/35 overflow-hidden">
+            <div class="flex-shrink-0 flex items-center justify-between px-5 pt-5 pb-3.5 sm:px-6 border-b border-slate-700/60 bg-gradient-to-b from-slate-950/80 to-slate-900/60">
+                <h2 class="text-lg font-semibold text-white tracking-tight">执行详情</h2>
+                <button type="button" class="modal-close text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800/80" data-close="modalRunDetail"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div id="modalRunDetailBody" class="runs-modal-scroll flex-1 min-h-0 overflow-y-auto p-5 sm:p-6 text-slate-300 text-base"></div>
+            <div id="modalRunDetailFooter" class="flex-shrink-0 flex flex-wrap items-center justify-end gap-2 px-4 sm:px-6 py-3.5">
+                <button type="button" id="rgRunDetailBtnTrig" class="runs-btn-op runs-btn-op--trig">触发条件</button>
+                <button type="button" id="rgRunDetailBtnQuery" class="runs-btn-op runs-btn-op--query">任务详情</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/rule_regulation_page.js"></script>
+    <script src="js/rule_regulation_runs_tab.js"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+</html>

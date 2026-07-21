@@ -1,0 +1,3435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>规则化追投</title>
+    <script src="js/tailwindcss.js"></script>
+    <script src="js/lucide.js"></script>
+    <script src="js/messagebox.js"></script>
+    <script src="js/imm_retargeting_field_validate.js"></script>
+    <!-- 追投记录弹窗挂到本页 body：内联 CSS，避免 file:// / pywebview 下外部 link 不加载 -->
+    <style id="runs-modal-styles-embedded">
+/**
+ * 追投记录 iframe 内弹窗样式（#modalRet / #modalTrig / #modalQuery 相关）。
+ * 弹窗节点会被 runsLiftModalsToParent() 挂到 rule_retargeting.html 的 body，
+ * 因此本文件必须在父页加载，否则详情栅格 / tag / 复制按钮等自定义类全部失效。
+ */
+.runs-empty {
+    color: #64748b;
+}
+/* 与 dashboard.html 一致：可点击复制 ID */
+.runs-copy {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.7rem;
+    line-height: 1.35;
+    color: #cbd5e1;
+    cursor: pointer;
+    transition: color 0.15s;
+    background: transparent;
+    border: none;
+    padding: 0;
+    text-align: left;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: bottom;
+}
+.runs-copy:hover {
+    color: #f1f5f9;
+}
+/* 追投详情弹窗：分块与栅格 */
+.runs-detail-card {
+    border-radius: 0.75rem;
+    border: 1px solid rgba(51, 65, 85, 0.55);
+    background: linear-gradient(165deg, rgba(15, 23, 42, 0.72) 0%, rgba(15, 23, 42, 0.45) 100%);
+    overflow: hidden;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 12px 32px rgba(0, 0, 0, 0.28);
+}
+.runs-detail-card-hd {
+    padding: 0.65rem 1rem;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.45);
+    background: rgba(15, 23, 42, 0.88);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: #f1f5f9;
+    letter-spacing: 0.03em;
+}
+.runs-detail-param-h {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    margin-bottom: 0.65rem;
+}
+.runs-detail-kv-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.85rem 1rem;
+}
+@media (min-width: 640px) {
+    .runs-detail-kv-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+@media (min-width: 1024px) {
+    .runs-detail-kv-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+.runs-detail-field {
+    border-radius: 0.5rem;
+    border: 1px solid rgba(51, 65, 85, 0.4);
+    background: rgba(15, 23, 42, 0.5);
+    padding: 0.65rem 0.8rem;
+    min-width: 0;
+}
+#modalRet .runs-modal-detail-panel {
+    min-height: 0;
+}
+.runs-modal-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(71, 85, 105, 0.9) rgba(15, 23, 42, 0.25);
+    -webkit-overflow-scrolling: touch;
+}
+.runs-modal-scroll::-webkit-scrollbar {
+    width: 6px;
+}
+.runs-modal-scroll::-webkit-scrollbar-track {
+    background: rgba(15, 23, 42, 0.35);
+    border-radius: 100px;
+    margin: 6px 0;
+}
+.runs-modal-scroll::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(100, 116, 139, 0.95), rgba(71, 85, 105, 0.85));
+    border-radius: 100px;
+}
+#modalRet .runs-copy--modal {
+    font-size: 0.8125rem;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-all;
+}
+.runs-detail-card--body-only .runs-detail-card-body {
+    padding: 1.15rem 1.25rem 1.25rem;
+}
+.runs-detail-main {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+.runs-detail-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.85rem 1.15rem;
+}
+@media (max-width: 640px) {
+    .runs-detail-row {
+        grid-template-columns: 1fr;
+    }
+}
+.runs-detail-cell {
+    min-width: 0;
+}
+.runs-detail-lbl {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #94a3b8;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.4rem;
+}
+.runs-detail-val {
+    font-size: 0.9375rem;
+    line-height: 1.45;
+    color: #f1f5f9;
+    min-width: 0;
+}
+.runs-detail-name-wrap {
+    word-break: break-word;
+}
+.runs-detail-msg {
+    color: #e2e8f0;
+}
+.runs-detail-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.8125rem;
+    color: #cbd5e1;
+}
+/* 详情弹窗「状态」：仅字色区分，无标签底 */
+.runs-detail-st-txt {
+    font-size: 0.9375rem;
+    font-weight: 500;
+}
+.runs-detail-st-txt--ok {
+    color: #34d399;
+}
+.runs-detail-st-txt--err {
+    color: #f87171;
+}
+.runs-detail-step-pill {
+    display: inline-flex;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.35rem;
+    font-size: 0.8125rem;
+    color: #cbd5e1;
+    background: rgba(51, 65, 85, 0.45);
+    border: 1px solid rgba(71, 85, 105, 0.55);
+}
+.runs-detail-tag-m {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 0.35rem;
+    border: 1px solid;
+    line-height: 1.2;
+}
+.runs-detail-tag-m--vol {
+    background: rgba(14, 165, 233, 0.16);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.35);
+}
+.runs-detail-tag-m--cc {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.35);
+}
+.runs-detail-tag-m--unk {
+    background: rgba(71, 85, 105, 0.35);
+    color: #cbd5e1;
+    border-color: rgba(100, 116, 139, 0.45);
+}
+.runs-detail-og {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 0.35rem;
+    border: 1px solid;
+}
+.runs-detail-og--empty {
+    color: #64748b;
+    background: rgba(30, 41, 59, 0.5);
+    border-color: rgba(51, 65, 85, 0.5);
+    font-weight: 500;
+}
+.runs-detail-og--net {
+    color: #22d3ee;
+    background: rgba(6, 182, 212, 0.12);
+    border-color: rgba(34, 211, 238, 0.35);
+}
+.runs-detail-og--live {
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(251, 191, 36, 0.35);
+}
+.runs-detail-og--other {
+    color: #a5b4fc;
+    background: rgba(99, 102, 241, 0.12);
+    border-color: rgba(129, 140, 248, 0.35);
+}
+.runs-detail-tri {
+    font-size: 0.875rem;
+    color: #e2e8f0;
+}
+.runs-detail-tri-meta {
+    font-size: 0.7rem;
+    color: #64748b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.runs-detail-error-banner {
+    border-radius: 0.65rem;
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    background: linear-gradient(135deg, rgba(127, 29, 29, 0.35) 0%, rgba(15, 23, 42, 0.65) 100%);
+    overflow: hidden;
+}
+.runs-detail-error-hd {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.85rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #fca5a5;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid rgba(248, 113, 113, 0.22);
+}
+.runs-detail-error-body {
+    padding: 0.75rem 0.85rem;
+    font-size: 0.8125rem;
+    line-height: 1.55;
+    color: #fecaca;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.runs-detail-task-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.runs-detail-task-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(51, 65, 85, 0.4);
+    background: rgba(15, 23, 42, 0.5);
+}
+.runs-detail-task-k {
+    flex: 0 0 11rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #94a3b8;
+}
+.runs-detail-task-v {
+    flex: 1 1 12rem;
+    font-size: 0.9rem;
+    color: #f1f5f9;
+    min-width: 0;
+    align-self: center;
+}
+.runs-detail-task-muted {
+    font-size: 0.8125rem;
+    color: #94a3b8;
+}
+#modalRetBody .runs-detail-card-hd {
+    font-size: 0.9rem;
+}
+#modalRetBody {
+    background: rgba(15, 23, 42, 0.35);
+}
+/* 与 rule_retargeting_runs_modals.css 同步：弹窗内操作按钮（挂到父 body 后依赖此块） */
+.runs-btn-op {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.65rem;
+    line-height: 1.2;
+    padding: 0.22rem 0.5rem;
+    border-radius: 0.35rem;
+    border: 1px solid;
+    cursor: pointer;
+    font-family: inherit;
+    margin: 0;
+    appearance: none;
+    -webkit-appearance: none;
+    transition: background 0.12s, border-color 0.12s, color 0.12s, filter 0.12s, box-shadow 0.12s;
+}
+.runs-btn-op:hover { filter: brightness(1.08); }
+.runs-btn-op:active { filter: brightness(0.96); }
+.runs-btn-op:focus-visible {
+    outline: 2px solid rgba(56, 189, 248, 0.55);
+    outline-offset: 2px;
+}
+.runs-btn-op--detail {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(14, 165, 233, 0.12);
+    color: #bae6fd;
+}
+.runs-btn-op--trig {
+    border-color: rgba(251, 191, 36, 0.45);
+    background: rgba(245, 158, 11, 0.12);
+    color: #fde68a;
+}
+.runs-btn-op--query {
+    border-color: rgba(167, 139, 250, 0.45);
+    background: rgba(139, 92, 246, 0.12);
+    color: #ddd6fe;
+}
+#modalRetFooter {
+    background: rgba(15, 23, 42, 0.88);
+    border-top: 1px solid rgba(51, 65, 85, 0.45);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+#modalRetFooter .runs-btn-op {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    padding: 0.5rem 1.1rem;
+    min-height: 2.35rem;
+    border-radius: 0.5rem;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+#modalRetFooter .runs-btn-op--trig {
+    border-color: rgba(251, 191, 36, 0.55);
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.22) 0%, rgba(180, 83, 9, 0.18) 100%);
+    color: #fef3c7;
+}
+#modalRetFooter .runs-btn-op--query {
+    border-color: rgba(167, 139, 250, 0.55);
+    background: linear-gradient(180deg, rgba(139, 92, 246, 0.22) 0%, rgba(91, 33, 182, 0.2) 100%);
+    color: #ede9fe;
+}
+#modalRetFooter .runs-btn-op:hover {
+    filter: brightness(1.12);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+    </style>
+    <style>
+        html { color-scheme: dark; }
+        html, body { height: 100%; }
+        body { overflow: hidden; }
+        .page-shell {
+            background: radial-gradient(1200px 600px at 80% -10%, rgba(59, 130, 246, 0.08), transparent 55%),
+                        radial-gradient(900px 500px at -5% 30%, rgba(99, 102, 241, 0.06), transparent 50%),
+                        linear-gradient(180deg, #0f172a 0%, #0b1222 100%);
+        }
+        /* 主内容区：须与 class 名一致；曾误用 .rr-scroll 导致无 overflow，整页被 body 裁切且无滚动条 */
+        .tab-scroll {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(71, 85, 105, 0.8) rgba(15, 23, 42, 0.2);
+        }
+        .tab-scroll::-webkit-scrollbar { width: 7px; height: 7px; }
+        .tab-scroll::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.35); border-radius: 8px; }
+        .tab-scroll::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, #475569, #334155);
+            border-radius: 8px;
+            border: 2px solid rgba(15, 23, 42, 0.4);
+        }
+        .rr-header {
+            background: rgba(15, 23, 42, 0.72);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            box-shadow: 0 1px 0 rgba(148, 163, 184, 0.06), 0 8px 32px -12px rgba(0, 0, 0, 0.45);
+        }
+        .rr-header::after {
+            content: '';
+            position: absolute;
+            left: 0; right: 0; bottom: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(56, 189, 248, 0.15), transparent);
+            pointer-events: none;
+        }
+        .rr-icon-wrap {
+            background: linear-gradient(145deg, rgba(99, 102, 241, 0.2), rgba(59, 130, 246, 0.12));
+            box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.12), inset 0 1px 0 rgba(255,255,255,0.06);
+        }
+        .rr-section {
+            border-radius: 1rem;
+            background: rgba(30, 41, 59, 0.35);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 0 1px rgba(148, 163, 184, 0.06);
+            padding: 1.25rem 1.35rem;
+        }
+        @media (min-width: 640px) {
+            .rr-section { padding: 1.35rem 1.5rem; }
+        }
+        .rr-section-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            color: #f1f5f9;
+        }
+        .rr-section-title i { opacity: 0.85; }
+        .rr-accent-bar {
+            width: 3px;
+            height: 14px;
+            border-radius: 9999px;
+            background: linear-gradient(180deg, #38bdf8, #6366f1);
+            flex-shrink: 0;
+        }
+        .rr-label { font-size: 0.75rem; font-weight: 500; color: #94a3b8; letter-spacing: 0.02em; }
+        /* label 内 span 默认行内，会与 inline-block 的 input 同一行；强制上下分布 */
+        label.block > .rr-label { display: block; }
+        .rr-input {
+            margin-top: 0.35rem;
+            width: 100%;
+            border-radius: 0.625rem;
+            background: rgba(15, 23, 42, 0.65);
+            padding: 0.5rem 0.75rem;
+            font-size: 0.875rem;
+            color: #f8fafc;
+            outline: none;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-input:focus {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2), 0 0 0 3px rgba(59, 130, 246, 0.15);
+        }
+        .rr-input--flush { margin-top: 0 !important; }
+        /* 追投次数限制：与开关同一行对齐的固定高度数字框 */
+        .rr-interval-num {
+            height: 2.25rem;
+            min-height: 2.25rem;
+            box-sizing: border-box;
+            padding-top: 0;
+            padding-bottom: 0;
+            border-radius: 0.5rem;
+            line-height: 1.25rem;
+            margin-top: 0 !important;
+        }
+        /* 追投次数限制：全局 | 策略 分段 tab（容器无底色，仅滑块高亮平移） */
+        .rr-seg-tabs {
+            position: relative;
+            display: inline-flex;
+            align-items: stretch;
+            width: 7.75rem;
+            flex-shrink: 0;
+            border-radius: 0.3125rem;
+            padding: 0.125rem;
+        }
+        .rr-seg-tabs__indicator {
+            position: absolute;
+            left: 0.125rem;
+            top: 0.125rem;
+            bottom: 0.125rem;
+            width: calc(50% - 0.125rem);
+            border-radius: 0.25rem;
+            background: rgba(51, 65, 85, 0.95);
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+            transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 0;
+            pointer-events: none;
+        }
+        .rr-seg-tabs--strategy .rr-seg-tabs__indicator {
+            transform: translateX(100%);
+        }
+        .rr-seg-tabs__btn {
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            outline: none;
+            font-size: 0.75rem;
+            line-height: 1.2;
+            padding: 0.25rem 0.375rem;
+        }
+        .rr-seg-tabs__btn:focus-visible {
+            box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.45);
+            border-radius: 0.25rem;
+        }
+        /* 调控任务：数字/短文本统一宽度，多行 label 内右缘对齐 */
+        .rr-input--compact,
+        .rr-input--suffix-compact {
+            width: 100%;
+            max-width: 17rem;
+            box-sizing: border-box;
+        }
+        .rr-input::placeholder { color: #64748b; }
+        /* 自定义下拉（替代原生 select，避免 macOS 系统弹出层样式） */
+        /* 自定义下拉：选项面板 absolute，避免展开时参与文档流、撑开下方布局 */
+        .rr-dd {
+            position: relative;
+            display: inline-block;
+            vertical-align: middle;
+            max-width: 100%;
+            z-index: 1;
+        }
+        .rr-dd.rr-dd-open {
+            z-index: 10050;
+        }
+        .rr-dd-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.4rem;
+            min-height: 2rem;
+            padding: 0.35rem 0.55rem 0.35rem 0.65rem;
+            border-radius: 0.5rem;
+            background: rgba(15, 23, 42, 0.88);
+            border: 1px solid rgba(51, 65, 85, 0.65);
+            font-size: 0.75rem;
+            line-height: 1.25;
+            color: #e2e8f0;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .rr-dd-trigger:hover { border-color: rgba(71, 85, 105, 0.9); }
+        .rr-dd.rr-dd-open .rr-dd-trigger {
+            border-color: rgba(59, 130, 246, 0.55);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+        }
+        .rr-dd-label { min-width: 0; flex: 1; }
+        .rr-dd-chevron { transition: transform 0.2s ease; }
+        .rr-dd.rr-dd-open .rr-dd-chevron { transform: rotate(180deg); }
+        .rr-dd--dropup:not(.rr-dd-open) .rr-dd-chevron { transform: rotate(180deg); }
+        .rr-dd--dropup.rr-dd-open .rr-dd-chevron { transform: rotate(0deg); }
+        .rr-dd-panel {
+            position: absolute;
+            left: 0;
+            top: calc(100% + 4px);
+            min-width: 100%;
+            width: max-content;
+            max-width: min(420px, calc(100vw - 16px));
+            box-sizing: border-box;
+            z-index: 10051;
+            border-radius: 0.5rem;
+            background: #1e293b;
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            box-shadow: 0 12px 48px -8px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(0, 0, 0, 0.25);
+            padding: 0.3rem;
+            max-height: 15rem;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #475569 #1e293b;
+        }
+        .rr-dd--dropup .rr-dd-panel {
+            top: auto;
+            bottom: calc(100% + 4px);
+        }
+        .rr-dd-panel::-webkit-scrollbar { width: 5px; }
+        .rr-dd-panel::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .rr-dd-opt {
+            display: block;
+            width: 100%;
+            border-radius: 0.35rem;
+            border: none;
+            background: transparent;
+            color: #e2e8f0;
+            cursor: pointer;
+            text-align: left;
+            font-size: 0.75rem;
+            line-height: 1.35;
+            padding: 0.5rem 0.6rem;
+            transition: background 0.1s;
+        }
+        .rr-dd-opt:hover { background: rgba(59, 130, 246, 0.14); }
+        .rr-dd-opt.rr-dd-opt--active {
+            background: rgba(59, 130, 246, 0.2);
+            color: #fff;
+        }
+        .rr-dd--sm .rr-dd-trigger { min-height: 1.85rem; padding: 0.28rem 0.45rem 0.28rem 0.5rem; font-size: 0.7rem; }
+        .rr-dd--sm .rr-dd-opt { font-size: 0.7rem; padding: 0.4rem 0.5rem; }
+        /* 监测条件行：指标选择不随容器拉满整行 */
+        .rr-dd-metric {
+            flex: 0 0 auto;
+            width: min(240px, 100%);
+            max-width: 100%;
+        }
+        .rr-dd-metric .rr-dd-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .rr-dd-op {
+            flex: 0 0 auto;
+            width: min(7.5rem, 100%);
+            max-width: 100%;
+        }
+        .rr-dd-op .rr-dd-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .rr-strategy-tab-inp {
+            border: 1px solid rgba(6, 182, 212, 0.45);
+            background: rgba(15, 23, 42, 0.92);
+            color: #cffafe;
+            outline: none;
+        }
+        .rr-strategy-tab-inp:focus {
+            box-shadow: 0 0 0 1px rgba(6, 182, 212, 0.35);
+        }
+        .rr-strategy-tag {
+            display: inline-flex;
+            align-items: stretch;
+            gap: 0.125rem;
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }
+        .rr-strategy-tag-main {
+            flex: 1 1 auto;
+            min-width: 0;
+            border: none;
+            background: transparent;
+            font: inherit;
+            color: inherit;
+            text-align: left;
+            cursor: pointer;
+        }
+        .rr-strategy-tag-x {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: auto;
+            min-width: 1.125rem;
+            margin-right: 0.125rem;
+            padding: 0 0.125rem;
+            border: none;
+            background: transparent;
+            color: rgba(148, 163, 184, 0.95);
+            cursor: pointer;
+            transition: color 0.12s ease;
+        }
+        .rr-strategy-tag-x:hover {
+            color: #fb7185;
+            background: transparent;
+        }
+        .seg-btn {
+            transition: transform 0.12s ease, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s;
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            background: rgba(30, 41, 59, 0.55);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+        }
+        .seg-btn:hover:not(.seg-btn-active) {
+            border-color: rgba(100, 116, 139, 0.7);
+            background: rgba(51, 65, 85, 0.45);
+        }
+        .seg-btn-active {
+            border-color: rgba(59, 130, 246, 0.65) !important;
+            background: linear-gradient(180deg, rgba(59, 130, 246, 0.22), rgba(59, 130, 246, 0.12)) !important;
+            color: #fff !important;
+            box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.12), inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .btn-ghost {
+            border: 1px solid rgba(71, 85, 105, 0.55);
+            background: rgba(30, 41, 59, 0.55);
+            transition: background 0.15s, border-color 0.15s, transform 0.1s;
+        }
+        .btn-ghost:hover { background: rgba(51, 65, 85, 0.65); border-color: rgba(100, 116, 139, 0.55); }
+        .btn-ghost:active { transform: scale(0.98); }
+        .btn-primary {
+            background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+            box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset, 0 4px 14px -4px rgba(37, 99, 235, 0.55);
+            transition: filter 0.15s, transform 0.1s;
+        }
+        .btn-primary:hover { filter: brightness(1.06); }
+        .btn-primary:active { transform: scale(0.98); }
+        .num-input::-webkit-outer-spin-button,
+        .num-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .num-input { -moz-appearance: textfield; appearance: textfield; }
+        .rr-field-err {
+            font-size: 11px;
+            line-height: 1.45;
+            color: #f87171;
+            margin-top: 0.35rem;
+        }
+        .rr-input--invalid {
+            border-color: rgba(248, 113, 113, 0.85) !important;
+            background: rgba(127, 29, 29, 0.14) !important;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2) !important;
+        }
+        .rr-input--invalid:focus {
+            border-color: rgba(248, 113, 113, 0.95) !important;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.2), 0 0 0 3px rgba(248, 113, 113, 0.12) !important;
+        }
+        @keyframes rr-imm-spin {
+            to { transform: rotate(360deg); }
+        }
+        .rr-imm-spinner {
+            display: inline-block;
+            width: 0.875rem;
+            height: 0.875rem;
+            border: 2px solid rgba(255, 255, 255, 0.35);
+            border-top-color: rgba(255, 255, 255, 0.95);
+            border-radius: 50%;
+            animation: rr-imm-spin 0.65s linear infinite;
+            vertical-align: -0.15em;
+            flex-shrink: 0;
+        }
+        #btnImmediateSubmit:disabled {
+            opacity: 0.88;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+        /*
+         * 追投记录：整段 iframe 当作一张 rr-section 圆角卡片（子页铺满同色底，由 overflow 裁剪圆角）
+         */
+        #tabPaneRuns {
+            background: transparent;
+            border-radius: 1rem;
+            overflow: hidden;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 0 1px rgba(148, 163, 184, 0.06);
+        }
+        #iframeRetargetingRuns {
+            width: 100%;
+            display: block;
+            border: 0;
+            outline: none;
+            background: transparent;
+        }
+        /* 追投记录 iframe 内弹窗会挂到本页 body，遮罩样式需在此定义 */
+        .modal-overlay {
+            background: rgba(2, 6, 23, 0.72);
+            backdrop-filter: blur(4px);
+        }
+        /* 红字 + 与 index 标题同结构的单层柔和高亮（0 0 10px · 0.5） */
+        #rrConfigUnsavedHint:not(.hidden) {
+            font-weight: 700;
+            letter-spacing: 0.025em;
+            color: #f87171;
+            text-shadow: 0 0 10px rgba(248, 113, 113, 0.5);
+        }
+    </style>
+</head>
+<body class="page-shell text-[#e2e8f0] h-full antialiased flex flex-col overflow-hidden">
+    <div class="flex flex-col flex-1 min-h-0">
+        <header class="rr-header relative flex-none shrink-0 z-10 px-3 sm:px-5 py-3.5 flex flex-wrap items-center justify-between gap-y-3 gap-x-4 border-b border-slate-700/30">
+            <div class="flex items-center gap-3.5 min-w-0">
+                <div class="rr-icon-wrap p-2.5 rounded-xl shrink-0">
+                    <i data-lucide="crosshair" class="w-5 h-5 text-sky-400"></i>
+                </div>
+                <div class="min-w-0">
+                    <div class="text-lg font-semibold text-white tracking-tight drop-shadow-sm">规则化追投</div>
+                    <div class="text-[11px] text-slate-500 mt-0.5 max-w-xl leading-relaxed">多策略 · 多条件组 · 监测达标即自动追投</div>
+                </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-3 sm:gap-4 shrink-0">
+                <div class="flex items-center gap-2 sm:gap-2.5 sm:border-r sm:border-slate-600/50 sm:pr-4">
+                    <span id="rrConfigUnsavedHint" class="hidden text-xs shrink-0 whitespace-nowrap" role="status">当前配置未保存</span>
+                    <span class="text-xs text-slate-400 whitespace-nowrap">启用规则化追投</span>
+                    <span id="enabledLabel" class="text-xs text-slate-500 shrink-0 tabular-nums min-w-[2.5rem]">关闭</span>
+                    <div class="relative h-6 w-11 shrink-0">
+                        <input type="checkbox" id="cfgEnabled" class="peer sr-only" />
+                        <div class="pointer-events-none absolute inset-0 h-6 w-11 rounded-full bg-slate-700/90 transition-colors peer-checked:bg-emerald-500 shadow-inner"></div>
+                        <div class="pointer-events-none absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow-md transition-transform peer-checked:translate-x-5"></div>
+                        <label for="cfgEnabled" class="absolute inset-0 z-10 cursor-pointer rounded-full"><span class="sr-only">启用规则化追投</span></label>
+                    </div>
+                </div>
+                <button type="button" id="btnImmediateRetarget"
+                        class="btn-ghost inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-slate-200 text-xs font-medium border border-amber-500/25">
+                    <i data-lucide="zap" class="w-3.5 h-3.5 opacity-90 text-amber-400"></i> 即刻追投
+                </button>
+                <button type="button" id="btnReload"
+                        class="btn-ghost inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-slate-200 text-xs font-medium">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5 opacity-90"></i> 重新加载
+                </button>
+                <button type="button" id="btnSave"
+                        class="btn-primary inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white text-xs font-semibold border border-blue-500/30">
+                    <i data-lucide="save" class="w-3.5 h-3.5 opacity-95"></i> 保存配置
+                </button>
+            </div>
+        </header>
+
+        <!-- 即刻追投弹窗：素材 ID + 调控任务（与主表单同步，无说明小字） -->
+        <div
+            id="modalImmediateRetarget"
+            class="fixed inset-0 z-[10060] hidden flex items-center justify-center px-4 modal-overlay"
+            aria-hidden="true"
+        >
+            <div class="absolute inset-0" id="modalImmediateRetargetBackdrop" aria-hidden="true"></div>
+            <div
+                class="relative w-full max-w-lg rounded-2xl bg-slate-900 border border-slate-600/35 shadow-2xl max-h-[min(92vh,720px)] flex flex-col"
+                role="dialog"
+                aria-labelledby="modalImmediateTitle"
+            >
+                <div class="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-600/25 shrink-0">
+                    <div class="min-w-0 flex-1 pr-2">
+                        <h2 id="modalImmediateTitle" class="text-base font-semibold text-white tracking-tight">即刻追投</h2>
+                        <p class="text-[11px] text-slate-500 mt-1.5 leading-snug">
+                            该方式固定显示浏览器且需用户自己<span class="font-semibold text-amber-400/95">手动提交</span>，确保操作无误
+                        </p>
+                    </div>
+                    <button
+                        type="button"
+                        id="btnImmediateClose"
+                        class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/80 shrink-0"
+                        aria-label="关闭"
+                    >
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+                <div class="px-5 py-4 space-y-5 overflow-y-auto flex-1 min-h-0">
+                    <div
+                        id="immModalAlert"
+                        class="hidden rounded-lg px-3 py-2.5 text-xs leading-snug border"
+                        role="alert"
+                        aria-live="polite"
+                    ></div>
+                    <label class="block">
+                        <span class="rr-label">素材 ID</span>
+                        <input
+                            type="text"
+                            id="immMaterialId"
+                            autocomplete="off"
+                            class="rr-input rr-input--compact w-full mt-1.5 font-mono text-sm"
+                            placeholder="请输入素材 ID"
+                        />
+                        <p id="errImmMaterialId" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                    </label>
+                    <div class="space-y-3">
+                        <div class="rr-section-title text-sm !mb-0">
+                            <span class="rr-accent-bar" aria-hidden="true"></span>
+                            <i data-lucide="rocket" class="w-4 h-4 text-amber-400/90"></i>
+                            调控任务
+                        </div>
+                        <div class="rr-label">追投方式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" data-method="volume" class="imm-method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">
+                                放量追投
+                            </button>
+                            <button type="button" data-method="cost_control" class="imm-method-btn seg-btn px-4 py-2 rounded-lg text-sm">
+                                控成本追投
+                            </button>
+                        </div>
+                        <div id="immPanelVolume" class="space-y-3 pt-1">
+                            <label class="block">
+                                <span class="rr-label">调控总预算（元）</span>
+                                <input
+                                    type="text"
+                                    id="immVolBudget"
+                                    inputmode="decimal"
+                                    autocomplete="off"
+                                    class="rr-input rr-input--compact num-input w-full mt-1.5"
+                                />
+                                <p id="errImmVolBudget" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                            </label>
+                            <div class="w-fit max-w-full">
+                                <span class="rr-label">调控时长（小时）</span>
+                                <div class="mt-1.5 flex items-stretch gap-2 w-fit">
+                                    <button type="button" id="immDurMinus" class="btn-ghost px-3 rounded-lg text-lg leading-none text-slate-300 min-w-[2.5rem] shrink-0">
+                                        −
+                                    </button>
+                                    <input
+                                        type="number"
+                                        id="immVolDuration"
+                                        step="0.5"
+                                        min="0.5"
+                                        max="24"
+                                        class="rr-input rr-input--flush num-input w-[5.25rem] shrink-0 text-center tabular-nums"
+                                    />
+                                    <button type="button" id="immDurPlus" class="btn-ghost px-3 rounded-lg text-lg leading-none text-slate-300 min-w-[2.5rem] shrink-0">
+                                        +
+                                    </button>
+                                    <span class="self-center text-xs text-slate-500 shrink-0 font-medium">小时</span>
+                                </div>
+                                <p id="errImmVolDuration" class="rr-field-err hidden max-w-[17rem] mt-1.5" role="alert"></p>
+                            </div>
+                        </div>
+                        <div id="immPanelCost" class="hidden space-y-3 pt-1">
+                            <div class="rr-label">优化目标</div>
+                            <div class="flex flex-wrap gap-2.5">
+                                <button type="button" data-goal="net_roi" class="imm-goal-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">
+                                    净成交ROI
+                                </button>
+                                <button type="button" data-goal="live_room" class="imm-goal-btn seg-btn px-4 py-2 rounded-lg text-sm">
+                                    直播间成交
+                                </button>
+                            </div>
+                            <div id="immPanelNetRoi" class="space-y-3 max-w-xl">
+                                <label class="block">
+                                    <span class="rr-label">调控日预算（元）</span>
+                                    <input
+                                        type="text"
+                                        id="immCcDailyNet"
+                                        inputmode="decimal"
+                                        autocomplete="off"
+                                        class="rr-input rr-input--compact num-input w-full mt-1.5"
+                                    />
+                                    <p id="errImmCcDailyNet" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                                </label>
+                                <label class="block">
+                                    <span class="rr-label">净成交ROI目标</span>
+                                    <input
+                                        type="text"
+                                        id="immCcRoiTarget"
+                                        inputmode="decimal"
+                                        autocomplete="off"
+                                        class="rr-input rr-input--compact num-input w-full mt-1.5"
+                                    />
+                                    <p id="errImmCcRoiTarget" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                                </label>
+                            </div>
+                            <div id="immPanelLiveRoom" class="hidden space-y-3 max-w-xl">
+                                <label class="block">
+                                    <span class="rr-label">调控日预算（元）</span>
+                                    <input
+                                        type="text"
+                                        id="immCcDailyLive"
+                                        inputmode="decimal"
+                                        autocomplete="off"
+                                        class="rr-input rr-input--compact num-input w-full mt-1.5"
+                                    />
+                                    <p id="errImmCcDailyLive" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                                </label>
+                                <label class="block">
+                                    <span class="rr-label">我的出价（元/成交）</span>
+                                    <input
+                                        type="text"
+                                        id="immCcBid"
+                                        inputmode="decimal"
+                                        autocomplete="off"
+                                        class="rr-input rr-input--compact num-input w-full mt-1.5"
+                                    />
+                                    <p id="errImmCcBid" class="rr-field-err hidden mt-1.5" role="alert"></p>
+                                </label>
+                            </div>
+                        </div>
+                        <label class="block max-w-xl pt-1">
+                            <span class="rr-label">任务名称后缀</span>
+                            <input
+                                type="text"
+                                id="immTaskSuffix"
+                                maxlength="15"
+                                autocomplete="off"
+                                class="rr-input rr-input--compact w-full mt-1.5"
+                                placeholder="素材看盘自动追投"
+                            />
+                            <p id="errImmTaskSuffix" class="rr-field-err hidden mt-1" role="alert"></p>
+                            <span class="text-[11px] text-slate-500 mt-1 block"
+                                ><span id="immSuffixCount">0</span>/15 · 留空为默认「素材看盘自动追投」</span
+                            >
+                        </label>
+                    </div>
+                </div>
+                <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-600/25 shrink-0 bg-slate-950/40">
+                    <button type="button" id="btnImmediateCancel" class="btn-ghost px-4 py-2 rounded-lg text-xs font-medium text-slate-300">
+                        取消
+                    </button>
+                    <button
+                        type="button"
+                        id="btnImmediateSubmit"
+                        class="btn-primary px-4 py-2 rounded-lg text-xs font-semibold text-white border border-blue-500/30 inline-flex items-center justify-center gap-2 shrink-0"
+                    >
+                        <span id="btnImmediateSubmitSpinner" class="rr-imm-spinner hidden" aria-hidden="true"></span>
+                        <span id="btnImmediateSubmitLabel">追投</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-scroll px-3 sm:px-5 py-5 sm:py-6">
+            <div class="w-[80%] max-w-full mx-auto flex flex-col gap-4">
+                <div class="flex flex-wrap gap-2 shrink-0">
+                    <button type="button" id="tabBtnConfig" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200">追投配置</button>
+                    <button type="button" id="tabBtnRuns" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200">追投记录</button>
+                </div>
+
+                <div id="tabPaneConfig" class="flex flex-col gap-6">
+                <!-- 运行配置：浏览器 + 追投次数限制 -->
+                <section class="rr-section space-y-4">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="settings" class="w-4 h-4 text-sky-400/90"></i>
+                        运行配置
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <div class="rr-label">启用窗口模式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" id="btnHeadful" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200">显示</button>
+                            <button type="button" id="btnHeadless" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200">不显示</button>
+                        </div>
+                        <div class="text-[11px] text-slate-600 leading-relaxed max-w-xl pt-0.5 space-y-1">
+                            <div><span class="text-slate-500">显示：</span>追投自动化执行时弹出可见浏览器窗口，便于观察操作与排错。</div>
+                            <div><span class="text-slate-500">不显示：</span>无头模式在后台运行，不弹出窗口，适合长期挂机。</div>
+                        </div>
+                        <div class="max-w-2xl pt-3 space-y-1.5">
+                            <div class="rr-label">浏览器程序路径（可选）</div>
+                            <p class="text-[11px] text-slate-600 leading-relaxed">指定自动化实际启动的浏览器可执行文件。留空或路径无效时，由程序在本机自动探测可用浏览器。</p>
+                            <input id="rrBrowserExecutable" type="text" autocomplete="off" spellcheck="false"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 font-mono"
+                                   placeholder="选填，完整路径" />
+                        </div>
+                    </div>
+                    <div class="max-w-3xl pl-[calc(0.5rem+3px)] pt-3 border-t border-slate-600/25">
+                        <input type="checkbox" id="perStrategyRateLimit" class="sr-only" />
+                        <div class="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+                            <span class="rr-label shrink-0">追投次数限制</span>
+                            <div
+                                id="perStrategySegWrap"
+                                class="rr-seg-tabs"
+                                role="tablist"
+                                aria-label="限频范围"
+                            >
+                                <span id="perStrategySegIndicator" class="rr-seg-tabs__indicator" aria-hidden="true"></span>
+                                <button
+                                    type="button"
+                                    id="btnSegGlobal"
+                                    class="rr-seg-tabs__btn relative z-10 flex-1 min-w-0 font-medium text-slate-100 rounded transition-colors"
+                                    role="tab"
+                                    aria-selected="true"
+                                >
+                                    全局
+                                </button>
+                                <button
+                                    type="button"
+                                    id="btnSegStrategy"
+                                    class="rr-seg-tabs__btn relative z-10 flex-1 min-w-0 font-medium text-slate-500 rounded transition-colors"
+                                    role="tab"
+                                    aria-selected="false"
+                                >
+                                    策略
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2.5">
+                            <div id="globalIntervalRowWrap" class="inline-flex flex-wrap items-center gap-x-2 gap-y-2 text-sm text-slate-200 transition-opacity">
+                                <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">每</span>
+                                <input type="number" id="intervalWindowSeconds" min="60" max="2592000" step="1"
+                                       class="rr-input rr-input--flush num-input rr-interval-num w-[7rem] text-center tabular-nums" value="86400" />
+                                <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">秒内，最多追投</span>
+                                <input type="number" id="intervalMaxCount" min="1" max="9999" step="1"
+                                       class="rr-input rr-input--flush num-input rr-interval-num w-[5.5rem] text-center tabular-nums" value="1" />
+                                <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">次</span>
+                            </div>
+                        </div>
+                        <div class="mt-1.5 space-y-1 max-w-xl">
+                            <p id="errIntervalWindowSeconds" class="rr-field-err hidden" role="alert"></p>
+                            <p id="errIntervalMaxCount" class="rr-field-err hidden" role="alert"></p>
+                        </div>
+                        <span id="globalIntervalHint" class="text-[11px] text-slate-600 mt-1.5 block leading-relaxed">同一条素材在规定的时间内只允许追投指定次数，以成功追投为准。多策略共用同一限频。</span>
+                    </div>
+                </section>
+
+                <!-- 追投策略：青色边框 Tab；非卡片 -->
+                <div class="flex flex-col gap-2">
+                    <div id="strategyTabsBar" class="flex flex-wrap gap-2 shrink-0"></div>
+                    <p class="text-[11px] text-slate-600 leading-relaxed max-w-3xl">
+                        支持配置多条追投策略；每条策略各自一套「监测指标」与「调控任务」；点选标签切换策略对象；双击可重命名。
+                    </p>
+                    <p id="strategyValidationBanner" class="text-[11px] text-rose-400/95 hidden leading-relaxed max-w-3xl" role="alert"></p>
+                </div>
+
+                <!-- 分策略限频：每条策略独立的滑动窗口计数 -->
+                <section id="sectionStrategyRunConfig" class="rr-section space-y-3 hidden">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="gauge" class="w-4 h-4 text-emerald-400/90"></i>
+                        运行配置（本策略）
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2 max-w-xl">
+                        <span class="rr-label">追投次数限制（本策略）</span>
+                        <div class="flex flex-wrap items-center gap-x-2 gap-y-2 text-sm text-slate-200 mt-1">
+                            <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">每</span>
+                            <input type="number" id="strategyIntervalWindowSeconds" min="60" max="2592000" step="1"
+                                   class="rr-input rr-input--flush num-input rr-interval-num w-[7rem] text-center tabular-nums" value="86400" />
+                            <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">秒内，最多追投</span>
+                            <input type="number" id="strategyIntervalMaxCount" min="1" max="9999" step="1"
+                                   class="rr-input rr-input--flush num-input rr-interval-num w-[5.5rem] text-center tabular-nums" value="1" />
+                            <span class="text-slate-500 shrink-0 h-9 inline-flex items-center">次</span>
+                        </div>
+                        <div class="space-y-1">
+                            <p id="errStrategyIntervalWindowSeconds" class="rr-field-err hidden" role="alert"></p>
+                            <p id="errStrategyIntervalMaxCount" class="rr-field-err hidden" role="alert"></p>
+                        </div>
+                        <span class="text-[11px] text-slate-600 block leading-relaxed">同一素材在不同策略下独立计数；某策略触顶不影响其他策略。</span>
+                    </div>
+                </section>
+
+                <!-- 监测条件 -->
+                <section class="rr-section space-y-3" id="sectionTriggerRetargeting">
+                    <div class="flex flex-wrap items-center justify-between gap-2 gap-y-2">
+                        <div class="rr-section-title">
+                            <span class="rr-accent-bar" aria-hidden="true"></span>
+                            <i data-lucide="filter" class="w-4 h-4 text-violet-400/90"></i>
+                            监测指标（触发条件）
+                        </div>
+                        <button type="button" id="btnAddGroup"
+                                class="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg bg-violet-500/12 text-violet-300 hover:bg-violet-500/18 border border-violet-500/20 transition-colors">
+                            <i data-lucide="plus" class="w-3.5 h-3.5"></i> 添加条件组
+                        </button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500 pl-[calc(0.5rem+3px)]">
+                        <span class="text-slate-500 shrink-0">多组之间</span>
+                        <div id="groupCombineMount" class="inline-block w-[min(300px,100%)] max-w-full shrink-0"></div>
+                    </div>
+                    <p class="text-[11px] text-slate-600 pl-[calc(0.5rem+3px)]">组内为「且」；指标与数据大屏列一致。</p>
+                    <p id="errTriggerConditions" class="rr-field-err hidden pl-[calc(0.5rem+3px)]" role="alert"></p>
+                    <div id="triggerGroups" class="flex flex-col gap-4 mt-1 pl-0"></div>
+                </section>
+
+                <!-- 调控任务 -->
+                <section class="rr-section space-y-4" id="sectionRetargetingTask">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="rocket" class="w-4 h-4 text-amber-400/90"></i>
+                        调控任务
+                    </div>
+
+                    <div class="pl-[calc(0.5rem+3px)] space-y-3">
+                    <div class="rr-label">追投方式</div>
+                    <div class="flex flex-wrap gap-2.5">
+                        <button type="button" data-method="volume" class="method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">放量追投</button>
+                        <button type="button" data-method="cost_control" class="method-btn seg-btn px-4 py-2 rounded-lg text-sm">控成本追投</button>
+                    </div>
+
+                    <!-- 放量 -->
+                    <div id="panelVolume" class="space-y-4 pt-1">
+                        <label class="block max-w-xl">
+                            <span class="rr-label">调控总预算（元）</span>
+                            <input type="text" id="volBudget" inputmode="decimal" autocomplete="off"
+                                   class="rr-input rr-input--compact num-input" placeholder="请输入" />
+                            <p id="errVolBudget" class="rr-field-err hidden" role="alert"></p>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block leading-relaxed">为素材追加的额外预算，请结合账户情况填写。</span>
+                        </label>
+                        <div class="w-fit max-w-full">
+                            <span class="rr-label">调控时长（小时）</span>
+                            <div class="mt-1.5 flex items-stretch gap-2 w-fit">
+                                <button type="button" id="durMinus" class="btn-ghost px-3 rounded-lg text-lg leading-none text-slate-300 min-w-[2.5rem] shrink-0">−</button>
+                                <input type="number" id="volDuration" step="0.5" min="0.5" max="24"
+                                       class="rr-input rr-input--flush num-input w-[5.25rem] shrink-0 text-center tabular-nums" />
+                                <button type="button" id="durPlus" class="btn-ghost px-3 rounded-lg text-lg leading-none text-slate-300 min-w-[2.5rem] shrink-0">+</button>
+                                <span class="self-center text-xs text-slate-500 shrink-0 font-medium">小时</span>
+                            </div>
+                            <p id="errVolDuration" class="rr-field-err hidden max-w-[17rem]" role="alert"></p>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">范围 0.5～24，步进 0.5。</span>
+                        </div>
+                    </div>
+
+                    <!-- 控成本 -->
+                    <div id="panelCost" class="hidden space-y-4 pt-1">
+                        <div class="rr-label">优化目标</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" data-goal="net_roi" class="goal-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">净成交ROI</button>
+                            <button type="button" data-goal="live_room" class="goal-btn seg-btn px-4 py-2 rounded-lg text-sm">直播间成交</button>
+                        </div>
+                        <div id="panelNetRoi" class="space-y-4 max-w-xl">
+                            <label class="block">
+                                <span class="rr-label">调控日预算（元）</span>
+                                <input type="text" id="ccDailyNet" inputmode="decimal" autocomplete="off"
+                                       class="rr-input rr-input--compact num-input" placeholder="请输入" />
+                                <p id="errCcDailyNet" class="rr-field-err hidden" role="alert"></p>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">净成交ROI目标</span>
+                                <input type="text" id="ccRoiTarget" inputmode="decimal" autocomplete="off"
+                                       class="rr-input rr-input--compact num-input" placeholder="请输入期望的净成交ROI目标" />
+                                <p id="errCcRoiTarget" class="rr-field-err hidden" role="alert"></p>
+                            </label>
+                        </div>
+                        <div id="panelLiveRoom" class="hidden space-y-4 max-w-xl">
+                            <label class="block">
+                                <span class="rr-label">调控日预算（元）</span>
+                                <input type="text" id="ccDailyLive" inputmode="decimal" autocomplete="off"
+                                       class="rr-input rr-input--compact num-input" placeholder="请输入" />
+                                <p id="errCcDailyLive" class="rr-field-err hidden" role="alert"></p>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">我的出价（元/成交）</span>
+                                <input type="text" id="ccBid" inputmode="decimal" autocomplete="off"
+                                       class="rr-input rr-input--compact num-input" placeholder="请输入期望的成交成本" />
+                                <p id="errCcBid" class="rr-field-err hidden" role="alert"></p>
+                            </label>
+                        </div>
+                    </div>
+
+                    <label class="block pt-1 max-w-xl">
+                        <span class="rr-label">任务名称后缀</span>
+                        <input type="text" id="taskSuffix" maxlength="15"
+                               class="rr-input rr-input--suffix-compact" placeholder="素材看盘自动追投" />
+                        <span class="text-[11px] text-slate-600 mt-1.5 block"><span id="suffixCount">0</span>/15 · 留空保存时为默认「素材看盘自动追投」</span>
+                    </label>
+                    </div>
+                </section>
+
+                <p class="text-center text-[10px] text-slate-600 pb-2">千川素材看盘工具</p>
+                </div>
+
+                <div id="tabPaneRuns" class="hidden w-full">
+                    <iframe id="iframeRetargetingRuns" src="components/rule_retargeting_runs.html" title="追投记录" class="w-full"></iframe>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        (function () {
+            const btnCfg = document.getElementById('tabBtnConfig');
+            const btnRuns = document.getElementById('tabBtnRuns');
+            const paneCfg = document.getElementById('tabPaneConfig');
+            const paneRuns = document.getElementById('tabPaneRuns');
+            if (!btnCfg || !btnRuns || !paneCfg || !paneRuns) return;
+            var iframeRuns = document.getElementById('iframeRetargetingRuns');
+            function showConfig() {
+                paneCfg.classList.remove('hidden');
+                paneRuns.classList.add('hidden');
+                btnCfg.classList.add('seg-btn-active');
+                btnRuns.classList.remove('seg-btn-active');
+            }
+            function refreshRunsIframeList() {
+                if (!iframeRuns) return;
+                try {
+                    var w = iframeRuns.contentWindow;
+                    if (w && typeof w.refreshRetargetingRunsList === 'function') {
+                        w.refreshRetargetingRunsList();
+                        return;
+                    }
+                } catch (e) {}
+                setTimeout(function () {
+                    try {
+                        var w2 = iframeRuns.contentWindow;
+                        if (w2 && typeof w2.refreshRetargetingRunsList === 'function') {
+                            w2.refreshRetargetingRunsList();
+                        }
+                    } catch (e2) {}
+                }, 200);
+            }
+            function showRuns() {
+                paneCfg.classList.add('hidden');
+                paneRuns.classList.remove('hidden');
+                btnRuns.classList.add('seg-btn-active');
+                btnCfg.classList.remove('seg-btn-active');
+                refreshRunsIframeList();
+                setTimeout(resizeRunsIframe, 0);
+                setTimeout(resizeRunsIframe, 150);
+                setTimeout(resizeRunsIframe, 400);
+            }
+            btnCfg.addEventListener('click', showConfig);
+            btnRuns.addEventListener('click', showRuns);
+
+            function resizeRunsIframe() {
+                if (!iframeRuns || paneRuns.classList.contains('hidden')) return;
+                try {
+                    var w = iframeRuns.contentWindow;
+                    var doc = w && w.document;
+                    if (!doc || !doc.body) return;
+                    var shell = doc.querySelector('.runs-shell');
+                    var h = 0;
+                    if (shell) {
+                        var r = shell.getBoundingClientRect();
+                        h = Math.ceil(r.bottom + (w.pageYOffset || doc.documentElement.scrollTop || 0));
+                    }
+                    if (h <= 0) {
+                        h = Math.max(doc.documentElement.scrollHeight || 0, doc.body.scrollHeight || 0);
+                    }
+                    if (h > 0) iframeRuns.style.height = h + 'px';
+                } catch (e) {}
+            }
+            window.addEventListener('message', function (ev) {
+                if (!ev.data || ev.data.type !== 'retargetingRunsHeight') return;
+                var fh = parseInt(ev.data.height, 10);
+                if (iframeRuns && fh > 0) iframeRuns.style.height = fh + 'px';
+            });
+            var _runsIframeResizeT = null;
+            window.addEventListener('resize', function () {
+                if (_runsIframeResizeT) clearTimeout(_runsIframeResizeT);
+                _runsIframeResizeT = setTimeout(resizeRunsIframe, 80);
+            });
+            if (iframeRuns) {
+                iframeRuns.addEventListener('load', resizeRunsIframe);
+            }
+        })();
+
+        // 与数据大屏 dashboard.html allColumns 中指标字段一致（便于与「数据大屏」列对齐）
+        const METRICS = [
+            { key: 'costDiff', label: '素材流速（时段流速）' },
+            { key: 'currentCost', label: '整体消耗' },
+            { key: 'estimatedEcpm', label: '预估ECPM' },
+            { key: 'netRoi', label: '净成交ROI' },
+            { key: 'netAmount', label: '净成交金额' },
+            { key: 'overallPayRoi', label: '整体支付ROI' },
+            { key: 'overallAmount', label: '整体成交金额' },
+            { key: 'hourRefundRate', label: '1h退款率' },
+            { key: 'netSettleRate', label: '净成交结算率' },
+            { key: 'netOrderCount', label: '净成交订单数' },
+            { key: 'overallOrderCount', label: '整体成交订单数' },
+            { key: 'overallShowCount', label: '整体展现次数' },
+            { key: 'overallClickCount', label: '整体点击次数' },
+            { key: 'overallCtr', label: '整体点击率' },
+            { key: 'overallConversionRate', label: '整体转化率' },
+        ];
+        /** 率类阈值在 JSON 中存百分数字面量 0~100（如 0.25 表示 0.25%，22 表示 22%）；回填不再把 |x|≤1 当小数比例乘 100 */
+        const RATE_METRICS = new Set([
+            'hourRefundRate',
+            'netSettleRate',
+            'overallCtr',
+            'overallConversionRate',
+        ]);
+        function isRateMetric(m) {
+            return !!(m && RATE_METRICS.has(m));
+        }
+        /** 率类界面输入：0~100，去掉多余尾零 */
+        function clampRatePercentUi(v) {
+            if (!Number.isFinite(v)) return 0;
+            return Math.max(0, Math.min(100, v));
+        }
+        function formatRatePercentFieldValue(v) {
+            const x = clampRatePercentUi(typeof v === 'number' ? v : parseFloat(String(v)));
+            if (!Number.isFinite(x)) return '0';
+            const s = x.toFixed(10).replace(/\.?0+$/, '');
+            return s === '' ? '0' : s;
+        }
+        /** 将已保存的数值原样显示在输入框（与配置/后端「百分数字面量」一致） */
+        function assistPercentLikeToUiNumber(n) {
+            const x = typeof n === 'number' ? n : parseFloat(String(n));
+            if (!Number.isFinite(x)) return 0;
+            return x;
+        }
+        function formatCondValForInput(metric, raw) {
+            if (isRateMetric(metric)) {
+                const pct = assistPercentLikeToUiNumber(raw != null && raw !== '' ? parseFloat(raw) : 0);
+                return formatRatePercentFieldValue(pct);
+            }
+            const v = raw != null && raw !== '' ? parseFloat(raw) : 0;
+            return Number.isFinite(v) ? String(v) : '0';
+        }
+        function applyCondValInputRules(inp, metric) {
+            if (isRateMetric(metric)) {
+                inp.min = '0';
+                inp.max = '100';
+                inp.step = 'any';
+                inp.value = formatRatePercentFieldValue(parseFloat(inp.value));
+            } else {
+                inp.removeAttribute('min');
+                inp.removeAttribute('max');
+                inp.step = 'any';
+                const v = parseFloat(inp.value);
+                inp.value = Number.isFinite(v) ? String(v) : '0';
+            }
+        }
+        const OPS = [
+            { key: 'gt', label: '大于' },
+            { key: 'gte', label: '大于或等于' },
+            { key: 'lt', label: '小于' },
+            { key: 'lte', label: '小于或等于' },
+            { key: 'eq', label: '等于' },
+        ];
+
+        const GROUP_COMBINE_ITEMS = [
+            { value: 'or', label: '满足任一组合即触发' },
+            { value: 'and', label: '需同时满足所有组合' },
+        ];
+
+        let _rrDdGlobalsBound = false;
+        function rrCloseAllDropdowns() {
+            document.querySelectorAll('.rr-dd.rr-dd-open').forEach((wrap) => {
+                const panel = wrap._rrPanel;
+                wrap.classList.remove('rr-dd-open');
+                if (panel && !panel.hidden) {
+                    panel.hidden = true;
+                    if (panel.parentNode === document.body) wrap.appendChild(panel);
+                }
+            });
+        }
+        function positionDdPanel(btn, panel) {
+            const r = btn.getBoundingClientRect();
+            const vw = window.innerWidth;
+            const pad = 8;
+            let left = r.left;
+            const w = Math.max(r.width, 160);
+            if (left + w > vw - pad) left = Math.max(pad, vw - w - pad);
+            panel.style.left = left + 'px';
+            panel.style.top = r.bottom + 4 + 'px';
+            panel.style.minWidth = w + 'px';
+            panel.style.maxWidth = Math.min(420, vw - 2 * pad) + 'px';
+        }
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s;
+            return d.innerHTML;
+        }
+        function ensureRrDdGlobalClose() {
+            if (_rrDdGlobalsBound) return;
+            _rrDdGlobalsBound = true;
+            document.addEventListener(
+                'click',
+                (e) => {
+                    if (e.target.closest && e.target.closest('.rr-dd')) return;
+                    rrCloseAllDropdowns();
+                },
+                true
+            );
+            const sc = document.querySelector('.tab-scroll');
+            if (sc) sc.addEventListener('scroll', rrCloseAllDropdowns, { passive: true });
+            window.addEventListener('resize', rrCloseAllDropdowns);
+        }
+        /**
+         * @param {{value:string,label:string}[]} items
+         * @param {string} value
+         * @param {{hiddenClass?:string,widthClass?:string,sm?:boolean,onChange?:function}} options
+         */
+        function createCustomDropdown(items, value, options) {
+            const opt = options || {};
+            const wrap = document.createElement('div');
+            wrap.className = 'rr-dd ' + (opt.sm ? 'rr-dd--sm ' : '') + (opt.widthClass || '');
+
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            if (opt.hiddenClass) hidden.className = opt.hiddenClass;
+            hidden.value = value;
+
+            const cur = items.find((x) => x.value === value) || items[0];
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'rr-dd-trigger';
+            btn.innerHTML =
+                '<span class="rr-dd-label">' +
+                escapeHtml(cur.label) +
+                '</span><i data-lucide="chevron-down" class="rr-dd-chevron w-3.5 h-3.5 shrink-0 opacity-70"></i>';
+
+            const panel = document.createElement('div');
+            panel.className = 'rr-dd-panel';
+            panel.hidden = true;
+            panel.setAttribute('role', 'listbox');
+
+            items.forEach((item) => {
+                const ob = document.createElement('button');
+                ob.type = 'button';
+                ob.className = 'rr-dd-opt' + (item.value === value ? ' rr-dd-opt--active' : '');
+                ob.textContent = item.label;
+                ob.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    hidden.value = item.value;
+                    const lab = btn.querySelector('.rr-dd-label');
+                    if (lab) lab.textContent = item.label;
+                    panel.querySelectorAll('.rr-dd-opt').forEach((el) => {
+                        el.classList.toggle('rr-dd-opt--active', el === ob);
+                    });
+                    rrCloseAllDropdowns();
+                    hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (typeof opt.onChange === 'function') opt.onChange(item.value);
+                });
+                panel.appendChild(ob);
+            });
+
+            wrap._rrPanel = panel;
+
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                ensureRrDdGlobalClose();
+                const wasOpen = wrap.classList.contains('rr-dd-open');
+                rrCloseAllDropdowns();
+                if (wasOpen) return;
+                document.body.appendChild(panel);
+                panel.hidden = false;
+                panel.style.position = 'fixed';
+                panel.style.zIndex = '10050';
+                positionDdPanel(btn, panel);
+                wrap.classList.add('rr-dd-open');
+                lucide.createIcons();
+            });
+
+            wrap.appendChild(hidden);
+            wrap.appendChild(btn);
+            wrap.appendChild(panel);
+            return wrap;
+        }
+
+        function mountGroupCombine(selectedValue) {
+            const mount = document.getElementById('groupCombineMount');
+            if (!mount) return;
+            let v = selectedValue;
+            if (v === undefined || v === null) {
+                const ex = document.getElementById('groupCombine');
+                v = ex ? ex.value : 'or';
+            }
+            if (v !== 'and') v = 'or';
+            rrCloseAllDropdowns();
+            mount.innerHTML = '';
+            const dd = createCustomDropdown(GROUP_COMBINE_ITEMS, v, {
+                widthClass: 'w-full',
+            });
+            const h = dd.querySelector('input[type="hidden"]');
+            h.id = 'groupCombine';
+            mount.appendChild(dd);
+            lucide.createIcons();
+        }
+
+        function getApi() {
+            try {
+                if (window.top && window.top.pywebviewAPI) return window.top.pywebviewAPI;
+            } catch (_) {}
+            if (window.pywebview && window.pywebview.api) return window.pywebview.api;
+            return null;
+        }
+
+        async function waitForApi(maxAttempts = 60) {
+            for (let i = 0; i < maxAttempts; i++) {
+                const api = getApi();
+                if (api && api.getRuleRetargetingConfig) return api;
+                await new Promise(r => setTimeout(r, 200));
+            }
+            return null;
+        }
+
+        /** 优先父页 toast；否则用 js/messagebox.js 的 appAlert（不使用原生 alert） */
+        function notifyErr(msg) {
+            if (window.showMsgBox) window.showMsgBox(msg, 'error');
+            else if (typeof window.appAlert === 'function') window.appAlert(msg, '错误');
+        }
+        function notifyOk(msg) {
+            if (window.showMsgBox) window.showMsgBox(msg, 'success');
+            else if (typeof window.appAlert === 'function') window.appAlert(msg, '提示');
+        }
+
+        const RR_MIN_BUDGET_YUAN = 100;
+        const RR_MAX_BID_YUAN = 10000;
+        /** 直播间成交 · 我的出价（元/成交），与千川侧最低出价口径对齐 */
+        const RR_MIN_LIVE_BID_YUAN = 0.1;
+        const RR_MIN_INTERVAL_SECONDS = 60;
+        const RR_MAX_INTERVAL_SECONDS = 2592000;
+        /** 默认：24 小时（秒）内最多 1 次，与后端 _DEFAULT_INTERVAL_WINDOW_SECONDS 一致 */
+        const RR_DEFAULT_INTERVAL_WINDOW_SECONDS = 24 * 3600;
+        function defaultIntervalPayload() {
+            return { window_seconds: RR_DEFAULT_INTERVAL_WINDOW_SECONDS, max_count: 1 };
+        }
+        /** 任务名称后缀留空时与后端 DEFAULT_TASK_NAME_SUFFIX、保存配置逻辑一致 */
+        const RR_DEFAULT_TASK_NAME_SUFFIX = '素材看盘自动追投';
+        /** 与后端 rule_retargeting_config.MAX_STRATEGIES 一致 */
+        const RR_MAX_STRATEGIES = 10;
+        /** 与后端 _STRATEGY_TITLE_MAX_LEN 一致 */
+        const RR_STRATEGY_TITLE_MAX_LEN = 32;
+        /** 表单未通过校验时的兜底提示（保存 / 启用 共用，启用即「保存并启用」） */
+        const RR_VALIDATION_FAIL_HINT = '请修正标红项后再保存';
+
+        function isPerStrategyRateLimit() {
+            const el = document.getElementById('perStrategyRateLimit');
+            return el ? el.checked : false;
+        }
+
+        function collectStrategyIntervalPayload() {
+            const elW = document.getElementById('strategyIntervalWindowSeconds');
+            const elM = document.getElementById('strategyIntervalMaxCount');
+            const w = elW ? parseFloat(elW.value) : NaN;
+            const m = elM ? parseInt(elM.value, 10) : NaN;
+            return {
+                window_seconds: Number.isFinite(w) ? w : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                max_count: Number.isFinite(m) && m >= 1 ? m : 1,
+            };
+        }
+
+        function updatePerStrategyRateLimitUi() {
+            const on = isPerStrategyRateLimit();
+            const wrap = document.getElementById('globalIntervalRowWrap');
+            const sec = document.getElementById('sectionStrategyRunConfig');
+            const hint = document.getElementById('globalIntervalHint');
+            const segWrap = document.getElementById('perStrategySegWrap');
+            const btnG = document.getElementById('btnSegGlobal');
+            const btnS = document.getElementById('btnSegStrategy');
+            if (segWrap) segWrap.classList.toggle('rr-seg-tabs--strategy', on);
+            if (btnG) {
+                btnG.classList.toggle('text-slate-100', !on);
+                btnG.classList.toggle('text-slate-500', on);
+                btnG.setAttribute('aria-selected', on ? 'false' : 'true');
+            }
+            if (btnS) {
+                btnS.classList.toggle('text-slate-100', on);
+                btnS.classList.toggle('text-slate-500', !on);
+                btnS.setAttribute('aria-selected', on ? 'true' : 'false');
+            }
+            if (wrap) {
+                wrap.classList.toggle('line-through', on);
+                wrap.classList.toggle('opacity-40', on);
+                wrap.classList.toggle('pointer-events-none', on);
+            }
+            const iw = document.getElementById('intervalWindowSeconds');
+            const im = document.getElementById('intervalMaxCount');
+            if (iw) iw.disabled = on;
+            if (im) im.disabled = on;
+            if (sec) sec.classList.toggle('hidden', !on);
+            if (hint) {
+                hint.textContent = on
+                    ? '分策略限频：各策略额度互不影响；成功追投同时记入整体。上方全局限频仅展示（与切回「全局」一致）。'
+                    : '同一条素材在规定的时间内只允许追投指定次数，以成功追投为准。多策略共用同一限频。';
+            }
+        }
+
+        function onPerStrategyRateLimitChange() {
+            syncCurrentStrategyFromDom();
+            updatePerStrategyRateLimitUi();
+            applyStrategyToDom(activeStrategyIndex);
+            rrScheduleDirtyCheck();
+        }
+
+        let strategiesState = [];
+        let activeStrategyIndex = 0;
+        /** 正在改名的策略下标，非 null 时该 Tab 显示为输入框 */
+        let strategyRenameIndex = null;
+
+        function defaultStrategyTitle(index) {
+            return '策略 ' + (index + 1);
+        }
+
+        function genStrategyId() {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+            return 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+        }
+
+        function defaultTriggerPayload() {
+            return {
+                group_combine: 'or',
+                groups: [{ join: 'and', conditions: [{ metric: 'costDiff', op: 'gt', value: 0 }] }],
+            };
+        }
+
+        function defaultRetargetingPayload(intervalObj) {
+            const inv = intervalObj || defaultIntervalPayload();
+            return {
+                method: 'volume',
+                volume: { total_budget_yuan: null, duration_hours: 1 },
+                cost_control: {
+                    optimization_goal: 'net_roi',
+                    net_roi: { daily_budget_yuan: null, net_roi_target: null },
+                    live_room: { daily_budget_yuan: null, bid_per_conversion_yuan: null },
+                },
+                interval: inv,
+                task_name_suffix: '',
+            };
+        }
+
+        function collectGlobalIntervalPayload() {
+            const w = parseFloat(document.getElementById('intervalWindowSeconds').value);
+            const m = parseInt(document.getElementById('intervalMaxCount').value, 10);
+            return {
+                window_seconds: Number.isFinite(w) ? w : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                max_count: Number.isFinite(m) && m >= 1 ? m : 1,
+            };
+        }
+
+        /** 从内存中的 interval 对象规范为 { window_seconds, max_count }（不切全局/策略时用于保留原值） */
+        function normalizeIntervalFromState(inv) {
+            if (!inv || typeof inv !== 'object') return null;
+            let ws = inv.window_seconds;
+            if (ws == null && inv.window_hours != null) ws = Number(inv.window_hours) * 3600;
+            if (ws == null || !Number.isFinite(Number(ws))) ws = RR_DEFAULT_INTERVAL_WINDOW_SECONDS;
+            const mc = inv.max_count != null ? inv.max_count : 1;
+            return {
+                window_seconds: Number.isFinite(parseFloat(ws)) ? parseFloat(ws) : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                max_count:
+                    Number.isFinite(parseInt(mc, 10)) && parseInt(mc, 10) >= 1 ? parseInt(mc, 10) : 1,
+            };
+        }
+
+        function finishStrategyRename(idx, inputEl) {
+            if (strategyRenameIndex !== idx || !strategiesState[idx]) return;
+            let t = (inputEl && inputEl.value != null ? String(inputEl.value) : '').trim();
+            if (!t) t = defaultStrategyTitle(idx);
+            t = t.slice(0, RR_STRATEGY_TITLE_MAX_LEN);
+            strategiesState[idx].title = t;
+            strategyRenameIndex = null;
+            renderStrategyTabs();
+            try {
+                lucide.createIcons();
+            } catch (e) {}
+            rrScheduleDirtyCheck();
+        }
+
+        function flushStrategyRename() {
+            if (strategyRenameIndex === null) return;
+            const inp = document.querySelector(
+                '#strategyTabsBar input[data-strategy-rename="' + strategyRenameIndex + '"]'
+            );
+            if (inp) finishStrategyRename(strategyRenameIndex, inp);
+        }
+
+        function deleteStrategy(idx) {
+            if (strategiesState.length <= 1) {
+                notifyErr('至少保留一条追投策略');
+                return;
+            }
+            if (idx < 0 || idx >= strategiesState.length) return;
+            flushStrategyRename();
+            syncCurrentStrategyFromDom();
+            const oldActive = activeStrategyIndex;
+            strategiesState.splice(idx, 1);
+            if (idx < oldActive) activeStrategyIndex = oldActive - 1;
+            else if (idx === oldActive) activeStrategyIndex = Math.min(oldActive, strategiesState.length - 1);
+            strategyRenameIndex = null;
+            renderStrategyTabs();
+            applyStrategyToDom(activeStrategyIndex);
+            try {
+                lucide.createIcons();
+            } catch (e) {}
+            rrScheduleDirtyCheck();
+        }
+
+        function syncCurrentStrategyFromDom() {
+            flushStrategyRename();
+            if (!strategiesState.length) {
+                strategiesState.push({
+                    id: genStrategyId(),
+                    title: defaultStrategyTitle(0),
+                    trigger: defaultTriggerPayload(),
+                    retargeting: defaultRetargetingPayload(),
+                });
+                activeStrategyIndex = 0;
+            }
+            syncTriggerGroupsFromDom();
+            const gcEl = document.getElementById('groupCombine');
+            const group_combine = gcEl ? gcEl.value : 'or';
+            const trig = { group_combine, groups: JSON.parse(JSON.stringify(_groupsRef)) };
+            const method =
+                document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            const goal =
+                document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            const volBudget = document.getElementById('volBudget').value.trim();
+            const volDur = parseFloat(document.getElementById('volDuration').value);
+            const cur = strategiesState[activeStrategyIndex];
+            if (!cur) return;
+            const gInv = collectGlobalIntervalPayload();
+            let invForStrategy;
+            if (isPerStrategyRateLimit()) {
+                invForStrategy = collectStrategyIntervalPayload();
+            } else {
+                // 全局模式：本策略「追投次数限制」输入框隐藏，勿用 gInv 覆盖内存里已保存的 per-strategy 限频（否则切回「策略」会丢自定义值）
+                const prevInv = cur.retargeting && cur.retargeting.interval;
+                invForStrategy = prevInv ? normalizeIntervalFromState(prevInv) : gInv;
+            }
+            const ret = {
+                method,
+                volume: {
+                    total_budget_yuan: volBudget === '' ? null : parseFloat(volBudget),
+                    duration_hours: Number.isFinite(volDur) ? volDur : 1,
+                },
+                cost_control: {
+                    optimization_goal: goal,
+                    net_roi: {
+                        daily_budget_yuan: (() => {
+                            const v = document.getElementById('ccDailyNet').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                        net_roi_target: (() => {
+                            const v = document.getElementById('ccRoiTarget').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                    },
+                    live_room: {
+                        daily_budget_yuan: (() => {
+                            const v = document.getElementById('ccDailyLive').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                        bid_per_conversion_yuan: (() => {
+                            const v = document.getElementById('ccBid').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                    },
+                },
+                task_name_suffix: document.getElementById('taskSuffix').value.trim().slice(0, 15),
+                interval: invForStrategy,
+            };
+            strategiesState[activeStrategyIndex] = {
+                id: cur.id || genStrategyId(),
+                title: cur.title || defaultStrategyTitle(activeStrategyIndex),
+                trigger: trig,
+                retargeting: ret,
+            };
+        }
+
+        function renderStrategyTabs() {
+            const bar = document.getElementById('strategyTabsBar');
+            if (!bar) return;
+            const TAG_SHELL =
+                'rr-strategy-tag shrink-0 border text-xs font-medium transition-colors min-h-[2.25rem] max-w-[14rem]';
+            const TAG_ON = 'bg-cyan-500/20 text-cyan-200 border-cyan-500/35';
+            const TAG_OFF = 'bg-slate-800/50 text-slate-400 border-slate-600/30 hover:border-slate-500/50';
+            bar.innerHTML = '';
+            strategiesState.forEach((st, idx) => {
+                const isActive = idx === activeStrategyIndex;
+                const isRenaming = strategyRenameIndex === idx;
+                if (isRenaming) {
+                    const tag = document.createElement('div');
+                    tag.className = TAG_SHELL + ' ' + TAG_ON + ' flex items-stretch';
+                    const inp = document.createElement('input');
+                    inp.type = 'text';
+                    inp.setAttribute('data-strategy-rename', String(idx));
+                    inp.setAttribute('aria-label', '策略名称');
+                    inp.maxLength = RR_STRATEGY_TITLE_MAX_LEN;
+                    inp.autocomplete = 'off';
+                    inp.className =
+                        'rr-strategy-tab-inp flex-1 min-w-0 min-h-[2.25rem] w-full px-2 py-1.5 border-0 rounded-none text-sm bg-transparent outline-none box-border';
+                    inp.value = (st.title && String(st.title).trim()) || defaultStrategyTitle(idx);
+                    inp.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            inp.blur();
+                        }
+                    });
+                    inp.addEventListener('click', (e) => e.stopPropagation());
+                    inp.addEventListener('blur', () => finishStrategyRename(idx, inp));
+                    tag.appendChild(inp);
+                    bar.appendChild(tag);
+                    return;
+                }
+                const tag = document.createElement('div');
+                tag.className = TAG_SHELL + ' ' + (isActive ? TAG_ON : TAG_OFF);
+
+                const main = document.createElement('button');
+                main.type = 'button';
+                main.className =
+                    'rr-strategy-tag-main py-1.5 truncate ' +
+                    (strategiesState.length > 1 ? 'pl-2 pr-0.5' : 'px-2');
+                main.textContent = (st.title && String(st.title).trim()) || defaultStrategyTitle(idx);
+                main.setAttribute('data-strategy-index', String(idx));
+                main.addEventListener('click', () => {
+                    const j = parseInt(main.getAttribute('data-strategy-index'), 10);
+                    if (j === activeStrategyIndex) return;
+                    syncCurrentStrategyFromDom();
+                    clearStrategyValidationBanner();
+                    activeStrategyIndex = j;
+                    renderStrategyTabs();
+                    applyStrategyToDom(activeStrategyIndex);
+                    try {
+                        lucide.createIcons();
+                    } catch (e) {}
+                    rrScheduleDirtyCheck();
+                });
+                main.addEventListener('dblclick', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    syncCurrentStrategyFromDom();
+                    const j = parseInt(main.getAttribute('data-strategy-index'), 10);
+                    if (activeStrategyIndex !== j) {
+                        clearStrategyValidationBanner();
+                        activeStrategyIndex = j;
+                        applyStrategyToDom(j);
+                    }
+                    strategyRenameIndex = j;
+                    renderStrategyTabs();
+                });
+
+                tag.appendChild(main);
+
+                if (strategiesState.length > 1) {
+                    const btnX = document.createElement('button');
+                    btnX.type = 'button';
+                    btnX.className = 'rr-strategy-tag-x';
+                    btnX.setAttribute('aria-label', '删除该策略');
+                    btnX.title = '删除';
+                    const ix = document.createElement('i');
+                    ix.setAttribute('data-lucide', 'x');
+                    ix.className = 'w-3.5 h-3.5';
+                    btnX.appendChild(ix);
+                    btnX.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        deleteStrategy(idx);
+                    });
+                    tag.appendChild(btnX);
+                }
+
+                bar.appendChild(tag);
+            });
+            if (strategiesState.length < RR_MAX_STRATEGIES) {
+                const add = document.createElement('button');
+                add.type = 'button';
+                add.className =
+                    'inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-dashed border-slate-600/50 text-slate-500 hover:text-cyan-300 hover:border-cyan-500/35 min-h-[2.25rem] transition-colors';
+                const plus = document.createElement('i');
+                plus.setAttribute('data-lucide', 'plus');
+                plus.className = 'w-3.5 h-3.5 shrink-0';
+                add.appendChild(plus);
+                add.appendChild(document.createTextNode(' 新建策略'));
+                add.addEventListener('click', () => addStrategy());
+                bar.appendChild(add);
+            }
+            try {
+                lucide.createIcons();
+            } catch (e) {}
+            if (strategyRenameIndex !== null) {
+                requestAnimationFrame(() => {
+                    const el = document.querySelector(
+                        '#strategyTabsBar input[data-strategy-rename="' + strategyRenameIndex + '"]'
+                    );
+                    if (el) {
+                        el.focus();
+                        const len = el.value.length;
+                        el.setSelectionRange(len, len);
+                    }
+                });
+            }
+        }
+
+        function addStrategy() {
+            if (strategiesState.length >= RR_MAX_STRATEGIES) {
+                notifyErr('最多 ' + RR_MAX_STRATEGIES + ' 条追投策略');
+                return;
+            }
+            syncCurrentStrategyFromDom();
+            const newIdx = strategiesState.length;
+            strategiesState.push({
+                id: genStrategyId(),
+                title: defaultStrategyTitle(newIdx),
+                trigger: defaultTriggerPayload(),
+                retargeting: defaultRetargetingPayload(),
+            });
+            activeStrategyIndex = strategiesState.length - 1;
+            strategyRenameIndex = activeStrategyIndex;
+            renderStrategyTabs();
+            applyStrategyToDom(activeStrategyIndex);
+            rrScheduleDirtyCheck();
+        }
+
+        function applyStrategyToDom(index, opts) {
+            const s = strategiesState[index];
+            if (!s) return;
+            const t = s.trigger || defaultTriggerPayload();
+            mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
+            _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
+            renderTriggerGroups(_groupsRef);
+
+            const r = s.retargeting || {};
+            const method = r.method === 'cost_control' ? 'cost_control' : 'volume';
+            document.querySelectorAll('.method-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-method') === method);
+            });
+            const vol = r.volume || {};
+            document.getElementById('volBudget').value =
+                vol.total_budget_yuan != null && vol.total_budget_yuan !== '' ? vol.total_budget_yuan : '';
+            document.getElementById('volDuration').value = vol.duration_hours != null ? vol.duration_hours : 1;
+
+            const cc = r.cost_control || {};
+            const goal = cc.optimization_goal === 'live_room' ? 'live_room' : 'net_roi';
+            document.querySelectorAll('.goal-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-goal') === goal);
+            });
+            const nr = cc.net_roi || {};
+            const lr = cc.live_room || {};
+            document.getElementById('ccDailyNet').value = nr.daily_budget_yuan != null ? nr.daily_budget_yuan : '';
+            document.getElementById('ccRoiTarget').value = nr.net_roi_target != null ? nr.net_roi_target : '';
+            document.getElementById('ccDailyLive').value = lr.daily_budget_yuan != null ? lr.daily_budget_yuan : '';
+            document.getElementById('ccBid').value = lr.bid_per_conversion_yuan != null ? lr.bid_per_conversion_yuan : '';
+
+            const sfx = (r.task_name_suffix || '').slice(0, 15);
+            document.getElementById('taskSuffix').value = sfx === '素材看盘自动追投' ? '' : sfx;
+            updateSuffixCount();
+            const inv = r.interval || {};
+            let ws = inv.window_seconds;
+            if (ws == null && inv.window_hours != null) ws = Number(inv.window_hours) * 3600;
+            if (ws == null || !Number.isFinite(Number(ws))) ws = RR_DEFAULT_INTERVAL_WINDOW_SECONDS;
+            const mc = inv.max_count != null ? inv.max_count : 1;
+            const siw = document.getElementById('strategyIntervalWindowSeconds');
+            const sim = document.getElementById('strategyIntervalMaxCount');
+            if (siw) siw.value = ws;
+            if (sim) sim.value = mc;
+            syncMethodPanels();
+            syncGoalPanels();
+            if (!opts || !opts.skipClearFieldErrors) {
+                clearAllRetargetingFieldErrors();
+            }
+        }
+
+        function setRrFieldError(inputEl, errEl, msg) {
+            if (!errEl) return;
+            if (!msg) {
+                errEl.textContent = '';
+                errEl.classList.add('hidden');
+                if (inputEl) inputEl.classList.remove('rr-input--invalid');
+                return;
+            }
+            errEl.textContent = msg;
+            errEl.classList.remove('hidden');
+            if (inputEl) inputEl.classList.add('rr-input--invalid');
+        }
+
+        function clearTriggerConditionError() {
+            const el = document.getElementById('errTriggerConditions');
+            if (!el) return;
+            el.textContent = '';
+            el.classList.add('hidden');
+        }
+
+        function setCondValFieldError(inp, errEl, msg) {
+            if (!errEl) return;
+            if (!msg) {
+                errEl.textContent = '';
+                errEl.classList.add('hidden');
+                if (inp) inp.classList.remove('rr-input--invalid');
+                return;
+            }
+            errEl.textContent = msg;
+            errEl.classList.remove('hidden');
+            if (inp) inp.classList.add('rr-input--invalid');
+        }
+
+        function clearTriggerCondFieldErrors() {
+            document.querySelectorAll('.cond-val-err').forEach((el) => {
+                el.textContent = '';
+                el.classList.add('hidden');
+            });
+            document.querySelectorAll('input.cond-val.rr-input--invalid').forEach((inp) => {
+                inp.classList.remove('rr-input--invalid');
+            });
+        }
+
+        /** 触发条件数值：须 > 0；禁止 01 这类前导零（0.5 等小数允许） */
+        function triggerCondValueErrorMsg(raw, metric) {
+            const s = String(raw).trim();
+            if (s === '') return '请输入触发条件数值';
+            if (hasLeadingZeroBad(s)) return '不能以0开头，请正确输入';
+            const n = parseFloat(s);
+            if (!Number.isFinite(n)) return '请输入有效数字';
+            if (n <= 0) return '触发条件数值须大于 0';
+            if (isRateMetric(metric)) {
+                if (n > 100) return '率类指标范围为大于 0 且不超过 100';
+            }
+            return '';
+        }
+
+        function setTriggerConditionError(msg) {
+            const el = document.getElementById('errTriggerConditions');
+            if (!el) return;
+            if (!msg) {
+                clearTriggerConditionError();
+                return;
+            }
+            el.textContent = msg;
+            el.classList.remove('hidden');
+        }
+
+        function clearRetargetingFieldErrorsOnly() {
+            [
+                ['volBudget', 'errVolBudget'],
+                ['volDuration', 'errVolDuration'],
+                ['ccDailyNet', 'errCcDailyNet'],
+                ['ccRoiTarget', 'errCcRoiTarget'],
+                ['ccDailyLive', 'errCcDailyLive'],
+                ['ccBid', 'errCcBid'],
+                ['intervalWindowSeconds', 'errIntervalWindowSeconds'],
+                ['intervalMaxCount', 'errIntervalMaxCount'],
+                ['strategyIntervalWindowSeconds', 'errStrategyIntervalWindowSeconds'],
+                ['strategyIntervalMaxCount', 'errStrategyIntervalMaxCount'],
+            ].forEach(([id, eid]) => {
+                setRrFieldError(document.getElementById(id), document.getElementById(eid), '');
+            });
+        }
+
+        function clearAllRetargetingFieldErrors() {
+            clearTriggerConditionError();
+            clearTriggerCondFieldErrors();
+            clearRetargetingFieldErrorsOnly();
+        }
+
+        function clearStrategyValidationBanner() {
+            const el = document.getElementById('strategyValidationBanner');
+            if (el) {
+                el.classList.add('hidden');
+                el.textContent = '';
+            }
+        }
+
+        /** 保存校验失败时：切到「追投配置」并把首个错项滚入可视区（主滚动容器为 .tab-scroll） */
+        function ensureConfigTabVisibleForValidation() {
+            const paneCfg = document.getElementById('tabPaneConfig');
+            if (paneCfg && paneCfg.classList.contains('hidden')) {
+                const btn = document.getElementById('tabBtnConfig');
+                if (btn) btn.click();
+            }
+        }
+
+        function scrollRrValidationTargetIntoView(el) {
+            if (!el || !(el instanceof Element)) return;
+            try {
+                el.scrollIntoView({ block: 'center', behavior: 'smooth', inline: 'nearest' });
+            } catch (e) {}
+        }
+
+        function validateAllStrategiesBeforeSave() {
+            clearStrategyValidationBanner();
+            clearAllRetargetingFieldErrors();
+            syncCurrentStrategyFromDom();
+            const savedIdx = activeStrategyIndex;
+            for (let i = 0; i < strategiesState.length; i++) {
+                activeStrategyIndex = i;
+                applyStrategyToDom(i);
+                clearAllRetargetingFieldErrors();
+                const vt = validateTriggerConditions();
+                const vr = validateRetargetingFields();
+                if (!vt.ok || !vr.ok) {
+                    renderStrategyTabs();
+                    applyStrategyToDom(i, { skipClearFieldErrors: true });
+                    const vtAfter = validateTriggerConditions();
+                    const vrAfter = validateRetargetingFields();
+                    try {
+                        lucide.createIcons();
+                    } catch (e) {}
+                    return {
+                        ok: false,
+                        vt: vtAfter,
+                        vr: vrAfter,
+                        failedStrategyIndex: i,
+                    };
+                }
+            }
+            clearStrategyValidationBanner();
+            activeStrategyIndex = savedIdx;
+            renderStrategyTabs();
+            applyStrategyToDom(activeStrategyIndex);
+            try {
+                lucide.createIcons();
+            } catch (e) {}
+            return { ok: true, vt: { ok: true }, vr: { ok: true } };
+        }
+
+        function runRuleRetargetingValidation() {
+            return validateAllStrategiesBeforeSave();
+        }
+
+        function presentRuleRetargetingValidationFailure(vt, vr, meta) {
+            const failedIdx = meta && meta.failedStrategyIndex != null ? meta.failedStrategyIndex : null;
+            const banner = document.getElementById('strategyValidationBanner');
+            if (banner) {
+                if (failedIdx != null && strategiesState[failedIdx]) {
+                    const title =
+                        (strategiesState[failedIdx].title || '').trim() || defaultStrategyTitle(failedIdx);
+                    banner.textContent = '「' + title + '」存在未通过项，请修正后保存。';
+                    banner.classList.remove('hidden');
+                } else {
+                    banner.classList.add('hidden');
+                    banner.textContent = '';
+                }
+            }
+            const msg = !vt.ok ? vt.firstMsg : vr.firstMsg;
+            let scrollEl = !vt.ok ? vt.firstScrollEl : vr.firstScrollEl;
+            if (!scrollEl) {
+                scrollEl = document.querySelector('#tabPaneConfig .rr-input--invalid');
+            }
+            if (!scrollEl) {
+                scrollEl = document.querySelector('#tabPaneConfig .rr-field-err:not(.hidden)');
+            }
+            notifyErr(msg || RR_VALIDATION_FAIL_HINT);
+            ensureConfigTabVisibleForValidation();
+            window.setTimeout(() => {
+                scrollRrValidationTargetIntoView(scrollEl);
+                if (
+                    scrollEl &&
+                    (scrollEl.tagName === 'INPUT' ||
+                        scrollEl.tagName === 'SELECT' ||
+                        scrollEl.tagName === 'TEXTAREA')
+                ) {
+                    try {
+                        scrollEl.focus({ preventScroll: true });
+                    } catch (e) {
+                        try {
+                            scrollEl.focus();
+                        } catch (e2) {}
+                    }
+                }
+            }, 120);
+        }
+
+        /** 至少存在一条条件行（与 collectPayload 一致，保存前会先 syncTriggerGroupsFromDom） */
+        function validateTriggerConditions() {
+            clearTriggerCondFieldErrors();
+            syncTriggerGroupsFromDom();
+            const groupEls = document.querySelectorAll('[data-group-index]');
+            const condRows = document.querySelectorAll('[data-cond-index]');
+            if (!groupEls.length || !condRows.length) {
+                setTriggerConditionError('请至少添加一条监测触发条件');
+                const errEl = document.getElementById('errTriggerConditions');
+                return {
+                    ok: false,
+                    firstMsg: '请至少添加一条监测触发条件',
+                    firstScrollEl: errEl || document.getElementById('triggerGroups'),
+                };
+            }
+            setTriggerConditionError('');
+            let ok = true;
+            let firstMsg = '';
+            let firstScrollEl = null;
+            condRows.forEach((row) => {
+                const inp = row.querySelector('input.cond-val');
+                const metric = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                const errEl = row.querySelector('.cond-val-err');
+                if (!inp) return;
+                const msg = triggerCondValueErrorMsg(inp.value, metric);
+                if (msg) {
+                    setCondValFieldError(inp, errEl, msg);
+                    ok = false;
+                    if (!firstMsg) firstMsg = msg;
+                    if (!firstScrollEl) firstScrollEl = inp;
+                }
+            });
+            if (!ok) return { ok: false, firstMsg, firstScrollEl };
+            return { ok: true, firstMsg: '', firstScrollEl: null };
+        }
+
+        function hasLeadingZeroBad(str) {
+            const s = String(str).trim();
+            if (!s) return false;
+            return /^0\d/.test(s);
+        }
+
+        /** 小数位是否超过 2 位，或仅有尾随小数点无小数位（如 100.、12.）（按输入字面量） */
+        function hasMoreThanTwoDecimalPlaces(str) {
+            const s = String(str).trim();
+            const dot = s.indexOf('.');
+            if (dot === -1) return false;
+            const frac = s.slice(dot + 1).replace(/[^\d]/g, '');
+            if (frac.length === 0) return true;
+            return frac.length > 2;
+        }
+
+        /** 预算类：调控总预算 / 调控日预算（非空时） */
+        function budgetYuanErrorMsg(raw) {
+            const s = String(raw).trim();
+            if (s === '') return '';
+            if (hasLeadingZeroBad(s)) return '不能以0开头，请正确输入';
+            if (hasMoreThanTwoDecimalPlaces(s)) return '仅支持最多2位小数';
+            const n = parseFloat(s);
+            if (!Number.isFinite(n)) return '请输入有效数字';
+            if (n <= 0) return '预算需大于 0 元';
+            if (n < RR_MIN_BUDGET_YUAN) return '预算需大于100元';
+            return '';
+        }
+
+        /** 净成交 ROI 目标：0.01～100，最多两位小数 */
+        function netRoiTargetErrorMsg(raw) {
+            const s = String(raw).trim();
+            if (s === '') return '';
+            if (hasLeadingZeroBad(s)) return '不能以0开头，请正确输入';
+            if (hasMoreThanTwoDecimalPlaces(s)) return '支持范围: 0.01-100，最多两位小数';
+            const n = parseFloat(s);
+            if (!Number.isFinite(n)) return '支持范围: 0.01-100，最多两位小数';
+            if (n < 0.01 || n > 100) return '支持范围: 0.01-100，最多两位小数';
+            return '';
+        }
+
+        function validateDurationText(v) {
+            const x = parseFloat(v);
+            if (!Number.isFinite(x)) return '调控时长范围 0.5～24 小时，请正确填写';
+            if (x < 0.5 || x > 24) return '调控时长范围 0.5～24 小时，请正确填写';
+            const steps = Math.round((x - 0.5) / 0.5);
+            const expected = 0.5 + steps * 0.5;
+            if (Math.abs(x - expected) > 1e-4) return '调控时长需为0.5的整数倍，请正确填写';
+            return '';
+        }
+
+        /** 追投间隔·时间范围（秒）：须为正整数，且 ≥60 */
+        function intervalWindowSecondsErrorMsg(raw) {
+            const s = String(raw).trim();
+            if (s === '') return '请填写时间范围秒数';
+            if (hasLeadingZeroBad(s)) return '不能以0开头，请正确输入';
+            if (!/^\d+$/.test(s)) return '时间范围须为整数秒';
+            const n = parseInt(s, 10);
+            if (n < RR_MIN_INTERVAL_SECONDS) return '时间范围不能低于 60 秒';
+            if (n > RR_MAX_INTERVAL_SECONDS) return `时间范围须在 60～${RR_MAX_INTERVAL_SECONDS} 秒之间`;
+            return '';
+        }
+
+        /** 追投次数上限：须为整数，且 ≥1（不可为小数） */
+        function intervalMaxCountErrorMsg(raw) {
+            const s = String(raw).trim();
+            if (s === '') return '请填写追投次数';
+            if (hasLeadingZeroBad(s)) return '不能以0开头，请正确输入';
+            if (!/^\d+$/.test(s)) return '追投次数须为整数';
+            const n = parseInt(s, 10);
+            if (n < 1) return '追投次数须大于等于 1';
+            if (n > 9999) return '追投次数须在 1～9999 之间';
+            return '';
+        }
+
+        /** @returns {{ ok: boolean, firstMsg: string, firstScrollEl: Element|null }} */
+        function validateRetargetingFields() {
+            clearRetargetingFieldErrorsOnly();
+            const method =
+                document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            const goal =
+                document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+
+            let ok = true;
+            let firstMsg = '';
+            let firstScrollEl = null;
+
+            if (method === 'volume') {
+                const vb = document.getElementById('volBudget');
+                const vs = String(vb.value).trim();
+                let m0 = '';
+                if (vs === '') {
+                    m0 = '请填写调控总预算';
+                } else {
+                    m0 = budgetYuanErrorMsg(vb.value);
+                }
+                if (m0) {
+                    setRrFieldError(vb, document.getElementById('errVolBudget'), m0);
+                    ok = false;
+                    firstMsg = firstMsg || m0;
+                    if (!firstScrollEl) firstScrollEl = vb;
+                }
+                const vd = document.getElementById('volDuration');
+                const md = validateDurationText(vd.value);
+                if (md) {
+                    setRrFieldError(vd, document.getElementById('errVolDuration'), md);
+                    ok = false;
+                    firstMsg = firstMsg || md;
+                    if (!firstScrollEl) firstScrollEl = vd;
+                }
+            }
+
+            if (method === 'cost_control') {
+                if (goal === 'net_roi') {
+                    const netEl = document.getElementById('ccDailyNet');
+                    const ns = String(netEl.value).trim();
+                    let n0 = '';
+                    if (ns === '') {
+                        n0 = '请填写调控日预算';
+                    } else {
+                        n0 = budgetYuanErrorMsg(netEl.value);
+                    }
+                    if (n0) {
+                        setRrFieldError(netEl, document.getElementById('errCcDailyNet'), n0);
+                        ok = false;
+                        firstMsg = firstMsg || n0;
+                        if (!firstScrollEl) firstScrollEl = netEl;
+                    }
+                    const roiEl = document.getElementById('ccRoiTarget');
+                    const rs = String(roiEl.value).trim();
+                    let roiErr = '';
+                    if (rs === '') {
+                        roiErr = '请输入期望的ROI目标';
+                    } else {
+                        roiErr = netRoiTargetErrorMsg(roiEl.value);
+                    }
+                    if (roiErr) {
+                        setRrFieldError(roiEl, document.getElementById('errCcRoiTarget'), roiErr);
+                        ok = false;
+                        firstMsg = firstMsg || roiErr;
+                        if (!firstScrollEl) firstScrollEl = roiEl;
+                    }
+                } else {
+                    const liveEl = document.getElementById('ccDailyLive');
+                    const ls = String(liveEl.value).trim();
+                    let l0 = '';
+                    if (ls === '') {
+                        l0 = '请填写调控日预算';
+                    } else {
+                        l0 = budgetYuanErrorMsg(liveEl.value);
+                    }
+                    if (l0) {
+                        setRrFieldError(liveEl, document.getElementById('errCcDailyLive'), l0);
+                        ok = false;
+                        firstMsg = firstMsg || l0;
+                        if (!firstScrollEl) firstScrollEl = liveEl;
+                    }
+                    const bidEl = document.getElementById('ccBid');
+                    const bidErr = document.getElementById('errCcBid');
+                    const bs = String(bidEl.value).trim();
+                    if (bs === '') {
+                        const msg = '出价不能为空';
+                        setRrFieldError(bidEl, bidErr, msg);
+                        ok = false;
+                        firstMsg = firstMsg || msg;
+                        if (!firstScrollEl) firstScrollEl = bidEl;
+                    } else if (hasLeadingZeroBad(bs)) {
+                        const msg = '不能以0开头，请正确输入';
+                        setRrFieldError(bidEl, bidErr, msg);
+                        ok = false;
+                        firstMsg = firstMsg || msg;
+                        if (!firstScrollEl) firstScrollEl = bidEl;
+                    } else if (hasMoreThanTwoDecimalPlaces(bs)) {
+                        const msg = '仅支持最多2位小数';
+                        setRrFieldError(bidEl, bidErr, msg);
+                        ok = false;
+                        firstMsg = firstMsg || msg;
+                        if (!firstScrollEl) firstScrollEl = bidEl;
+                    } else {
+                        const bid = parseFloat(bs);
+                        if (!Number.isFinite(bid)) {
+                            const msg = '请输入有效数字';
+                            setRrFieldError(bidEl, bidErr, msg);
+                            ok = false;
+                            firstMsg = firstMsg || msg;
+                            if (!firstScrollEl) firstScrollEl = bidEl;
+                        } else if (bid < RR_MIN_LIVE_BID_YUAN) {
+                            const msg = '出价不能低于0.1元';
+                            setRrFieldError(bidEl, bidErr, msg);
+                            ok = false;
+                            firstMsg = firstMsg || msg;
+                            if (!firstScrollEl) firstScrollEl = bidEl;
+                        } else if (bid > RR_MAX_BID_YUAN) {
+                            const msg = '出价不能高于10,000元';
+                            setRrFieldError(bidEl, bidErr, msg);
+                            ok = false;
+                            firstMsg = firstMsg || msg;
+                            if (!firstScrollEl) firstScrollEl = bidEl;
+                        } else {
+                            const dbStr = String(document.getElementById('ccDailyLive').value).trim();
+                            if (dbStr !== '') {
+                                const db = parseFloat(dbStr);
+                                if (Number.isFinite(db) && bid > db) {
+                                    const msg = '出价不能高于预算';
+                                    setRrFieldError(bidEl, bidErr, msg);
+                                    ok = false;
+                                    firstMsg = firstMsg || msg;
+                                    if (!firstScrollEl) firstScrollEl = bidEl;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (isPerStrategyRateLimit()) {
+                const iwEl = document.getElementById('strategyIntervalWindowSeconds');
+                const iwMsg = intervalWindowSecondsErrorMsg(iwEl && iwEl.value);
+                if (iwMsg) {
+                    setRrFieldError(iwEl, document.getElementById('errStrategyIntervalWindowSeconds'), iwMsg);
+                    ok = false;
+                    firstMsg = firstMsg || iwMsg;
+                    if (!firstScrollEl) firstScrollEl = iwEl;
+                }
+                const imEl = document.getElementById('strategyIntervalMaxCount');
+                const imMsg = intervalMaxCountErrorMsg(imEl && imEl.value);
+                if (imMsg) {
+                    setRrFieldError(imEl, document.getElementById('errStrategyIntervalMaxCount'), imMsg);
+                    ok = false;
+                    firstMsg = firstMsg || imMsg;
+                    if (!firstScrollEl) firstScrollEl = imEl;
+                }
+            } else {
+                const iwEl = document.getElementById('intervalWindowSeconds');
+                const iwMsg = intervalWindowSecondsErrorMsg(iwEl.value);
+                if (iwMsg) {
+                    setRrFieldError(iwEl, document.getElementById('errIntervalWindowSeconds'), iwMsg);
+                    ok = false;
+                    firstMsg = firstMsg || iwMsg;
+                    if (!firstScrollEl) firstScrollEl = iwEl;
+                }
+                const imEl = document.getElementById('intervalMaxCount');
+                const imMsg = intervalMaxCountErrorMsg(imEl.value);
+                if (imMsg) {
+                    setRrFieldError(imEl, document.getElementById('errIntervalMaxCount'), imMsg);
+                    ok = false;
+                    firstMsg = firstMsg || imMsg;
+                    if (!firstScrollEl) firstScrollEl = imEl;
+                }
+            }
+
+            return { ok, firstMsg, firstScrollEl };
+        }
+
+        function defaultCondition() {
+            return { metric: 'costDiff', op: 'gt', value: 0 };
+        }
+        function defaultGroup() {
+            return { join: 'and', conditions: [defaultCondition()] };
+        }
+
+        function collectPayload() {
+            const enabled = document.getElementById('cfgEnabled').checked;
+            const headless = document.getElementById('btnHeadless').classList.contains('seg-btn-active');
+            syncCurrentStrategyFromDom();
+            const gInv = collectGlobalIntervalPayload();
+            const perStr = isPerStrategyRateLimit();
+            const strategies = strategiesState.map((s) => ({
+                id: s.id,
+                title: s.title,
+                trigger: s.trigger,
+                retargeting: {
+                    ...s.retargeting,
+                    interval: perStr ? (s.retargeting && s.retargeting.interval) || gInv : gInv,
+                },
+            }));
+            const browser_executable_path = (
+                document.getElementById('rrBrowserExecutable')?.value || ''
+            ).trim();
+            return {
+                enabled,
+                browser_headless: headless,
+                browser_executable_path,
+                per_strategy_rate_limit: perStr,
+                interval: gInv,
+                strategies,
+            };
+        }
+
+        let rrLastSavedSnapshot = null;
+        let rrDirtyTimer = null;
+
+        function rrSnapshotPayloadString() {
+            try {
+                syncCurrentStrategyFromDom();
+                return JSON.stringify(collectPayload());
+            } catch (e) {
+                return '';
+            }
+        }
+
+        function rrRefreshUnsavedHint() {
+            const el = document.getElementById('rrConfigUnsavedHint');
+            if (!el) return;
+            if (rrLastSavedSnapshot === null) {
+                el.classList.add('hidden');
+                return;
+            }
+            const cur = rrSnapshotPayloadString();
+            el.classList.toggle('hidden', cur === rrLastSavedSnapshot);
+        }
+
+        function rrMarkSavedSnapshot() {
+            rrLastSavedSnapshot = rrSnapshotPayloadString();
+            rrRefreshUnsavedHint();
+        }
+
+        function rrScheduleDirtyCheck() {
+            if (rrDirtyTimer) clearTimeout(rrDirtyTimer);
+            rrDirtyTimer = window.setTimeout(function () {
+                rrDirtyTimer = null;
+                rrRefreshUnsavedHint();
+            }, 80);
+        }
+
+        let _groupsRef = [];
+
+        /** 从当前 DOM 读回条件组，写入 _groupsRef；避免「+ 条件 / 添加组」重绘时仍用旧内存数据导致已填内容被清空 */
+        function syncTriggerGroupsFromDom() {
+            const groupEls = Array.from(document.querySelectorAll('[data-group-index]')).sort(
+                (a, b) =>
+                    parseInt(a.getAttribute('data-group-index'), 10) -
+                    parseInt(b.getAttribute('data-group-index'), 10)
+            );
+            if (!groupEls.length) return;
+            const next = [];
+            groupEls.forEach((gel) => {
+                const condEls = gel.querySelectorAll('[data-cond-index]');
+                const conditions = [];
+                condEls.forEach((cel) => {
+                    const metric = cel.querySelector('input.cond-metric')?.value;
+                    const op = cel.querySelector('input.cond-op')?.value;
+                    const raw = cel.querySelector('.cond-val')?.value;
+                    let val = parseFloat(raw);
+                    const m = metric || 'costDiff';
+                    if (isRateMetric(m)) val = clampRatePercentUi(val);
+                    else if (!Number.isFinite(val)) val = 0;
+                    conditions.push({
+                        metric: m,
+                        op: op || 'gt',
+                        value: val,
+                    });
+                });
+                if (conditions.length) next.push({ join: 'and', conditions });
+            });
+            if (!next.length) return;
+            _groupsRef.length = 0;
+            next.forEach((g) => _groupsRef.push(g));
+        }
+
+        function renderTriggerGroups(groups) {
+            rrCloseAllDropdowns();
+            const host = document.getElementById('triggerGroups');
+            host.innerHTML = '';
+            groups.forEach((g, gi) => {
+                const wrap = document.createElement('div');
+                wrap.className = 'rounded-xl pl-4 pr-3 py-3 space-y-2.5 bg-slate-950/40 border border-slate-600/25 border-l-[3px] border-l-sky-500/50 shadow-sm';
+                wrap.setAttribute('data-group-index', String(gi));
+                const header = document.createElement('div');
+                header.className = 'flex flex-wrap items-center justify-between gap-2 mb-1';
+                const title = document.createElement('span');
+                title.className = 'text-xs font-semibold text-slate-200 tracking-wide';
+                title.textContent = '条件组 ' + (gi + 1) + '（组内为「且」）';
+                const right = document.createElement('div');
+                right.className = 'flex items-center gap-2 shrink-0';
+                const addBtn = document.createElement('button');
+                addBtn.type = 'button';
+                addBtn.className = 'inline-flex items-center gap-0.5 text-xs font-medium px-2 py-1 rounded-md bg-sky-500/12 text-sky-300 hover:bg-sky-500/18 border border-sky-500/20';
+                addBtn.textContent = '+ 条件';
+                addBtn.addEventListener('click', () => {
+                    syncTriggerGroupsFromDom();
+                    const grp = _groupsRef[gi];
+                    if (!grp) return;
+                    if (!grp.conditions) grp.conditions = [];
+                    grp.conditions.push(defaultCondition());
+                    renderTriggerGroups(_groupsRef);
+                });
+                const rmGroup = document.createElement('button');
+                rmGroup.type = 'button';
+                rmGroup.className = 'text-xs font-medium text-rose-400/85 hover:text-rose-300 px-1.5 py-0.5 rounded hover:bg-rose-500/10';
+                rmGroup.textContent = '删除组';
+                rmGroup.disabled = groups.length <= 1;
+                rmGroup.classList.toggle('opacity-40', groups.length <= 1);
+                rmGroup.addEventListener('click', () => {
+                    syncTriggerGroupsFromDom();
+                    if (_groupsRef.length <= 1) return;
+                    _groupsRef.splice(gi, 1);
+                    renderTriggerGroups(_groupsRef);
+                });
+                right.appendChild(addBtn);
+                right.appendChild(rmGroup);
+                header.appendChild(title);
+                header.appendChild(right);
+                wrap.appendChild(header);
+
+                const condList = g.conditions && g.conditions.length ? g.conditions : [defaultCondition()];
+                g.conditions = condList;
+                condList.forEach((c, ci) => {
+                    const rowWrap = document.createElement('div');
+                    rowWrap.setAttribute('data-cond-index', String(ci));
+                    rowWrap.className = 'cond-row-block';
+
+                    const row = document.createElement('div');
+                    row.className = 'flex flex-wrap items-center gap-2';
+
+                    const errP = document.createElement('p');
+                    errP.className = 'cond-val-err rr-field-err hidden w-full';
+
+                    const inp = document.createElement('input');
+                    inp.type = 'number';
+                    inp.step = 'any';
+                    inp.className =
+                        'cond-val num-input rr-input rr-input--flush w-28 max-w-full text-xs py-1.5 tabular-nums pr-2';
+                    const m0 = c.metric || 'costDiff';
+                    inp.value = formatCondValForInput(m0, c.value);
+                    applyCondValInputRules(inp, m0);
+
+                    const inpWrap = document.createElement('div');
+                    inpWrap.className = 'relative inline-flex items-center max-w-full shrink-0';
+                    const pctSuffix = document.createElement('span');
+                    pctSuffix.className =
+                        'cond-pct-suffix pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs leading-none';
+                    pctSuffix.textContent = '%';
+                    pctSuffix.setAttribute('aria-hidden', 'true');
+                    inpWrap.appendChild(inp);
+                    inpWrap.appendChild(pctSuffix);
+
+                    const rangeHint = document.createElement('span');
+                    rangeHint.className = 'cond-rate-range-hint text-[10px] text-slate-500 whitespace-nowrap shrink-0';
+                    rangeHint.textContent = '取值范围: 0~100';
+
+                    const valCluster = document.createElement('div');
+                    valCluster.className = 'flex items-center gap-2 shrink-0 min-w-0';
+                    valCluster.appendChild(inpWrap);
+
+                    function setRateChrome(metric) {
+                        const show = isRateMetric(metric);
+                        pctSuffix.classList.toggle('hidden', !show);
+                        rangeHint.classList.toggle('hidden', !show);
+                        inp.classList.toggle('pr-7', show);
+                        inp.classList.toggle('pr-2', !show);
+                    }
+                    setRateChrome(m0);
+
+                    const ms = createCustomDropdown(
+                        METRICS.map((m) => ({ value: m.key, label: m.label })),
+                        m0,
+                        {
+                            hiddenClass: 'cond-metric',
+                            widthClass: 'rr-dd-metric shrink-0',
+                            sm: true,
+                            onChange: (newMetric) => {
+                                applyCondValInputRules(inp, newMetric);
+                                setRateChrome(newMetric);
+                                setCondValFieldError(inp, errP, '');
+                            },
+                        }
+                    );
+                    const os = createCustomDropdown(
+                        OPS.map((o) => ({ value: o.key, label: o.label })),
+                        c.op || 'gt',
+                        { hiddenClass: 'cond-op', widthClass: 'rr-dd-op shrink-0', sm: true }
+                    );
+
+                    const syncRateOnBlur = () => {
+                        const m = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                        if (!isRateMetric(m)) return;
+                        inp.value = formatRatePercentFieldValue(parseFloat(inp.value));
+                    };
+                    const onCondValBlur = () => {
+                        syncRateOnBlur();
+                        const m = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                        const msg = triggerCondValueErrorMsg(inp.value, m);
+                        setCondValFieldError(inp, errP, msg);
+                    };
+                    inp.addEventListener('blur', onCondValBlur);
+                    inp.addEventListener('change', syncRateOnBlur);
+                    inp.addEventListener('input', () => setCondValFieldError(inp, errP, ''));
+
+                    const rm = document.createElement('button');
+                    rm.type = 'button';
+                    rm.className = 'text-xs text-slate-500 hover:text-rose-400 px-1.5 py-0.5 rounded hover:bg-slate-800/80';
+                    rm.textContent = '删除';
+                    rm.addEventListener('click', () => {
+                        syncTriggerGroupsFromDom();
+                        const grp = _groupsRef[gi];
+                        if (!grp || !grp.conditions || grp.conditions.length <= 1) return;
+                        grp.conditions.splice(ci, 1);
+                        renderTriggerGroups(_groupsRef);
+                    });
+
+                    row.appendChild(ms);
+                    row.appendChild(os);
+                    row.appendChild(valCluster);
+                    row.appendChild(rm);
+                    row.appendChild(rangeHint);
+                    rowWrap.appendChild(row);
+                    rowWrap.appendChild(errP);
+                    wrap.appendChild(rowWrap);
+                });
+
+                host.appendChild(wrap);
+            });
+            lucide.createIcons();
+            rrScheduleDirtyCheck();
+        }
+
+        function applyData(data) {
+            if (!data || data.success === false) return;
+            clearStrategyValidationBanner();
+            document.getElementById('cfgEnabled').checked = !!data.enabled;
+            syncEnabledLabel();
+            const hl = !!data.browser_headless;
+            document.getElementById('btnHeadful').classList.toggle('seg-btn-active', !hl);
+            document.getElementById('btnHeadless').classList.toggle('seg-btn-active', hl);
+            const rrBx = document.getElementById('rrBrowserExecutable');
+            if (rrBx) rrBx.value = (data.browser_executable_path != null) ? String(data.browser_executable_path) : '';
+
+            const perStr = !!data.per_strategy_rate_limit;
+            const elPs = document.getElementById('perStrategyRateLimit');
+            if (elPs) elPs.checked = perStr;
+
+            let invRoot = data.interval;
+            if (!invRoot || typeof invRoot !== 'object') {
+                const st0 = (data.strategies || [])[0];
+                const rLegacy = data.retargeting;
+                invRoot =
+                    (st0 && st0.retargeting && st0.retargeting.interval) ||
+                    (rLegacy && rLegacy.interval) ||
+                    {};
+            }
+            let ws = invRoot.window_seconds;
+            if (ws == null && invRoot.window_hours != null) {
+                ws = Number(invRoot.window_hours) * 3600;
+            }
+            if (ws == null || !Number.isFinite(Number(ws))) ws = RR_DEFAULT_INTERVAL_WINDOW_SECONDS;
+            const mc = invRoot.max_count != null ? invRoot.max_count : 1;
+            document.getElementById('intervalWindowSeconds').value = ws;
+            document.getElementById('intervalMaxCount').value = mc;
+
+            const gInv = {
+                window_seconds: Number.isFinite(parseFloat(ws)) ? parseFloat(ws) : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                max_count: Number.isFinite(parseInt(mc, 10)) && parseInt(mc, 10) >= 1 ? parseInt(mc, 10) : 1,
+            };
+
+            strategyRenameIndex = null;
+            if (Array.isArray(data.strategies) && data.strategies.length) {
+                strategiesState = data.strategies.map((s, i) => {
+                    const invRaw = (s.retargeting && s.retargeting.interval) || {};
+                    let wsS = invRaw.window_seconds;
+                    if (wsS == null && invRaw.window_hours != null) wsS = Number(invRaw.window_hours) * 3600;
+                    if (wsS == null || !Number.isFinite(Number(wsS))) wsS = RR_DEFAULT_INTERVAL_WINDOW_SECONDS;
+                    const mcS = invRaw.max_count != null ? invRaw.max_count : 1;
+                    const sInv = {
+                        window_seconds: Number.isFinite(parseFloat(wsS))
+                            ? parseFloat(wsS)
+                            : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                        max_count:
+                            Number.isFinite(parseInt(mcS, 10)) && parseInt(mcS, 10) >= 1
+                                ? parseInt(mcS, 10)
+                                : 1,
+                    };
+                    const mergedInv = perStr ? sInv : gInv;
+                    return {
+                        id: s.id || genStrategyId(),
+                        title: (s.title || '').trim() || defaultStrategyTitle(i),
+                        trigger: s.trigger || defaultTriggerPayload(),
+                        retargeting: {
+                            ...(s.retargeting || defaultRetargetingPayload(gInv)),
+                            interval: mergedInv,
+                        },
+                    };
+                });
+            } else {
+                const t = data.trigger || defaultTriggerPayload();
+                const r = data.retargeting || defaultRetargetingPayload(gInv);
+                strategiesState = [
+                    {
+                        id: genStrategyId(),
+                        title: defaultStrategyTitle(0),
+                        trigger: t,
+                        retargeting: { ...r, interval: gInv },
+                    },
+                ];
+            }
+            activeStrategyIndex = 0;
+            renderStrategyTabs();
+            applyStrategyToDom(0);
+            updatePerStrategyRateLimitUi();
+            rrMarkSavedSnapshot();
+        }
+
+        function syncEnabledLabel() {
+            const on = document.getElementById('cfgEnabled').checked;
+            const el = document.getElementById('enabledLabel');
+            el.textContent = on ? '已启用' : '关闭';
+            el.className = on
+                ? 'text-xs text-emerald-400 shrink-0 tabular-nums min-w-[2.5rem]'
+                : 'text-xs text-slate-500 shrink-0 tabular-nums min-w-[2.5rem]';
+        }
+
+        function syncMethodPanels() {
+            const m = document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            document.getElementById('panelVolume').classList.toggle('hidden', m !== 'volume');
+            document.getElementById('panelCost').classList.toggle('hidden', m !== 'cost_control');
+        }
+
+        function syncGoalPanels() {
+            const g = document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            document.getElementById('panelNetRoi').classList.toggle('hidden', g !== 'net_roi');
+            document.getElementById('panelLiveRoom').classList.toggle('hidden', g !== 'live_room');
+        }
+
+        function updateSuffixCount() {
+            const v = document.getElementById('taskSuffix').value;
+            document.getElementById('suffixCount').textContent = String(v.length);
+        }
+
+        function updateImmSuffixCount() {
+            const el = document.getElementById('immTaskSuffix');
+            const cnt = document.getElementById('immSuffixCount');
+            if (!el || !cnt) return;
+            cnt.textContent = String(el.value.length);
+        }
+
+        let _triggerGroupBtnBound = false;
+        function bindTriggerGroupRef() {
+            if (_triggerGroupBtnBound) return;
+            _triggerGroupBtnBound = true;
+            document.getElementById('btnAddGroup').addEventListener('click', () => {
+                syncTriggerGroupsFromDom();
+                _groupsRef.push(defaultGroup());
+                renderTriggerGroups(_groupsRef);
+                rrScheduleDirtyCheck();
+            });
+        }
+
+        /** 仅 ±0.5 与边界 [0.5, 24]，不自动对齐到 0.5 步进，非法值由校验提示 */
+        function applyDurationStep(delta) {
+            const el = document.getElementById('volDuration');
+            let x = parseFloat(el.value);
+            if (!Number.isFinite(x)) x = 1;
+            x = Math.min(24, Math.max(0.5, x + delta));
+            el.value = x;
+            validateRetargetingFields();
+        }
+
+        document.getElementById('durMinus').addEventListener('click', () => {
+            applyDurationStep(-0.5);
+            rrScheduleDirtyCheck();
+        });
+        document.getElementById('durPlus').addEventListener('click', () => {
+            applyDurationStep(0.5);
+            rrScheduleDirtyCheck();
+        });
+        document.getElementById('volDuration').addEventListener('input', () => validateRetargetingFields());
+        document.getElementById('volDuration').addEventListener('blur', () => validateRetargetingFields());
+
+        document.getElementById('btnHeadful').addEventListener('click', () => {
+            document.getElementById('btnHeadful').classList.add('seg-btn-active');
+            document.getElementById('btnHeadless').classList.remove('seg-btn-active');
+            rrScheduleDirtyCheck();
+        });
+        document.getElementById('btnHeadless').addEventListener('click', () => {
+            document.getElementById('btnHeadless').classList.add('seg-btn-active');
+            document.getElementById('btnHeadful').classList.remove('seg-btn-active');
+            rrScheduleDirtyCheck();
+        });
+        const rrBx = document.getElementById('rrBrowserExecutable');
+        if (rrBx) {
+            rrBx.addEventListener('input', () => rrScheduleDirtyCheck());
+            rrBx.addEventListener('change', () => rrScheduleDirtyCheck());
+        }
+
+        document.querySelectorAll('.method-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                document.querySelectorAll('.method-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncMethodPanels();
+                validateRetargetingFields();
+                rrScheduleDirtyCheck();
+            });
+        });
+        document.querySelectorAll('.goal-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                document.querySelectorAll('.goal-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncGoalPanels();
+                validateRetargetingFields();
+                rrScheduleDirtyCheck();
+            });
+        });
+
+        ['volBudget', 'ccDailyNet', 'ccRoiTarget', 'ccDailyLive', 'ccBid'].forEach((id) => {
+            const el = document.getElementById(id);
+            el.addEventListener('input', () => validateRetargetingFields());
+            el.addEventListener('blur', () => validateRetargetingFields());
+        });
+        ['intervalWindowSeconds', 'intervalMaxCount'].forEach((id) => {
+            const el = document.getElementById(id);
+            el.addEventListener('input', () => validateRetargetingFields());
+            el.addEventListener('blur', () => validateRetargetingFields());
+        });
+
+        document.getElementById('cfgEnabled').addEventListener('change', async () => {
+            const cb = document.getElementById('cfgEnabled');
+            const prev = !cb.checked;
+            const api = getApi();
+            if (!api || !api.setRuleRetargetingConfig) {
+                cb.checked = prev;
+                syncEnabledLabel();
+                notifyErr('无法连接本地服务');
+                return;
+            }
+            if (cb.checked) {
+                const { ok, vt, vr, failedStrategyIndex } = runRuleRetargetingValidation();
+                if (!ok) {
+                    cb.checked = false;
+                    syncEnabledLabel();
+                    presentRuleRetargetingValidationFailure(vt, vr, { failedStrategyIndex });
+                    return;
+                }
+            }
+            try {
+                const res = await api.setRuleRetargetingConfig(collectPayload());
+                if (res && res.success) {
+                    syncEnabledLabel();
+                    rrMarkSavedSnapshot();
+                } else {
+                    cb.checked = prev;
+                    syncEnabledLabel();
+                    notifyErr((res && res.message) || '保存失败');
+                }
+            } catch (e) {
+                cb.checked = prev;
+                syncEnabledLabel();
+                notifyErr(String(e && e.message ? e.message : e));
+            }
+        });
+        document.getElementById('taskSuffix').addEventListener('input', updateSuffixCount);
+        document.getElementById('immTaskSuffix').addEventListener('input', updateImmSuffixCount);
+
+        function syncImmediateMethodPanels() {
+            const m =
+                document.querySelector('.imm-method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            const pv = document.getElementById('immPanelVolume');
+            const pc = document.getElementById('immPanelCost');
+            if (pv) pv.classList.toggle('hidden', m !== 'volume');
+            if (pc) pc.classList.toggle('hidden', m !== 'cost_control');
+        }
+        function syncImmediateGoalPanels() {
+            const g =
+                document.querySelector('.imm-goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            document.getElementById('immPanelNetRoi')?.classList.toggle('hidden', g !== 'net_roi');
+            document.getElementById('immPanelLiveRoom')?.classList.toggle('hidden', g !== 'live_room');
+        }
+        function syncImmediateModalFromMain() {
+            const method = document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            document.querySelectorAll('.imm-method-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-method') === method);
+            });
+            const goal = document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            document.querySelectorAll('.imm-goal-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-goal') === goal);
+            });
+            const vb = document.getElementById('volBudget');
+            const vd = document.getElementById('volDuration');
+            if (document.getElementById('immVolBudget')) document.getElementById('immVolBudget').value = vb ? vb.value : '';
+            if (document.getElementById('immVolDuration')) document.getElementById('immVolDuration').value = vd ? vd.value : '';
+            const n0 = document.getElementById('ccDailyNet');
+            const n1 = document.getElementById('ccRoiTarget');
+            const l0 = document.getElementById('ccDailyLive');
+            const l1 = document.getElementById('ccBid');
+            if (document.getElementById('immCcDailyNet')) document.getElementById('immCcDailyNet').value = n0 ? n0.value : '';
+            if (document.getElementById('immCcRoiTarget')) document.getElementById('immCcRoiTarget').value = n1 ? n1.value : '';
+            if (document.getElementById('immCcDailyLive')) document.getElementById('immCcDailyLive').value = l0 ? l0.value : '';
+            if (document.getElementById('immCcBid')) document.getElementById('immCcBid').value = l1 ? l1.value : '';
+            const ts = document.getElementById('taskSuffix');
+            if (document.getElementById('immTaskSuffix')) {
+                document.getElementById('immTaskSuffix').value = ts ? ts.value : '';
+                updateImmSuffixCount();
+            }
+            syncImmediateMethodPanels();
+            syncImmediateGoalPanels();
+        }
+        function collectImmediateRetargeting() {
+            const method =
+                document.querySelector('.imm-method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            const goal = document.querySelector('.imm-goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            const volBudget = document.getElementById('immVolBudget').value.trim();
+            const volDur = parseFloat(document.getElementById('immVolDuration').value);
+            const ws = parseFloat(document.getElementById('intervalWindowSeconds').value);
+            const mc = parseInt(document.getElementById('intervalMaxCount').value, 10);
+            return {
+                method,
+                volume: {
+                    total_budget_yuan: volBudget === '' ? null : parseFloat(volBudget),
+                    duration_hours: Number.isFinite(volDur) ? volDur : 1,
+                },
+                cost_control: {
+                    optimization_goal: goal,
+                    net_roi: {
+                        daily_budget_yuan: (() => {
+                            const v = document.getElementById('immCcDailyNet').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                        net_roi_target: (() => {
+                            const v = document.getElementById('immCcRoiTarget').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                    },
+                    live_room: {
+                        daily_budget_yuan: (() => {
+                            const v = document.getElementById('immCcDailyLive').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                        bid_per_conversion_yuan: (() => {
+                            const v = document.getElementById('immCcBid').value.trim();
+                            return v === '' ? null : parseFloat(v);
+                        })(),
+                    },
+                },
+                task_name_suffix: (() => {
+                    const t = document.getElementById('immTaskSuffix').value.trim().slice(0, 15);
+                    return t || RR_DEFAULT_TASK_NAME_SUFFIX;
+                })(),
+                interval: {
+                    window_seconds: Number.isFinite(ws) ? ws : RR_DEFAULT_INTERVAL_WINDOW_SECONDS,
+                    max_count: Number.isFinite(mc) && mc >= 1 ? mc : 1,
+                },
+            };
+        }
+        function applyImmediateDurationStep(delta) {
+            const el = document.getElementById('immVolDuration');
+            let x = parseFloat(el.value);
+            if (!Number.isFinite(x)) x = 1;
+            x = Math.min(24, Math.max(0.5, x + delta));
+            el.value = x;
+            if (typeof window.clearImmediateErrorByInputId === 'function') {
+                window.clearImmediateErrorByInputId('immVolDuration');
+            }
+        }
+        /** 即刻追投弹窗内提示（避免全局 toast 被 z-[10060] 遮挡） */
+        function clearImmediateModalMessage() {
+            const el = document.getElementById('immModalAlert');
+            if (!el) return;
+            el.textContent = '';
+            el.classList.add('hidden');
+            el.classList.remove(
+                'border-red-500/45',
+                'bg-red-950/55',
+                'text-red-100',
+                'border-emerald-500/40',
+                'bg-emerald-950/45',
+                'text-emerald-100'
+            );
+        }
+        function setImmediateModalMessage(kind, msg) {
+            const el = document.getElementById('immModalAlert');
+            if (!el) return;
+            if (!msg) {
+                clearImmediateModalMessage();
+                return;
+            }
+            el.textContent = msg;
+            el.classList.remove('hidden');
+            el.classList.remove(
+                'border-red-500/45',
+                'bg-red-950/55',
+                'text-red-100',
+                'border-emerald-500/40',
+                'bg-emerald-950/45',
+                'text-emerald-100'
+            );
+            if (kind === 'success') {
+                el.classList.add('border-emerald-500/40', 'bg-emerald-950/45', 'text-emerald-100');
+            } else {
+                el.classList.add('border-red-500/45', 'bg-red-950/55', 'text-red-100');
+            }
+            try {
+                el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            } catch (e) {}
+        }
+        function setImmediateSubmitLoading(loading) {
+            const btn = document.getElementById('btnImmediateSubmit');
+            const spin = document.getElementById('btnImmediateSubmitSpinner');
+            const lab = document.getElementById('btnImmediateSubmitLabel');
+            if (!btn) return;
+            btn.disabled = !!loading;
+            btn.setAttribute('aria-busy', loading ? 'true' : 'false');
+            if (spin) spin.classList.toggle('hidden', !loading);
+            if (lab) lab.textContent = loading ? '追投中' : '追投';
+        }
+        function openImmediateModal() {
+            syncImmediateModalFromMain();
+            clearImmediateModalMessage();
+            setImmediateSubmitLoading(false);
+            if (typeof window.clearImmediateFieldErrors === 'function') window.clearImmediateFieldErrors();
+            document.getElementById('immMaterialId').value = '';
+            const m = document.getElementById('modalImmediateRetarget');
+            m.classList.remove('hidden');
+            m.setAttribute('aria-hidden', 'false');
+            try {
+                lucide.createIcons();
+            } catch (e) {}
+        }
+        function closeImmediateModal() {
+            clearImmediateModalMessage();
+            setImmediateSubmitLoading(false);
+            if (typeof window.clearImmediateFieldErrors === 'function') window.clearImmediateFieldErrors();
+            const m = document.getElementById('modalImmediateRetarget');
+            m.classList.add('hidden');
+            m.setAttribute('aria-hidden', 'true');
+        }
+        function validateImmediateRetargetingInput() {
+            clearImmediateModalMessage();
+            if (typeof window.validateImmediateModalFields !== 'function') {
+                setImmediateModalMessage('error', '校验脚本未加载，请刷新页面');
+                return false;
+            }
+            const r = window.validateImmediateModalFields();
+            if (!r.ok && r.firstMsg) {
+                try {
+                    const bad = document.querySelector('#modalImmediateRetarget .rr-input--invalid');
+                    if (bad) bad.scrollIntoView({ block: 'center', behavior: 'smooth', inline: 'nearest' });
+                } catch (e) {}
+            }
+            return r.ok;
+        }
+
+        document.getElementById('btnImmediateRetarget').addEventListener('click', () => {
+            openImmediateModal();
+        });
+        document.getElementById('modalImmediateRetargetBackdrop').addEventListener('click', closeImmediateModal);
+        document.getElementById('btnImmediateClose').addEventListener('click', closeImmediateModal);
+        document.getElementById('btnImmediateCancel').addEventListener('click', closeImmediateModal);
+        document.getElementById('immDurMinus').addEventListener('click', () => applyImmediateDurationStep(-0.5));
+        document.getElementById('immDurPlus').addEventListener('click', () => applyImmediateDurationStep(0.5));
+        document.querySelectorAll('.imm-method-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                clearImmediateModalMessage();
+                if (typeof window.clearImmediateFieldErrors === 'function') window.clearImmediateFieldErrors();
+                document.querySelectorAll('.imm-method-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncImmediateMethodPanels();
+            });
+        });
+        document.querySelectorAll('.imm-goal-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                clearImmediateModalMessage();
+                if (typeof window.clearImmediateFieldErrors === 'function') window.clearImmediateFieldErrors();
+                document.querySelectorAll('.imm-goal-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncImmediateGoalPanels();
+            });
+        });
+        document.getElementById('modalImmediateRetarget').addEventListener('input', (e) => {
+            if (e.target && e.target.closest && e.target.closest('#modalImmediateRetarget')) {
+                const id = e.target.id || '';
+                if (
+                    id === 'immMaterialId' ||
+                    id.startsWith('immVol') ||
+                    id.startsWith('immCc') ||
+                    id === 'immTaskSuffix'
+                ) {
+                    clearImmediateModalMessage();
+                    if (typeof window.clearImmediateErrorByInputId === 'function') {
+                        window.clearImmediateErrorByInputId(id);
+                    }
+                }
+            }
+        });
+        (function bindImmModalBlurValidate() {
+            const root = document.getElementById('modalImmediateRetarget');
+            if (!root) return;
+            const blurIds = new Set([
+                'immMaterialId',
+                'immVolBudget',
+                'immVolDuration',
+                'immCcDailyNet',
+                'immCcRoiTarget',
+                'immCcDailyLive',
+                'immCcBid',
+                'immTaskSuffix',
+            ]);
+            root.addEventListener(
+                'focusout',
+                (e) => {
+                    const t = e.target;
+                    if (!t || !t.id || !blurIds.has(t.id)) return;
+                    if (typeof window.validateImmediateFieldOnBlur !== 'function') return;
+                    window.validateImmediateFieldOnBlur(t.id);
+                },
+                false
+            );
+        })();
+        document.getElementById('btnImmediateSubmit').addEventListener('click', async () => {
+            if (!validateImmediateRetargetingInput()) return;
+            const api = getApi();
+            if (!api || !api.runImmediateRetargetPrepare) {
+                setImmediateModalMessage('error', '无法连接本地服务');
+                return;
+            }
+            setImmediateSubmitLoading(true);
+            clearImmediateModalMessage();
+            let successCloseScheduled = false;
+            try {
+                const res = await api.runImmediateRetargetPrepare(
+                    document.getElementById('immMaterialId').value.trim(),
+                    collectImmediateRetargeting()
+                );
+                if (res && res.success) {
+                    const okMsg = res.message || '已打开浏览器，请在页面内手动提交';
+                    setImmediateModalMessage('success', okMsg);
+                    successCloseScheduled = true;
+                    window.setTimeout(() => {
+                        closeImmediateModal();
+                    }, 1400);
+                } else {
+                    setImmediateModalMessage('error', (res && res.message) || '追投失败');
+                }
+            } catch (e) {
+                setImmediateModalMessage('error', String(e && e.message ? e.message : e));
+            } finally {
+                if (!successCloseScheduled) setImmediateSubmitLoading(false);
+            }
+        });
+
+        document.getElementById('btnSave').addEventListener('click', async () => {
+            const api = getApi();
+            if (!api || !api.setRuleRetargetingConfig) {
+                notifyErr('无法连接本地服务');
+                return;
+            }
+            const { ok, vt, vr, failedStrategyIndex } = runRuleRetargetingValidation();
+            if (!ok) {
+                presentRuleRetargetingValidationFailure(vt, vr, { failedStrategyIndex });
+                return;
+            }
+            const payload = collectPayload();
+            const res = await api.setRuleRetargetingConfig(payload);
+            if (res && res.success) {
+                notifyOk('配置保存成功');
+                rrMarkSavedSnapshot();
+            } else {
+                const msg = (res && res.message) || '保存失败';
+                notifyErr(msg);
+            }
+        });
+
+        document.getElementById('btnReload').addEventListener('click', async () => {
+            const api = await waitForApi();
+            if (!api) return;
+            const res = await api.getRuleRetargetingConfig();
+            applyData(res);
+        });
+
+        ensureRrDdGlobalClose();
+        bindTriggerGroupRef();
+        const perStrEl = document.getElementById('perStrategyRateLimit');
+        if (perStrEl) perStrEl.addEventListener('change', onPerStrategyRateLimitChange);
+        document.getElementById('btnSegGlobal')?.addEventListener('click', () => {
+            const cb = document.getElementById('perStrategyRateLimit');
+            if (!cb || !cb.checked) return;
+            cb.checked = false;
+            cb.dispatchEvent(new Event('change', { bubbles: true }));
+            rrScheduleDirtyCheck();
+        });
+        document.getElementById('btnSegStrategy')?.addEventListener('click', () => {
+            const cb = document.getElementById('perStrategyRateLimit');
+            if (!cb || cb.checked) return;
+            cb.checked = true;
+            cb.dispatchEvent(new Event('change', { bubbles: true }));
+            rrScheduleDirtyCheck();
+        });
+        strategiesState = [
+            {
+                id: genStrategyId(),
+                title: defaultStrategyTitle(0),
+                trigger: defaultTriggerPayload(),
+                retargeting: defaultRetargetingPayload(),
+            },
+        ];
+        activeStrategyIndex = 0;
+        renderStrategyTabs();
+        applyStrategyToDom(0);
+        updatePerStrategyRateLimitUi();
+        rrMarkSavedSnapshot();
+
+        (async function init() {
+            const api = await waitForApi();
+            if (api) {
+                const res = await api.getRuleRetargetingConfig();
+                applyData(res);
+                if (!res || res.success === false) rrMarkSavedSnapshot();
+            } else {
+                document.getElementById('btnHeadless').classList.add('seg-btn-active');
+                document.getElementById('btnHeadful').classList.remove('seg-btn-active');
+                syncMethodPanels();
+                syncGoalPanels();
+                rrMarkSavedSnapshot();
+            }
+        })();
+
+        (function bindRuleRetargetingUnsavedListeners() {
+            const pane = document.getElementById('tabPaneConfig');
+            if (pane) {
+                pane.addEventListener('input', rrScheduleDirtyCheck);
+                pane.addEventListener('change', rrScheduleDirtyCheck);
+            }
+            document.addEventListener('visibilitychange', function () {
+                if (!document.hidden) rrRefreshUnsavedHint();
+            });
+            window.addEventListener('focus', rrRefreshUnsavedHint);
+        })();
+    </script>
+    <!-- 与 rule_retargeting_runs.html #runsToast 同款；内联 SVG 避免父页 lucide 未渲染到弹层时无图标 -->
+    <div id="runsLiftedToast" class="fixed top-4 left-1/2 transform -translate-x-1/2 z-[10070] bg-slate-800 text-white px-4 py-2 rounded-lg shadow-lg border border-slate-600 opacity-0 transition-opacity duration-300 pointer-events-none">
+        <div class="flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0" aria-hidden="true">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <polyline points="22 4 12 14.01 9 11.01" />
+            </svg>
+            <span id="runsLiftedToastMsg">复制成功</span>
+        </div>
+    </div>
+    <script>
+        (function () {
+            /** 与 components/rule_retargeting_runs.html showRunsToast 一致 */
+            function showRunsLiftedToast(message) {
+                var toast = document.getElementById('runsLiftedToast');
+                var toastMessage = document.getElementById('runsLiftedToastMsg');
+                if (!toast || !toastMessage) return;
+                toastMessage.textContent = message;
+                toast.classList.remove('opacity-0');
+                toast.classList.add('opacity-100');
+                clearTimeout(toast._runsT);
+                toast._runsT = setTimeout(function () {
+                    toast.classList.remove('opacity-100');
+                    toast.classList.add('opacity-0');
+                }, 2000);
+            }
+            function copyRunsLiftedFallback(text, msg) {
+                var textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.opacity = '0';
+                document.body.appendChild(textarea);
+                textarea.select();
+                try {
+                    document.execCommand('copy');
+                    showRunsLiftedToast(msg);
+                } catch (err) {
+                    showRunsLiftedToast('复制失败');
+                }
+                document.body.removeChild(textarea);
+            }
+            document.addEventListener(
+                'click',
+                function (e) {
+                    var copyBtn = e.target.closest && e.target.closest('.runs-copy');
+                    if (!copyBtn) return;
+                    var root = copyBtn.closest('#modalRet') || copyBtn.closest('#modalTrig') || copyBtn.closest('#modalQuery');
+                    if (!root) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var txt = copyBtn.getAttribute('data-copy');
+                    if (!txt) return;
+                    var toast = copyBtn.getAttribute('data-toast') || '已复制到剪贴板';
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(txt).then(
+                            function () {
+                                showRunsLiftedToast(toast);
+                            },
+                            function () {
+                                copyRunsLiftedFallback(txt, toast);
+                            }
+                        );
+                    } else {
+                        copyRunsLiftedFallback(txt, toast);
+                    }
+                },
+                true
+            );
+        })();
+    </script>
+</body>
+</html>

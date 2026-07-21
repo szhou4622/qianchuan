@@ -1,0 +1,1457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>千川素材监控系统</title>
+    <script src="js/tailwindcss.js"></script>
+    <script src="js/lucide.js"></script>
+    <script src="js/messagebox.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; overflow: hidden; }
+        body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
+
+        /* 左侧菜单 */
+        .sidebar { width: 260px; background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%); border-right: 1px solid #334155; display: flex; flex-direction: column; transition: width 0.2s ease; }
+        .sidebar-header { padding: 16px 12px; border-bottom: 1px solid #334155; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+        .sidebar-header-left { min-width: 0; }
+        .sidebar-title { font-size: 16px; font-weight: 700; color: #38bdf8; }
+        .sidebar-subtitle { font-size: 11px; color: #64748b; margin-top: 4px; }
+        .collapse-btn { width: 34px; height: 34px; border-radius: 10px; border: none; background: transparent; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: color 0.15s ease, opacity 0.15s ease; flex: none; color: #94a3b8; opacity: 0.9; }
+        .collapse-btn:hover { color: #e2e8f0; opacity: 1; }
+        .collapse-btn i { width: 18px; height: 18px; }
+
+        .menu-list { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 8px; }
+
+        /* 左下角用户区（与上方菜单之间无顶部分隔线；账号区与版本区分隔线在版本区上方） */
+        .sidebar-footer {
+            flex-shrink: 0;
+            padding: 12px 10px;
+            background: rgba(15, 23, 42, 0.6);
+        }
+        .sidebar-footer-rule {
+            border-top: 1px solid #334155;
+            margin: 12px 0 0;
+        }
+        .sidebar-user-btn {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            gap: 8px;
+            padding: 10px 8px 10px 10px;
+            border-radius: 10px;
+            background: rgba(30, 41, 59, 0.42);
+            color: #e2e8f0;
+            cursor: pointer;
+            text-align: left;
+        }
+        .sidebar-user-btn:hover {
+            background: rgba(30, 41, 59, 0.62);
+        }
+        .sidebar-user-top {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+        .sidebar-user-avatar-wrap {
+            flex-shrink: 0;
+            padding: 0;
+            border-radius: 50%;
+            background: transparent;
+        }
+        .sidebar-user-avatar {
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            background: linear-gradient(160deg, #0ea5e9 0%, #6366f1 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            border: 2px solid rgba(148, 163, 184, 0.22);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.22);
+        }
+        .sidebar-user-avatar-letter {
+            font-size: 15px;
+            font-weight: 700;
+            color: #fff;
+            line-height: 1;
+            user-select: none;
+        }
+        .sidebar-user-kv {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .sidebar-kv-row {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 2px;
+            min-width: 0;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+        .sidebar-kv-label {
+            flex-shrink: 0;
+            color: #64748b;
+            font-weight: 500;
+        }
+        .sidebar-kv-label::after {
+            content: '：';
+        }
+        /* 紧跟在「账号：」「状态：」后面，不左右拉开 */
+        .sidebar-kv-value {
+            flex: 1;
+            min-width: 0;
+            color: #f8fafc;
+            font-weight: 600;
+            text-align: left;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sidebar-kv-value--status {
+            flex: 0 1 auto;
+            display: inline-block;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.2;
+            padding: 2px 7px;
+            border-radius: 6px;
+            white-space: nowrap;
+        }
+        .sidebar-user-status--muted {
+            color: #94a3b8;
+            background: rgba(15, 23, 42, 0.55);
+            border: 1px solid rgba(51, 65, 85, 0.7);
+        }
+        .sidebar-user-status--ok {
+            color: #4ade80;
+            background: rgba(74, 222, 128, 0.08);
+            border: 1px solid rgba(74, 222, 128, 0.28);
+        }
+        .sidebar-user-status--bad {
+            color: #f87171;
+            background: rgba(248, 113, 113, 0.06);
+            border: 1px solid rgba(248, 113, 113, 0.28);
+        }
+        /* 有效期：与账号/状态同一行「有效期：时间」，时间略小字号 */
+        .sidebar-user-valid-row {
+            width: 100%;
+            margin: 0;
+            padding: 8px 0 0;
+            border-top: 1px solid rgba(51, 65, 85, 0.45);
+            box-sizing: border-box;
+        }
+        .sidebar-kv-value--date {
+            flex: 1;
+            min-width: 0;
+            font-size: 10px;
+            font-weight: 600;
+            color: #cbd5e1;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.35;
+            text-align: left;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .sidebar.collapsed .sidebar-footer { padding: 10px 8px; }
+        .sidebar.collapsed .sidebar-user-kv,
+        .sidebar.collapsed .sidebar-user-valid-row,
+        .sidebar.collapsed .sidebar-user-chevron { display: none; }
+        .sidebar.collapsed .sidebar-user-top { justify-content: center; width: 100%; }
+        .sidebar.collapsed .sidebar-user-btn {
+            padding: 10px;
+        }
+        .sidebar.collapsed .sidebar-footer-rule { display: none; }
+
+        /* 登录弹窗 */
+        .login-modal-overlay {
+            display: none; position: fixed; inset: 0; z-index: 100;
+            background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(4px);
+            align-items: center; justify-content: center; padding: 16px;
+        }
+        .login-modal-overlay.show { display: flex; }
+        .login-modal {
+            width: 100%; max-width: 400px;
+            background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid #334155; border-radius: 16px;
+            padding: 24px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
+        }
+        .login-modal h2 { font-size: 18px; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+        .login-modal .sub { font-size: 12px; color: #64748b; margin-bottom: 20px; }
+        .login-modal label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+        .login-modal input {
+            width: 100%; padding: 10px 12px; border-radius: 8px;
+            border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
+            font-size: 14px; outline: none;
+        }
+        .login-modal input:focus { border-color: #38bdf8; }
+        .login-modal .field { margin-bottom: 14px; }
+        .login-modal .err { font-size: 12px; color: #f87171; margin-top: 8px; min-height: 18px; }
+        .login-modal .actions { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+        .login-modal .btn-cancel {
+            padding: 10px 16px; border-radius: 8px; border: 1px solid #475569;
+            background: transparent; color: #cbd5e1; cursor: pointer; font-size: 13px;
+        }
+        .login-modal .btn-cancel:hover { background: rgba(148, 163, 184, 0.1); }
+        .login-modal .btn-submit {
+            padding: 10px 20px; border-radius: 8px; border: none;
+            background: #38bdf8; color: #0f172a; font-weight: 600; cursor: pointer; font-size: 13px;
+        }
+        .login-modal .btn-submit:hover { background: #7dd3fc; }
+        .login-modal .btn-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* 版本信息弹窗（精简、无下载说明） */
+        .version-modal.login-modal {
+            max-width: 360px;
+            padding: 0;
+            overflow: hidden;
+            border-radius: 18px;
+            border: 1px solid rgba(51, 65, 85, 0.85);
+            box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(56, 189, 248, 0.06);
+        }
+        .version-modal-head {
+            padding: 22px 24px 16px;
+            background: linear-gradient(165deg, rgba(30, 41, 59, 0.95) 0%, rgba(15, 23, 42, 0.98) 100%);
+            border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+        }
+        .version-modal-head h2 {
+            margin: 0;
+            font-size: 17px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            color: #f8fafc;
+        }
+        .version-modal-body { padding: 8px 16px 16px; }
+        .version-row {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px;
+            padding: 12px 10px;
+            border-radius: 12px;
+            margin-top: 6px;
+            background: rgba(15, 23, 42, 0.45);
+            border: 1px solid rgba(51, 65, 85, 0.35);
+        }
+        .version-row:first-child { margin-top: 0; }
+        .version-row-label { font-size: 12px; color: #94a3b8; font-weight: 500; }
+        .version-row-value {
+            font-size: 14px; font-weight: 600; color: #f1f5f9;
+            font-variant-numeric: tabular-nums;
+        }
+        .version-status {
+            display: inline-block;
+            font-size: 12px; font-weight: 600;
+            padding: 4px 10px; border-radius: 999px;
+            white-space: nowrap;
+        }
+        .version-status--pending { color: #94a3b8; background: rgba(51, 65, 85, 0.4); }
+        .version-status--ok { color: #4ade80; background: rgba(34, 197, 94, 0.12); border: 1px solid rgba(74, 222, 128, 0.25); }
+        .version-status--update { color: #fbbf24; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); }
+        .version-status--fail { color: #f87171; background: rgba(248, 113, 113, 0.1); border: 1px solid rgba(248, 113, 113, 0.25); }
+        .version-modal .err { margin: 0 24px 12px; min-height: 0; }
+        .version-modal-actions.actions { margin-top: 0; padding: 16px 24px 22px; border-top: 1px solid rgba(51, 65, 85, 0.45); background: rgba(15, 23, 42, 0.35); }
+
+        /* 立即更新：加载中 */
+        #verUpdateNow.ver-update-loading {
+            cursor: wait;
+            opacity: 0.95;
+            pointer-events: none;
+        }
+        .ver-update-btn-row {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        .ver-update-spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.35);
+            border-top-color: rgba(255, 255, 255, 0.95);
+            border-radius: 50%;
+            animation: ver-update-spin 0.65s linear infinite;
+            flex-shrink: 0;
+        }
+        @keyframes ver-update-spin {
+            to { transform: rotate(360deg); }
+        }
+        #versionModalClose:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        /* 版本号：左为版本文案+红点；右为「检查更新」右对齐 */
+        .sidebar-version-wrap {
+            margin-top: 10px;
+            padding: 0 2px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .sidebar-version-left {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+            flex: 1;
+        }
+        .sidebar-check-update-btn {
+            -webkit-appearance: none; appearance: none;
+            margin: 0; padding: 0; border: none; background: none;
+            font: inherit; font-size: 12px; color: #94a3b8; cursor: pointer;
+            flex-shrink: 0;
+            transition: color 0.15s ease;
+        }
+        .sidebar-check-update-btn:hover { color: #38bdf8; }
+        .sidebar-check-update-btn:focus { outline: none; }
+        .sidebar-check-update-btn:focus-visible { color: #38bdf8; text-decoration: underline; text-underline-offset: 2px; }
+        .sidebar-version-link {
+            -webkit-appearance: none; appearance: none;
+            margin: 0; padding: 0; border: none; background: none;
+            font: inherit; font-size: 12px; color: #94a3b8; cursor: pointer;
+            min-width: 0;
+            flex: 1;
+            text-align: left;
+            transition: color 0.15s ease;
+        }
+        .sidebar-version-link:hover { color: #38bdf8; }
+        .sidebar-version-link:focus { outline: none; }
+        .sidebar-version-link:focus-visible { color: #38bdf8; text-decoration: underline; text-underline-offset: 2px; }
+        .sidebar-version-label {
+            display: block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .version-dot {
+            width: 8px; height: 8px; border-radius: 50%; background: #ef4444; flex-shrink: 0;
+            box-shadow: 0 0 8px rgba(239, 68, 68, 0.6); pointer-events: none;
+        }
+        .version-dot.hidden { display: none; }
+        .sidebar-version-fallback { display: none; }
+        .sidebar.collapsed .sidebar-version-label { display: none; }
+        .sidebar.collapsed .sidebar-version-fallback { display: inline; font-size: 11px; color: #94a3b8; }
+        .sidebar.collapsed .sidebar-version-wrap { justify-content: center; padding-left: 0; padding-right: 0; }
+        .sidebar.collapsed .sidebar-version-left { flex: none; justify-content: center; }
+        .sidebar.collapsed .sidebar-check-update-btn { display: none; }
+
+        /* 透明占位 border，避免 .active 切换时 1px 抖动；去掉 WebView2 默认焦点白边（outline） */
+        .menu-item {
+            display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 8px;
+            cursor: pointer; transition: background-color 0.2s, color 0.2s, border-color 0.2s;
+            margin-bottom: 4px; color: #94a3b8;
+            border: 1px solid transparent;
+            outline: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .menu-item:hover { background: rgba(56, 189, 248, 0.1); color: #e2e8f0; }
+        .menu-item.active { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3); }
+        .menu-item:focus:not(:focus-visible) { outline: none; }
+        .menu-item:focus-visible { outline: 2px solid rgba(56, 189, 248, 0.45); outline-offset: 2px; }
+        .menu-item svg { pointer-events: none; }
+        .menu-item i { width: 18px; height: 18px; }
+        .menu-item span { font-size: 13px; }
+
+        /* 收起态 */
+        .sidebar.collapsed { width: 64px; }
+        .sidebar.collapsed .sidebar-header-left { display: none; }
+        .sidebar.collapsed .sidebar-title,
+        .sidebar.collapsed .sidebar-subtitle,
+        .sidebar.collapsed .menu-item span { display: none; }
+        .sidebar.collapsed .sidebar-header { padding: 12px 0; justify-content: center; align-items: center; }
+        .sidebar.collapsed .collapse-btn { width: 40px; height: 40px; border-radius: 12px; }
+        .sidebar.collapsed .menu-list { padding: 12px 0; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+        .sidebar.collapsed .menu-item { justify-content: center; padding: 0; width: 44px; height: 44px; margin-bottom: 0; border-radius: 12px; }
+        .sidebar-user-chevron {
+            flex-shrink: 0;
+            align-self: center;
+            opacity: 0.75;
+            pointer-events: none;
+        }
+        .sidebar.collapsed .sidebar-user-chevron { display: none; }
+
+        /* 右侧主体 */
+        .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+
+        .iframe-container {
+            position: relative;
+            flex: 1;
+            background: #0f172a;
+            min-height: 0;
+        }
+        .iframe-stack {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            min-height: 0;
+        }
+        .iframe-stack .main-frame-page {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+            visibility: hidden;
+            pointer-events: none;
+            z-index: 0;
+        }
+        .iframe-stack .main-frame-page.is-active {
+            visibility: visible;
+            pointer-events: auto;
+            z-index: 1;
+        }
+        iframe { width: 100%; height: 100%; border: none; }
+        /* 切换菜单后、iframe 未加载完前：盖住旧页面，避免仍显示上一页（如服务控制） */
+        .iframe-loading-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 30;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            background: rgba(15, 23, 42, 0.96);
+            backdrop-filter: blur(6px);
+        }
+        .iframe-loading-overlay[hidden] { display: none !important; }
+        .iframe-loading-inner {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            padding: 24px;
+        }
+        .iframe-loading-spin {
+            display: block;
+            animation: qc-iframe-spin 0.85s linear infinite;
+        }
+        @keyframes qc-iframe-spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* 滚动条 */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    </style>
+</head>
+<body class="flex h-screen w-screen overflow-hidden">
+    <!-- 左侧菜单 -->
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-header-left">
+                <div class="flex items-center gap-2">
+                    <div class="p-2 bg-blue-500/20 rounded-lg text-blue-400">
+                        <i data-lucide="activity" class="w-[18px] h-[18px]"></i>
+                    </div>
+                    <div class="text-lg font-bold text-white tracking-wide" style="text-shadow: 0 0 10px rgba(56, 189, 248, 0.5);">千川素材看盘工具</div>
+                </div>
+            </div>
+            <button class="collapse-btn" id="sidebarToggle" title="收起/展开">
+                <i data-lucide="panel-left-close"></i>
+            </button>
+        </div>
+        <nav class="menu-list">
+            <div class="menu-item active" data-page="dashboard" data-title="数据大屏">
+                <i data-lucide="layout-dashboard"></i>
+                <span>数据大屏</span>
+            </div>
+            <div class="menu-item" data-page="control" data-title="服务控制">
+                <i data-lucide="play-circle"></i>
+                <span>服务控制</span>
+            </div>
+            <div class="menu-item" data-page="rule-retargeting" data-title="规则化追投">
+                <i data-lucide="crosshair"></i>
+                <span>规则化追投</span>
+            </div>
+            <div class="menu-item" data-page="rule-regulation" data-title="规则化停投">
+                <i data-lucide="sliders-horizontal"></i>
+                <span>规则化停投</span>
+            </div>
+            <div class="menu-item" data-page="tutorial" data-title="使用教程">
+                <i data-lucide="book-open"></i>
+                <span>使用教程</span>
+            </div>
+        </nav>
+        <div class="sidebar-footer">
+            <button type="button" class="sidebar-user-btn" id="sidebarUserBtn">
+                <div class="sidebar-user-top">
+                    <div class="sidebar-user-avatar-wrap" aria-hidden="true">
+                        <div class="sidebar-user-avatar">
+                            <span class="sidebar-user-avatar-letter" id="sidebarUserAvatarLetter">U</span>
+                        </div>
+                    </div>
+                    <div class="sidebar-user-kv">
+                        <div class="sidebar-kv-row">
+                            <span class="sidebar-kv-label">账号</span>
+                            <span class="sidebar-kv-value" id="sidebarUserName">未登录</span>
+                        </div>
+                        <div class="sidebar-kv-row">
+                            <span class="sidebar-kv-label">状态</span>
+                            <span class="sidebar-kv-value sidebar-kv-value--status sidebar-user-status--muted" id="sidebarUserStatus">未登录</span>
+                        </div>
+                    </div>
+                    <i data-lucide="chevron-right" class="w-4 h-4 text-slate-500 sidebar-user-chevron"></i>
+                </div>
+                <div class="sidebar-user-valid-row sidebar-kv-row">
+                    <span class="sidebar-kv-label">有效期</span>
+                    <span class="sidebar-kv-value sidebar-kv-value--date" id="sidebarUserValid">—</span>
+                </div>
+            </button>
+            <div class="sidebar-footer-rule" aria-hidden="true"></div>
+            <div class="sidebar-version-wrap">
+                <div class="sidebar-version-left">
+                    <span id="versionUpdateDot" class="version-dot hidden" aria-hidden="true"></span>
+                    <button type="button" class="sidebar-version-link" id="versionInfoBtn" title="版本信息">
+                        <span class="sidebar-version-label" id="sidebarVersionLabel">版本号: —</span>
+                        <span class="sidebar-version-fallback" aria-hidden="true">版</span>
+                    </button>
+                </div>
+                <button type="button" class="sidebar-check-update-btn" id="versionCheckBtn" title="检查更新">检查更新</button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 登录弹窗 -->
+    <div class="login-modal-overlay" id="loginModal" aria-hidden="true">
+        <div class="login-modal" role="dialog" aria-labelledby="loginModalTitle">
+            <h2 id="loginModalTitle">登录账号</h2>
+            <p class="sub" id="loginModalSub">登录后可在「服务控制」中启动采集；账号需在有效期内且未被禁用。</p>
+
+            <div id="loginFormPanel">
+                <form id="loginForm">
+                    <div class="field">
+                        <label for="loginUser">用户名</label>
+                        <input type="text" id="loginUser" name="username" autocomplete="username" placeholder="普通用户账号" />
+                    </div>
+                    <div class="field">
+                        <label for="loginPass">密码</label>
+                        <input type="password" id="loginPass" name="password" autocomplete="current-password" placeholder="密码" />
+                    </div>
+                    <div class="err" id="loginErr"></div>
+                    <div class="actions">
+                        <button type="button" class="btn-cancel" id="loginCancel">取消</button>
+                        <button type="submit" class="btn-submit" id="loginSubmit">登录</button>
+                    </div>
+                </form>
+            </div>
+
+            <div id="loggedPanel" style="display: none;">
+                <div class="rounded-lg border border-slate-600/80 bg-slate-950/40 p-3 mb-3 text-sm">
+                    <div class="text-slate-400 text-xs mb-1">当前账号</div>
+                    <div class="text-white font-semibold" id="loggedUserName">—</div>
+                    <div class="text-xs text-slate-400 mt-2">有效期：<span id="loggedRange">—</span></div>
+                    <div class="text-xs mt-1" id="loggedStatus"></div>
+                </div>
+                <div class="actions" style="justify-content: space-between;">
+                    <button type="button" class="btn-cancel" id="btnSwitchAccount">切换账号</button>
+                    <button type="button" class="btn-submit" style="background:#f87171;color:#fff;" id="btnLogout">退出登录</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 版本信息 -->
+    <div class="login-modal-overlay" id="versionModal" aria-hidden="true">
+        <div class="login-modal version-modal" role="dialog" aria-labelledby="versionModalTitle">
+            <div class="version-modal-head">
+                <h2 id="versionModalTitle">版本信息</h2>
+            </div>
+            <div class="version-modal-body">
+                <div class="version-row">
+                    <span class="version-row-label">当前版本</span>
+                    <span class="version-row-value" id="verCurrent">—</span>
+                </div>
+                <div class="version-row">
+                    <span class="version-row-label">最新版本</span>
+                    <span class="version-row-value" id="verLatest">—</span>
+                </div>
+                <div class="version-row">
+                    <span class="version-row-label">状态</span>
+                    <span id="verStatus" class="version-status version-status--pending">—</span>
+                </div>
+            </div>
+            <div class="err" id="verErr"></div>
+            <div class="actions version-modal-actions" style="justify-content: flex-end; flex-wrap: wrap; gap: 8px;">
+                <button type="button" class="btn-cancel" id="versionModalClose">关闭</button>
+                <button type="button" class="btn-submit" id="verUpdateNow" style="display: none; background: #22c55e; color: #fff;">立即更新</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 右侧主体（使用教程为独立 tutorial.html 占位页，见 static/tutorial.html） -->
+    <main class="main">
+        <div class="iframe-container">
+            <div id="iframeLoading" class="iframe-loading-overlay" hidden aria-busy="false">
+                <div class="iframe-loading-inner">
+                    <i data-lucide="loader-2" class="iframe-loading-spin w-10 h-10 text-sky-400" aria-hidden="true"></i>
+                    <p id="iframeLoadingHint" class="text-slate-400 text-sm mt-4 max-w-[240px] leading-relaxed">加载中…</p>
+                </div>
+            </div>
+            <div class="iframe-stack">
+                <!-- 数据大屏：独立 iframe，与规则化追投同理保活，轮询不中断 -->
+                <iframe id="frameDashboard" class="main-frame-page is-active" src="dashboard.html" title="数据大屏" onload="try{this.dataset.loaded='1'}catch(e){}"></iframe>
+                <!-- 服务控制 / 使用教程：共用 #contentFrame，切换菜单即改 src 重新加载 -->
+                <iframe id="contentFrame" class="main-frame-page" src="about:blank" title="主内容"></iframe>
+                <!-- 规则化追投：单独 iframe，首次进入后保活，避免未保存配置因切页丢失；页内「重新加载」可刷新 -->
+                <iframe id="frameRuleRetargeting" class="main-frame-page" title="规则化追投"></iframe>
+                <!-- 规则化停投：同上 -->
+                <iframe id="frameRuleRegulation" class="main-frame-page" title="规则化停投"></iframe>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        lucide.createIcons();
+
+        // 等待 pywebview API 加载完成后暴露给全局，供 iframe 子页面使用
+        function exposePywebviewAPI() {
+            if (window.pywebview && window.pywebview.api) {
+                // 暴露到 top（顶级窗口），让所有 iframe 都能访问
+                window.top.pywebviewAPI = window.pywebview.api;
+                // 同时在主窗口暴露一份
+                window.pywebviewAPI = window.pywebview.api;
+                console.log('pywebview API 已初始化');
+                return true;
+            }
+            return false;
+        }
+
+        // 优先使用官方 ready 事件（更稳定），同时保留轮询兜底
+        window.addEventListener('pywebviewready', function () {
+            exposePywebviewAPI();
+            if (typeof refreshVersionUI === 'function') refreshVersionUI();
+            if (typeof verifySavedSessionOnStartup === 'function') verifySavedSessionOnStartup();
+        });
+
+        (function initPywebviewAPI() {
+            if (exposePywebviewAPI()) return;
+            setTimeout(initPywebviewAPI, 100);
+        })();
+
+        const menuItems = document.querySelectorAll('.menu-item');
+        const iframeLoading = document.getElementById('iframeLoading');
+        const iframeLoadingHint = document.getElementById('iframeLoadingHint');
+
+        const pageMap = {
+            'dashboard': 'dashboard.html',
+            'control': 'control.html',
+            'rule-retargeting': 'rule_retargeting.html',
+            'rule-regulation': 'rule_regulation.html',
+            'tutorial': 'tutorial.html'
+        };
+
+        let iframeNavToken = 0;
+        let iframeLoadTimer = null;
+        /** 上一次为 iframe 注册的 load，快速切换菜单时需先移除，避免旧回调关掉新遮罩 */
+        let pendingIframeLoadHandler = null;
+        let pendingLoadFrame = null;
+
+        function showIframeLoading(hint) {
+            if (iframeLoadingHint) iframeLoadingHint.textContent = hint || '加载中…';
+            if (iframeLoading) {
+                iframeLoading.hidden = false;
+                iframeLoading.setAttribute('aria-busy', 'true');
+            }
+            lucide.createIcons();
+        }
+
+        function hideIframeLoading() {
+            if (iframeLoading) {
+                iframeLoading.hidden = true;
+                iframeLoading.setAttribute('aria-busy', 'false');
+            }
+        }
+
+        /**
+         * 数据大屏：#frameDashboard，仅首次设置 src，之后只显示/隐藏（保活轮询）。
+         * 服务控制 / 使用教程：共用 #contentFrame，每次切换改 src → 重新加载。
+         * 规则化追投 / 规则化停投：独立 iframe，仅首次设置 src，之后只显示/隐藏；刷新用页内「重新加载」。
+         */
+        function setMainFramePage(page) {
+            const url = pageMap[page] || 'dashboard.html';
+            const dashFrame = document.getElementById('frameDashboard');
+            const contentFrame = document.getElementById('contentFrame');
+            const rrFrame = document.getElementById('frameRuleRetargeting');
+            const rgFrame = document.getElementById('frameRuleRegulation');
+            if (!dashFrame || !contentFrame || !rrFrame || !rgFrame) return;
+
+            iframeNavToken += 1;
+            const myToken = iframeNavToken;
+
+            if (iframeLoadTimer) {
+                clearTimeout(iframeLoadTimer);
+                iframeLoadTimer = null;
+            }
+            if (pendingIframeLoadHandler && pendingLoadFrame) {
+                pendingLoadFrame.removeEventListener('load', pendingIframeLoadHandler);
+                pendingIframeLoadHandler = null;
+                pendingLoadFrame = null;
+            }
+
+            function cleanupFrameLoadListener() {
+                if (pendingIframeLoadHandler && pendingLoadFrame) {
+                    pendingLoadFrame.removeEventListener('load', pendingIframeLoadHandler);
+                    pendingIframeLoadHandler = null;
+                    pendingLoadFrame = null;
+                }
+                if (iframeLoadTimer) {
+                    clearTimeout(iframeLoadTimer);
+                    iframeLoadTimer = null;
+                }
+            }
+
+            if (page === 'dashboard') {
+                contentFrame.classList.remove('is-active');
+                rrFrame.classList.remove('is-active');
+                rgFrame.classList.remove('is-active');
+                dashFrame.classList.add('is-active');
+
+                if (dashFrame.dataset.loaded === '1') {
+                    hideIframeLoading();
+                    return;
+                }
+
+                function onDashLoad() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        dashFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                function fallbackDash() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        dashFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                showIframeLoading('正在加载页面…');
+
+                const noSrcDash =
+                    !dashFrame.hasAttribute('src') ||
+                    String(dashFrame.getAttribute('src')).trim() === '' ||
+                    (dashFrame.src && String(dashFrame.src).indexOf('about:blank') !== -1);
+                if (noSrcDash) {
+                    dashFrame.src = url;
+                }
+
+                pendingIframeLoadHandler = onDashLoad;
+                pendingLoadFrame = dashFrame;
+                dashFrame.addEventListener('load', onDashLoad);
+                iframeLoadTimer = setTimeout(fallbackDash, 20000);
+
+                try {
+                    if (
+                        dashFrame.contentWindow &&
+                        dashFrame.contentWindow.document &&
+                        dashFrame.contentWindow.document.readyState === 'complete'
+                    ) {
+                        dashFrame.dataset.loaded = '1';
+                        cleanupFrameLoadListener();
+                        hideIframeLoading();
+                    }
+                } catch (e) {}
+                return;
+            }
+
+            if (page === 'rule-retargeting') {
+                dashFrame.classList.remove('is-active');
+                contentFrame.classList.remove('is-active');
+                rgFrame.classList.remove('is-active');
+                rrFrame.classList.add('is-active');
+
+                if (rrFrame.dataset.loaded === '1') {
+                    hideIframeLoading();
+                    return;
+                }
+
+                function onRrLoad() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        rrFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                function fallbackRr() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        rrFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                showIframeLoading('正在加载页面…');
+
+                const noSrc =
+                    !rrFrame.hasAttribute('src') ||
+                    String(rrFrame.getAttribute('src')).trim() === '' ||
+                    (rrFrame.src && String(rrFrame.src).indexOf('about:blank') !== -1);
+                if (noSrc) {
+                    rrFrame.src = url;
+                }
+
+                pendingIframeLoadHandler = onRrLoad;
+                pendingLoadFrame = rrFrame;
+                rrFrame.addEventListener('load', onRrLoad);
+                iframeLoadTimer = setTimeout(fallbackRr, 20000);
+
+                try {
+                    if (
+                        rrFrame.contentWindow &&
+                        rrFrame.contentWindow.document &&
+                        rrFrame.contentWindow.document.readyState === 'complete'
+                    ) {
+                        rrFrame.dataset.loaded = '1';
+                        cleanupFrameLoadListener();
+                        hideIframeLoading();
+                    }
+                } catch (e) {}
+                return;
+            }
+
+            if (page === 'rule-regulation') {
+                dashFrame.classList.remove('is-active');
+                contentFrame.classList.remove('is-active');
+                rrFrame.classList.remove('is-active');
+                rgFrame.classList.add('is-active');
+
+                if (rgFrame.dataset.loaded === '1') {
+                    hideIframeLoading();
+                    return;
+                }
+
+                function onRgLoad() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        rgFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                function fallbackRg() {
+                    if (myToken !== iframeNavToken) return;
+                    try {
+                        rgFrame.dataset.loaded = '1';
+                    } catch (_) {}
+                    cleanupFrameLoadListener();
+                    hideIframeLoading();
+                }
+
+                showIframeLoading('正在加载页面…');
+
+                const noSrcRg =
+                    !rgFrame.hasAttribute('src') ||
+                    String(rgFrame.getAttribute('src')).trim() === '' ||
+                    (rgFrame.src && String(rgFrame.src).indexOf('about:blank') !== -1);
+                if (noSrcRg) {
+                    rgFrame.src = url;
+                }
+
+                pendingIframeLoadHandler = onRgLoad;
+                pendingLoadFrame = rgFrame;
+                rgFrame.addEventListener('load', onRgLoad);
+                iframeLoadTimer = setTimeout(fallbackRg, 20000);
+
+                try {
+                    if (
+                        rgFrame.contentWindow &&
+                        rgFrame.contentWindow.document &&
+                        rgFrame.contentWindow.document.readyState === 'complete'
+                    ) {
+                        rgFrame.dataset.loaded = '1';
+                        cleanupFrameLoadListener();
+                        hideIframeLoading();
+                    }
+                } catch (e) {}
+                return;
+            }
+
+            dashFrame.classList.remove('is-active');
+            rrFrame.classList.remove('is-active');
+            rgFrame.classList.remove('is-active');
+            contentFrame.classList.add('is-active');
+
+            function onMainLoad() {
+                if (myToken !== iframeNavToken) return;
+                cleanupFrameLoadListener();
+                hideIframeLoading();
+            }
+
+            function fallbackMain() {
+                if (myToken !== iframeNavToken) return;
+                cleanupFrameLoadListener();
+                hideIframeLoading();
+            }
+
+            showIframeLoading('正在加载页面…');
+
+            pendingIframeLoadHandler = onMainLoad;
+            pendingLoadFrame = contentFrame;
+            contentFrame.addEventListener('load', onMainLoad);
+            iframeLoadTimer = setTimeout(fallbackMain, 20000);
+
+            contentFrame.src = url;
+        }
+
+        // 左侧栏收起/展开（记忆状态）
+        const sidebar = document.querySelector('.sidebar');
+        const sidebarToggle = document.getElementById('sidebarToggle');
+        const SIDEBAR_KEY = 'qc-sidebar-collapsed';
+
+        function setSidebarCollapsed(collapsed) {
+            if (!sidebar) return;
+            sidebar.classList.toggle('collapsed', !!collapsed);
+            try { localStorage.setItem(SIDEBAR_KEY, collapsed ? '1' : '0'); } catch (_) {}
+
+            // 更新按钮图标
+            if (sidebarToggle) {
+                sidebarToggle.innerHTML = collapsed
+                    ? '<i data-lucide="panel-left-open"></i>'
+                    : '<i data-lucide="panel-left-close"></i>';
+                lucide.createIcons();
+            }
+
+            // 收起时用 title 做简单提示
+            menuItems.forEach(item => {
+                const title = item.dataset.title || '';
+                item.title = collapsed ? title : '';
+            });
+        }
+
+        (function initSidebarCollapsed() {
+            let collapsed = false;
+            try { collapsed = localStorage.getItem(SIDEBAR_KEY) === '1'; } catch (_) {}
+            setSidebarCollapsed(collapsed);
+        })();
+
+        if (sidebarToggle) {
+            sidebarToggle.addEventListener('click', () => {
+                const next = !sidebar.classList.contains('collapsed');
+                setSidebarCollapsed(next);
+            });
+        }
+
+        let currentMainPage = (function () {
+            const a = document.querySelector('.menu-item.active');
+            return (a && a.dataset.page) ? a.dataset.page : 'dashboard';
+        })();
+
+        menuItems.forEach(item => {
+            item.addEventListener('click', () => {
+                const page = item.dataset.page;
+                if (page === currentMainPage) return;
+                currentMainPage = page;
+
+                menuItems.forEach(m => m.classList.remove('active'));
+                item.classList.add('active');
+
+                setMainFramePage(page);
+            });
+        });
+
+        // ---------- 账号登录（左下角）----------
+        const QC_AUTH_SESSION = 'qc_auth_session';
+        const QC_AUTH_LAST = 'qc_auth_last';
+
+        function readAuthSession() {
+            try {
+                const raw = localStorage.getItem(QC_AUTH_SESSION);
+                if (!raw) return null;
+                const o = JSON.parse(raw);
+                if (o && o.username && o.password != null) return o;
+            } catch (_) {}
+            return null;
+        }
+
+        function readAuthLast() {
+            try {
+                const raw = localStorage.getItem(QC_AUTH_LAST);
+                if (!raw) return null;
+                return JSON.parse(raw);
+            } catch (_) {}
+            return null;
+        }
+
+        function saveAuthSession(username, password) {
+            localStorage.setItem(QC_AUTH_SESSION, JSON.stringify({ username, password }));
+        }
+
+        function clearAuthSession() {
+            try {
+                localStorage.removeItem(QC_AUTH_SESSION);
+                localStorage.removeItem(QC_AUTH_LAST);
+            } catch (_) {}
+        }
+
+        function saveAuthLast(payload) {
+            try {
+                localStorage.setItem(QC_AUTH_LAST, JSON.stringify(payload));
+            } catch (_) {}
+        }
+
+        function notifyIframeAuthChanged() {
+            ['contentFrame', 'frameDashboard', 'frameRuleRetargeting', 'frameRuleRegulation'].forEach((id) => {
+                const f = document.getElementById(id);
+                if (!f || !f.contentWindow) return;
+                if (id !== 'contentFrame' && f.dataset.loaded !== '1') return;
+                try {
+                    f.contentWindow.postMessage({ type: 'qc-auth-changed' }, '*');
+                } catch (_) {}
+            });
+        }
+
+        /** 子页（如服务控制）因后端校验失败要求主窗口清除登录态 */
+        window.addEventListener('message', function (e) {
+            if (!e.data || e.data.type !== 'qc-auth-clear') return;
+            clearAuthSession();
+            updateSidebarUserUI();
+            notifyIframeAuthChanged();
+        });
+
+        function sidebarAvatarLetter(username) {
+            const s = username == null ? '' : String(username).trim();
+            if (!s) return 'U';
+            const ch = [...s][0];
+            if (/[a-zA-Z]/.test(ch)) return ch.toUpperCase();
+            return ch;
+        }
+
+        function updateSidebarUserUI() {
+            const nameEl = document.getElementById('sidebarUserName');
+            const avEl = document.getElementById('sidebarUserAvatarLetter');
+            const stEl = document.getElementById('sidebarUserStatus');
+            const vaEl = document.getElementById('sidebarUserValid');
+            const sess = readAuthSession();
+            if (!sess) {
+                nameEl.textContent = '未登录';
+                if (avEl) avEl.textContent = 'U';
+                if (stEl) {
+                    stEl.textContent = '未登录';
+                    stEl.classList.remove('sidebar-user-status--ok', 'sidebar-user-status--bad');
+                    stEl.classList.add('sidebar-user-status--muted');
+                }
+                if (vaEl) vaEl.textContent = '—';
+                return;
+            }
+            nameEl.textContent = sess.username;
+            if (avEl) avEl.textContent = sidebarAvatarLetter(sess.username);
+            const last = readAuthLast();
+            if (stEl) {
+                stEl.classList.remove('sidebar-user-status--muted', 'sidebar-user-status--ok', 'sidebar-user-status--bad');
+                if (last && last.is_disabled === 1) {
+                    stEl.textContent = '已禁用';
+                    stEl.classList.add('sidebar-user-status--bad');
+                } else {
+                    stEl.textContent = '正常';
+                    stEl.classList.add('sidebar-user-status--ok');
+                }
+            }
+            if (vaEl) {
+                const vu = last && last.valid_until ? String(last.valid_until).trim() : '';
+                vaEl.textContent = vu || '—';
+            }
+        }
+
+        const loginModal = document.getElementById('loginModal');
+        const loginFormPanel = document.getElementById('loginFormPanel');
+        const loggedPanel = document.getElementById('loggedPanel');
+        const loginErr = document.getElementById('loginErr');
+
+        function openLoginModal() {
+            const sess = readAuthSession();
+            loginErr.textContent = '';
+            if (sess) {
+                loginFormPanel.style.display = 'none';
+                loggedPanel.style.display = 'block';
+                document.getElementById('loginModalTitle').textContent = '账号';
+                document.getElementById('loginModalSub').style.display = 'none';
+                document.getElementById('loggedUserName').textContent = sess.username;
+                const last = readAuthLast();
+                const vf = last && last.valid_from ? last.valid_from : '—';
+                const vu = last && last.valid_until ? last.valid_until : '—';
+                document.getElementById('loggedRange').textContent =
+                    (vf === '—' && vu === '—') ? '—' : (vf + ' ~ ' + vu);
+                const st = document.getElementById('loggedStatus');
+                if (last && last.is_disabled === 1) {
+                    st.textContent = '状态：已禁用（含代理被禁用）';
+                    st.style.color = '#f87171';
+                } else {
+                    st.textContent = '状态：正常';
+                    st.style.color = '#4ade80';
+                }
+            } else {
+                loginFormPanel.style.display = 'block';
+                loggedPanel.style.display = 'none';
+                document.getElementById('loginModalTitle').textContent = '登录账号';
+                document.getElementById('loginModalSub').style.display = 'block';
+                document.getElementById('loginUser').value = '';
+                document.getElementById('loginPass').value = '';
+            }
+            loginModal.classList.add('show');
+            loginModal.setAttribute('aria-hidden', 'false');
+            lucide.createIcons();
+        }
+
+        function closeLoginModal() {
+            loginModal.classList.remove('show');
+            loginModal.setAttribute('aria-hidden', 'true');
+        }
+
+        document.getElementById('sidebarUserBtn').addEventListener('click', openLoginModal);
+        document.getElementById('loginCancel').addEventListener('click', closeLoginModal);
+        loginModal.addEventListener('click', (e) => {
+            if (e.target === loginModal) closeLoginModal();
+        });
+        document.getElementById('btnLogout').addEventListener('click', () => {
+            clearAuthSession();
+            updateSidebarUserUI();
+            closeLoginModal();
+            notifyIframeAuthChanged();
+        });
+        document.getElementById('btnSwitchAccount').addEventListener('click', () => {
+            const sess = readAuthSession();
+            loginFormPanel.style.display = 'block';
+            loggedPanel.style.display = 'none';
+            document.getElementById('loginModalTitle').textContent = '登录账号';
+            document.getElementById('loginModalSub').style.display = 'block';
+            document.getElementById('loginUser').value = sess ? (sess.username || '') : '';
+            document.getElementById('loginPass').value = '';
+            loginErr.textContent = '';
+            lucide.createIcons();
+        });
+
+        function waitTopApi(maxAttempts = 120) {
+            return new Promise((resolve) => {
+                let n = 0;
+                const t = setInterval(() => {
+                    try {
+                        const api = window.top && window.top.pywebviewAPI;
+                        if (api && typeof api.verifyAccountLogin === 'function'
+                            && typeof api.checkAppVersion === 'function'
+                            && typeof api.getAppVersion === 'function') {
+                            clearInterval(t);
+                            return resolve(api);
+                        }
+                    } catch (_) {}
+                    n++;
+                    if (n >= maxAttempts) {
+                        clearInterval(t);
+                        resolve(null);
+                    }
+                }, 100);
+            });
+        }
+
+        /** 最近一次版本检查结果（供弹窗与小红点使用） */
+        let lastVersionCheck = null;
+        let lastLocalVersionLabel = '—';
+
+        async function refreshVersionUI() {
+            const labelEl = document.getElementById('sidebarVersionLabel');
+            const dotEl = document.getElementById('versionUpdateDot');
+            const api = await waitTopApi();
+            if (!api) {
+                if (labelEl) labelEl.textContent = '版本号: —';
+                lastLocalVersionLabel = '—';
+                if (dotEl) dotEl.classList.add('hidden');
+                return;
+            }
+            try {
+                const gv = await api.getAppVersion();
+                const v = gv && gv.success && gv.version != null ? String(gv.version) : '—';
+                lastLocalVersionLabel = v;
+                if (labelEl) labelEl.textContent = '版本号: ' + v;
+            } catch (_) {
+                if (labelEl) labelEl.textContent = '版本号: —';
+                lastLocalVersionLabel = '—';
+            }
+            try {
+                const chk = await api.checkAppVersion();
+                lastVersionCheck = chk;
+                const hasUp = chk && chk.success && chk.data && chk.data.has_update === true;
+                if (dotEl) {
+                    if (hasUp) dotEl.classList.remove('hidden');
+                    else dotEl.classList.add('hidden');
+                }
+            } catch (_) {
+                lastVersionCheck = { success: false, message: '版本检查失败' };
+                if (dotEl) dotEl.classList.add('hidden');
+            }
+        }
+
+        const versionModal = document.getElementById('versionModal');
+        const verErr = document.getElementById('verErr');
+        const verUpdateNow = document.getElementById('verUpdateNow');
+        const versionModalCloseBtn = document.getElementById('versionModalClose');
+
+        function resetVerUpdateButton() {
+            verUpdateNow.classList.remove('ver-update-loading');
+            verUpdateNow.disabled = false;
+            verUpdateNow.textContent = '立即更新';
+            versionModal.dataset.updateBusy = '';
+            if (versionModalCloseBtn) {
+                versionModalCloseBtn.disabled = false;
+            }
+        }
+
+        function setVerUpdateLoading(on) {
+            if (on) {
+                verUpdateNow.classList.add('ver-update-loading');
+                verUpdateNow.disabled = true;
+                verUpdateNow.innerHTML =
+                    '<span class="ver-update-btn-row"><span class="ver-update-spinner" aria-hidden="true"></span><span>更新中…</span></span>';
+                versionModal.dataset.updateBusy = '1';
+                if (versionModalCloseBtn) versionModalCloseBtn.disabled = true;
+            } else {
+                resetVerUpdateButton();
+            }
+        }
+
+        function setVerStatusEl(text, kind) {
+            const el = document.getElementById('verStatus');
+            el.textContent = text;
+            el.className = 'version-status version-status--' + (kind || 'pending');
+        }
+
+        function fillVersionModal() {
+            resetVerUpdateButton();
+            document.getElementById('verCurrent').textContent = lastLocalVersionLabel || '—';
+            verErr.textContent = '';
+            const chk = lastVersionCheck;
+            if (!chk) {
+                document.getElementById('verLatest').textContent = '—';
+                setVerStatusEl('尚未检查', 'pending');
+                verUpdateNow.style.display = 'none';
+                return;
+            }
+            if (!chk.success) {
+                document.getElementById('verLatest').textContent = '—';
+                setVerStatusEl('检查失败', 'fail');
+                verErr.textContent = chk.message || '无法获取版本信息';
+                verUpdateNow.style.display = 'none';
+                return;
+            }
+            const d = chk.data || {};
+            document.getElementById('verLatest').textContent = d.latest_version != null ? String(d.latest_version) : '—';
+            const hasUp = d.has_update === true;
+            if (hasUp) {
+                setVerStatusEl('发现新版本', 'update');
+            } else {
+                setVerStatusEl('已是最新', 'ok');
+            }
+            const url = (d.download_url && String(d.download_url).trim()) ? String(d.download_url).trim() : '';
+            verUpdateNow.style.display = (hasUp && url) ? 'inline-block' : 'none';
+            verUpdateNow.dataset.downloadUrl = url;
+        }
+
+        async function openVersionModal() {
+            versionModal.classList.add('show');
+            versionModal.setAttribute('aria-hidden', 'false');
+            resetVerUpdateButton();
+            verErr.textContent = '';
+            setVerStatusEl('检查中…', 'pending');
+            document.getElementById('verCurrent').textContent = lastLocalVersionLabel || '—';
+            document.getElementById('verLatest').textContent = '—';
+            verUpdateNow.style.display = 'none';
+            try {
+                await refreshVersionUI();
+            } finally {
+                fillVersionModal();
+            }
+        }
+
+        function closeVersionModal() {
+            if (versionModal.dataset.updateBusy === '1') return;
+            versionModal.classList.remove('show');
+            versionModal.setAttribute('aria-hidden', 'true');
+        }
+
+        document.getElementById('versionInfoBtn').addEventListener('click', openVersionModal);
+        const versionCheckBtn = document.getElementById('versionCheckBtn');
+        if (versionCheckBtn) versionCheckBtn.addEventListener('click', openVersionModal);
+        document.getElementById('versionModalClose').addEventListener('click', closeVersionModal);
+        versionModal.addEventListener('click', (e) => {
+            if (e.target === versionModal) {
+                if (versionModal.dataset.updateBusy === '1') return;
+                closeVersionModal();
+            }
+        });
+
+        verUpdateNow.addEventListener('click', async () => {
+            const url = verUpdateNow.dataset.downloadUrl;
+            if (!url) return;
+            if (!(await appConfirm('将下载并安装更新，程序会关闭并自动重启。是否继续？', '更新确认'))) return;
+            verErr.textContent = '';
+            const api = await waitTopApi();
+            if (!api || typeof api.performAppUpdate !== 'function') {
+                verErr.textContent = '无法调用更新接口';
+                return;
+            }
+            setVerUpdateLoading(true);
+            try {
+                const res = await api.performAppUpdate(url);
+                if (res && res.success === false) {
+                    verErr.textContent = res.message || '更新失败';
+                    return;
+                }
+                verErr.textContent = '若程序未自动退出，请稍后手动重启。';
+            } catch (e) {
+                verErr.textContent = (e && e.message) ? e.message : '更新异常';
+            } finally {
+                setVerUpdateLoading(false);
+            }
+        });
+
+        let versionPollTimer = null;
+        function startVersionPolling() {
+            if (versionPollTimer) clearInterval(versionPollTimer);
+            versionPollTimer = setInterval(refreshVersionUI, 10 * 60 * 1000);
+        }
+
+        function parseServerDateLogin(s) {
+            if (!s) return null;
+            const d = new Date(String(s).replace(' ', 'T'));
+            return isNaN(d.getTime()) ? null : d;
+        }
+        function isWithinValidityLogin(data) {
+            if (!data || typeof data !== 'object') return true;
+            const now = Date.now();
+            const from = parseServerDateLogin(data.valid_from);
+            const until = parseServerDateLogin(data.valid_until);
+            if (from && now < from.getTime()) return false;
+            if (until && now > until.getTime()) return false;
+            return true;
+        }
+
+        let startupAuthVerifyStarted = false;
+
+        /**
+         * 软件启动后主窗口校验一次本地已保存账号；失败则清空 localStorage 并显示未登录。
+         * 远程校验不在进入「服务控制」时做，而在启动采集时由后端再做。
+         */
+        async function verifySavedSessionOnStartup() {
+            if (startupAuthVerifyStarted) return;
+            startupAuthVerifyStarted = true;
+            const sess = readAuthSession();
+            if (!sess) {
+                updateSidebarUserUI();
+                return;
+            }
+            const api = await waitTopApi();
+            if (!api || typeof api.verifyAccountLogin !== 'function') {
+                updateSidebarUserUI();
+                return;
+            }
+            try {
+                const res = await api.verifyAccountLogin(sess.username, sess.password);
+                if (!res || !res.success) {
+                    clearAuthSession();
+                    updateSidebarUserUI();
+                    notifyIframeAuthChanged();
+                    return;
+                }
+                const d = res.data || {};
+                if (d.is_disabled === 1) {
+                    clearAuthSession();
+                    updateSidebarUserUI();
+                    notifyIframeAuthChanged();
+                    return;
+                }
+                if (!isWithinValidityLogin(d)) {
+                    clearAuthSession();
+                    updateSidebarUserUI();
+                    notifyIframeAuthChanged();
+                    return;
+                }
+                saveAuthLast({
+                    username: sess.username,
+                    valid_from: d.valid_from,
+                    valid_until: d.valid_until,
+                    is_disabled: d.is_disabled,
+                    verifiedAt: Date.now(),
+                });
+                updateSidebarUserUI();
+                notifyIframeAuthChanged();
+            } catch (_) {
+                updateSidebarUserUI();
+            }
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            loginErr.textContent = '';
+            const u = (document.getElementById('loginUser').value || '').trim();
+            const p = document.getElementById('loginPass').value || '';
+            if (!u || !p) {
+                loginErr.textContent = '请输入账号和密码';
+                return;
+            }
+            const api = await waitTopApi();
+            if (!api) {
+                loginErr.textContent = '无法连接桌面端接口，请重试';
+                return;
+            }
+            const btn = document.getElementById('loginSubmit');
+            btn.disabled = true;
+            try {
+                const res = await api.verifyAccountLogin(u, p);
+                if (!res || !res.success) {
+                    loginErr.textContent = (res && res.message) ? res.message : '登录失败';
+                    return;
+                }
+                const d = res.data || {};
+                if (d.is_disabled === 1) {
+                    loginErr.textContent = '账号已禁用或所属代理已禁用，无法使用';
+                    return;
+                }
+                if (!isWithinValidityLogin(d)) {
+                    loginErr.textContent = '账号不在有效期内';
+                    return;
+                }
+                saveAuthSession(u, p);
+                saveAuthLast({
+                    username: u,
+                    valid_from: d.valid_from,
+                    valid_until: d.valid_until,
+                    is_disabled: d.is_disabled,
+                    verifiedAt: Date.now(),
+                });
+                updateSidebarUserUI();
+                closeLoginModal();
+                notifyIframeAuthChanged();
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        updateSidebarUserUI();
+
+        setTimeout(() => {
+            refreshVersionUI();
+            startVersionPolling();
+        }, 400);
+    </script>
+</body>
+</html>

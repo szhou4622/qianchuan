@@ -1,0 +1,363 @@
+/**
+ * 追投记录 iframe 内弹窗样式（#modalRet / #modalTrig / #modalQuery 相关）。
+ * 弹窗节点会被 runsLiftModalsToParent() 挂到 rule_retargeting.html 的 body，
+ * 因此本文件必须在父页加载，否则详情栅格 / tag / 复制按钮等自定义类全部失效。
+ */
+.runs-empty {
+    color: #64748b;
+}
+/* 与 dashboard.html 一致：可点击复制 ID */
+.runs-copy {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.7rem;
+    line-height: 1.35;
+    color: #cbd5e1;
+    cursor: pointer;
+    transition: color 0.15s;
+    background: transparent;
+    border: none;
+    padding: 0;
+    text-align: left;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: bottom;
+}
+.runs-copy:hover {
+    color: #f1f5f9;
+}
+/* 追投详情弹窗：分块与栅格 */
+.runs-detail-card {
+    border-radius: 0.75rem;
+    border: 1px solid rgba(51, 65, 85, 0.55);
+    background: linear-gradient(165deg, rgba(15, 23, 42, 0.72) 0%, rgba(15, 23, 42, 0.45) 100%);
+    overflow: hidden;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 12px 32px rgba(0, 0, 0, 0.28);
+}
+.runs-detail-card-hd {
+    padding: 0.65rem 1rem;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.45);
+    background: rgba(15, 23, 42, 0.88);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: #f1f5f9;
+    letter-spacing: 0.03em;
+}
+.runs-detail-param-h {
+    font-size: 0.8125rem;
+    font-weight: 600;
+    margin-bottom: 0.65rem;
+}
+.runs-detail-kv-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.85rem 1rem;
+}
+@media (min-width: 640px) {
+    .runs-detail-kv-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+@media (min-width: 1024px) {
+    .runs-detail-kv-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+.runs-detail-field {
+    border-radius: 0.5rem;
+    border: 1px solid rgba(51, 65, 85, 0.4);
+    background: rgba(15, 23, 42, 0.5);
+    padding: 0.65rem 0.8rem;
+    min-width: 0;
+}
+#modalRet .runs-modal-detail-panel {
+    min-height: 0;
+}
+.runs-modal-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(71, 85, 105, 0.9) rgba(15, 23, 42, 0.25);
+    -webkit-overflow-scrolling: touch;
+}
+.runs-modal-scroll::-webkit-scrollbar {
+    width: 6px;
+}
+.runs-modal-scroll::-webkit-scrollbar-track {
+    background: rgba(15, 23, 42, 0.35);
+    border-radius: 100px;
+    margin: 6px 0;
+}
+.runs-modal-scroll::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(100, 116, 139, 0.95), rgba(71, 85, 105, 0.85));
+    border-radius: 100px;
+}
+#modalRet .runs-copy--modal {
+    font-size: 0.8125rem;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-all;
+}
+.runs-detail-card--body-only .runs-detail-card-body {
+    padding: 1.15rem 1.25rem 1.25rem;
+}
+.runs-detail-main {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+.runs-detail-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.85rem 1.15rem;
+}
+@media (max-width: 640px) {
+    .runs-detail-row {
+        grid-template-columns: 1fr;
+    }
+}
+.runs-detail-cell {
+    min-width: 0;
+}
+.runs-detail-lbl {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #94a3b8;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.4rem;
+}
+.runs-detail-val {
+    font-size: 0.9375rem;
+    line-height: 1.45;
+    color: #f1f5f9;
+    min-width: 0;
+}
+.runs-detail-name-wrap {
+    word-break: break-word;
+}
+.runs-detail-msg {
+    color: #e2e8f0;
+}
+.runs-detail-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.8125rem;
+    color: #cbd5e1;
+}
+/* 详情弹窗「状态」：仅字色区分，无标签底 */
+.runs-detail-st-txt {
+    font-size: 0.9375rem;
+    font-weight: 500;
+}
+.runs-detail-st-txt--ok {
+    color: #34d399;
+}
+.runs-detail-st-txt--err {
+    color: #f87171;
+}
+.runs-detail-step-pill {
+    display: inline-flex;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.35rem;
+    font-size: 0.8125rem;
+    color: #cbd5e1;
+    background: rgba(51, 65, 85, 0.45);
+    border: 1px solid rgba(71, 85, 105, 0.55);
+}
+.runs-detail-tag-m {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 0.35rem;
+    border: 1px solid;
+    line-height: 1.2;
+}
+.runs-detail-tag-m--vol {
+    background: rgba(14, 165, 233, 0.16);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.35);
+}
+.runs-detail-tag-m--cc {
+    background: rgba(245, 158, 11, 0.14);
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.35);
+}
+.runs-detail-tag-m--unk {
+    background: rgba(71, 85, 105, 0.35);
+    color: #cbd5e1;
+    border-color: rgba(100, 116, 139, 0.45);
+}
+.runs-detail-og {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.2rem 0.55rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 0.35rem;
+    border: 1px solid;
+}
+.runs-detail-og--empty {
+    color: #64748b;
+    background: rgba(30, 41, 59, 0.5);
+    border-color: rgba(51, 65, 85, 0.5);
+    font-weight: 500;
+}
+.runs-detail-og--net {
+    color: #22d3ee;
+    background: rgba(6, 182, 212, 0.12);
+    border-color: rgba(34, 211, 238, 0.35);
+}
+.runs-detail-og--live {
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(251, 191, 36, 0.35);
+}
+.runs-detail-og--other {
+    color: #a5b4fc;
+    background: rgba(99, 102, 241, 0.12);
+    border-color: rgba(129, 140, 248, 0.35);
+}
+.runs-detail-tri {
+    font-size: 0.875rem;
+    color: #e2e8f0;
+}
+.runs-detail-tri-meta {
+    font-size: 0.7rem;
+    color: #64748b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.runs-detail-error-banner {
+    border-radius: 0.65rem;
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    background: linear-gradient(135deg, rgba(127, 29, 29, 0.35) 0%, rgba(15, 23, 42, 0.65) 100%);
+    overflow: hidden;
+}
+.runs-detail-error-hd {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.85rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #fca5a5;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid rgba(248, 113, 113, 0.22);
+}
+.runs-detail-error-body {
+    padding: 0.75rem 0.85rem;
+    font-size: 0.8125rem;
+    line-height: 1.55;
+    color: #fecaca;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.runs-detail-task-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+/* 与上方 .runs-detail-field 同系底色，整行铺满，避免短数值右侧透出更深底 */
+.runs-detail-task-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(51, 65, 85, 0.4);
+    background: rgba(15, 23, 42, 0.5);
+}
+.runs-detail-task-k {
+    flex: 0 0 11rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #94a3b8;
+}
+.runs-detail-task-v {
+    flex: 1 1 12rem;
+    font-size: 0.9rem;
+    color: #f1f5f9;
+    min-width: 0;
+    align-self: center;
+}
+.runs-detail-task-muted {
+    font-size: 0.8125rem;
+    color: #94a3b8;
+}
+#modalRetBody .runs-detail-card-hd {
+    font-size: 0.9rem;
+}
+/* 详情滚动区与卡片同调，减少缝与底部「断层」感 */
+#modalRetBody {
+    background: rgba(15, 23, 42, 0.35);
+}
+
+/*
+ * 列表操作列 / 详情底部「触发条件·素材信息」：与 iframe 内联样式一致。
+ * 弹窗挂到父 document 后，iframe 里的 <style> 不会作用到父节点，此处必须定义否则像纯文字。
+ */
+.runs-btn-op {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.65rem;
+    line-height: 1.2;
+    padding: 0.22rem 0.5rem;
+    border-radius: 0.35rem;
+    border: 1px solid;
+    cursor: pointer;
+    font-family: inherit;
+    margin: 0;
+    appearance: none;
+    -webkit-appearance: none;
+    transition:
+        background 0.12s,
+        border-color 0.12s,
+        color 0.12s,
+        filter 0.12s,
+        box-shadow 0.12s;
+}
+.runs-btn-op:hover {
+    filter: brightness(1.08);
+}
+.runs-btn-op:active {
+    filter: brightness(0.96);
+}
+.runs-btn-op:focus-visible {
+    outline: 2px solid rgba(56, 189, 248, 0.55);
+    outline-offset: 2px;
+}
+.runs-btn-op--detail {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(14, 165, 233, 0.12);
+    color: #bae6fd;
+}
+/* 与表格操作列一致：描边 + 透明底（幽灵按钮） */
+.runs-btn-op--trig {
+    border-color: rgba(251, 191, 36, 0.55);
+    background: transparent;
+    color: #fde68a;
+}
+.runs-btn-op--trig:hover {
+    background: rgba(245, 158, 11, 0.16);
+}
+.runs-btn-op--query {
+    border-color: rgba(167, 139, 250, 0.5);
+    background: transparent;
+    color: #ddd6fe;
+}
+.runs-btn-op--query:hover {
+    background: rgba(139, 92, 246, 0.14);
+}
+
+/* 追投详情底部栏：仅栏背景与分割线；按钮样式与表格同一套，不再单独放大/渐变 */
+#modalRetFooter {
+    background: rgba(15, 23, 42, 0.88);
+    border-top: 1px solid rgba(51, 65, 85, 0.45);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}

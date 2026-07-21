@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>启动服务</title>
+    <script src="js/tailwindcss.js"></script>
+    <script src="js/lucide.js"></script>
+    <script src="js/messagebox.js"></script>
+    <style>
+        /* macOS WebKit：声明深色配色，避免系统默认浅色/白色滚动条（与主窗口 index 一致） */
+        html { color-scheme: dark; }
+        html, body { height: 100%; }
+        body { overflow: hidden; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+        .log-box {
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-x: hidden;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: #475569 rgba(15, 23, 42, 0.35);
+        }
+        .log-box::-webkit-scrollbar { width: 8px; height: 8px; }
+        .log-box::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.35); border-radius: 8px; }
+        .log-box::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 8px;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+        .log-box::-webkit-scrollbar-thumb:hover { background: #64748b; }
+        /* .tab-scroll 必须写全 track，否则 WKWebView 上轨道易呈白底 */
+        .tab-scroll {
+            overflow-y: auto;
+            overflow-x: hidden;
+            scrollbar-width: thin;
+            scrollbar-color: #475569 rgba(15, 23, 42, 0.35);
+        }
+        .tab-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+        .tab-scroll::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.4); border-radius: 6px; }
+        .tab-scroll::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 6px;
+            border: 1px solid transparent;
+            background-clip: padding-box;
+        }
+        .tab-scroll::-webkit-scrollbar-thumb:hover { background: #475569; }
+        .tab-btn-active {
+            background: rgba(59, 130, 246, 0.18);
+            border-color: rgba(59, 130, 246, 0.45);
+            color: #fff;
+        }
+        /* 轮询间隔：限制宽度；隐藏原生微调器白底，右侧用自定义深色 +/- 按钮 */
+        .interval-field {
+            max-width: 11rem;
+            width: 100%;
+        }
+        .interval-input {
+            color-scheme: dark;
+            -moz-appearance: textfield;
+            appearance: textfield;
+        }
+        .interval-input::-webkit-outer-spin-button,
+        .interval-input::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+    </style>
+</head>
+<body class="bg-[#0f172a] text-[#e2e8f0] h-full">
+    <div class="h-full flex flex-col p-4 gap-3 min-h-0">
+        <!-- 顶栏 -->
+        <header class="flex-none rounded-xl border border-slate-700/60 bg-slate-900/30 backdrop-blur p-4 flex items-center justify-between gap-4">
+            <div class="flex items-center gap-3">
+                <div class="p-2 rounded-lg bg-blue-500/15 border border-blue-500/20">
+                    <i data-lucide="rocket" class="w-5 h-5 text-blue-400"></i>
+                </div>
+                <div>
+                    <div class="text-lg font-semibold text-white tracking-wide">启动服务</div>
+                    <div class="text-xs text-slate-400 mt-0.5">上半：配置（分 Tab）| 下半：日志</div>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                <span id="statusText" class="text-sm text-slate-300">状态：未知</span>
+            </div>
+        </header>
+
+        <!-- 下方：配置（占剩余高度，可滚） + 日志（约视口 40%） -->
+        <div class="flex-1 min-h-0 flex flex-col gap-3">
+        <!-- 配置：flex 吃满「非日志」区域，Tab 内滚动 -->
+        <section class="flex-1 min-h-[200px] flex flex-col rounded-xl border border-slate-700/60 bg-slate-900/30 backdrop-blur overflow-hidden">
+            <div class="flex items-center justify-between gap-3 px-4 pt-3 pb-2 shrink-0 border-b border-slate-700/40">
+                <div class="text-sm font-semibold text-white flex items-center gap-2">
+                    <i data-lucide="sliders" class="w-4 h-4 text-slate-300"></i>
+                    <span>配置选项</span>
+                    <span class="text-[11px] font-normal text-emerald-400/90">(实时更新)</span>
+                </div>
+                <div class="flex flex-col items-end gap-1">
+                    <div id="startAuthHint" class="text-[11px] text-amber-400/90 max-w-[260px] text-right leading-snug hidden"></div>
+                    <div class="flex items-center gap-2">
+                        <button id="btnStart"
+                                class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 transition-colors text-white text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i data-lucide="play" class="w-4 h-4"></i> 启动
+                        </button>
+                        <button id="btnStop"
+                                class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 transition-colors text-white text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i data-lucide="square" class="w-4 h-4"></i> 停止
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex gap-1 px-3 pt-2 pb-1 shrink-0 border-b border-slate-700/30">
+                <button type="button" class="tab-btn tab-btn-active px-3 py-1.5 rounded-lg border border-transparent text-xs font-medium text-slate-300 hover:text-white transition-colors" data-tab="scrape">采集服务</button>
+                <button type="button" class="tab-btn px-3 py-1.5 rounded-lg border border-transparent text-xs font-medium text-slate-400 hover:text-white transition-colors" data-tab="feishu">飞书多维表格</button>
+                <button type="button" class="tab-btn px-3 py-1.5 rounded-lg border border-transparent text-xs font-medium text-slate-400 hover:text-white transition-colors" data-tab="robot">平台机器人推送</button>
+            </div>
+
+            <div class="flex-1 min-h-0 relative">
+                <!-- Tab: 采集服务 -->
+                <div id="panelScrape" class="tab-panel absolute inset-0 tab-scroll px-4 py-3">
+                    <div class="flex flex-col gap-4 w-full">
+                        <label class="block w-full max-w-[11rem]">
+                            <div class="text-xs text-slate-400 mb-1">轮询间隔 interval（秒）</div>
+                            <div class="interval-field flex rounded-lg border border-slate-700 bg-slate-950/40 overflow-hidden focus-within:border-blue-500/60 focus-within:ring-1 focus-within:ring-blue-500/25">
+                                <input id="cfgInterval" type="number" min="5" step="1"
+                                       class="interval-input flex-1 min-w-0 border-0 bg-transparent px-3 py-2 text-sm text-white outline-none" />
+                                <div class="flex flex-col w-8 shrink-0 border-l border-slate-700/90 divide-y divide-slate-700/90" role="group" aria-label="调整秒数">
+                                    <button type="button" id="cfgIntervalStepUp"
+                                            class="interval-step flex flex-1 items-center justify-center min-h-0 bg-slate-800/70 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                                            title="加 1 秒" aria-label="加一">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/></svg>
+                                    </button>
+                                    <button type="button" id="cfgIntervalStepDown"
+                                            class="interval-step flex flex-1 items-center justify-center min-h-0 bg-slate-800/70 hover:bg-slate-700 text-slate-300 hover:text-white transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                                            title="减 1 秒" aria-label="减一">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </label>
+                        <div class="block w-full">
+                            <div class="text-xs text-slate-400 mb-1.5">是否启用无头模式（轮询阶段）</div>
+                            <div class="flex items-center gap-3 min-h-[42px]">
+                                <div class="relative h-6 w-11 shrink-0">
+                                    <input type="checkbox" id="cfgHeadful" class="peer sr-only" checked aria-label="无头模式（轮询阶段）" />
+                                    <div class="pointer-events-none absolute inset-0 h-6 w-11 rounded-full bg-slate-700 transition-colors peer-checked:bg-blue-600"></div>
+                                    <div class="pointer-events-none absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform peer-checked:translate-x-5"></div>
+                                    <label for="cfgHeadful" class="absolute inset-0 z-10 cursor-pointer rounded-full"><span class="sr-only">切换无头模式</span></label>
+                                </div>
+                                <span id="cfgHeadfulLabel" class="text-sm text-emerald-400 select-none pointer-events-none">启用（轮询采集时不显示浏览器）</span>
+                            </div>
+                        </div>
+                        <label class="block w-full max-w-2xl">
+                            <div class="text-xs text-slate-400 mb-1">浏览器程序路径（可选）</div>
+                            <p class="text-[11px] text-slate-500 mb-1.5 leading-relaxed">指定采集自动化实际启动的浏览器可执行文件。留空或路径无效时，由程序在本机自动探测可用浏览器。</p>
+                            <input id="cfgBrowserExecutable" type="text" autocomplete="off" spellcheck="false"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 font-mono"
+                                   placeholder="选填，完整路径" />
+                        </label>
+                        <div class="block w-full">
+                            <div class="text-xs text-slate-400 mb-1.5">联同采集调控任务（素材追投列表）</div>
+                            <div class="flex items-center gap-3 min-h-[42px]">
+                                <div class="relative h-6 w-11 shrink-0">
+                                    <input type="checkbox" id="cfgFetchAssistTasks" class="peer sr-only" checked aria-label="联同采集调控任务" />
+                                    <div class="pointer-events-none absolute inset-0 h-6 w-11 rounded-full bg-slate-700 transition-colors peer-checked:bg-blue-600"></div>
+                                    <div class="pointer-events-none absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform peer-checked:translate-x-5"></div>
+                                    <label for="cfgFetchAssistTasks" class="absolute inset-0 z-10 cursor-pointer rounded-full"><span class="sr-only">切换联同调控任务</span></label>
+                                </div>
+                                <span id="cfgFetchAssistLabel" class="text-sm text-emerald-400 select-none pointer-events-none">已开启（每轮素材采集后采集调控任务）</span>
+                            </div>
+                            <p class="text-[11px] text-slate-500 mt-1 max-w-xl">素材采完后再拉调控追投任务写入本地库。</p>
+                        </div>
+                    </div>
+                    <div class="mt-4 rounded-lg border border-slate-700/60 bg-slate-950/20 p-3">
+                        <div class="text-xs text-slate-500">说明</div>
+                        <div class="text-xs text-slate-300 mt-1 leading-relaxed" id="cfgDescText">
+                            首次有头登录并保存 Cookie；之后按无头/有头设置轮询，改后下一轮生效。
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab: 飞书多维表格 -->
+                <div id="panelFeishu" class="tab-panel absolute inset-0 tab-scroll px-4 py-3 hidden">
+                    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                        <div class="text-xs font-medium text-slate-300">飞书多维表</div>
+                        <div class="inline-flex items-center gap-2">
+                            <input type="checkbox" id="cfgFeishuEnabled" aria-label="启用同步到表格"
+                                   class="w-4 h-4 shrink-0 cursor-pointer rounded bg-slate-700 border-slate-600 text-blue-500 focus:ring-blue-500" />
+                            <span class="text-sm text-slate-300 select-none pointer-events-none">启用同步到表格</span>
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-3 w-full">
+                        <div class="block w-full rounded-lg border border-slate-700/60 bg-slate-950/15 px-3 py-2.5">
+                            <div class="text-xs text-slate-400 mb-2">写入模式</div>
+                            <div class="flex flex-col gap-2.5">
+                                <label class="inline-flex items-start gap-2.5 cursor-pointer group">
+                                    <input type="radio" name="cfgFeishuPushMode" value="each_crawl" checked
+                                           class="mt-0.5 h-4 w-4 shrink-0 border-slate-500 bg-slate-900 text-blue-500 focus:ring-blue-500/40" />
+                                    <span>
+                                        <span class="text-sm text-slate-200 group-hover:text-white">每次采集写入</span>
+                                        <span class="block text-[11px] text-slate-500 mt-0.5 leading-snug">每轮采集入库后立即写入飞书</span>
+                                    </span>
+                                </label>
+                                <label class="inline-flex items-start gap-2.5 cursor-pointer group">
+                                    <input type="radio" name="cfgFeishuPushMode" value="hourly_latest"
+                                           class="mt-0.5 h-4 w-4 shrink-0 border-slate-500 bg-slate-900 text-blue-500 focus:ring-blue-500/40" />
+                                    <span>
+                                        <span class="text-sm text-slate-200 group-hover:text-white">整点写入最新数据</span>
+                                        <span class="block text-[11px] text-slate-500 mt-0.5 leading-snug">采集时不写飞书；整点时写入近 1 小时最新数据</span>
+                                    </span>
+                                </label>
+                            </div>
+                        </div>
+                        <label class="block w-full">
+                            <div class="text-xs text-slate-400 mb-1">app_token（Base 文档唯一标识）</div>
+                            <input id="cfgFeishuAppToken" type="text" autocomplete="off"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 mono" placeholder="可选" />
+                        </label>
+                        <label class="block w-full">
+                            <div class="text-xs text-slate-400 mb-1">personal_base_token（Base 文档授权码）</div>
+                            <input id="cfgFeishuPersonalToken" type="text" autocomplete="off"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 mono" placeholder="可选" />
+                        </label>
+                        <label class="block w-full">
+                            <div class="text-xs text-slate-400 mb-1">table_id（数据表 ID）</div>
+                            <input id="cfgFeishuTableId" type="text" autocomplete="off"
+                                   class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 mono" placeholder="可选" />
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Tab: 平台机器人推送 -->
+                <div id="panelRobot" class="tab-panel absolute inset-0 tab-scroll px-4 py-3 hidden">
+                    <div class="space-y-5">
+                        <div>
+                            <div class="text-xs font-medium text-slate-300 mb-2">飞书群机器人（整点推送）</div>
+                            <div class="flex flex-wrap items-center gap-3 mb-3">
+                                <div class="inline-flex items-center gap-2">
+                                    <input type="checkbox" id="cfgWhPushEnabled" aria-label="飞书群机器人整点推送"
+                                           class="w-4 h-4 shrink-0 cursor-pointer rounded bg-slate-700 border-slate-600 text-blue-500 focus:ring-blue-500" />
+                                    <span class="text-sm text-slate-300 select-none pointer-events-none">启用（每整点推送本地库 Top15）</span>
+                                </div>
+                                <button type="button" id="btnWhPushTest"
+                                        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium">测试推送</button>
+                            </div>
+                            <div class="flex flex-col gap-3 w-full">
+                                <label class="block w-full">
+                                    <div class="text-xs text-slate-400 mb-1">Webhook URL</div>
+                                    <input id="cfgWhWebhook" type="text" autocomplete="off"
+                                           class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 mono" placeholder="https://open.feishu.cn/..." />
+                                </label>
+                                <label class="block w-full">
+                                    <div class="text-xs text-slate-400 mb-1">关键词 KEYWORD</div>
+                                    <input id="cfgWhKeyword" type="text" autocomplete="off"
+                                           class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60" placeholder="安全设置关键词" />
+                                </label>
+                            </div>
+                        </div>
+                        <div class="border-t border-slate-700/40 pt-4">
+                            <div class="text-xs font-medium text-slate-300 mb-2">钉钉群机器人（整点推送）</div>
+                            <div class="flex flex-wrap items-center gap-3 mb-3">
+                                <div class="inline-flex items-center gap-2">
+                                    <input type="checkbox" id="cfgDingWhPushEnabled" aria-label="钉钉群机器人整点推送"
+                                           class="w-4 h-4 shrink-0 cursor-pointer rounded bg-slate-700 border-slate-600 text-blue-500 focus:ring-blue-500" />
+                                    <span class="text-sm text-slate-300 select-none pointer-events-none">启用（每整点推送本地库 Top15）</span>
+                                </div>
+                                <button type="button" id="btnDingWhPushTest"
+                                        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs font-medium">测试推送</button>
+                            </div>
+                            <div class="flex flex-col gap-3 w-full">
+                                <label class="block w-full">
+                                    <div class="text-xs text-slate-400 mb-1">Webhook URL</div>
+                                    <input id="cfgDingWhWebhook" type="text" autocomplete="off"
+                                           class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 mono" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+                                </label>
+                                <label class="block w-full">
+                                    <div class="text-xs text-slate-400 mb-1">关键词 KEYWORD</div>
+                                    <input id="cfgDingWhKeyword" type="text" autocomplete="off"
+                                           class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60" placeholder="安全设置关键词" />
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 日志：约占整个视口高度的 40% -->
+        <section class="flex-none h-[40vh] min-h-[180px] max-h-[50vh] rounded-xl border border-slate-700/60 bg-slate-900/30 backdrop-blur p-4 flex flex-col">
+            <div class="flex items-center justify-between shrink-0">
+                <div class="text-sm font-semibold text-white flex items-center gap-2">
+                    <i data-lucide="file-text" class="w-4 h-4 text-slate-300"></i>
+                    日志
+                </div>
+                <div class="flex items-center gap-3 text-xs text-slate-500">
+                    <span>每 2 秒刷新</span>
+                    <button id="btnClearLogs" class="text-slate-400 hover:text-white transition-colors">清空</button>
+                </div>
+            </div>
+            <pre id="logBox" class="log-box mt-3 flex-1 min-h-0 rounded-lg bg-slate-950/40 border border-slate-700 p-3 text-xs text-slate-200 mono"></pre>
+        </section>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        const QC_AUTH_SESSION = 'qc_auth_session';
+        const QC_AUTH_LAST = 'qc_auth_last';
+
+        function getAuthSession() {
+            try {
+                const raw = localStorage.getItem(QC_AUTH_SESSION);
+                if (!raw) return null;
+                const o = JSON.parse(raw);
+                if (o && o.username && o.password != null) return o;
+            } catch (_) {}
+            return null;
+        }
+
+        let authGateOk = false;
+        let authGateReason = '';
+
+        function setStartAuthHint(text, show) {
+            const el = document.getElementById('startAuthHint');
+            if (!el) return;
+            el.textContent = text || '';
+            el.classList.toggle('hidden', !show);
+        }
+
+        function getApi() {
+            try {
+                if (window.top && window.top.pywebviewAPI) return window.top.pywebviewAPI;
+            } catch (_) {}
+            if (window.pywebview && window.pywebview.api) return window.pywebview.api;
+            return null;
+        }
+
+        async function waitForApi(maxAttempts = 60) {
+            for (let i = 0; i < maxAttempts; i++) {
+                const api = getApi();
+                if (api && api.getServiceStatus) return api;
+                await new Promise(r => setTimeout(r, 200));
+            }
+            return null;
+        }
+
+        let displayTick = null;
+        let lastStatusSnapshot = {
+            running: false,
+            phase: '',
+            lastFetchTime: 0,
+            interval: 60,
+            fetchProgress: null,
+            assistProgress: null,
+        };
+
+        function syncStartButtonOnly() {
+            const running = lastStatusSnapshot.running;
+            const startEl = document.getElementById('btnStart');
+            if (startEl) startEl.disabled = running || !authGateOk;
+        }
+
+        function getCurrentTimestamp() {
+            return Math.floor(Date.now() / 1000);
+        }
+
+        function stopDisplayTick() {
+            if (displayTick) {
+                clearInterval(displayTick);
+                displayTick = null;
+            }
+        }
+
+        function updateRunningDisplay() {
+            const text = document.getElementById('statusText');
+            const st = lastStatusSnapshot;
+            if (!st.running || st.phase !== 'running') return;
+
+            const progress = st.fetchProgress;
+            const ap = st.assistProgress;
+            if (progress && (progress.current > 0 || progress.total > 0)) {
+                let line = `状态：采集中（已获取 ${progress.current}/${progress.total} 条数据`;
+                if (ap && (ap.active || (ap.current > 0 || ap.total > 0))) {
+                    if (ap.current > 0 || ap.total > 0) {
+                        line += `；调控任务 ${ap.current}/${ap.total} 条`;
+                    } else if (ap.active) {
+                        line += '；调控任务等待数据...';
+                    }
+                }
+                line += '）';
+                text.textContent = line;
+                return;
+            }
+
+            if (ap && (ap.current > 0 || ap.total > 0)) {
+                text.textContent = `状态：采集中（调控任务 ${ap.current}/${ap.total} 条数据）`;
+                return;
+            }
+            if (ap && ap.active) {
+                text.textContent = `状态：采集中（调控任务等待数据...）`;
+                return;
+            }
+
+            const lf = Math.floor(Number(st.lastFetchTime) || 0);
+            const iv = Math.max(5, Math.floor(Number(st.interval) || 60));
+            if (lf <= 0) {
+                text.textContent = `状态：采集中（等待数据...）`;
+                return;
+            }
+
+            const remaining = Math.ceil(iv - (getCurrentTimestamp() - lf));
+            if (remaining <= 0) {
+                text.textContent = `状态：等待中（服务端即将采集…）`;
+            } else {
+                text.textContent = `状态：等待中（${remaining}s 后继续获取）`;
+            }
+        }
+
+        function startDisplayTick() {
+            if (displayTick) return;
+            updateRunningDisplay();
+            displayTick = setInterval(updateRunningDisplay, 1000);
+        }
+
+        function setStatusUI(st) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            const running = !!st?.running;
+            const phase = st?.phase || 'unknown';
+            const msg = st?.message || '';
+            const autoTerminated =
+                !running && phase === 'stopped' && msg && msg.indexOf('程序自动终止') === 0;
+
+            lastStatusSnapshot = {
+                running,
+                phase,
+                lastFetchTime: Number(st?.lastFetchTime) || 0,
+                interval: Math.floor(st?.interval) || 60,
+                fetchProgress: st?.fetchProgress || null,
+                assistProgress: st?.assistProgress || null,
+            };
+
+            if (running) {
+                dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.55)]';
+            } else {
+                if (autoTerminated) {
+                    dot.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.45)]';
+                } else {
+                    dot.className = 'w-2.5 h-2.5 rounded-full bg-slate-500';
+                }
+                stopDisplayTick();
+            }
+
+            const phaseText = (phase === 'waiting_login') ? '等待登录' :
+                              (phase === 'running') ? '采集中' :
+                              (phase === 'starting') ? '启动中' :
+                              (phase === 'error') ? '异常' :
+                              (phase === 'stopped') ? '已停止' : phase;
+
+            text.dataset.phaseText = phaseText;
+
+            if (running && phase === 'running') {
+                startDisplayTick();
+                updateRunningDisplay();
+            } else {
+                stopDisplayTick();
+                if (autoTerminated) {
+                    text.textContent = '状态：' + msg;
+                } else {
+                    text.textContent = `状态：${phaseText}${msg ? '（' + msg + '）' : ''}`;
+                }
+            }
+
+            syncStartButtonOnly();
+            document.getElementById('btnStop').disabled = !running;
+        }
+
+        /**
+         * 仅根据 localStorage 是否已有会话更新「启动」按钮；远程校验在主窗口启动时及点击「启动」后由后端完成。
+         */
+        function syncAuthGateFromLocalOnly() {
+            const sess = getAuthSession();
+            if (!sess) {
+                authGateOk = false;
+                authGateReason = '请先在左侧栏底部登录账号';
+                setStartAuthHint(authGateReason, true);
+                syncStartButtonOnly();
+                return;
+            }
+            authGateOk = true;
+            authGateReason = '';
+            setStartAuthHint('', false);
+            syncStartButtonOnly();
+        }
+
+        // ---------- Tab ----------
+        function switchTab(name) {
+            document.querySelectorAll('.tab-btn').forEach(function (b) {
+                const on = b.getAttribute('data-tab') === name;
+                b.classList.toggle('tab-btn-active', on);
+                b.classList.toggle('text-white', on);
+                b.classList.toggle('text-slate-400', !on);
+            });
+            ['scrape', 'feishu', 'robot'].forEach(function (k) {
+                const el = document.getElementById(k === 'scrape' ? 'panelScrape' : k === 'feishu' ? 'panelFeishu' : 'panelRobot');
+                if (el) el.classList.toggle('hidden', k !== name);
+            });
+        }
+
+        document.querySelectorAll('.tab-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                switchTab(btn.getAttribute('data-tab'));
+            });
+        });
+
+        // ---------- 配置：与 data/control_*.json 同步 ----------
+        let lastSyncedInterval = 600;
+
+        function getIntervalFromUI() {
+            return Number(document.getElementById('cfgInterval').value || 600);
+        }
+
+        function getHeadlessPollFromUI() {
+            return !!document.getElementById('cfgHeadful').checked;
+        }
+
+        function getFetchAssistTasksFromUI() {
+            return !!document.getElementById('cfgFetchAssistTasks')?.checked;
+        }
+
+        function getBrowserExecutableFromUI() {
+            const el = document.getElementById('cfgBrowserExecutable');
+            return (el && el.value) ? String(el.value).trim() : '';
+        }
+
+        function updateFetchAssistLabel(enabled) {
+            const label = document.getElementById('cfgFetchAssistLabel');
+            if (!label) return;
+            if (enabled) {
+                label.textContent = '已开启（每轮素材采集后采集调控任务）';
+                label.className = 'text-sm text-emerald-400 select-none pointer-events-none';
+            } else {
+                label.textContent = '关闭（仅采集素材数据）';
+                label.className = 'text-sm text-slate-500 select-none pointer-events-none';
+            }
+        }
+
+        async function syncScrapePanelToBackend() {
+            const api = await waitForApi();
+            if (!api || !api.setScrapeServicePanelConfig) return;
+            const interval_seconds = Math.max(5, getIntervalFromUI());
+            const headless_poll = getHeadlessPollFromUI();
+            const fetch_assist_tasks = getFetchAssistTasksFromUI();
+            const browser_executable_path = getBrowserExecutableFromUI();
+            try {
+                await api.setScrapeServicePanelConfig(
+                    interval_seconds,
+                    headless_poll,
+                    fetch_assist_tasks,
+                    browser_executable_path
+                );
+            } catch (_) {}
+        }
+
+        function refreshIntervalStepButtonsState() {
+            const el = document.getElementById('cfgInterval');
+            const down = document.getElementById('cfgIntervalStepDown');
+            if (!el || !down) return;
+            const min = 5;
+            const v = parseInt(el.value, 10);
+            down.disabled = !isNaN(v) && v <= min;
+        }
+
+        function wireIntervalSteppers() {
+            const el = document.getElementById('cfgInterval');
+            const up = document.getElementById('cfgIntervalStepUp');
+            const down = document.getElementById('cfgIntervalStepDown');
+            if (!el || !up || !down) return;
+            const min = 5;
+            function bump(delta) {
+                let v = parseInt(el.value, 10);
+                if (isNaN(v)) v = min;
+                v = Math.max(min, v + delta);
+                el.value = String(v);
+                refreshIntervalStepButtonsState();
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            up.addEventListener('click', function (e) {
+                e.preventDefault();
+                bump(1);
+            });
+            down.addEventListener('click', function (e) {
+                e.preventDefault();
+                bump(-1);
+            });
+            el.addEventListener('input', refreshIntervalStepButtonsState);
+            el.addEventListener('change', refreshIntervalStepButtonsState);
+            refreshIntervalStepButtonsState();
+        }
+
+        async function hydrateScrapeFromBackend() {
+            const api = await waitForApi();
+            if (!api || !api.getScrapeServicePanelConfig) return;
+            try {
+                const r = await api.getScrapeServicePanelConfig();
+                if (!r || !r.success) return;
+                const iv = document.getElementById('cfgInterval');
+                const hd = document.getElementById('cfgHeadful');
+                if (iv) iv.value = String(r.interval_seconds != null ? r.interval_seconds : 600);
+                refreshIntervalStepButtonsState();
+                if (hd) {
+                    hd.checked = r.headless_poll !== false;
+                    updateHeadfulLabel(hd.checked);
+                }
+                const fa = document.getElementById('cfgFetchAssistTasks');
+                if (fa) {
+                    fa.checked = r.fetch_assist_tasks === true;
+                    updateFetchAssistLabel(fa.checked);
+                }
+                const bx = document.getElementById('cfgBrowserExecutable');
+                if (bx) bx.value = (r.browser_executable_path != null) ? String(r.browser_executable_path) : '';
+                lastSyncedInterval = getIntervalFromUI();
+            } catch (_) {}
+        }
+
+        function getFeishuFromUI() {
+            const modeEl = document.querySelector('input[name="cfgFeishuPushMode"]:checked');
+            const pushMode = (modeEl && modeEl.value === 'hourly_latest') ? 'hourly_latest' : 'each_crawl';
+            return {
+                enabled: !!(document.getElementById('cfgFeishuEnabled')?.checked),
+                app: (document.getElementById('cfgFeishuAppToken')?.value || '').trim(),
+                pat: (document.getElementById('cfgFeishuPersonalToken')?.value || '').trim(),
+                tbl: (document.getElementById('cfgFeishuTableId')?.value || '').trim(),
+                pushMode: pushMode,
+            };
+        }
+
+        async function syncFeishuConfigToBackend() {
+            const api = await waitForApi();
+            if (!api || !api.setFeishuBitableConfig) return;
+            const { enabled, app, pat, tbl, pushMode } = getFeishuFromUI();
+            try {
+                await api.setFeishuBitableConfig(app, pat, tbl, enabled, pushMode);
+            } catch (_) {}
+        }
+
+        async function hydrateFeishuFromBackend() {
+            const api = await waitForApi();
+            if (!api || !api.getFeishuBitablePanelConfig) return;
+            try {
+                const r = await api.getFeishuBitablePanelConfig();
+                if (!r || !r.success) return;
+                const en = document.getElementById('cfgFeishuEnabled');
+                const a = document.getElementById('cfgFeishuAppToken');
+                const p = document.getElementById('cfgFeishuPersonalToken');
+                const t = document.getElementById('cfgFeishuTableId');
+                if (en) en.checked = r.enabled !== false;
+                if (a) a.value = r.app_token || '';
+                if (p) p.value = r.personal_base_token || '';
+                if (t) t.value = r.table_id || '';
+                const pm = (r.push_mode === 'hourly_latest') ? 'hourly_latest' : 'each_crawl';
+                const rEach = document.querySelector('input[name="cfgFeishuPushMode"][value="each_crawl"]');
+                const rHour = document.querySelector('input[name="cfgFeishuPushMode"][value="hourly_latest"]');
+                if (rEach && rHour) {
+                    if (pm === 'hourly_latest') rHour.checked = true;
+                    else rEach.checked = true;
+                }
+            } catch (_) {}
+        }
+
+        function getWhPushFromUI() {
+            return {
+                enabled: !!(document.getElementById('cfgWhPushEnabled')?.checked),
+                webhook: (document.getElementById('cfgWhWebhook')?.value || '').trim(),
+                keyword: (document.getElementById('cfgWhKeyword')?.value || '').trim(),
+            };
+        }
+
+        async function syncWhPushConfigToBackend() {
+            const api = await waitForApi();
+            if (!api || !api.setFeishuWebhookPushConfig) return;
+            const { enabled, webhook, keyword } = getWhPushFromUI();
+            try {
+                await api.setFeishuWebhookPushConfig(enabled, webhook, keyword);
+            } catch (_) {}
+        }
+
+        async function hydrateWhPushFromBackend() {
+            const api = await waitForApi();
+            if (!api || !api.getFeishuWebhookPushConfig) return;
+            try {
+                const r = await api.getFeishuWebhookPushConfig();
+                if (!r || !r.success) return;
+                const en = document.getElementById('cfgWhPushEnabled');
+                const w = document.getElementById('cfgWhWebhook');
+                const k = document.getElementById('cfgWhKeyword');
+                if (en) en.checked = !!r.enabled;
+                if (w) w.value = r.webhook || '';
+                if (k) k.value = r.keyword || '';
+            } catch (_) {}
+        }
+
+        function getDingWhPushFromUI() {
+            return {
+                enabled: !!(document.getElementById('cfgDingWhPushEnabled')?.checked),
+                webhook: (document.getElementById('cfgDingWhWebhook')?.value || '').trim(),
+                keyword: (document.getElementById('cfgDingWhKeyword')?.value || '').trim(),
+            };
+        }
+
+        async function syncDingtalkWhPushConfigToBackend() {
+            const api = await waitForApi();
+            if (!api || !api.setDingtalkWebhookPushConfig) return;
+            const { enabled, webhook, keyword } = getDingWhPushFromUI();
+            try {
+                await api.setDingtalkWebhookPushConfig(enabled, webhook, keyword);
+            } catch (_) {}
+        }
+
+        async function hydrateDingtalkWhPushFromBackend() {
+            const api = await waitForApi();
+            if (!api || !api.getDingtalkWebhookPushConfig) return;
+            try {
+                const r = await api.getDingtalkWebhookPushConfig();
+                if (!r || !r.success) return;
+                const en = document.getElementById('cfgDingWhPushEnabled');
+                const w = document.getElementById('cfgDingWhWebhook');
+                const k = document.getElementById('cfgDingWhKeyword');
+                if (en) en.checked = !!r.enabled;
+                if (w) w.value = r.webhook || '';
+                if (k) k.value = r.keyword || '';
+            } catch (_) {}
+        }
+
+        function updateHeadfulLabel(headlessEnabled) {
+            const label = document.getElementById('cfgHeadfulLabel');
+            const descText = document.getElementById('cfgDescText');
+            if (headlessEnabled) {
+                label.textContent = '启用（轮询采集时不显示浏览器）';
+                label.className = 'text-sm text-emerald-400';
+                descText.textContent = '首次有头登录存 Cookie；轮询可无头。改选项后下一轮生效。';
+            } else {
+                label.textContent = '关闭（全程显示浏览器）';
+                label.className = 'text-sm text-slate-400';
+                descText.textContent = '登录与轮询均显示浏览器窗口。';
+            }
+        }
+
+        const MAX_LOG_LINES = 500;
+        let userScrolledUp = false;
+
+        function initScrollListener() {
+            const box = document.getElementById('logBox');
+            box.addEventListener('scroll', function() {
+                const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 80;
+                userScrolledUp = !nearBottom;
+            });
+        }
+
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) {
+                userScrolledUp = false;
+            }
+        });
+
+        async function refreshStatusAndLogs() {
+            const api = await waitForApi();
+            if (!api) return;
+
+            const st = await api.getServiceStatus();
+            setStatusUI(st);
+
+            const logs = await api.readLogs(300);
+            if (logs && logs.success) {
+                const box = document.getElementById('logBox');
+                let lines = logs.lines || [];
+                if (lines.length > MAX_LOG_LINES) {
+                    lines = lines.slice(-MAX_LOG_LINES);
+                }
+                if (!userScrolledUp) {
+                    box.textContent = lines.join('\n');
+                    box.scrollTop = box.scrollHeight;
+                } else {
+                    box.textContent = lines.join('\n');
+                }
+            }
+        }
+
+        document.getElementById('btnClearLogs').addEventListener('click', () => {
+            document.getElementById('logBox').textContent = '';
+            userScrolledUp = false;
+        });
+
+        document.getElementById('btnStart').addEventListener('click', async () => {
+            const api = await waitForApi();
+            if (!api) {
+                await appAlert(
+                    '未连接到桌面端 API（pywebview）。请通过「千川素材看盘工具」客户端打开，勿在浏览器中单独打开本页；若已用客户端，请重启应用后再试。',
+                    '无法启动'
+                );
+                return;
+            }
+            syncAuthGateFromLocalOnly();
+            const sess = getAuthSession();
+            if (!sess || !sess.username) {
+                await appAlert('请先在左侧栏底部登录账号', '无法启动');
+                return;
+            }
+            const interval = getIntervalFromUI();
+            const headlessPoll = getHeadlessPollFromUI();
+            let st;
+            try {
+                st = await api.startService(interval, headlessPoll, sess.username, sess.password);
+            } catch (e) {
+                await appAlert((e && e.message) ? String(e.message) : '启动请求异常', '无法启动');
+                return;
+            }
+            if (st && st.success === false) {
+                try {
+                    localStorage.removeItem(QC_AUTH_SESSION);
+                    localStorage.removeItem(QC_AUTH_LAST);
+                } catch (_) {}
+                syncAuthGateFromLocalOnly();
+                try {
+                    window.top.postMessage({ type: 'qc-auth-clear' }, '*');
+                } catch (_) {}
+                await appAlert(st.message || '账号校验失败，无法启动采集', '无法启动');
+                try {
+                    const st2 = await api.getServiceStatus();
+                    setStatusUI(st2);
+                } catch (_) {
+                    setStatusUI(st);
+                }
+                return;
+            }
+            setStatusUI(st);
+            lastSyncedInterval = interval;
+        });
+
+        wireIntervalSteppers();
+
+        document.getElementById('cfgInterval').addEventListener('change', async function() {
+            const api = await waitForApi();
+            if (!api) return;
+            const newInterval = getIntervalFromUI();
+            if (newInterval >= 5) {
+                await syncScrapePanelToBackend();
+                if (api.setServiceInterval) {
+                    await api.setServiceInterval(newInterval);
+                }
+                lastSyncedInterval = newInterval;
+            }
+            refreshIntervalStepButtonsState();
+        });
+
+        document.getElementById('cfgHeadful').addEventListener('change', function() {
+            updateHeadfulLabel(this.checked);
+            syncScrapePanelToBackend();
+        });
+
+        document.getElementById('cfgFetchAssistTasks')?.addEventListener('change', function() {
+            updateFetchAssistLabel(this.checked);
+            syncScrapePanelToBackend();
+        });
+
+        document.getElementById('cfgBrowserExecutable')?.addEventListener('change', function() {
+            syncScrapePanelToBackend();
+        });
+
+        document.getElementById('cfgFeishuEnabled')?.addEventListener('change', syncFeishuConfigToBackend);
+        ['cfgFeishuAppToken', 'cfgFeishuPersonalToken', 'cfgFeishuTableId'].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.addEventListener('change', syncFeishuConfigToBackend);
+        });
+        document.querySelectorAll('input[name="cfgFeishuPushMode"]').forEach(function (el) {
+            el.addEventListener('change', syncFeishuConfigToBackend);
+        });
+
+        document.getElementById('cfgWhPushEnabled')?.addEventListener('change', syncWhPushConfigToBackend);
+        ['cfgWhWebhook', 'cfgWhKeyword'].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.addEventListener('change', syncWhPushConfigToBackend);
+        });
+        async function showWebhookTestResult(r, dialogTitle) {
+            if (!r) {
+                await appAlert('无响应', dialogTitle);
+                return;
+            }
+            if (r.success) {
+                const n = (typeof r.row_count === 'number') ? r.row_count : null;
+                const tail = n != null ? '（共 ' + n + ' 条）' : '';
+                await appAlert((r.message || '已发送') + tail, dialogTitle);
+                return;
+            }
+            const msg = r.message || '发送失败';
+            const prefix = r.skipped ? '【已跳过】' : '';
+            await appAlert(prefix + msg, dialogTitle);
+        }
+
+        document.getElementById('btnWhPushTest')?.addEventListener('click', async function () {
+            const api = await waitForApi();
+            if (!api || !api.testFeishuWebhookPush) {
+                await appAlert('API 未就绪', '提示');
+                return;
+            }
+            let r;
+            try {
+                r = await api.testFeishuWebhookPush();
+            } catch (e) {
+                await appAlert(String(e), '飞书 · 测试推送');
+                return;
+            }
+            await showWebhookTestResult(r, '飞书 · 测试推送');
+        });
+
+        document.getElementById('cfgDingWhPushEnabled')?.addEventListener('change', syncDingtalkWhPushConfigToBackend);
+        ['cfgDingWhWebhook', 'cfgDingWhKeyword'].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.addEventListener('change', syncDingtalkWhPushConfigToBackend);
+        });
+        document.getElementById('btnDingWhPushTest')?.addEventListener('click', async function () {
+            const api = await waitForApi();
+            if (!api || !api.testDingtalkWebhookPush) {
+                await appAlert('API 未就绪', '提示');
+                return;
+            }
+            let r;
+            try {
+                r = await api.testDingtalkWebhookPush();
+            } catch (e) {
+                await appAlert(String(e), '钉钉 · 测试推送');
+                return;
+            }
+            await showWebhookTestResult(r, '钉钉 · 测试推送');
+        });
+
+        document.getElementById('btnStop').addEventListener('click', async () => {
+            const api = await waitForApi();
+            if (!api) {
+                await appAlert('未连接到桌面端 API，请使用客户端打开服务控制页。', '无法停止');
+                return;
+            }
+            const st = await api.stopService();
+            setStatusUI(st);
+        });
+
+        // init
+        switchTab('scrape');
+        (async function initConfigs() {
+            await hydrateScrapeFromBackend();
+            await hydrateFeishuFromBackend();
+            await hydrateWhPushFromBackend();
+            await hydrateDingtalkWhPushFromBackend();
+        })();
+
+        initScrollListener();
+        refreshStatusAndLogs();
+        setInterval(refreshStatusAndLogs, 2000);
+
+        window.addEventListener('message', (e) => {
+            if (e.data && e.data.type === 'qc-auth-changed') syncAuthGateFromLocalOnly();
+        });
+
+        syncAuthGateFromLocalOnly();
+    </script>
+</body>
+</html>
