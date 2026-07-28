@@ -304,10 +304,10 @@ class Api:
     def getScrapeServicePanelConfig(self):
         """抓取服务 Tab：control_panel.json → crawl"""
         from services.control_panel_config import load_scrape_service_config
-        from utils.common import default_browser_executable_hint
+        from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
 
         c = load_scrape_service_config()
-        stored = (c.get("browser_executable_path") or "").strip()
+        stored = configured_chrome_path_or_empty(c.get("browser_executable_path"))
         display_path = stored if stored else default_browser_executable_hint()
         return {
             "success": True,
@@ -383,12 +383,63 @@ class Api:
         """
         远程校验普通用户账号与密码，并返回有效期、禁用状态（见 dev_files/api文档.md）。
         """
-        return self.account_auth.verify_login(username, password)
+        result = self.account_auth.verify_login(username, password)
+        data = result.get("data") if isinstance(result, dict) else None
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and isinstance(data, dict)
+            and int(data.get("is_disabled") or 0) != 1
+            and self.account_auth._is_within_validity(data)
+        ):
+            from services.local_feishu_bridge import activate_local_feishu_account
+
+            activate_local_feishu_account(username)
+        return result
 
     def clearDeviceSession(self):
+        from services.local_feishu_bridge import deactivate_local_feishu_account
         from services.cloud_retarget_client import clear_device_session
 
+        deactivate_local_feishu_account()
         return clear_device_session()
+
+    # ========== 本地飞书长连接 ==========
+
+    def getLocalFeishuStatus(self):
+        from services.local_feishu_bridge import get_local_feishu_status
+
+        return get_local_feishu_status()
+
+    def saveLocalFeishuConfig(self, config):
+        from services.local_feishu_bridge import save_local_feishu_config
+
+        return save_local_feishu_config(config if isinstance(config, dict) else {})
+
+    def testLocalFeishuCredentials(self):
+        from services.local_feishu_bridge import test_local_feishu_credentials
+
+        return test_local_feishu_credentials()
+
+    def issueLocalFeishuBindingCode(self, purpose: str):
+        from services.local_feishu_bridge import issue_local_feishu_binding_code
+
+        return issue_local_feishu_binding_code(purpose)
+
+    def removeLocalFeishuGroup(self, chat_id: str):
+        from services.local_feishu_bridge import remove_local_feishu_group
+
+        return remove_local_feishu_group(chat_id)
+
+    def clearLocalFeishuBinding(self):
+        from services.local_feishu_bridge import clear_local_feishu_binding
+
+        return clear_local_feishu_binding()
+
+    def sendLocalFeishuTestCard(self):
+        from services.local_feishu_bridge import send_local_feishu_test_card
+
+        return send_local_feishu_test_card()
 
     def get_app_version(self):
         """当前程序版本号（展示用，与 config.CURRENT_VERSION 一致）。"""
@@ -453,13 +504,13 @@ class Api:
 
     def getRuleRetargetingConfig(self):
         """读取 data/rule_retargeting.json（规范化后返回）。"""
-        from utils.common import default_browser_executable_hint
+        from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
 
         from .rule_retargeting_config import load_rule_retargeting_config
 
         c = load_rule_retargeting_config()
         out = dict(c)
-        stored = (out.get("browser_executable_path") or "").strip()
+        stored = configured_chrome_path_or_empty(out.get("browser_executable_path"))
         out["browser_executable_path"] = stored if stored else default_browser_executable_hint()
         out["success"] = True
         return out
@@ -506,13 +557,13 @@ class Api:
 
     def getRuleRegulationConfig(self):
         """读取 data/rule_regulation.json（规则化停投，规范化后返回）。"""
-        from utils.common import default_browser_executable_hint
+        from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
 
         from .rule_regulation_config import load_rule_regulation_config
 
         c = load_rule_regulation_config()
         out = dict(c)
-        stored = (out.get("browser_executable_path") or "").strip()
+        stored = configured_chrome_path_or_empty(out.get("browser_executable_path"))
         out["browser_executable_path"] = stored if stored else default_browser_executable_hint()
         out["success"] = True
         return out

@@ -47,6 +47,7 @@ from services.control_panel_config import (
     load_feishu_bitable_panel_config,
 )
 from config import PROJECT_ROOT, DATA_DIR, LOGS_DIR, DB_FILE
+from utils.common import browser_runtime_info
 
 
 """
@@ -448,10 +449,41 @@ class ServiceController:
         with self._lock:
             running = self._thread is not None and self._thread.is_alive()
             try:
-                interval = int(load_scrape_service_config().get("interval_seconds") or 60)
+                scrape_status_cfg = load_scrape_service_config()
+                interval = int(scrape_status_cfg.get("interval_seconds") or 60)
             except Exception:
+                scrape_status_cfg = {}
                 interval = 60
             interval = max(5, interval)
+            browser_info = browser_runtime_info(
+                str(scrape_status_cfg.get("browser_executable_path") or "").strip() or None
+            )
+            cookie_path = ServiceConfig().normalize_paths().cookie_path
+            cookie_exists = bool(cookie_path and os.path.isfile(cookie_path))
+            cookie_updated_at = ""
+            if cookie_exists:
+                try:
+                    cookie_updated_at = datetime.fromtimestamp(
+                        os.path.getmtime(cookie_path)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                except OSError:
+                    cookie_updated_at = ""
+            if self._phase == "waiting_login":
+                login_status = "等待在可见Chrome中完成登录"
+            elif cookie_exists:
+                login_status = "已保存千川登录状态"
+            else:
+                login_status = "尚未保存千川登录状态"
+            if self._phase == "running":
+                browser_phase = (
+                    "后台无头运行"
+                    if self._active_poll_headless is not False
+                    else "可见窗口运行"
+                )
+            elif self._phase in {"starting", "waiting_login"}:
+                browser_phase = "可见窗口登录"
+            else:
+                browser_phase = "未运行"
 
             # 获取抓取进度（素材 + 可选调控任务）
             fetch_progress = None
@@ -492,6 +524,15 @@ class ServiceController:
                 "interval": interval,
                 "fetchProgress": fetch_progress,
                 "assistProgress": assist_progress,
+                "browser": {
+                    **browser_info,
+                    "phase": browser_phase,
+                },
+                "qianchuanLogin": {
+                    "status": login_status,
+                    "cookie_saved": cookie_exists,
+                    "cookie_updated_at": cookie_updated_at,
+                },
             }
 
     # ---------------- interval 配置 ----------------

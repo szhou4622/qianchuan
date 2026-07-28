@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>飞书绑定</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0b1220;
+            --panel: #111b2e;
+            --panel-2: #0e1728;
+            --line: #26344d;
+            --text: #e8eef8;
+            --muted: #93a4bd;
+            --blue: #38bdf8;
+            --blue-dark: #075985;
+            --green: #34d399;
+            --amber: #fbbf24;
+            --red: #fb7185;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-width: 820px;
+            background: var(--bg);
+            color: var(--text);
+            font: 14px/1.55 "Microsoft YaHei", "Segoe UI", sans-serif;
+        }
+        button, input { font: inherit; }
+        .shell { max-width: 1260px; margin: 0 auto; padding: 26px 30px 48px; }
+        .topbar {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 24px;
+            margin-bottom: 22px;
+        }
+        h1 { margin: 0 0 7px; font-size: 24px; line-height: 1.25; }
+        h2 { margin: 0; font-size: 16px; }
+        h3 { margin: 0 0 5px; font-size: 14px; }
+        p { margin: 0; }
+        .sub { color: var(--muted); font-size: 13px; }
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--panel);
+            white-space: nowrap;
+        }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; }
+        .status.connected .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(52,211,153,.12); }
+        .status.connecting .dot { background: var(--amber); }
+        .status.error .dot { background: var(--red); }
+        .notice {
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+            padding: 13px 15px;
+            margin-bottom: 18px;
+            border: 1px solid #174b69;
+            border-radius: 10px;
+            background: rgba(14,116,144,.13);
+            color: #c8edff;
+        }
+        .notice strong { color: #e9f8ff; }
+        .grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(360px, .9fr); gap: 16px; }
+        .stack { display: grid; gap: 16px; align-content: start; }
+        .card {
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: var(--panel);
+            overflow: hidden;
+        }
+        .card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            padding: 17px 18px;
+            border-bottom: 1px solid var(--line);
+        }
+        .step {
+            display: inline-grid;
+            place-items: center;
+            width: 26px;
+            height: 26px;
+            margin-right: 9px;
+            border-radius: 8px;
+            background: var(--blue-dark);
+            color: #e0f7ff;
+            font-weight: 700;
+        }
+        .card-body { padding: 18px; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        label { display: block; margin-bottom: 6px; color: #c6d2e5; font-size: 12px; }
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            min-height: 40px;
+            padding: 9px 11px;
+            border: 1px solid #34445f;
+            border-radius: 8px;
+            outline: none;
+            background: #0a1323;
+            color: var(--text);
+        }
+        input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(56,189,248,.12); }
+        .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .row.end { justify-content: flex-end; }
+        .actions { margin-top: 16px; }
+        .btn {
+            min-height: 38px;
+            padding: 8px 14px;
+            border: 1px solid #3b4a63;
+            border-radius: 8px;
+            background: #172238;
+            color: #dce6f5;
+            cursor: pointer;
+        }
+        .btn:hover { background: #1e2c45; }
+        .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+        .btn.primary { border-color: #0ea5e9; background: #0284c7; color: white; font-weight: 650; }
+        .btn.primary:hover { background: #0ea5e9; }
+        .btn.danger { border-color: #7f1d1d; background: #35131d; color: #fda4af; }
+        .btn:disabled { opacity: .5; cursor: wait; }
+        .switch-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 13px 0;
+            border-top: 1px solid var(--line);
+        }
+        .switch-row:first-child { border-top: 0; }
+        .switch {
+            position: relative;
+            width: 42px;
+            height: 24px;
+            flex: 0 0 auto;
+        }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; inset: 0; border-radius: 999px; background: #3a475c; cursor: pointer; }
+        .slider:before {
+            content: "";
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            left: 3px;
+            top: 3px;
+            border-radius: 50%;
+            background: white;
+            transition: transform .14s ease;
+        }
+        .switch input:checked + .slider { background: #0284c7; }
+        .switch input:checked + .slider:before { transform: translateX(18px); }
+        .code {
+            position: relative;
+            margin-top: 12px;
+            padding: 14px 82px 14px 14px;
+            border: 1px solid #30425f;
+            border-radius: 9px;
+            background: #080f1d;
+            color: #bce9ff;
+            font: 12px/1.55 Consolas, monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .copy {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            min-height: 30px;
+            padding: 5px 9px;
+        }
+        .binding-box {
+            margin-top: 14px;
+            padding: 14px;
+            border: 1px dashed #40516c;
+            border-radius: 10px;
+            background: var(--panel-2);
+        }
+        .command {
+            display: block;
+            margin: 9px 0 4px;
+            color: #d9f3ff;
+            font: 600 19px/1.4 Consolas, monospace;
+            letter-spacing: .3px;
+        }
+        .mini { color: var(--muted); font-size: 12px; }
+        .group-list { display: grid; gap: 8px; margin-top: 12px; }
+        .group {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 11px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--panel-2);
+        }
+        .group code { color: #c9d8ec; word-break: break-all; }
+        ol { margin: 0; padding-left: 21px; }
+        li { margin: 7px 0; color: #c8d3e4; }
+        code.inline { padding: 2px 5px; border-radius: 5px; background: #081323; color: #b7eaff; }
+        .feedback {
+            min-height: 20px;
+            margin-top: 11px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .feedback.ok { color: var(--green); }
+        .feedback.error { color: var(--red); }
+        @media (max-width: 1000px) {
+            .grid { grid-template-columns: 1fr; }
+            .form-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<main class="shell">
+    <header class="topbar">
+        <div>
+            <h1>飞书绑定</h1>
+            <p class="sub">飞书消息和卡片按钮直接通过本机长连接处理，不需要服务器、域名或回调地址。</p>
+        </div>
+        <div class="status" id="statusPill" role="status" aria-live="polite">
+            <span class="dot"></span>
+            <span id="statusText">正在读取状态</span>
+        </div>
+    </header>
+
+    <div class="notice">
+        <span aria-hidden="true">ⓘ</span>
+        <p><strong>工具必须保持运行。</strong> 工具关闭期间点击卡片不会执行；重新打开并显示“已连接”后，在有效期内重新点击即可。</p>
+    </div>
+
+    <div class="grid">
+        <section class="stack">
+            <article class="card">
+                <div class="card-head">
+                    <h2><span class="step">1</span>连接飞书应用</h2>
+                    <button class="btn" id="testCredentials" type="button">检测应用</button>
+                </div>
+                <div class="card-body">
+                    <div class="form-grid">
+                        <div>
+                            <label for="appId">App ID</label>
+                            <input id="appId" type="text" autocomplete="off" placeholder="cli_xxxxxxxxxxxxxxxx">
+                        </div>
+                        <div>
+                            <label for="appSecret">App Secret</label>
+                            <input id="appSecret" type="password" autocomplete="new-password" placeholder="未保存">
+                        </div>
+                    </div>
+                    <div class="actions row end">
+                        <button class="btn primary" id="saveConfig" type="button">保存并连接</button>
+                    </div>
+                    <p class="feedback" id="configFeedback" aria-live="polite"></p>
+                </div>
+            </article>
+
+            <article class="card">
+                <div class="card-head">
+                    <h2><span class="step">2</span>绑定个人</h2>
+                    <button class="btn" id="personalCodeBtn" type="button">生成绑定码</button>
+                </div>
+                <div class="card-body">
+                    <p class="sub">生成后，在10分钟内私聊机器人发送下面的完整命令。</p>
+                    <div class="binding-box">
+                        <span class="mini">绑定命令</span>
+                        <span class="command" id="personalCommand">等待生成</span>
+                        <span class="mini" id="personalExpiry">绑定码一次有效，用后失效</span>
+                    </div>
+                    <p class="feedback" id="personalFeedback" aria-live="polite"></p>
+                </div>
+            </article>
+
+            <article class="card">
+                <div class="card-head">
+                    <h2><span class="step">3</span>绑定接收群</h2>
+                    <button class="btn" id="groupCodeBtn" type="button">生成群绑定码</button>
+                </div>
+                <div class="card-body">
+                    <p class="sub">先完成个人绑定，再把机器人加入群，由已绑定授权人在群内@机器人发送命令。</p>
+                    <div class="binding-box">
+                        <span class="mini">群绑定命令</span>
+                        <span class="command" id="groupCommand">等待生成</span>
+                        <span class="mini" id="groupExpiry">只有已绑定授权人可以操作</span>
+                    </div>
+                    <div class="group-list" id="groupList"></div>
+                    <p class="feedback" id="groupFeedback" aria-live="polite"></p>
+                </div>
+            </article>
+        </section>
+
+        <aside class="stack">
+            <article class="card">
+                <div class="card-head"><h2>飞书后台一次性设置</h2></div>
+                <div class="card-body">
+                    <ol>
+                        <li>在“权限管理”批量导入下方JSON。</li>
+                        <li>在“事件与回调”选择<strong>使用长连接接收回调</strong>。</li>
+                        <li>订阅 <code class="inline">card.action.trigger</code> 和 <code class="inline">im.message.receive_v1</code>。</li>
+                        <li>创建并发布版本，确保你和接收群在应用可用范围内。</li>
+                    </ol>
+                    <div class="code" id="scopeJson">{
+  "scopes": {
+    "tenant": [
+      "im:message:send_as_bot",
+      "im:message:update",
+      "im:message.p2p_msg:readonly",
+      "im:message.group_at_msg:readonly"
+    ]
+  }
+}<button class="btn copy" id="copyScopes" type="button">复制</button></div>
+                </div>
+            </article>
+
+            <article class="card">
+                <div class="card-head"><h2>发送位置</h2></div>
+                <div class="card-body">
+                    <div class="switch-row">
+                        <div><h3>发送给已绑定个人</h3><p class="mini" id="personalState">尚未绑定</p></div>
+                        <label class="switch" aria-label="发送给个人"><input id="sendPersonal" type="checkbox" checked><span class="slider"></span></label>
+                    </div>
+                    <div class="switch-row">
+                        <div><h3>发送到已绑定群</h3><p class="mini" id="groupsState">尚未绑定群</p></div>
+                        <label class="switch" aria-label="发送到群"><input id="sendGroups" type="checkbox" checked><span class="slider"></span></label>
+                    </div>
+                    <div class="actions row">
+                        <button class="btn primary" id="testCard" type="button">发送测试卡片</button>
+                        <button class="btn danger" id="clearBinding" type="button">解除全部绑定</button>
+                    </div>
+                    <p class="feedback" id="actionFeedback" aria-live="polite"></p>
+                </div>
+            </article>
+
+            <article class="card">
+                <div class="card-head"><h2>本机安全说明</h2></div>
+                <div class="card-body sub">
+                    App Secret按当前工具账号隔离，并使用Windows本机凭据保护加密。密钥不会上传到中心服务器，也不会写入日志和操作流水。切换工具账号时，旧账号的飞书连接会立即停止。
+                </div>
+            </article>
+        </aside>
+    </div>
+</main>
+
+<script>
+    const ui = (id) => document.getElementById(id);
+    let latest = null;
+    let busy = false;
+
+    function api() {
+        try { return window.top && window.top.pywebviewAPI; } catch (_) { return null; }
+    }
+
+    async function waitApi() {
+        for (let i = 0; i < 80; i++) {
+            const found = api();
+            if (found && typeof found.getLocalFeishuStatus === 'function') return found;
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        return null;
+    }
+
+    function feedback(id, text, ok) {
+        const el = ui(id);
+        el.textContent = text || '';
+        el.className = 'feedback' + (text ? (ok ? ' ok' : ' error') : '');
+    }
+
+    function statusLabel(status, connected) {
+        if (connected) return ['已连接', 'connected'];
+        const labels = {
+            logged_out: '请先登录工具账号',
+            not_configured: '未配置',
+            connecting: '连接中',
+            reconnecting: '断线重连中',
+            stopped: '已停止',
+            permission_missing: '权限不足',
+            app_unpublished: '应用未发布',
+            error: '连接异常'
+        };
+        return [
+            labels[status] || '未连接',
+            status === 'connecting' || status === 'reconnecting'
+                ? 'connecting'
+                : (['error', 'permission_missing', 'app_unpublished'].includes(status) ? 'error' : '')
+        ];
+    }
+
+    function render(data) {
+        latest = data || {};
+        const profile = latest.profile || {};
+        const state = statusLabel(latest.status, latest.connected);
+        ui('statusText').textContent = state[0];
+        ui('statusPill').className = 'status ' + state[1];
+        if (profile.app_id && !ui('appId').value) ui('appId').value = profile.app_id;
+        ui('appSecret').placeholder = profile.app_secret_saved ? '已加密保存，留空表示不修改' : '请输入App Secret';
+        ui('sendPersonal').checked = profile.send_personal !== false;
+        ui('sendGroups').checked = profile.send_groups !== false;
+        const owner = profile.authorized_open_id || '';
+        const groups = Array.isArray(profile.groups) ? profile.groups : [];
+        ui('personalState').textContent = owner ? ('已绑定 ' + owner) : '尚未绑定';
+        ui('groupsState').textContent = groups.length ? ('已绑定 ' + groups.length + ' 个群') : '尚未绑定群';
+        ui('groupCodeBtn').disabled = !owner;
+        ui('testCard').disabled = !latest.connected || !owner;
+        if (latest.last_card_action_at) {
+            feedback(
+                'actionFeedback',
+                '测试按钮回传成功：' + latest.last_card_action_at,
+                true
+            );
+        }
+        ui('groupList').innerHTML = groups.length ? groups.map(group => {
+            const chatId = String(group.chat_id || '');
+            return '<div class="group"><div><strong>' + escapeHtml(group.name || '已绑定群') +
+                '</strong><br><code>' + escapeHtml(chatId) +
+                '</code></div><button class="btn remove-group" type="button" data-chat="' +
+                escapeHtml(chatId) + '">移除</button></div>';
+        }).join('') : '<p class="mini">暂无接收群</p>';
+        document.querySelectorAll('.remove-group').forEach(btn => {
+            btn.addEventListener('click', () => removeGroup(btn.dataset.chat));
+        });
+        if (latest.last_error) feedback('configFeedback', latest.last_error, false);
+    }
+
+    function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[c]);
+    }
+
+    async function refresh() {
+        const bridge = await waitApi();
+        if (!bridge) {
+            render({status: 'error', connected: false, last_error: '无法连接桌面端接口'});
+            return;
+        }
+        try { render(await bridge.getLocalFeishuStatus()); }
+        catch (err) { render({status: 'error', connected: false, last_error: String(err)}); }
+    }
+
+    async function runButton(button, fn) {
+        if (busy) return;
+        busy = true;
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '处理中';
+        try { return await fn(); }
+        finally {
+            busy = false;
+            button.disabled = false;
+            button.textContent = original;
+        }
+    }
+
+    ui('saveConfig').addEventListener('click', async () => {
+        const button = ui('saveConfig');
+        await runButton(button, async () => {
+            const bridge = await waitApi();
+            if (!bridge) return feedback('configFeedback', '无法连接桌面端接口', false);
+            const result = await bridge.saveLocalFeishuConfig({
+                app_id: ui('appId').value.trim(),
+                app_secret: ui('appSecret').value,
+                enabled: true,
+                send_personal: ui('sendPersonal').checked,
+                send_groups: ui('sendGroups').checked
+            });
+            feedback('configFeedback', result.message || (result.success ? '保存成功' : '保存失败'), !!result.success);
+            if (result.success) ui('appSecret').value = '';
+            await refresh();
+        });
+    });
+
+    ui('testCredentials').addEventListener('click', async () => {
+        await runButton(ui('testCredentials'), async () => {
+            const bridge = await waitApi();
+            const result = bridge ? await bridge.testLocalFeishuCredentials() : {success:false, message:'无法连接桌面端接口'};
+            feedback('configFeedback', result.message, !!result.success);
+        });
+    });
+
+    async function issueCode(purpose) {
+        const button = purpose === 'personal' ? ui('personalCodeBtn') : ui('groupCodeBtn');
+        await runButton(button, async () => {
+            const bridge = await waitApi();
+            const result = bridge ? await bridge.issueLocalFeishuBindingCode(purpose) : {success:false, message:'无法连接桌面端接口'};
+            const prefix = purpose === 'personal' ? 'personal' : 'group';
+            if (result.success) {
+                ui(prefix + 'Command').textContent = result.command;
+                ui(prefix + 'Expiry').textContent = '有效期至 ' + result.expires_at;
+                feedback(prefix + 'Feedback', '绑定码已生成，请现在去飞书发送', true);
+                try { await navigator.clipboard.writeText(result.command); } catch (_) {}
+            } else {
+                feedback(prefix + 'Feedback', result.message || '生成失败', false);
+            }
+        });
+    }
+    ui('personalCodeBtn').addEventListener('click', () => issueCode('personal'));
+    ui('groupCodeBtn').addEventListener('click', () => issueCode('group'));
+
+    async function saveSwitches() {
+        if (!latest || !latest.profile || !latest.profile.app_id) return;
+        const bridge = await waitApi();
+        const result = await bridge.saveLocalFeishuConfig({
+            app_id: latest.profile.app_id,
+            app_secret: '',
+            enabled: true,
+            send_personal: ui('sendPersonal').checked,
+            send_groups: ui('sendGroups').checked
+        });
+        feedback('actionFeedback', result.message, !!result.success);
+        await refresh();
+    }
+    ui('sendPersonal').addEventListener('change', saveSwitches);
+    ui('sendGroups').addEventListener('change', saveSwitches);
+
+    async function removeGroup(chatId) {
+        const bridge = await waitApi();
+        const result = bridge ? await bridge.removeLocalFeishuGroup(chatId) : {success:false, message:'无法连接桌面端接口'};
+        feedback('groupFeedback', result.success ? '接收群已移除' : result.message, !!result.success);
+        await refresh();
+    }
+
+    ui('testCard').addEventListener('click', async () => {
+        await runButton(ui('testCard'), async () => {
+            const bridge = await waitApi();
+            const result = bridge ? await bridge.sendLocalFeishuTestCard() : {success:false, message:'无法连接桌面端接口'};
+            feedback('actionFeedback', result.message, !!result.success);
+        });
+    });
+
+    ui('clearBinding').addEventListener('click', async () => {
+        if (!confirm('确定解除当前工具账号的个人和群绑定吗？')) return;
+        const bridge = await waitApi();
+        const result = bridge ? await bridge.clearLocalFeishuBinding() : {success:false, message:'无法连接桌面端接口'};
+        feedback('actionFeedback', result.success ? '已解除全部绑定' : result.message, !!result.success);
+        await refresh();
+    });
+
+    ui('copyScopes').addEventListener('click', async () => {
+        const clone = ui('scopeJson').cloneNode(true);
+        const button = clone.querySelector('button');
+        if (button) button.remove();
+        try {
+            await navigator.clipboard.writeText(clone.textContent.trim());
+            ui('copyScopes').textContent = '已复制';
+            setTimeout(() => ui('copyScopes').textContent = '复制', 1200);
+        } catch (_) {
+            feedback('configFeedback', '复制失败，请手动选中JSON', false);
+        }
+    });
+
+    refresh();
+    setInterval(refresh, 2500);
+</script>
+</body>
+</html>

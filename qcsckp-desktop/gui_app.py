@@ -515,6 +515,27 @@ class JSApi:
     def clearDeviceSession(self):
         return self.api.clearDeviceSession()
 
+    def getLocalFeishuStatus(self):
+        return self.api.getLocalFeishuStatus()
+
+    def saveLocalFeishuConfig(self, config):
+        return self.api.saveLocalFeishuConfig(config)
+
+    def testLocalFeishuCredentials(self):
+        return self.api.testLocalFeishuCredentials()
+
+    def issueLocalFeishuBindingCode(self, purpose):
+        return self.api.issueLocalFeishuBindingCode(purpose)
+
+    def removeLocalFeishuGroup(self, chatId):
+        return self.api.removeLocalFeishuGroup(chatId)
+
+    def clearLocalFeishuBinding(self):
+        return self.api.clearLocalFeishuBinding()
+
+    def sendLocalFeishuTestCard(self):
+        return self.api.sendLocalFeishuTestCard()
+
     def checkAppVersion(self, currentVersion=None):
         return self.api.check_app_version(currentVersion)
 
@@ -922,7 +943,7 @@ def main():
         # ===== 规则化追投调度（见 services/retargeting_rule_runner.py；enabled 见 rule_retargeting.json）=====
         start_retargeting_rule_runner_background_thread()
 
-        # ===== 飞书卡片已批准追投：云端任务领取、复核与执行 =====
+        # ===== 飞书卡片已批准追投：本地任务队列领取、复核与执行 =====
         start_retarget_task_worker_background_thread()
 
         # ===== 千川/巨量纵横后台操作日志：已发现页面每5分钟增量同步 =====
@@ -942,6 +963,12 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        try:
+            from services.local_feishu_bridge import deactivate_local_feishu_account
+
+            deactivate_local_feishu_account()
+        except Exception:
+            pass
         print("程序已退出")
 
 

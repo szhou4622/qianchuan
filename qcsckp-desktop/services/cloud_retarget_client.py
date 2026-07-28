@@ -117,6 +117,13 @@ def _token() -> str:
 
 
 def create_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from services.local_feishu_bridge import (
+        create_local_retarget_task,
+        selected_task_backend,
+    )
+
+    if selected_task_backend() == "local_ws":
+        return create_local_retarget_task(payload)
     token = _token()
     if not token:
         return {"success": False, "message": "桌面端尚未取得设备令牌，请重新登录工具账号"}
@@ -124,6 +131,13 @@ def create_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def pull_retarget_task() -> Dict[str, Any]:
+    from services.local_feishu_bridge import (
+        pull_local_retarget_task,
+        selected_task_backend,
+    )
+
+    if selected_task_backend() == "local_ws":
+        return pull_local_retarget_task()
     token = _token()
     if not token:
         return {"success": False, "message": "missing_device_session", "silent": True}
@@ -140,6 +154,18 @@ def report_retarget_task(
     regulate_task_id: str = "",
     result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    from services.local_feishu_bridge import report_local_retarget_task, selected_task_backend
+
+    if selected_task_backend() == "local_ws":
+        return report_local_retarget_task(
+            task_uid,
+            claim_token,
+            status,
+            message=message,
+            detail=detail,
+            regulate_task_id=regulate_task_id,
+            result=result,
+        )
     token = _token()
     if not token:
         return {"success": False, "message": "missing_device_session"}

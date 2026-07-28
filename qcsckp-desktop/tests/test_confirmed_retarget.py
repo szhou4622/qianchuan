@@ -472,7 +472,9 @@ class PlatformLogMonitorTests(unittest.TestCase):
 
 class CloudClientTests(unittest.TestCase):
     def test_result_report_includes_claim_token(self):
-        with patch("services.cloud_retarget_client._token", return_value="device-token"), patch(
+        with patch.dict(os.environ, {"QCSCKP_RETARGET_TASK_BACKEND": "cloud_http"}), patch(
+            "services.cloud_retarget_client._token", return_value="device-token"
+        ), patch(
             "services.cloud_retarget_client._request", return_value={"success": True}
         ) as request:
             response = report_retarget_task("task-1", "a" * 64, "executing", message="执行中")

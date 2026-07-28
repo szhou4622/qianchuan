@@ -53,7 +53,7 @@ def _get_project_root() -> str:
 PROJECT_ROOT = _get_project_root()
 
 
-CURRENT_VERSION = "0.1.6"
+CURRENT_VERSION = "0.1.7"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

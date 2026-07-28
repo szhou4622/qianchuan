@@ -9,8 +9,8 @@ from urllib.parse import urlparse, parse_qs, unquote, urlencode, quote
 
 def require_executable_path(browser_path: str = None) -> str:
     """
-    智能获取 Chromium 内核浏览器路径，供 Playwright 使用。
-    Windows：优先 Edge，其次 Chrome；macOS：仅使用 Google Chrome。
+    获取本机 Google Chrome 路径，供 Playwright 使用。
+    日常运行不读取用户资料目录，也不会自动改用 Edge 或下载 Chromium。
 
     Args:
         browser_path: 可选参数，指定浏览器可执行文件路径
@@ -24,8 +24,16 @@ def require_executable_path(browser_path: str = None) -> str:
 
     if browser_path:
         p = os.path.abspath(os.path.expanduser(browser_path.strip()))
-        if os.path.isfile(p):
+        filename = os.path.basename(p).lower()
+        if os.path.isfile(p) and filename in {"chrome.exe", "google chrome"}:
             return p
+        # 升级前界面会预填 Edge。保留旧配置文件，但运行时忽略它并重新探测 Chrome。
+        if os.path.isfile(p) and filename in {"msedge.exe", "microsoft edge"}:
+            browser_path = None
+        else:
+            raise FileNotFoundError(
+                "手动配置的路径不是有效的Google Chrome程序，请重新选择chrome.exe。"
+            )
 
     # macOS：仅查找 Google Chrome（.app 内二进制）
     if sys.platform == "darwin":
@@ -45,41 +53,19 @@ def require_executable_path(browser_path: str = None) -> str:
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         )
 
-    # Edge浏览器常见路径
-    edge_paths = [
-        r'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',  # 32位优先
-        r'C:/Program Files/Microsoft/Edge/Application/msedge.exe',        # 64位
-    ]
-    # 用户目录下的Edge路径
-    try:
-        user_edge_path = os.path.expanduser(r'~/AppData/Local/Microsoft/Edge/Application/msedge.exe')
-        edge_paths.append(user_edge_path)
-    except Exception:
-        pass
-    for edge_path in edge_paths:
-        if os.path.exists(edge_path):
-            return edge_path
-
     # Chrome浏览器常见路径
     chrome_paths = [
+        os.path.expanduser(r'~/AppData/Local/Google/Chrome/Application/chrome.exe'),
         r'C:/Program Files/Google/Chrome/Application/chrome.exe',
         r'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
     ]
-    # 用户目录下的Chrome路径
-    try:
-        user_chrome_path = os.path.expanduser(r'~/AppData/Local/Google/Chrome/Application/chrome.exe')
-        chrome_paths.append(user_chrome_path)
-    except Exception:
-        pass
     for chrome_path in chrome_paths:
         if os.path.exists(chrome_path):
             return chrome_path
 
-    # 未查找到浏览器，抛出异常（用简明的内联文本提示）
     raise FileNotFoundError(
-        "未检测到Edge或Chrome浏览器可执行文件。\n"
-        "请安装 Microsoft Edge 或 Google Chrome 浏览器，并确保其已安装在标准目录下，\n"
-        "或手动指定浏览器可执行文件路径。"
+        "未检测到Google Chrome浏览器可执行文件。\n"
+        "请安装Google Chrome并确保其位于标准目录，或在高级设置中手动选择chrome.exe。"
     )
 
 
@@ -102,30 +88,46 @@ def default_browser_executable_hint() -> str:
     if sys.platform != "win32":
         return ""
 
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    try:
-        edge_paths.append(
-            os.path.expanduser(r"~\AppData\Local\Microsoft\Edge\Application\msedge.exe")
-        )
-    except Exception:
-        pass
     chrome_paths = [
+        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     ]
-    try:
-        chrome_paths.append(
-            os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe")
-        )
-    except Exception:
-        pass
-    for p in edge_paths + chrome_paths:
+    for p in chrome_paths:
         if os.path.isfile(p):
             return os.path.normpath(p)
-    return os.path.normpath(edge_paths[0])
+    return os.path.normpath(chrome_paths[0])
+
+
+def configured_chrome_path_or_empty(value: Any) -> str:
+    """旧版保存过 Edge 路径时返回空，让界面和运行流程自动切换到 Chrome。"""
+    path = str(value or "").strip()
+    if os.path.basename(path).lower() in {"msedge.exe", "microsoft edge"}:
+        return ""
+    return path
+
+
+def browser_runtime_info(browser_path: str = None) -> Dict[str, Any]:
+    """返回自动化实际使用的本机浏览器，不启动浏览器。"""
+    try:
+        resolved = require_executable_path(browser_path)
+    except Exception as exc:
+        return {
+            "available": False,
+            "name": "Google Chrome",
+            "path": "",
+            "is_chrome": False,
+            "message": str(exc),
+        }
+    filename = os.path.basename(resolved).lower()
+    is_chrome = filename in {"chrome.exe", "google chrome"} or "chrome" in filename
+    return {
+        "available": True,
+        "name": "Google Chrome" if is_chrome else filename,
+        "path": os.path.normpath(resolved),
+        "is_chrome": is_chrome,
+        "message": "" if is_chrome else "当前程序不是Google Chrome",
+    }
 
 
 def timestamp_to_datetime(ts):

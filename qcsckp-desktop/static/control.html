@@ -155,11 +155,26 @@
                         </div>
                         <label class="block w-full max-w-2xl">
                             <div class="text-xs text-slate-400 mb-1">浏览器程序路径（可选）</div>
-                            <p class="text-[11px] text-slate-500 mb-1.5 leading-relaxed">指定采集自动化实际启动的浏览器可执行文件。留空或路径无效时，由程序在本机自动探测可用浏览器。</p>
+                            <p class="text-[11px] text-slate-500 mb-1.5 leading-relaxed">默认使用本机Google Chrome和工具独立会话，不读取日常Chrome资料。仅在高级排错时手动修改。</p>
                             <input id="cfgBrowserExecutable" type="text" autocomplete="off" spellcheck="false"
                                    class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 font-mono"
                                    placeholder="选填，完整路径" />
                         </label>
+                        <div class="w-full max-w-2xl rounded-xl border border-slate-700/70 bg-slate-950/25 px-4 py-3">
+                            <div class="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-x-4 gap-y-2 text-xs">
+                                <div class="text-slate-500">当前浏览器</div>
+                                <div id="runtimeBrowserName" class="text-slate-200">正在检测</div>
+                                <div class="text-slate-500">实际程序路径</div>
+                                <div id="runtimeBrowserPath" class="text-slate-300 font-mono break-all">正在检测</div>
+                                <div class="text-slate-500">当前阶段</div>
+                                <div id="runtimeBrowserPhase" class="text-slate-200">未运行</div>
+                                <div class="text-slate-500">千川登录状态</div>
+                                <div>
+                                    <span id="runtimeLoginStatus" class="text-slate-200">正在检测</span>
+                                    <span id="runtimeCookieTime" class="block text-[11px] text-slate-500 mt-0.5"></span>
+                                </div>
+                            </div>
+                        </div>
                         <div class="block w-full">
                             <div class="text-xs text-slate-400 mb-1.5">联同采集调控任务（素材追投列表）</div>
                             <div class="flex items-center gap-3 min-h-[42px]">
@@ -443,6 +458,33 @@
                 fetchProgress: st?.fetchProgress || null,
                 assistProgress: st?.assistProgress || null,
             };
+
+            const browser = st?.browser || {};
+            const login = st?.qianchuanLogin || {};
+            const browserName = document.getElementById('runtimeBrowserName');
+            const browserPath = document.getElementById('runtimeBrowserPath');
+            const browserPhase = document.getElementById('runtimeBrowserPhase');
+            const loginStatus = document.getElementById('runtimeLoginStatus');
+            const cookieTime = document.getElementById('runtimeCookieTime');
+            if (browserName) {
+                browserName.textContent = browser.available === false
+                    ? '未检测到Google Chrome'
+                    : (browser.name || 'Google Chrome');
+                browserName.className = browser.available === false
+                    ? 'text-rose-400'
+                    : (browser.is_chrome === false ? 'text-amber-400' : 'text-emerald-400');
+            }
+            if (browserPath) browserPath.textContent = browser.path || '未检测到可用程序';
+            if (browserPhase) browserPhase.textContent = browser.phase || '未运行';
+            if (loginStatus) {
+                loginStatus.textContent = login.status || '尚未检测';
+                loginStatus.className = login.cookie_saved ? 'text-emerald-400' : 'text-amber-400';
+            }
+            if (cookieTime) {
+                cookieTime.textContent = login.cookie_updated_at
+                    ? `Cookie更新时间：${login.cookie_updated_at}`
+                    : '';
+            }
 
             if (running) {
                 dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.55)]';

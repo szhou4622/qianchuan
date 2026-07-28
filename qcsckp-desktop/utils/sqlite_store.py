@@ -393,6 +393,40 @@ class SQLiteStore:
                 ('uk_cloud_retarget_local_task', 'cloud_task_id'),
             ],
         },
+        # 本地飞书长连接模式的追投确认任务。active_dedupe_key 在终态后置空。
+        'local_retarget_task': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'task_uid': 'TEXT NOT NULL',
+                'account_username': 'TEXT NOT NULL',
+                'active_dedupe_key': 'TEXT',
+                'status': 'TEXT NOT NULL',
+                'action_nonce': 'TEXT NOT NULL',
+                'payload_json': 'TEXT NOT NULL',
+                'card_messages_json': "TEXT NOT NULL DEFAULT '[]'",
+                'approved_by': 'TEXT',
+                'claim_token': 'TEXT',
+                'claim_expires_at': 'TEXT',
+                'result_message': 'TEXT',
+                'result_detail': 'TEXT',
+                'regulate_task_id': 'TEXT',
+                'result_json': 'TEXT',
+                'expires_at': 'TEXT NOT NULL',
+                'approved_at': 'TEXT',
+                'claimed_at': 'TEXT',
+                'finished_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_local_retarget_account_status', 'account_username, status'),
+                ('idx_local_retarget_expires', 'expires_at'),
+            ],
+            'unique_indexes': [
+                ('uk_local_retarget_task_uid', 'task_uid'),
+                ('uk_local_retarget_active_dedupe', 'active_dedupe_key'),
+            ],
+        },
         # 平台操作日志同步状态；每个账户保存覆盖范围、游标和最近错误。
         'platform_log_sync_state': {
             'columns': {

@@ -758,12 +758,12 @@ async def run_worker_loop() -> None:
             if not executing_report.get("success"):
                 refused = {
                     "success": False,
-                    "message": "云端未确认本机执行租约，本次未执行追投",
+                    "message": "任务队列未确认本机执行租约，本次未执行追投",
                     "detail": str(executing_report.get("message") or "任务租约无效"),
                     "step": "claim_confirm",
                 }
                 _save_local_task(db, task_uid, "failed", refused, task)
-                logger.warning("[飞书确认追投] 云端拒绝执行租约 %s: %s", task_uid, refused["detail"])
+                logger.warning("[飞书确认追投] 任务队列拒绝执行租约 %s: %s", task_uid, refused["detail"])
                 continue
             heartbeat = asyncio.create_task(_heartbeat_lease(task_uid, claim_token))
             try:

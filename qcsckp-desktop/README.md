@@ -1,8 +1,8 @@
 # 千川素材看盘工具（qianchuan-promotion-crawl）
 
-基于 **Python + pywebview** 的桌面端应用，配合 **Playwright** 在浏览器中访问[巨量千川](https://qianchuan.jinritemai.com)，拦截素材列表接口数据，落库 **SQLite**，并在本地 Web 界面中展示消耗、排行、素材历史曲线等「看盘」能力。支持可选同步**飞书多维表**与**群机器人 Webhook 整点推送**。
+基于 **Python + pywebview** 的桌面端应用，配合 **Playwright + 本机 Google Chrome** 访问[巨量千川](https://qianchuan.jinritemai.com)，拦截素材列表接口数据，落库 **SQLite**，并在本地 Web 界面中展示消耗、排行、素材历史曲线等「看盘」能力。飞书确认追投使用本地 WebSocket 长连接，不需要服务器回调、域名或 Cloudflare。
 
-> **说明**：浏览器可执行文件探测逻辑（`utils/common.py`）当前以 **Windows + Edge/Chrome 标准安装路径**为主；生产使用建议以 Windows 环境为准。macOS 下 GUI 虽可运行，若遇浏览器路径问题需自行扩展或调整。
+> **说明**：正式用户需在 Windows 10/11 安装 Google Chrome。工具使用独立会话，不读取用户日常 Chrome 资料，也不会自动下载 Chromium 或改用 Edge。
 
 ---
 
@@ -13,6 +13,7 @@
 | 数据采集 | 有头浏览器登录千川 → 进入投放详情页（识别 `aavid` / `adId`）→ 按间隔轮询拦截 `uni-promotion/material/list-required` 接口并写入 SQLite |
 | 本地看盘 | 表格、Top 消耗、素材历史折线等（`static/` + `api/dashboard.py`） |
 | 账号校验 | 启动采集前经远程服务校验账号（`config.API_BASE_URL`，见 `api/account_auth.py`） |
+| 飞书确认追投 | `lark-oapi 1.7.1` 本地长连接接收消息和卡片按钮，App Secret 使用 Windows DPAPI 加密 |
 | 飞书多维表 | 配置 `app_token` / `personal_base_token` / `table_id`，在抓取入库后同步（见 `services/feishu_bitable/`） |
 | 飞书 Webhook | 可配置整点推送大屏表格摘要（`services/feishu_webhook_push.py`） |
 | 单实例 | 同机重复启动时激活已有窗口并退出新进程（`data/command.json`） |
@@ -26,15 +27,15 @@
 - **Python** ≥ 3.12（见 `.python-version`）
 - **依赖管理**：[`uv`](https://github.com/astral-sh/uv)（`pyproject.toml` + `uv.lock`）
 - **GUI**：`pywebview`
-- **自动化**：`playwright`（使用本机 Chromium 内核浏览器：**Microsoft Edge 或 Google Chrome**）
+- **自动化**：`playwright`（只启动本机 **Google Chrome**）
 - **数据**：`SQLite`（`utils/sqlite_store.py`）
-- **可选**：飞书 Open API（`baseopensdk`）、Windows 更新流程（`services/update_service_win.py`）
+- **飞书**：`lark-oapi==1.7.1` 本地长连接、`baseopensdk` 多维表
 
 ---
 
 ## 环境要求
 
-1. **操作系统**：推荐 **Windows 10/11**（已安装 **Edge 或 Chrome** 于常见路径）。
+1. **操作系统**：**Windows 10/11**，已安装 **Google Chrome**。
 2. **Python**：3.12+。
 3. **网络**：首次启动采集、账号登录、版本检查等需能访问配置的远程 API（`API_BASE_URL`）及千川站点。
 
@@ -67,7 +68,7 @@ uv run python gui_app.py
 
 1. 启动服务后，会打开**有头**浏览器窗口，请在千川完成登录。
 2. 进入**投放详情页**，使地址符合配置中的前缀（默认 `https://qianchuan.jinritemai.com/uni-prom/deta...`），并包含 `aavid` 与 `adId`。
-3. 程序识别目标后会**保存 Cookie** 到 `data/qcookie.json`（路径可在服务配置中调整），随后可按设定间隔**有头或无头**轮询抓取。
+3. 程序识别目标后会**保存 Cookie** 到 `data/qcookie.json`（路径可在服务配置中调整），随后默认使用**无头 Chrome**轮询抓取。
 4. 数据写入 `data/qianchuan.db`（默认路径见 `config.DB_FILE`），日志在 `logs/` 下滚动。
 
 ---
@@ -84,6 +85,16 @@ API_BASE_URL = "https://qcscjk.shanghaijiyue.com"
 
 账号校验、版本检测等 HTTP 接口均在此基址下拼接路径（详见 `api/account_auth.py` 内注释及仓库内 API 文档，若存在 `dev_files/`）。
 
+### 飞书本地长连接
+
+1. 登录工具账号后进入“飞书绑定”。
+2. 填写飞书自建应用的 App ID 和 App Secret，点击“保存并连接”。
+3. 按页面给出的权限 JSON 开通权限，在飞书后台选择“使用长连接接收回调”，订阅 `card.action.trigger` 和 `im.message.receive_v1`，然后发布应用。
+4. 生成个人绑定码，私聊机器人发送“绑定 123456”。绑定群时，由已绑定授权人在群内@机器人发送“绑定群 123456”。
+5. 页面显示“已连接”后发送测试卡片。
+
+App Secret 按工具登录账号隔离，使用 Windows DPAPI 加密保存在本机。普通用户流程不需要 Verification Token、Encrypt Key、回调 URL、服务器、域名或 Cloudflare。工具关闭期间无法接收按钮；重启并恢复连接后，需要在卡片有效期内重新点击。
+
 ### SQLite 自动裁剪（可选）
 
 通过环境变量控制（默认值见 `config.py`）：
@@ -99,7 +110,7 @@ API_BASE_URL = "https://qcscjk.shanghaijiyue.com"
 
 | 路径 | 用途 |
 |------|------|
-| `data/` | Cookie、SQLite、服务配置、飞书 Webhook 配置等 |
+| `data/` | Cookie、SQLite、服务配置、DPAPI 加密后的飞书配置等 |
 | `logs/` | 应用日志（含轮转文件） |
 | `temp/` | 临时文件（启动时会尝试清理 `data/temp`） |
 
@@ -119,7 +130,7 @@ qcsckp/
 ├── gui_app.py              # 程序入口：pywebview + 托盘 + 单实例
 ├── config.py               # 根路径、版本号、API 基址、SQLite 裁剪参数等
 ├── api/                    # 暴露给前端的 Python API（看盘、账号、服务控制）
-├── services/               # 抓取主流程、飞书同步、Webhook、Windows 更新
+├── services/               # 抓取主流程、飞书长连接/同步、Windows 更新
 ├── utils/                  # SQLite、日志、通用工具、裁剪调度
 ├── static/                 # 前端页面与静态资源（HTML/JS/CSS）
 ├── hook/                   # 飞书机器人 Webhook 封装等
@@ -130,8 +141,8 @@ qcsckp/
 
 ## 常见问题
 
-1. **提示未检测到 Edge/Chrome**  
-   在 Windows 上安装浏览器至默认路径，或后续在代码中扩展 `require_executable_path` 以支持自定义路径。
+1. **提示未检测到 Google Chrome**
+   在 Windows 上安装 Google Chrome 至默认路径，或在“服务控制”的高级设置中选择 `chrome.exe`。
 
 2. **无法启动采集**  
    需同时填写账号密码并通过远程校验；请确认网络可达 `API_BASE_URL` 且账号有效。
@@ -140,7 +151,7 @@ qcsckp/
    确认已开启 SQLite 裁剪环境变量，并按业务量调整 `SQLITE_PRUNE_MAX_ROWS`。
 
 4. **飞书卡片没有发送或点击后不执行**
-   先确认服务端已配置飞书自建应用、公开 HTTPS 回调、唯一授权 Open ID 和接收目标，再在桌面端重新登录以取得设备令牌。完整部署和验收步骤见 `../qcsckp-api-services/doc/FEISHU_RETARGET_SETUP.md`。
+   打开“飞书绑定”，确认状态为“已连接”、应用已经发布、事件和权限已经开通，并完成个人绑定。无需配置公网回调。工具关闭期间的点击不会执行，重新启动后请再次点击。
 
 ---
 
