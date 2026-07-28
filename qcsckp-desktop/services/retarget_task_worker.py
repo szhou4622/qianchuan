@@ -270,7 +270,7 @@ def _validate_task(
         ):
             raise RuntimeError("当前账户、广告ID或计划体系与提醒不一致")
         if plan_system == "unknown":
-            raise RuntimeError("计划体系尚未确认是传统全域还是千川乘方")
+            raise RuntimeError("计划体系尚未确认是全域还是千川乘方")
         if plan_system == "chengfang":
             raise RuntimeError("千川乘方计划尚未通过本机追投适配验证")
         if promotion_scene == "product":

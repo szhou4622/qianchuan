@@ -812,7 +812,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             )
             if plan_system == "unknown":
                 logger.warning(
-                    "%s 策略 %s 对应计划尚未确认是传统全域还是千川乘方，"
+                    "%s 策略 %s 对应计划尚未确认是全域还是千川乘方，"
                     "本轮不发送卡片、不执行追投",
                     _log_sched,
                     st.get("id"),

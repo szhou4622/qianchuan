@@ -107,7 +107,13 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
         validate_rule_retargeting_config,
     )
     from services.cloud_retarget_client import load_device_session
-    from services.retargeting_rule_runner import resolve_ad_id_for_aavid
+    from services.retargeting_rule_runner import (
+        _interval_from_root_cfg,
+        _interval_window_and_max,
+        rate_limit_should_skip,
+        rate_limit_strategy_should_skip,
+        resolve_ad_id_for_aavid,
+    )
     from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
     checks: List[Dict[str, Any]] = []
@@ -151,11 +157,13 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
     )
 
     strategy_summaries: List[Dict[str, str]] = []
+    card_strategies: List[Dict[str, Any]] = []
     for strategy in cfg.get("strategies") or []:
         if not isinstance(strategy, dict):
             continue
         if str(strategy.get("action_mode") or "card_confirm") != "card_confirm":
             continue
+        card_strategies.append(strategy)
         retargeting = (
             strategy.get("retargeting")
             if isinstance(strategy.get("retargeting"), dict)
@@ -216,6 +224,8 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
     monitor_target_account_matches = False
     monitor_target_status = ""
     retarget_capability_ready = False
+    rate_limit_ready = False
+    rate_limit_detail = "尚未取得可检查限频的计划和素材"
     if target_ready:
         try:
             init_sqlite_schema()
@@ -298,6 +308,67 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
             if material_row:
                 material_found = True
                 material_name = str(material_row.get("video_name") or "").strip()
+            if material_found and target_uid:
+                relevant_strategies = [
+                    item
+                    for item in card_strategies
+                    if not str(item.get("target_uid") or "").strip()
+                    or str(item.get("target_uid") or "").strip() == target_uid
+                ]
+                if bool(cfg.get("per_strategy_rate_limit")):
+                    blocked_strategies: List[str] = []
+                    for item in relevant_strategies:
+                        retargeting = (
+                            item.get("retargeting")
+                            if isinstance(item.get("retargeting"), dict)
+                            else {}
+                        )
+                        window_seconds, max_count = _interval_window_and_max(
+                            retargeting
+                        )
+                        if rate_limit_strategy_should_skip(
+                            db,
+                            TEST_MATERIAL_ID,
+                            str(item.get("id") or ""),
+                            window_seconds,
+                            max_count,
+                            target_uid,
+                        ):
+                            blocked_strategies.append(
+                                str(item.get("title") or item.get("id") or "未命名策略")
+                            )
+                    rate_limit_ready = bool(relevant_strategies) and not blocked_strategies
+                    rate_limit_detail = (
+                        "所选素材在全部飞书确认策略中均未达到限频"
+                        if rate_limit_ready
+                        else (
+                            "已达到分策略限频：" + "、".join(blocked_strategies)
+                            if blocked_strategies
+                            else "没有可用于白名单计划的飞书确认策略"
+                        )
+                    )
+                else:
+                    window_seconds, max_count = _interval_from_root_cfg(cfg)
+                    blocked = rate_limit_should_skip(
+                        db,
+                        TEST_MATERIAL_ID,
+                        window_seconds,
+                        max_count,
+                        target_uid,
+                    )
+                    rate_limit_ready = not blocked
+                    if window_seconds <= 0 or max_count <= 0:
+                        rate_limit_detail = "当前未启用全局追投限频"
+                    elif blocked:
+                        rate_limit_detail = (
+                            f"当前窗口已达到全局限频：{window_seconds}秒内最多"
+                            f"{max_count}次，请等待窗口结束"
+                        )
+                    else:
+                        rate_limit_detail = (
+                            f"当前未达到全局限频：{window_seconds}秒内最多"
+                            f"{max_count}次"
+                        )
         except Exception as exc:
             add_check("local_data", "本地账户数据", False, f"读取失败：{exc}")
     add_check(
@@ -348,7 +419,7 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
             f"{account_name + '；' if account_name else ''}"
             f"{plan_name + '；' if plan_name else ''}"
             f"{'推商品；' if promotion_scene == 'product' else ('推直播；' if promotion_scene == 'live' else '')}"
-            f"{'传统全域；' if plan_system == 'global' else ('千川乘方；' if plan_system == 'chengfang' else '计划体系待确认；')}"
+            f"{'全域；' if plan_system == 'global' else ('千川乘方；' if plan_system == 'chengfang' else '计划体系待确认；')}"
             f"广告ID {ad_id}"
             if ad_id
             else "尚未采集到该账户的广告ID"
@@ -359,7 +430,7 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
         "计划体系与执行适配器",
         plan_system == "global",
         (
-            "已识别为传统全域，可使用当前已验证适配器"
+            "已识别为全域，可使用当前已验证适配器"
             if plan_system == "global"
             else (
                 "已识别为千川乘方；乘方适配器尚未完成受控验证"
@@ -391,6 +462,12 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
             if material_found
             else "尚未在该账户的本地数据中找到白名单素材"
         ),
+    )
+    add_check(
+        "retarget_rate_limit",
+        "追投限频",
+        rate_limit_ready,
+        rate_limit_detail,
     )
 
     consumed = os.path.isfile(CONSUMED_FILE)

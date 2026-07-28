@@ -30,7 +30,7 @@ def normalize_plan_system(value: Any, *, allow_unknown: bool = True) -> str:
     if system not in ALLOWED_PLAN_SYSTEMS:
         raise ValueError("plan_system 仅支持 global、chengfang 或 unknown")
     if system == "unknown" and not allow_unknown:
-        raise ValueError("计划体系尚未确认是传统全域还是千川乘方")
+        raise ValueError("计划体系尚未确认是全域还是千川乘方")
     return system
 
 

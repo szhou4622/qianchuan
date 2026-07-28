@@ -931,6 +931,9 @@ class LocalTestGuardTests(unittest.TestCase):
                     return {"video_name": "测试素材"}
                 return None
 
+            def select(self, *_args, **_kwargs):
+                return []
+
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "qcookie.json"), "w", encoding="utf-8") as handle:
                 handle.write("{}")
@@ -961,12 +964,31 @@ class LocalTestGuardTests(unittest.TestCase):
                 return_value=FakeStore(),
             ):
                 result = local_test_guard.build_live_retarget_preflight()
+                with patch(
+                    "services.retargeting_rule_runner.rate_limit_should_skip",
+                    return_value=True,
+                ):
+                    limited_result = local_test_guard.build_live_retarget_preflight()
 
         self.assertTrue(result["ready_to_arm"])
         self.assertFalse(result["ready_to_execute"])
         self.assertEqual("测试账户", result["account_name"])
         self.assertEqual("测试素材", result["material_name"])
         self.assertIn("预算 100 元", result["strategies"][0]["summary"])
+        rate_limit_check = next(
+            item
+            for item in result["checks"]
+            if item["key"] == "retarget_rate_limit"
+        )
+        self.assertTrue(rate_limit_check["ok"])
+        limited_rate_check = next(
+            item
+            for item in limited_result["checks"]
+            if item["key"] == "retarget_rate_limit"
+        )
+        self.assertFalse(limited_result["ready_to_arm"])
+        self.assertFalse(limited_rate_check["ok"])
+        self.assertIn("达到全局限频", limited_rate_check["detail"])
 
     def test_preflight_rejects_pending_monitor_target(self):
         config = {
@@ -1008,6 +1030,9 @@ class LocalTestGuardTests(unittest.TestCase):
                 if table == "pmc_promotion_material":
                     return {"video_name": "测试素材"}
                 return None
+
+            def select(self, *_args, **_kwargs):
+                return []
 
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "qcookie.json"), "w", encoding="utf-8") as handle:

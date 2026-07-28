@@ -48,7 +48,7 @@
     function message(text,bad=false){$('notice').textContent=text||'';$('notice').classList.toggle('show',!!text);$('notice').style.borderColor=bad?'#be123c88':'#1d4ed866';}
     function statusText(x){return ({ok:'同步正常',pending:'等待首次同步',paused:'计划已暂停',not_delivering:'计划未在投放',error:'同步异常',capability_mismatch:'页面能力未识别'})[x]||x||'等待首次同步'}
     function sceneText(x){return x==='product'?'推商品':x==='live'?'推直播':'未知场景'}
-    function systemText(x){return x==='global'?'传统全域':x==='chengfang'?'千川乘方':'体系待确认'}
+    function systemText(x){return x==='global'?'全域':x==='chengfang'?'千川乘方':'体系待确认'}
     async function load(){
       const a=await waitApi(); const r=await a.listPromotionTargets();
       const rows=r?.data||[]; $('empty').style.display=rows.length?'none':'block';

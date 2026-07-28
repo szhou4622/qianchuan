@@ -380,7 +380,7 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
     $reason = (string)($trigger['strategy_title'] ?? $task['strategy_name'] ?? '追投策略命中');
     $sceneText = (($task['promotion_scene'] ?? 'live') === 'product') ? '推商品' : '推直播';
     $planSystemText = [
-        'global' => '传统全域',
+        'global' => '全域',
         'chengfang' => '千川乘方',
         'unknown' => '待确认',
     ][(string)($task['plan_system'] ?? 'unknown')] ?? '待确认';

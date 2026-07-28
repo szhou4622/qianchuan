@@ -339,7 +339,7 @@
         const hint = document.getElementById('regStrategyTargetScene');
         if (hint) {
             hint.textContent = target
-                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '传统全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
+                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
                 : '请先在“监控计划”页面添加并启用计划。';
         }
         const err = document.getElementById('errRegulationTarget');
@@ -357,7 +357,7 @@
         if (!select) return;
         const current = select.value;
         select.innerHTML = '<option value="">请选择监控计划</option>' + promotionTargetsState.map((x) =>
-            `<option value="${escapeTargetHtml(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '传统全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${escapeTargetHtml(x.plan_name || x.ad_id)}｜${escapeTargetHtml(x.aadvid)}</option>`
+            `<option value="${escapeTargetHtml(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${escapeTargetHtml(x.plan_name || x.ad_id)}｜${escapeTargetHtml(x.aadvid)}</option>`
         ).join('');
         if (current) select.value = current;
         syncRegulationTargetHint();

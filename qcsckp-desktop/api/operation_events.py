@@ -484,7 +484,7 @@ def export_operation_events_csv(**filters: Any) -> str:
                 row.get("aavid", ""),
                 row.get("target_uid", ""),
                 "推商品" if row.get("promotion_scene") == "product" else ("推直播" if row.get("promotion_scene") == "live" else row.get("promotion_scene", "")),
-                {"global": "传统全域", "chengfang": "千川乘方", "unknown": "待确认"}.get(row.get("plan_system"), "待确认"),
+                {"global": "全域", "chengfang": "千川乘方", "unknown": "待确认"}.get(row.get("plan_system"), "待确认"),
                 row.get("occurred_at", ""),
                 row.get("action_label", ""),
                 row.get("object_type", ""),
