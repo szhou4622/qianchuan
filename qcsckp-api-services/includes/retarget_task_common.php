@@ -56,6 +56,7 @@ function ensure_retarget_task_schema(PDO $pdo): void
       product_name varchar(512) NOT NULL DEFAULT '',
       material_id varchar(128) NOT NULL,
       material_name varchar(512) NOT NULL DEFAULT '',
+      materials_json longtext,
       strategy_id varchar(128) NOT NULL,
       strategy_name varchar(128) NOT NULL DEFAULT '',
       strategy_hash char(64) NOT NULL,
@@ -96,6 +97,7 @@ function ensure_retarget_task_schema(PDO $pdo): void
         "ADD COLUMN trigger_level varchar(32) NOT NULL DEFAULT 'material' AFTER plan_system",
         "ADD COLUMN product_id varchar(128) NOT NULL DEFAULT '' AFTER trigger_level",
         "ADD COLUMN product_name varchar(512) NOT NULL DEFAULT '' AFTER product_id",
+        "ADD COLUMN materials_json longtext AFTER material_name",
     ] as $alter) {
         try {
             $pdo->exec("ALTER TABLE retarget_tasks $alter");
@@ -354,6 +356,20 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
 {
     $retargeting = safe_json_decode((string)($task['retargeting_json'] ?? ''));
     $trigger = safe_json_decode((string)($task['trigger_snapshot_json'] ?? ''));
+    $result = safe_json_decode((string)($task['result_json'] ?? ''));
+    $materials = safe_json_decode((string)($task['materials_json'] ?? ''));
+    if (!$materials || array_keys($materials) !== range(0, count($materials) - 1)) {
+        $materials = [[
+            'material_id' => (string)($task['material_id'] ?? ''),
+            'material_name' => (string)($task['material_name'] ?? ''),
+            'product_id' => (string)($task['product_id'] ?? ''),
+            'product_name' => (string)($task['product_name'] ?? ''),
+        ]];
+    }
+    $materials = array_values(array_filter(
+        $materials,
+        static fn($item): bool => is_array($item) && trim((string)($item['material_id'] ?? '')) !== ''
+    ));
     $status = $displayStatus !== '' ? $displayStatus : (string)($task['status'] ?? 'pending');
     $statusText = [
         'pending' => '等待确认', 'approved_queued' => '已批准，等待桌面工具', 'claimed' => '桌面工具已领取',
@@ -376,7 +392,26 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
     }
     $accountName = trim((string)($task['account_name'] ?? '')) ?: '未命名账户';
     $planName = trim((string)($task['plan_name'] ?? '')) ?: '未命名计划';
-    $materialName = trim((string)($task['material_name'] ?? '')) ?: '未命名素材';
+    $materialLines = [];
+    foreach ($materials as $index => $material) {
+        $materialName = mb_substr(
+            trim((string)($material['material_name'] ?? '')) ?: '未命名素材',
+            0,
+            160
+        );
+        $materialId = trim((string)($material['material_id'] ?? ''));
+        $materialProductName = trim((string)($material['product_name'] ?? ''));
+        $materialProductId = trim((string)($material['product_id'] ?? ''));
+        $line = ((int)$index + 1) . '. ' . $materialName . "\n   素材ID：`" . $materialId . '`';
+        if ($materialProductName !== '' || $materialProductId !== '') {
+            $line .= "\n   关联商品：" . ($materialProductName !== '' ? $materialProductName : '未命名商品');
+            if ($materialProductId !== '') {
+                $line .= '（`' . $materialProductId . '`）';
+            }
+        }
+        $materialLines[] = $line;
+    }
+    $materialCount = count($materialLines);
     $elements = [
         ['tag' => 'markdown', 'content' => "**千川账户：** " . $accountName
             . "\n**账户ID：** `" . ($task['aavid'] ?? '') . '`'
@@ -386,17 +421,29 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
             . "\n**计划体系：** " . $planSystemText
             . "\n**触发层级：** " . $levelText
             . $productLine
-            . "\n\n**本卡追投素材（1条）：**"
-            . "\n1. " . $materialName
-            . "\n   素材ID：`" . ($task['material_id'] ?? '') . '`'
+            . "\n\n**本卡追投素材（" . $materialCount . "条）：**"
+            . "\n" . implode("\n", $materialLines)
             . "\n\n**策略：** " . $reason],
         ['tag' => 'markdown', 'content' => "**命中原因：** " . trigger_metric_summary($trigger) . "\n**追投参数：** " . retarget_method_summary($retargeting) . "\n**有效期至：** " . ($task['expires_at'] ?? '') . "\n**当前状态：** " . $statusText],
     ];
     if (!empty($task['result_message'])) {
         $elements[] = ['tag' => 'markdown', 'content' => "**执行结果：** " . mb_substr((string)$task['result_message'], 0, 500)];
     }
-    if (!empty($task['regulate_task_id'])) {
-        $elements[] = ['tag' => 'markdown', 'content' => "**千川调控任务ID：** `" . mb_substr((string)$task['regulate_task_id'], 0, 128) . '`'];
+    $regulateTaskIds = [];
+    foreach ((is_array($result['regulate_task_ids'] ?? null) ? $result['regulate_task_ids'] : []) as $taskId) {
+        $taskId = mb_substr(trim((string)$taskId), 0, 128);
+        if ($taskId !== '' && !in_array($taskId, $regulateTaskIds, true)) $regulateTaskIds[] = $taskId;
+    }
+    if (!$regulateTaskIds && !empty($task['regulate_task_id'])) {
+        $regulateTaskIds[] = mb_substr((string)$task['regulate_task_id'], 0, 128);
+    }
+    if ($regulateTaskIds) {
+        $taskIdLines = array_map(
+            static fn($taskId, $index): string => ((int)$index + 1) . '. `' . $taskId . '`',
+            $regulateTaskIds,
+            array_keys($regulateTaskIds)
+        );
+        $elements[] = ['tag' => 'markdown', 'content' => "**千川调控任务ID：**\n" . implode("\n", $taskIdLines)];
     }
     if ($expanded) {
         $prettyRetargeting = json_encode($retargeting, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);

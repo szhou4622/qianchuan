@@ -171,12 +171,25 @@ class LocalIntegrationSuite:
         token: Optional[str] = None,
         aavid: str = "10001",
         material_id: str = "20001",
+        material_ids: Optional[List[str]] = None,
         target_uid: str = "target_local_live_30001",
         promotion_scene: str = "live",
         plan_system: str = "global",
         trigger_level: str = "material",
         product_id: str = "",
+        expect_success: bool = True,
     ) -> Dict[str, Any]:
+        selected_material_ids = material_ids or [material_id]
+        materials = [
+            {
+                "material_id": current_id,
+                "material_name": f"本地素材{current_id}",
+                "product_id": product_id,
+                "product_name": "本地测试商品" if product_id else "",
+                "product_ids": [product_id] if product_id else [],
+            }
+            for current_id in selected_material_ids
+        ]
         snapshot = {
             "id": f"strategy-{suffix}",
             "title": f"本地策略{suffix}",
@@ -185,7 +198,7 @@ class LocalIntegrationSuite:
             "product_filter": [],
             "candidate_trigger": {"groups": []},
             "candidate_sort": "net_roi_desc",
-            "candidate_limit": 1,
+            "candidate_limit": 20,
             "action_mode": "card_confirm",
             "trigger": {"groups": []},
             "retargeting": {
@@ -214,6 +227,7 @@ class LocalIntegrationSuite:
                 "product_name": "本地测试商品" if product_id else "",
                 "material_id": material_id,
                 "material_name": f"本地素材{material_id}",
+                "materials": materials,
                 "strategy_id": snapshot["id"],
                 "strategy_name": snapshot["title"],
                 "strategy_hash": strategy_hash,
@@ -224,7 +238,11 @@ class LocalIntegrationSuite:
             },
             self.authorized(token),
         )
-        self.check(response.status == 200 and response.body.get("success"), f"create task {suffix}")
+        if expect_success:
+            self.check(
+                response.status == 200 and response.body.get("success"),
+                f"create task {suffix}",
+            )
         return response.body
 
     def task_row(self, task_uid: str) -> Dict[str, Any]:
@@ -405,7 +423,25 @@ class LocalIntegrationSuite:
         other_path = request_json("POST", "http://127.0.0.1:8788/api/device/session.php", {})
         self.check(other_path.status == 404, "tunnel proxy exposes callback path only")
 
-        created = self.create_task("security")
+        too_many = self.create_task(
+            "too-many",
+            material_ids=[f"material-{index}" for index in range(21)],
+            target_uid="target_local_product_30001",
+            promotion_scene="product",
+            expect_success=False,
+        )
+        self.check(
+            too_many.get("success") is False
+            and "最多支持20条素材" in str(too_many.get("message") or ""),
+            "more than twenty materials are rejected",
+        )
+
+        created = self.create_task(
+            "security",
+            material_ids=["20001", "20002", "20003"],
+            target_uid="target_local_product_30001",
+            promotion_scene="product",
+        )
         task_uid = created["data"]["task_uid"]
         row = self.task_row(task_uid)
         message_count = self.db_one(
@@ -413,7 +449,12 @@ class LocalIntegrationSuite:
             (row["id"],),
         )
         self.check(message_count["total"] == 2, "group and personal mock cards share one task")
-        duplicate = self.create_task("security")
+        duplicate = self.create_task(
+            "security",
+            material_ids=["29999"],
+            target_uid="target_local_product_30001",
+            promotion_scene="product",
+        )
         self.check(duplicate.get("duplicate") is True, "duplicate trigger is idempotent")
         self.check(duplicate["data"]["task_uid"] == task_uid, "duplicate returns original task")
 
@@ -450,14 +491,16 @@ class LocalIntegrationSuite:
                     "账户ID",
                     "本地测试计划",
                     "计划ID",
-                    "推直播",
+                    "推商品",
                     "传统全域",
-                    "本卡追投素材（1条）",
+                    "本卡追投素材（3条）",
                     "本地素材20001",
+                    "本地素材20002",
+                    "本地素材20003",
                     "素材ID",
                 ]
             ),
-            "card shows account, plan, scene, system, and exact material",
+            "one card shows account, plan, scene, system, and all materials",
         )
         wrong_callback_token = self.schema_callback(
             task_uid,
@@ -482,6 +525,11 @@ class LocalIntegrationSuite:
         )
         claimed = self.pull()
         self.check(claimed and claimed["task_uid"] == task_uid, "approved task claimed")
+        self.check(
+            [item["material_id"] for item in claimed.get("materials", [])]
+            == ["20001", "20002", "20003"],
+            "one claimed task carries all card materials",
+        )
         wrong_lease = self.result(claimed, "executing", claim_token="0" * 64)
         self.check(wrong_lease.status == 409, "tampered lease token rejected")
         executing = self.result(claimed, "executing")

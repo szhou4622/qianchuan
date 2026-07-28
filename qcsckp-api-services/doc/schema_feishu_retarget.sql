@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS `retarget_tasks` (
   `product_name` varchar(512) NOT NULL DEFAULT '',
   `material_id` varchar(128) NOT NULL,
   `material_name` varchar(512) NOT NULL DEFAULT '',
+  `materials_json` longtext,
   `strategy_id` varchar(128) NOT NULL,
   `strategy_name` varchar(128) NOT NULL DEFAULT '',
   `strategy_hash` char(64) NOT NULL,

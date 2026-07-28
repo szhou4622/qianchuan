@@ -17,23 +17,77 @@ $planSystem = mb_substr(trim((string)($input['plan_system'] ?? 'unknown')), 0, 3
 $triggerLevel = mb_substr(trim((string)($input['trigger_level'] ?? 'material')), 0, 32);
 $productId = mb_substr(trim((string)($input['product_id'] ?? '')), 0, 128);
 $productName = mb_substr(trim((string)($input['product_name'] ?? '')), 0, 512);
-$materialId = mb_substr(trim((string)($input['material_id'] ?? '')), 0, 128);
 $strategyId = mb_substr(trim((string)($input['strategy_id'] ?? '')), 0, 128);
 $strategyName = mb_substr(trim((string)($input['strategy_name'] ?? '')), 0, 128);
-$materialName = mb_substr(trim((string)($input['material_name'] ?? '')), 0, 512);
 $strategyHash = trim((string)($input['strategy_hash'] ?? ''));
+$rawMaterials = is_array($input['materials'] ?? null) ? $input['materials'] : [];
+$legacyMaterialInput = false;
+if (!$rawMaterials && trim((string)($input['material_id'] ?? '')) !== '') {
+    $legacyMaterialInput = true;
+    $rawMaterials = [[
+        'material_id' => $input['material_id'] ?? '',
+        'material_name' => $input['material_name'] ?? '',
+        'product_id' => $productId,
+        'product_name' => $productName,
+    ]];
+}
+$materials = [];
+$seenMaterialIds = [];
+$tooManyMaterials = false;
+foreach ($rawMaterials as $rawMaterial) {
+    if (!is_array($rawMaterial)) continue;
+    $mid = mb_substr(trim((string)($rawMaterial['material_id'] ?? '')), 0, 128);
+    if ($mid === '' || isset($seenMaterialIds[$mid])) continue;
+    $seenMaterialIds[$mid] = true;
+    $materialProductIds = [];
+    foreach ((is_array($rawMaterial['product_ids'] ?? null) ? $rawMaterial['product_ids'] : []) as $pid) {
+        $pid = mb_substr(trim((string)$pid), 0, 128);
+        if ($pid !== '' && !in_array($pid, $materialProductIds, true)) $materialProductIds[] = $pid;
+    }
+    $materialProductId = mb_substr(trim((string)($rawMaterial['product_id'] ?? '')), 0, 128);
+    if ($materialProductId !== '' && !in_array($materialProductId, $materialProductIds, true)) {
+        array_unshift($materialProductIds, $materialProductId);
+    }
+    if (count($materials) >= 20) {
+        $tooManyMaterials = true;
+        break;
+    }
+    $materials[] = [
+        'material_id' => $mid,
+        'material_name' => mb_substr(trim((string)($rawMaterial['material_name'] ?? '')), 0, 512),
+        'product_id' => $materialProductId,
+        'product_name' => mb_substr(trim((string)($rawMaterial['product_name'] ?? '')), 0, 512),
+        'product_ids' => array_slice($materialProductIds, 0, 20),
+    ];
+}
+$firstMaterial = $materials[0] ?? [];
+$materialId = (string)($firstMaterial['material_id'] ?? '');
+$materialName = (string)($firstMaterial['material_name'] ?? '');
+if ($legacyMaterialInput && $productId === '') {
+    $productId = (string)($firstMaterial['product_id'] ?? '');
+}
+if ($legacyMaterialInput && $productName === '') {
+    $productName = (string)($firstMaterial['product_name'] ?? '');
+}
+if ($tooManyMaterials) {
+    api_json(['success' => false, 'message' => '单个追投计划最多支持20条素材'], 400);
+}
 if (
     $aavid === '' || $adId === '' || $targetUid === '' || $materialId === ''
     || $strategyId === '' || !in_array($promotionScene, ['live', 'product'], true)
     || !in_array($planSystem, ['global', 'chengfang'], true)
     || !in_array($triggerLevel, ['material', 'product'], true)
-    || ($triggerLevel === 'product' && $productId === '')
+    || ($triggerLevel === 'product' && array_filter(
+        $materials,
+        static fn($item): bool => trim((string)($item['product_id'] ?? '')) === ''
+            && empty($item['product_ids'])
+    ))
     || !preg_match('/^[a-f0-9]{64}$/', $strategyHash)
 ) {
     api_json(['success' => false, 'message' => '账户、广告、素材、策略或策略版本参数不完整'], 400);
 }
 expire_old_tasks($pdo, (int)$user['id']);
-$dedupe = hash('sha256', implode('|', [(string)$user['id'], $targetUid, $materialId, $strategyId]));
+$dedupe = hash('sha256', implode('|', [(string)$user['id'], $targetUid, $strategyId]));
 $taskUid = uuid_v4();
 $nonce = bin2hex(random_bytes(32));
 $json = static function ($v): string {
@@ -41,13 +95,13 @@ $json = static function ($v): string {
 };
 try {
     $st = $pdo->prepare(
-        "INSERT INTO retarget_tasks(task_uid,user_id,active_dedupe_key,aavid,account_name,ad_id,target_uid,plan_name,promotion_scene,plan_system,trigger_level,product_id,product_name,material_id,material_name,strategy_id,strategy_name,strategy_hash,status,action_nonce,trigger_snapshot_json,query_snapshot_json,retargeting_json,rule_snapshot_json,expires_at) "
-        . "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,DATE_ADD(NOW(),INTERVAL 30 MINUTE))"
+        "INSERT INTO retarget_tasks(task_uid,user_id,active_dedupe_key,aavid,account_name,ad_id,target_uid,plan_name,promotion_scene,plan_system,trigger_level,product_id,product_name,material_id,material_name,materials_json,strategy_id,strategy_name,strategy_hash,status,action_nonce,trigger_snapshot_json,query_snapshot_json,retargeting_json,rule_snapshot_json,expires_at) "
+        . "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,DATE_ADD(NOW(),INTERVAL 30 MINUTE))"
     );
     $st->execute([
         $taskUid, (int)$user['id'], $dedupe, $aavid, $accountName, $adId,
         $targetUid, $planName, $promotionScene, $planSystem, $triggerLevel, $productId, $productName,
-        $materialId, $materialName,
+        $materialId, $materialName, $json($materials),
         $strategyId, $strategyName, $strategyHash, $nonce,
         $json($input['trigger_snapshot'] ?? []), $json($input['query_snapshot'] ?? []),
         $json($input['retargeting'] ?? []), $json($input['rule_snapshot'] ?? []),

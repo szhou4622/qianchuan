@@ -705,13 +705,22 @@ class QianChuanRetargetingService:
             return "商品素材追投表单未正常打开"
         return None
 
-    async def _select_product_material(
+    async def _select_product_materials(
         self,
         page: Page,
-        material_id: str,
+        material_ids: List[str],
     ) -> Optional[str]:
-        """在商品追投弹层中按精确素材ID选择一条视频。"""
-        mid = str(material_id or "").strip()
+        """在商品追投弹层中按精确素材ID批量选择视频，最多20条。"""
+        ids: List[str] = []
+        for raw_id in material_ids:
+            mid = str(raw_id or "").strip()
+            if mid and mid not in ids:
+                ids.append(mid)
+        if not ids:
+            return "商品追投任务缺少素材"
+        if len(ids) > 20:
+            return "商品追投单次最多支持20条素材"
+
         add_video = page.get_by_text("添加视频", exact=True)
         if not await self._click_last_visible(add_video):
             return "商品素材追投表单未找到「添加视频」"
@@ -730,15 +739,18 @@ class QianChuanRetargetingService:
         # 素材误判为 disabled。
         await page.wait_for_timeout(2_000)
 
-        material_matches = page.get_by_text(f"素材ID: {mid}", exact=True)
-        already_visible = False
-        for index in range(await material_matches.count() - 1, -1, -1):
-            if await material_matches.nth(index).is_visible():
-                already_visible = True
-                break
-        if not already_visible:
+        selector_modal = search_input.last.locator(
+            "xpath=ancestor::div["
+            "contains(concat(' ',normalize-space(@class),' '),' ovui-modal ')"
+            "][1]"
+        )
+        if await selector_modal.count() < 1:
+            return "商品素材选择弹层结构无法识别"
+
+        for selected_count, mid in enumerate(ids, start=1):
             await search_input.last.fill(mid)
             await search_input.last.press("Enter")
+            material_matches = page.get_by_text(f"素材ID: {mid}", exact=True)
             try:
                 await material_matches.last.wait_for(
                     state="visible",
@@ -748,86 +760,80 @@ class QianChuanRetargetingService:
                 return f"商品计划未找到素材 ID：{mid}"
             await page.wait_for_timeout(1_000)
 
-        material_row = None
-        disabled_row = None
-        for index in range(await material_matches.count() - 1, -1, -1):
-            text_candidate = material_matches.nth(index)
-            if not await text_candidate.is_visible():
-                continue
-            row_candidate = text_candidate.locator("xpath=ancestor::tr[1]")
-            label_candidate = row_candidate.locator("label.ovui-checkbox")
-            label_class = (
-                await label_candidate.first.get_attribute("class")
-                if await label_candidate.count() > 0
-                else ""
-            ) or ""
-            if "ovui-checkbox--disabled" not in label_class:
-                material_row = row_candidate
-                break
-            if disabled_row is None:
-                disabled_row = row_candidate
-        if material_row is None:
-            material_row = disabled_row
-        if material_row is None:
-            return f"无法定位商品素材 {mid} 的选择行"
-        if await material_row.count() < 1:
-            return f"无法定位商品素材 {mid} 的选择行"
-
-        checkbox_input = material_row.locator('input[type="checkbox"]')
-        if await checkbox_input.count() > 0:
-            try:
-                checkbox_label = checkbox_input.first.locator(
-                    "xpath=ancestor::label[1]"
-                )
+            material_row = None
+            disabled_row = None
+            for index in range(await material_matches.count() - 1, -1, -1):
+                text_candidate = material_matches.nth(index)
+                if not await text_candidate.is_visible():
+                    continue
+                row_candidate = text_candidate.locator("xpath=ancestor::tr[1]")
+                label_candidate = row_candidate.locator("label.ovui-checkbox")
                 label_class = (
-                    await checkbox_label.get_attribute("class")
-                    if await checkbox_label.count() > 0
+                    await label_candidate.first.get_attribute("class")
+                    if await label_candidate.count() > 0
                     else ""
                 ) or ""
-                if "ovui-checkbox--disabled" in label_class:
-                    try:
-                        await page.wait_for_function(
-                            """label => !String(label && label.className || "")
-                                .includes("ovui-checkbox--disabled")""",
-                            await checkbox_label.element_handle(),
-                            timeout=min(self._opt.goto_timeout_ms, 8_000),
-                        )
-                    except Exception:
-                        return f"商品素材 {mid} 当前不可追投（选择框禁用）"
-                # 点击组件 label，让千川自身的选择事件更新「已选」计数；
-                # 直接 check 隐藏 input 只会改变原生属性，不会更新业务状态。
-                if await checkbox_label.count() > 0:
-                    await checkbox_label.click()
-                else:
-                    await checkbox_input.first.evaluate("element => element.click()")
-                if not await checkbox_input.first.is_checked():
-                    return f"商品素材 {mid} 未被选中"
-            except Exception:
-                return f"商品素材 {mid} 的选择框无法勾选"
-        else:
-            checkbox_inner = material_row.locator(
-                'div[class*="ovui-checkbox__inner"]'
-            )
-            if await checkbox_inner.count() < 1:
-                return f"商品素材 {mid} 没有可用的选择框"
-            await checkbox_inner.first.click(force=True)
+                if "ovui-checkbox--disabled" not in label_class:
+                    material_row = row_candidate
+                    break
+                if disabled_row is None:
+                    disabled_row = row_candidate
+            if material_row is None:
+                material_row = disabled_row
+            if material_row is None or await material_row.count() < 1:
+                return f"无法定位商品素材 {mid} 的选择行"
 
-        selector_modal = search_input.last.locator(
-            "xpath=ancestor::div["
-            "contains(concat(' ',normalize-space(@class),' '),' ovui-modal ')"
-            "][1]"
-        )
-        if await selector_modal.count() < 1:
-            return "商品素材选择弹层结构无法识别"
-        try:
-            await page.wait_for_function(
-                """() => /已选\\s*[1-9]\\d*\\s*\\/\\s*20/.test(
-                    document.body ? document.body.innerText : ""
-                )""",
-                timeout=min(self._opt.goto_timeout_ms, 15_000),
-            )
-        except Exception:
-            return f"商品素材 {mid} 勾选后未进入已选列表"
+            checkbox_input = material_row.locator('input[type="checkbox"]')
+            if await checkbox_input.count() > 0:
+                try:
+                    checkbox_label = checkbox_input.first.locator(
+                        "xpath=ancestor::label[1]"
+                    )
+                    label_class = (
+                        await checkbox_label.get_attribute("class")
+                        if await checkbox_label.count() > 0
+                        else ""
+                    ) or ""
+                    if "ovui-checkbox--disabled" in label_class:
+                        try:
+                            await page.wait_for_function(
+                                """label => !String(label && label.className || "")
+                                    .includes("ovui-checkbox--disabled")""",
+                                await checkbox_label.element_handle(),
+                                timeout=min(self._opt.goto_timeout_ms, 8_000),
+                            )
+                        except Exception:
+                            return f"商品素材 {mid} 当前不可追投（选择框禁用）"
+                    if not await checkbox_input.first.is_checked():
+                        # 点击组件 label，让千川自身的选择事件更新「已选」计数。
+                        if await checkbox_label.count() > 0:
+                            await checkbox_label.click()
+                        else:
+                            await checkbox_input.first.evaluate("element => element.click()")
+                    if not await checkbox_input.first.is_checked():
+                        return f"商品素材 {mid} 未被选中"
+                except Exception:
+                    return f"商品素材 {mid} 的选择框无法勾选"
+            else:
+                checkbox_inner = material_row.locator(
+                    'div[class*="ovui-checkbox__inner"]'
+                )
+                if await checkbox_inner.count() < 1:
+                    return f"商品素材 {mid} 没有可用的选择框"
+                await checkbox_inner.first.click(force=True)
+
+            try:
+                await page.wait_for_function(
+                    """expected => {
+                        const text = document.body ? document.body.innerText : "";
+                        const match = text.match(/已选\\s*(\\d+)\\s*\\/\\s*20/);
+                        return !!match && Number(match[1]) >= Number(expected);
+                    }""",
+                    selected_count,
+                    timeout=min(self._opt.goto_timeout_ms, 15_000),
+                )
+            except Exception:
+                return f"商品素材 {mid} 勾选后未进入已选列表"
 
         confirm = selector_modal.get_by_role("button", name="确定", exact=True)
         if not await self._click_last_visible(confirm):
@@ -838,14 +844,25 @@ class QianChuanRetargetingService:
                 timeout=min(self._opt.goto_timeout_ms, 15_000),
             )
             await page.wait_for_function(
-                """() => /已添加[：:]\\s*[1-9]\\d*\\s*\\/\\s*20/.test(
-                    document.body ? document.body.innerText : ""
-                )""",
+                """expected => {
+                    const text = document.body ? document.body.innerText : "";
+                    const match = text.match(/已添加[：:]\\s*(\\d+)\\s*\\/\\s*20/);
+                    return !!match && Number(match[1]) === Number(expected);
+                }""",
+                len(ids),
                 timeout=min(self._opt.goto_timeout_ms, 15_000),
             )
         except Exception:
-            return f"商品素材 {mid} 选择结果未写入追投表单"
+            return f"{len(ids)}条商品素材的选择结果未写入追投表单"
         return None
+
+    async def _select_product_material(
+        self,
+        page: Page,
+        material_id: str,
+    ) -> Optional[str]:
+        """兼容单素材调用。"""
+        return await self._select_product_materials(page, [material_id])
 
     async def _search_material_and_open_dialog(self, page: Page, material_id: str) -> Optional[str]:
         mid = str(material_id).strip()
@@ -993,6 +1010,7 @@ class QianChuanRetargetingService:
         ad_id: int,
         material_id: str,
         retargeting: Dict[str, Any],
+        material_ids: Optional[List[str]] = None,
         strategy_title: Optional[str] = None,
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
@@ -1010,6 +1028,14 @@ class QianChuanRetargetingService:
         """
         self._log_tag = retarget_log_tag(strategy_title=strategy_title, immediate=False)
         rdict = retargeting if isinstance(retargeting, dict) else {}
+        batch_material_ids: List[str] = []
+        for raw_id in material_ids or [material_id]:
+            mid = str(raw_id or "").strip()
+            if mid and mid not in batch_material_ids:
+                batch_material_ids.append(mid)
+        if not batch_material_ids and str(material_id or "").strip():
+            batch_material_ids.append(str(material_id).strip())
+        material_id = batch_material_ids[0] if batch_material_ids else ""
         try:
             scene = normalize_scene(promotion_scene or "live")
         except ValueError as e:
@@ -1024,6 +1050,12 @@ class QianChuanRetargetingService:
             )
 
         vmsg = self._validate_retargeting_payload(rdict, scene)
+        if not vmsg and not batch_material_ids:
+            vmsg = "追投任务缺少素材"
+        if not vmsg and len(batch_material_ids) > 20:
+            vmsg = "单次追投最多支持20条素材"
+        if not vmsg and scene != "product" and len(batch_material_ids) > 1:
+            vmsg = "直播追投尚不支持在一个调控任务中批量添加素材"
         if vmsg:
             return self._make_result(
                 success=False,
@@ -1136,7 +1168,7 @@ class QianChuanRetargetingService:
                 if scene == "product":
                     err = await self._open_product_retarget_dialog(page, ad_id)
                     if not err:
-                        err = await self._select_product_material(page, material_id)
+                        err = await self._select_product_materials(page, batch_material_ids)
                 else:
                     err = await self._search_material_and_open_dialog(page, material_id)
                 if err:

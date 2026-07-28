@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import tempfile
 import unittest
@@ -169,6 +170,30 @@ class ProductPromotionTests(unittest.TestCase):
                 "product",
             ),
         )
+
+    def test_product_batch_has_twenty_material_limit(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+        result = asyncio.run(
+            service.run(
+                aavid=10001,
+                ad_id=30001,
+                material_id="m1",
+                material_ids=[f"m{index}" for index in range(21)],
+                retargeting={
+                    "method": "volume",
+                    "volume": {
+                        "total_budget_yuan": 100,
+                        "duration_hours": 1,
+                    },
+                },
+                promotion_scene="product",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertEqual("validate", result.step)
+        self.assertIn("最多支持20条素材", result.message)
 
     def test_product_material_request_accepts_req_from_in_post_body(self):
         fetcher = QianChuanFetcher()

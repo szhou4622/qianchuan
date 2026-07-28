@@ -10,14 +10,17 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from api.dashboard import DashboardApi
 from api.operation_events import prune_operation_events
 from api.rule_retargeting_config import evaluate_trigger, load_rule_retargeting_config
 from config import DATA_DIR
 from services.cloud_retarget_client import pull_retarget_task, report_retarget_task
-from services.local_test_guard import assert_test_scope, consume_live_retarget_once
+from services.local_test_guard import (
+    assert_test_scope,
+    consume_live_retarget_batch_once,
+)
 from services.retargeting_rule_runner import (
     _insert_run,
     _interval_from_root_cfg,
@@ -174,7 +177,52 @@ def _cached_report(task_uid: str, claim_token: str, local: Dict[str, Any]) -> No
     )
 
 
-def _validate_task(task: Dict[str, Any], db: SQLiteStore) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def _task_materials(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_materials = task.get("materials")
+    if not isinstance(raw_materials, list) or not raw_materials:
+        raw_materials = [
+            {
+                "material_id": task.get("material_id"),
+                "material_name": task.get("material_name"),
+                "product_id": task.get("product_id"),
+                "product_name": task.get("product_name"),
+            }
+        ]
+    materials: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_materials:
+        if not isinstance(raw, dict):
+            continue
+        material_id = str(raw.get("material_id") or "").strip()
+        if not material_id or material_id in seen:
+            continue
+        seen.add(material_id)
+        product_id = str(raw.get("product_id") or "").strip()
+        product_ids: List[str] = []
+        for value in raw.get("product_ids") or []:
+            pid = str(value or "").strip()
+            if pid and pid not in product_ids:
+                product_ids.append(pid)
+        if product_id and product_id not in product_ids:
+            product_ids.insert(0, product_id)
+        materials.append(
+            {
+                "material_id": material_id,
+                "material_name": str(raw.get("material_name") or "").strip()[:512],
+                "product_id": product_id,
+                "product_name": str(raw.get("product_name") or "").strip()[:512],
+                "product_ids": product_ids[:20],
+            }
+        )
+        if len(materials) >= 20:
+            break
+    return materials
+
+
+def _validate_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
     cfg = load_rule_retargeting_config()
     if not cfg.get("enabled"):
         raise RuntimeError("规则化追投已关闭")
@@ -197,9 +245,13 @@ def _validate_task(task: Dict[str, Any], db: SQLiteStore) -> Tuple[Dict[str, Any
     promotion_scene = str(task.get("promotion_scene") or "live")
     plan_system = normalize_plan_system(task.get("plan_system") or "unknown")
     trigger_level = str(task.get("trigger_level") or "material")
-    product_id = str(task.get("product_id") or "")
-    material_id = str(task.get("material_id") or "")
-    assert_test_scope(aavid, material_id)
+    materials = _task_materials(task)
+    if not materials:
+        raise RuntimeError("追投任务没有有效素材")
+    if len(materials) > 20:
+        raise RuntimeError("单个追投计划最多支持20条素材")
+    for material in materials:
+        assert_test_scope(aavid, material["material_id"])
     target: Dict[str, Any] = {}
     if target_uid:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
@@ -246,35 +298,32 @@ def _validate_task(task: Dict[str, Any], db: SQLiteStore) -> Tuple[Dict[str, Any
     period = str(cfg.get("trigger_query_period") or "1h")
     if target_uid:
         target_rows = _latest_target_rows(target_uid, period)
-        row = next(
-            (
-                item
-                for item in target_rows
-                if str(item.get("id") or "") == material_id
-                and str(item.get("aadvid") or "") == aavid
-            ),
-            None,
-        )
+        rows_by_id = {
+            str(item.get("id") or ""): item
+            for item in target_rows
+            if str(item.get("aadvid") or "") == aavid
+        }
     else:
         target_rows = []
-        row = _latest_material_row(aavid, material_id, period)
-    if not row:
-        raise RuntimeError("最新素材数据中已找不到该素材")
+        rows_by_id = {}
+        for material in materials:
+            material_id = material["material_id"]
+            row = _latest_material_row(aavid, material_id, period)
+            if row:
+                rows_by_id[material_id] = row
+    missing_ids = [
+        material["material_id"]
+        for material in materials
+        if material["material_id"] not in rows_by_id
+    ]
+    if missing_ids:
+        raise RuntimeError("最新素材数据中已找不到素材：" + "、".join(missing_ids))
+
     trigger = strategy.get("trigger") or {}
     trigger_level = str(strategy.get("trigger_level") or "material")
     if trigger_level == "product":
-        if promotion_scene != "product" or not product_id:
-            raise RuntimeError("商品级提醒缺少有效商品")
-        relation = db.select_one(
-            "promotion_material_product",
-            where={
-                "target_uid": target_uid,
-                "material_id": material_id,
-                "product_id": product_id,
-            },
-        )
-        if not relation:
-            raise RuntimeError("商品已移除或素材已不再关联该商品")
+        if promotion_scene != "product":
+            raise RuntimeError("商品级提醒不能用于直播计划")
         relation_rows = db.select(
             "promotion_material_product",
             fields="material_id, product_id",
@@ -294,25 +343,57 @@ def _validate_task(task: Dict[str, Any], db: SQLiteStore) -> Tuple[Dict[str, Any
             str(item.get("product_id") or ""): str(item.get("product_name") or "")
             for item in product_rows
         }
+        snapshot_product_ids = {
+            product_id
+            for material in materials
+            for product_id in material.get("product_ids") or []
+            if product_id
+        }
+        if not snapshot_product_ids:
+            raise RuntimeError("商品级提醒缺少有效商品")
         hits = evaluate_product_strategy(
             target_rows,
             strategy,
             relation_map=relation_map,
             product_names=product_names,
-            allowed_product_ids=[product_id],
+            allowed_product_ids=sorted(snapshot_product_ids),
         )
-        still_candidate = any(
-            str(hit.get("productId") or "") == product_id
-            and any(
-                str(candidate.get("id") or "") == material_id
-                for candidate in (hit.get("candidates") or [])
+        current_candidates: Dict[str, set[str]] = {}
+        for hit in hits:
+            hit_product_id = str(hit.get("productId") or "")
+            for candidate in hit.get("candidates") or []:
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id:
+                    current_candidates.setdefault(candidate_id, set()).add(
+                        hit_product_id
+                    )
+        for material in materials:
+            material_id = material["material_id"]
+            stored_products = set(material.get("product_ids") or [])
+            current_relations = set(relation_map.get(material_id) or [])
+            if not stored_products.intersection(current_relations):
+                raise RuntimeError(
+                    f"素材 {material_id} 已不再关联卡片中的商品"
+                )
+            if not stored_products.intersection(
+                current_candidates.get(material_id) or set()
+            ):
+                raise RuntimeError(
+                    f"素材 {material_id} 的商品汇总或候选条件已不满足追投规则"
+                )
+    else:
+        failed_ids = [
+            material["material_id"]
+            for material in materials
+            if not evaluate_trigger(
+                trigger,
+                rows_by_id[material["material_id"]],
             )
-            for hit in hits
-        )
-        if not still_candidate:
-            raise RuntimeError("商品最新汇总或候选素材条件已不满足追投规则")
-    elif not evaluate_trigger(trigger, row):
-        raise RuntimeError("素材最新数据已不满足追投规则")
+        ]
+        if failed_ids:
+            raise RuntimeError(
+                "以下素材最新数据已不满足追投规则：" + "、".join(failed_ids)
+            )
 
     retargeting = task.get("retargeting")
     if not isinstance(retargeting, dict):
@@ -321,22 +402,24 @@ def _validate_task(task: Dict[str, Any], db: SQLiteStore) -> Tuple[Dict[str, Any
         task_snapshot.get("retargeting") or {}, ensure_ascii=False, sort_keys=True
     ):
         raise RuntimeError("追投参数快照与策略版本不一致")
-    if bool(cfg.get("per_strategy_rate_limit")):
-        ws, mc = _interval_window_and_max(retargeting)
-        if rate_limit_strategy_should_skip(
-            db,
-            material_id,
-            strategy_id,
-            ws,
-            mc,
-            target_uid,
-        ):
-            raise RuntimeError("该素材已达到本策略追投次数上限")
-    else:
-        ws, mc = _interval_from_root_cfg(cfg)
-        if rate_limit_should_skip(db, material_id, ws, mc, target_uid):
-            raise RuntimeError("该素材已达到全局追投次数上限")
-    return cfg, strategy, row
+    for material in materials:
+        material_id = material["material_id"]
+        if bool(cfg.get("per_strategy_rate_limit")):
+            ws, mc = _interval_window_and_max(retargeting)
+            if rate_limit_strategy_should_skip(
+                db,
+                material_id,
+                strategy_id,
+                ws,
+                mc,
+                target_uid,
+            ):
+                raise RuntimeError(f"素材 {material_id} 已达到本策略追投次数上限")
+        else:
+            ws, mc = _interval_from_root_cfg(cfg)
+            if rate_limit_should_skip(db, material_id, ws, mc, target_uid):
+                raise RuntimeError(f"素材 {material_id} 已达到全局追投次数上限")
+    return cfg, strategy, [rows_by_id[item["material_id"]] for item in materials]
 
 
 async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]:
@@ -347,16 +430,19 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
     promotion_scene = str(task.get("promotion_scene") or "live")
     plan_system = _safe_plan_system(task.get("plan_system"))
     trigger_level = str(task.get("trigger_level") or "material")
-    product_id = str(task.get("product_id") or "")
-    product_name = str(task.get("product_name") or "")
-    material_id = str(task.get("material_id") or "")
+    materials = _task_materials(task)
+    first_material = materials[0] if materials else {}
+    product_id = str(first_material.get("product_id") or task.get("product_id") or "")
+    product_name = str(first_material.get("product_name") or task.get("product_name") or "")
+    material_id = str(first_material.get("material_id") or task.get("material_id") or "")
+    material_ids = [item["material_id"] for item in materials]
     started_at = _now()
     t0 = time.time()
     cfg: Dict[str, Any] = {}
     strategy: Dict[str, Any] = {}
-    row: Dict[str, Any] = {}
+    rows: List[Dict[str, Any]] = []
     try:
-        cfg, strategy, row = await asyncio.to_thread(_validate_task, task, db)
+        cfg, strategy, rows = await asyncio.to_thread(_validate_task, task, db)
     except Exception as exc:
         failure = {"success": False, "message": str(exc), "detail": traceback.format_exc(), "step": "revalidate"}
         ended_at = _now()
@@ -391,13 +477,14 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
             trigger_source=f"feishu_card:{task_uid}"[:64],
             cloud_task_id=task_uid,
             operator_id=str(task.get("clicker_open_id") or ""),
+            materials=materials,
         )
         return failure
 
     retargeting = task.get("retargeting") or {}
     strategy_name = str(strategy.get("title") or task.get("strategy_name") or "飞书确认追投")
     try:
-        consume_live_retarget_once(task_uid, aavid, material_id)
+        consume_live_retarget_batch_once(task_uid, aavid, material_ids)
     except Exception as exc:
         failure = {
             "success": False,
@@ -436,44 +523,103 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
             trigger_source=f"feishu_card:{task_uid}"[:64],
             cloud_task_id=task_uid,
             operator_id=str(task.get("clicker_open_id") or ""),
+            materials=materials,
         )
         return failure
     svc = QianChuanRetargetingService.from_rule_file_dict(cfg)
+    results: List[Any] = []
     try:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
         async with exclusive_browser_operation(
-            f"飞书确认追投:{target_uid}:{material_id}"
+            f"飞书确认追投:{target_uid}:{','.join(material_ids)}"
         ):
-            result = await svc.run(
-                aavid=int(aavid),
-                ad_id=int(ad_id),
-                material_id=material_id,
-                retargeting=retargeting,
-                strategy_title=strategy_name,
-                target_uid=target_uid,
-                promotion_scene=promotion_scene,
-                source_url=target.get("sanitized_page_url") or None,
-                reuse_session=False,
-                close_session=False,
-            )
+            if promotion_scene == "product":
+                results.append(
+                    await svc.run(
+                        aavid=int(aavid),
+                        ad_id=int(ad_id),
+                        material_id=material_id,
+                        material_ids=material_ids,
+                        retargeting=retargeting,
+                        strategy_title=strategy_name,
+                        target_uid=target_uid,
+                        promotion_scene=promotion_scene,
+                        source_url=target.get("sanitized_page_url") or None,
+                        reuse_session=False,
+                        close_session=False,
+                    )
+                )
+            else:
+                # 直播详情页一次只能从具体素材行创建调控任务；仍然只发
+                # 一张飞书卡、只确认一次，但在同一浏览器锁内逐条完成。
+                for current_material_id in material_ids:
+                    results.append(
+                        await svc.run(
+                            aavid=int(aavid),
+                            ad_id=int(ad_id),
+                            material_id=current_material_id,
+                            retargeting=retargeting,
+                            strategy_title=strategy_name,
+                            target_uid=target_uid,
+                            promotion_scene=promotion_scene,
+                            source_url=target.get("sanitized_page_url") or None,
+                            reuse_session=False,
+                            close_session=False,
+                        )
+                    )
     except Exception as exc:
-        result = None
+        results = []
         failure = {"success": False, "message": "追投执行异常", "detail": traceback.format_exc(), "step": "exception"}
     finally:
         await svc.close()
 
     ended_at = _now()
     duration = int((time.time() - t0) * 1000)
-    if result is None:
+    if not results:
         payload = failure
         regulate_task_id = ""
     else:
-        payload = result.asdict()
-        regulate_task_id = str(result.regulate_task_id or "")
+        result_payloads = [item.asdict() for item in results]
+        regulate_task_ids = [
+            str(item.regulate_task_id or "")
+            for item in results
+            if str(item.regulate_task_id or "")
+        ]
+        successful_material_ids = (
+            material_ids
+            if promotion_scene == "product" and bool(results[0].success)
+            else [
+                current_material_id
+                for current_material_id, current_result in zip(material_ids, results)
+                if bool(current_result.success)
+            ]
+        )
+        all_succeeded = (
+            bool(results[0].success)
+            if promotion_scene == "product"
+            else len(successful_material_ids) == len(material_ids)
+        )
+        first_result = results[0]
+        payload = first_result.asdict()
+        payload["success"] = all_succeeded
+        payload["regulate_task_ids"] = regulate_task_ids
+        payload["successful_material_ids"] = successful_material_ids
+        payload["results"] = result_payloads
+        if all_succeeded:
+            payload["message"] = f"追投成功（{len(materials)}条素材）"
+        elif successful_material_ids:
+            payload["message"] = (
+                f"部分追投成功（{len(successful_material_ids)}/{len(materials)}条素材）"
+            )
+            payload["detail"] = _json(result_payloads)
+            payload["step"] = "partial_failure"
+        regulate_task_id = regulate_task_ids[0] if regulate_task_ids else ""
+    payload["materials"] = materials
+    payload["material_count"] = len(materials)
     trigger_snapshot = task.get("trigger_snapshot") or {}
     query_snapshot = dict(task.get("query_snapshot") or {})
     query_snapshot["revalidated_at"] = ended_at
-    query_snapshot["revalidated_material_row"] = row
+    query_snapshot["revalidated_material_rows"] = rows
     _insert_run(
         db,
         aavid=aavid,
@@ -504,26 +650,33 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
         trigger_source=f"feishu_card:{task_uid}"[:64],
         cloud_task_id=task_uid,
         operator_id=str(task.get("clicker_open_id") or ""),
+        materials=materials,
     )
-    if payload.get("success"):
-        if bool(cfg.get("per_strategy_rate_limit")):
-            ws, mc = _interval_window_and_max(retargeting)
-            rate_limit_strategy_record_success(
+    successful_ids = set(payload.get("successful_material_ids") or [])
+    if payload.get("success") and not successful_ids:
+        successful_ids = set(material_ids)
+    if successful_ids:
+        for current_material_id in material_ids:
+            if current_material_id not in successful_ids:
+                continue
+            if bool(cfg.get("per_strategy_rate_limit")):
+                ws, mc = _interval_window_and_max(retargeting)
+                rate_limit_strategy_record_success(
+                    db,
+                    current_material_id,
+                    str(strategy.get("id") or ""),
+                    ws,
+                    mc,
+                    target_uid,
+                )
+            root_ws, root_mc = _interval_from_root_cfg(cfg)
+            rate_limit_record_success(
                 db,
-                material_id,
-                str(strategy.get("id") or ""),
-                ws,
-                mc,
+                current_material_id,
+                root_ws,
+                root_mc,
                 target_uid,
             )
-        root_ws, root_mc = _interval_from_root_cfg(cfg)
-        rate_limit_record_success(
-            db,
-            material_id,
-            root_ws,
-            root_mc,
-            target_uid,
-        )
     payload["regulate_task_id"] = regulate_task_id
     return payload
 

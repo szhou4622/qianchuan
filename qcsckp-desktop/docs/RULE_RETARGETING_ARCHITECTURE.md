@@ -95,7 +95,13 @@
 
   若 hit_rows 为空 → return
 
-  为本策略创建 QianChuanRetargetingService.from_rule_file_dict(cfg)
+  card_confirm：
+        ├── 先过滤已达限频素材，并按 material_id 去重（最多20条）
+        ├── 同一「账户＋计划＋策略」只创建一个云端任务和一张飞书卡
+        ├── 商品计划确认后一次打开素材选择器、批量勾选、只提交一次
+        └── 一次执行流水保存完整 materials_json；每条素材分别记限频
+
+  auto_execute：为本策略创建 QianChuanRetargetingService.from_rule_file_dict(cfg)
 
   对 hit_rows 中每个 row（素材）：
         │
@@ -119,6 +125,7 @@
 
 - **指标口径**：触发判断与「素材数据」行字段一致，来自 `get_table_data`，与前端看盘对齐。
 - **多策略**：策略间并行、策略内对命中素材顺序执行；同一 `material_id` 用锁避免竞态超频。
+- **单卡多素材**：同一计划与策略本轮命中的素材聚合到一个任务，卡片列出全部素材，用户只确认一次；商品追投最多20条并只产生一个千川调控任务。
 - **流水**：`pmc_retargeting_run` 记录每次尝试（成功/失败），`strategy_name` 等见表结构说明。
 
 ---

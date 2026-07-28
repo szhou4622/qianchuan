@@ -195,6 +195,7 @@ class SQLiteStore:
                 'trigger_level': "TEXT NOT NULL DEFAULT 'material'",
                 'material_id': 'TEXT NOT NULL',
                 'material_name': 'TEXT',
+                'materials_json': 'TEXT',
                 'strategy_name': 'TEXT',
                 'regulate_task_id': 'TEXT',
                 'started_at': 'TEXT NOT NULL',

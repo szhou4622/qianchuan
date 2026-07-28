@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import copy
+import json
 import os
 import tempfile
 import unittest
@@ -109,6 +111,112 @@ class RetargetConfigTests(unittest.TestCase):
         snapshot["retargeting"]["volume"]["total_budget_yuan"] = 999
         self.assertNotEqual(_strategy_hash(strategy), _snapshot_hash(snapshot))
 
+    def test_one_strategy_cycle_creates_one_card_with_all_product_materials(self):
+        strategy = {
+            "id": "batch-strategy",
+            "title": "批量商品追投",
+            "target_uid": "target-product",
+            "trigger_level": "material",
+            "action_mode": "card_confirm",
+            "trigger": {"groups": []},
+            "retargeting": {
+                "method": "volume",
+                "volume": {
+                    "total_budget_yuan": 100,
+                    "duration_hours": 1,
+                },
+            },
+        }
+        target = {
+            "target_uid": "target-product",
+            "aadvid": "10001",
+            "ad_id": "30001",
+            "plan_name": "商品全域计划",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "last_status": "ok",
+            "enabled": 1,
+            "capability_json": '{"retarget_execute":true}',
+        }
+        rows = [
+            {
+                "targetUid": "target-product",
+                "aadvid": "10001",
+                "id": "m1",
+                "videoName": "素材1",
+            },
+            {
+                "targetUid": "target-product",
+                "aadvid": "10001",
+                "id": "m2",
+                "videoName": "素材2",
+            },
+        ]
+
+        class FakeDashboard:
+            def get_table_data(self, **_kwargs):
+                return {
+                    "success": True,
+                    "data": rows,
+                    "total": len(rows),
+                    "period": "近1小时",
+                }
+
+            def get_dashboard_account_label(self):
+                return {"label": "测试账户"}
+
+        class FakeStore:
+            def select(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return [target]
+                return []
+
+            def select_one(self, table, **_kwargs):
+                if table == "pmc_ad_detail_basic":
+                    return {"user_info_name": "测试账户"}
+                return None
+
+        with patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value={
+                "enabled": True,
+                "trigger_query_period": "1h",
+                "strategies": [strategy],
+            },
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeDashboard(),
+        ), patch(
+            "services.retargeting_rule_runner.row_is_in_test_scope",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.evaluate_trigger",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.build_trigger_evaluation_snapshot",
+            return_value={"passed": True},
+        ), patch(
+            "services.retargeting_rule_runner.rate_limit_should_skip",
+            return_value=False,
+        ), patch(
+            "services.retargeting_rule_runner.create_retarget_task",
+            return_value={
+                "success": True,
+                "duplicate": False,
+                "data": {"task_uid": "task-batch"},
+            },
+        ) as create_task:
+            asyncio.run(
+                retargeting_rule_runner.run_one_cycle(FakeStore())
+            )
+
+        self.assertEqual(1, create_task.call_count)
+        payload = create_task.call_args.args[0]
+        self.assertEqual(
+            ["m1", "m2"],
+            [item["material_id"] for item in payload["materials"]],
+        )
+
 
 class OperationEventTests(unittest.TestCase):
     def setUp(self):
@@ -148,6 +256,50 @@ class OperationEventTests(unittest.TestCase):
             ),
         )
         self.assertEqual("plan_create", normalize_action_type("新建计划"))
+
+    def test_batch_retarget_writes_one_operation_with_all_materials(self):
+        materials = [
+            {"material_id": "m1", "material_name": "素材1"},
+            {"material_id": "m2", "material_name": "素材2"},
+        ]
+        retargeting_rule_runner._insert_run(
+            self.db,
+            aavid="1001",
+            ad_id="plan1",
+            target_uid="target1",
+            promotion_scene="product",
+            plan_system="global",
+            trigger_level="material",
+            material_id="m1",
+            material_name="素材1",
+            strategy_name="批量策略",
+            regulate_task_id="regulate1",
+            started_at="2026-07-28 10:00:00",
+            ended_at="2026-07-28 10:00:01",
+            duration_ms=1000,
+            status=1,
+            step="done",
+            message="追投成功（2条素材）",
+            detail="",
+            retargeting={"method": "volume"},
+            rule_full_json="{}",
+            trigger_snapshot_json="{}",
+            query_snapshot_json="{}",
+            headless=True,
+            browser_headless_rule=True,
+            cloud_task_id="cloud-batch",
+            materials=materials,
+        )
+        runs = self.db.select("pmc_retargeting_run")
+        events = self.db.select("account_operation_event")
+        self.assertEqual(1, len(runs))
+        self.assertEqual(1, len(events))
+        self.assertEqual(materials, json.loads(runs[0]["materials_json"]))
+        self.assertEqual("assist_task", events[0]["object_type"])
+        self.assertEqual(
+            materials,
+            json.loads(events[0]["raw_json"])["materials"],
+        )
         self.assertEqual("budget_update", normalize_action_type("调整日预算"))
         self.assertEqual("other", normalize_action_type("查看报表"))
 
@@ -411,6 +563,152 @@ class RetargetWorkerValidationTests(unittest.TestCase):
     def test_rate_limit_blocks_execution(self):
         with self.assertRaisesRegex(RuntimeError, "次数上限"):
             self.validate(rate_limited=True)
+
+    def test_product_batch_revalidates_every_material_in_one_task(self):
+        task = {
+            **self.task,
+            "promotion_scene": "product",
+            "materials": [
+                {"material_id": "20001", "material_name": "素材1"},
+                {"material_id": "20002", "material_name": "素材2"},
+            ],
+        }
+        cfg = {
+            "enabled": True,
+            "trigger_query_period": "1h",
+            "per_strategy_rate_limit": False,
+            "strategies": [copy.deepcopy(self.strategy)],
+        }
+
+        def latest(_aavid, material_id, _period):
+            return {"aadvid": "10001", "id": material_id}
+
+        with patch(
+            "services.retarget_task_worker.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retarget_task_worker.resolve_ad_id_for_aavid",
+            return_value="30001",
+        ), patch(
+            "services.retarget_task_worker.os.path.isfile",
+            return_value=True,
+        ), patch(
+            "services.retarget_task_worker._latest_material_row",
+            side_effect=latest,
+        ), patch(
+            "services.retarget_task_worker.evaluate_trigger",
+            return_value=True,
+        ) as evaluate, patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 1),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_should_skip",
+            return_value=False,
+        ) as rate_limit, patch(
+            "services.retarget_task_worker.assert_test_scope",
+        ):
+            _cfg, _strategy, rows = retarget_task_worker._validate_task(
+                task,
+                object(),
+            )
+
+        self.assertEqual(["20001", "20002"], [row["id"] for row in rows])
+        self.assertEqual(2, evaluate.call_count)
+        self.assertEqual(2, rate_limit.call_count)
+
+    def test_task_materials_deduplicate_and_preserve_order(self):
+        materials = retarget_task_worker._task_materials(
+            {
+                "materials": [
+                    {"material_id": "m2", "material_name": "第二条"},
+                    {"material_id": "m1", "material_name": "第一条"},
+                    {"material_id": "m2", "material_name": "重复"},
+                ]
+            }
+        )
+        self.assertEqual(["m2", "m1"], [item["material_id"] for item in materials])
+
+    def test_batch_execution_submits_once_and_records_each_material_limit(self):
+        task = {
+            **self.task,
+            "task_uid": "task-batch",
+            "target_uid": "target-product",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "materials": [
+                {"material_id": "m1", "material_name": "素材1"},
+                {"material_id": "m2", "material_name": "素材2"},
+            ],
+            "trigger_snapshot": {},
+            "query_snapshot": {},
+        }
+        cfg = {
+            "enabled": True,
+            "browser_headless": True,
+            "per_strategy_rate_limit": False,
+        }
+
+        class FakeResult:
+            success = True
+            regulate_task_id = "regulate-batch"
+
+            def asdict(self):
+                return {
+                    "success": True,
+                    "message": "追投成功",
+                    "detail": "",
+                    "step": "done",
+                    "headless": True,
+                }
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResult()
+
+            async def close(self):
+                return None
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {"sanitized_page_url": "https://example.test/product"}
+                return None
+
+        service = FakeService()
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}, {"id": "m2"}]),
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ) as consume, patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retarget_task_worker._insert_run",
+        ) as insert_run, patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 5),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_record_success",
+        ) as record_limit:
+            result = asyncio.run(
+                retarget_task_worker._execute_task(task, FakeStore())
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("追投成功（2条素材）", result["message"])
+        consume.assert_called_once_with("task-batch", "10001", ["m1", "m2"])
+        self.assertEqual(1, len(service.calls))
+        self.assertEqual(["m1", "m2"], service.calls[0]["material_ids"])
+        self.assertEqual(1, insert_run.call_count)
+        self.assertEqual(
+            ["m1", "m2"],
+            [call.args[1] for call in record_limit.call_args_list],
+        )
 
     def validate_target_plan_system(self, plan_system):
         strategy = copy.deepcopy(self.strategy)

@@ -375,21 +375,34 @@ def row_is_in_test_scope(row: Dict[str, Any]) -> bool:
 
 
 def consume_live_retarget_once(task_uid: str, aavid: str, material_id: str) -> None:
+    consume_live_retarget_batch_once(task_uid, aavid, [material_id])
+
+
+def consume_live_retarget_batch_once(
+    task_uid: str,
+    aavid: str,
+    material_ids: List[str],
+) -> None:
     """
-    在真正调用千川前原子消费一次性授权。
+    在真正调用千川前为整批素材原子消费一次性授权。
 
     即使执行中断也不允许自动再试，避免形成重复真实追投。
     """
     if not TEST_MODE:
         return
-    assert_test_scope(aavid, material_id)
+    ids = [str(item or "").strip() for item in material_ids if str(item or "").strip()]
+    if not ids:
+        raise RuntimeError("本地真实追投缺少素材")
+    for material_id in ids:
+        assert_test_scope(aavid, material_id)
     if not ALLOW_LIVE_RETARGET:
         raise RuntimeError("本地真实追投开关未开启，本次只允许模拟验收")
     os.makedirs(DATA_DIR, exist_ok=True)
     payload = {
         "task_uid": str(task_uid),
         "aavid": str(aavid),
-        "material_id": str(material_id),
+        "material_id": ids[0],
+        "material_ids": ids,
         "consumed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:

@@ -605,6 +605,7 @@ def _insert_run(
     trigger_source: str = "scheduler",
     cloud_task_id: str = "",
     operator_id: str = "",
+    materials: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     _rid = str(regulate_task_id or "").strip()
     _mn = str(material_name or "").strip()
@@ -624,6 +625,7 @@ def _insert_run(
         "product_name": str(product_name or "").strip() or None,
         "material_id": material_id,
         "material_name": _mn if _mn else None,
+        "materials_json": _json_dumps(materials or []),
         "strategy_name": _sn,
         "regulate_task_id": _rid if _rid else None,
         "started_at": started_at,
@@ -658,9 +660,13 @@ def _insert_run(
                 "plan_system": normalize_plan_system(plan_system or "unknown"),
                 "source": "tool_direct",
                 "action_type": "retarget",
-                "object_type": "material",
-                "object_id": material_id,
-                "object_name": _mn,
+                "object_type": "assist_task" if len(materials or []) > 1 else "material",
+                "object_id": _rid or material_id,
+                "object_name": (
+                    f"{len(materials or [])}条素材追投"
+                    if len(materials or []) > 1
+                    else _mn
+                ),
                 "plan_id": ad_id,
                 "material_id": material_id,
                 "material_name": _mn,
@@ -670,10 +676,14 @@ def _insert_run(
                 "status": "success" if status == 1 else "failed",
                 "summary": message or "追投",
                 "detail": detail,
-                "after": {"regulate_task_id": _rid},
+                "after": {
+                    "regulate_task_id": _rid,
+                    "materials": materials or [],
+                },
                 "trigger_json": trigger_snapshot_json,
                 "request_json": data["retargeting_json"],
                 "response": {"step": step},
+                "raw": {"materials": materials or []},
                 "cloud_task_id": cloud_task_id,
                 "operator_id": operator_id,
                 "operator_name": "飞书确认用户" if operator_id else "工具",
@@ -921,6 +931,210 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             if not hit_rows:
                 return
 
+            if action_mode == "card_confirm":
+                aavid_raw = target.get("aadvid")
+                aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
+                ad_id = str(target.get("ad_id") or "").strip()
+                try:
+                    aavid_int = int(aavid)
+                    ad_id_int = int(ad_id)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "%s 监控计划缺少有效账户或计划ID，无法创建批量追投卡片",
+                        _tag,
+                    )
+                    return
+
+                batch_materials: List[Dict[str, Any]] = []
+                material_index: Dict[str, Dict[str, Any]] = {}
+                evaluation_snapshots: List[Dict[str, Any]] = []
+                query_material_rows: List[Dict[str, Any]] = []
+                for row in hit_rows:
+                    material_id = str(row.get("id") or "").strip()
+                    if not material_id:
+                        continue
+                    if per_strategy_rl:
+                        limited = rate_limit_strategy_should_skip(
+                            db,
+                            material_id,
+                            strategy_id_for_rl,
+                            ws_s,
+                            mc_s,
+                            target_uid,
+                        )
+                    else:
+                        limited = rate_limit_should_skip(
+                            db,
+                            material_id,
+                            ws,
+                            mc,
+                            target_uid,
+                        )
+                    if limited:
+                        logger.info(
+                            "%s 批量卡片跳过已达限频素材 material_id=%s",
+                            _tag,
+                            material_id,
+                        )
+                        continue
+
+                    product_id = str(row.get("_product_id") or "").strip()
+                    product_name = str(row.get("_product_name") or "").strip()
+                    evaluation_row = (
+                        row.get("_product_metrics")
+                        if trigger_level == "product"
+                        and isinstance(row.get("_product_metrics"), dict)
+                        else row
+                    )
+                    if material_id in material_index:
+                        existing = material_index[material_id]
+                        if product_id and product_id not in existing["product_ids"]:
+                            existing["product_ids"].append(product_id)
+                        continue
+                    if len(batch_materials) >= 20:
+                        logger.warning(
+                            "%s 单个追投计划最多20条素材，其余命中素材留待本任务结束后再次提醒",
+                            _tag,
+                        )
+                        break
+
+                    material = {
+                        "material_id": material_id,
+                        "material_name": _material_name_from_dashboard_row(row),
+                        "product_id": product_id,
+                        "product_name": product_name,
+                        "product_ids": [product_id] if product_id else [],
+                    }
+                    batch_materials.append(material)
+                    material_index[material_id] = material
+                    evaluation_snapshots.append(
+                        {
+                            "material_id": material_id,
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "evaluation": build_trigger_evaluation_snapshot(
+                                trigger,
+                                evaluation_row,
+                            ),
+                        }
+                    )
+                    query_material_rows.append(
+                        {
+                            "material_id": material_id,
+                            "material_name": material["material_name"],
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "material_row": row,
+                        }
+                    )
+
+                if not batch_materials:
+                    return
+                strategy_snapshot = {
+                    "id": str(st.get("id") or ""),
+                    "title": st_label,
+                    "target_uid": target_uid,
+                    "trigger_level": trigger_level,
+                    "product_filter": st.get("product_filter") or [],
+                    "candidate_trigger": st.get("candidate_trigger") or {},
+                    "candidate_sort": st.get("candidate_sort") or "net_roi_desc",
+                    "candidate_limit": st.get("candidate_limit") or 1,
+                    "action_mode": action_mode,
+                    "trigger": trigger,
+                    "retargeting": retargeting,
+                }
+                strategy_json = json.dumps(
+                    strategy_snapshot,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                strategy_hash = hashlib.sha256(
+                    strategy_json.encode("utf-8")
+                ).hexdigest()
+                product_ids = {
+                    pid
+                    for material in batch_materials
+                    for pid in material.get("product_ids") or []
+                    if pid
+                }
+                first_material = batch_materials[0]
+                trigger_snapshot = {
+                    "strategy_id": st.get("id"),
+                    "strategy_title": st.get("title"),
+                    "target_uid": target_uid,
+                    "promotion_scene": promotion_scene,
+                    "plan_system": plan_system,
+                    "trigger_level": trigger_level,
+                    "trigger_config": trigger,
+                    "material_count": len(batch_materials),
+                    "materials": evaluation_snapshots,
+                }
+                query_snapshot = {
+                    "query_period": period,
+                    "period_label": period_label,
+                    "query_at": query_at,
+                    "dashboard_total": resp.get("total"),
+                    "materials": query_material_rows,
+                    "target": {
+                        "target_uid": target_uid,
+                        "aavid": aavid,
+                        "ad_id": ad_id,
+                        "plan_name": target.get("plan_name"),
+                        "promotion_scene": promotion_scene,
+                        "plan_system": plan_system,
+                    },
+                }
+                card_payload = {
+                    "aavid": str(aavid_int),
+                    "account_name": target_account_name,
+                    "ad_id": str(ad_id_int),
+                    "target_uid": target_uid,
+                    "plan_name": str(target.get("plan_name") or ""),
+                    "promotion_scene": promotion_scene,
+                    "plan_system": plan_system,
+                    "trigger_level": trigger_level,
+                    "product_id": (
+                        str(first_material.get("product_id") or "")
+                        if len(product_ids) == 1
+                        else ""
+                    ),
+                    "product_name": (
+                        str(first_material.get("product_name") or "")
+                        if len(product_ids) == 1
+                        else ""
+                    ),
+                    "material_id": str(first_material["material_id"]),
+                    "material_name": str(first_material["material_name"]),
+                    "materials": batch_materials,
+                    "strategy_id": str(st.get("id") or "__legacy__"),
+                    "strategy_name": st_label,
+                    "strategy_hash": strategy_hash,
+                    "trigger_snapshot": trigger_snapshot,
+                    "query_snapshot": query_snapshot,
+                    "retargeting": retargeting,
+                    "rule_snapshot": strategy_snapshot,
+                }
+                card_result = await asyncio.to_thread(
+                    create_retarget_task,
+                    card_payload,
+                )
+                if card_result.get("success"):
+                    logger.info(
+                        "%s 已创建单张批量飞书确认卡片 materials=%s task_uid=%s duplicate=%s",
+                        _tag,
+                        len(batch_materials),
+                        (card_result.get("data") or {}).get("task_uid"),
+                        bool(card_result.get("duplicate")),
+                    )
+                else:
+                    logger.warning(
+                        "%s 批量飞书确认任务创建失败: %s",
+                        _tag,
+                        card_result.get("message") or "未知错误",
+                    )
+                return
+
             svc = QianChuanRetargetingService.from_rule_file_dict(cfg)
             headless_cfg = browser_rule
             try:
@@ -1081,66 +1295,6 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 headless=headless_cfg,
                                 browser_headless_rule=browser_rule,
                             )
-                            continue
-
-                        if action_mode == "card_confirm":
-                            strategy_snapshot = {
-                                "id": str(st.get("id") or ""),
-                                "title": st_label,
-                                "target_uid": target_uid,
-                                "trigger_level": trigger_level,
-                                "product_filter": st.get("product_filter") or [],
-                                "candidate_trigger": st.get("candidate_trigger") or {},
-                                "candidate_sort": st.get("candidate_sort") or "net_roi_desc",
-                                "candidate_limit": st.get("candidate_limit") or 1,
-                                "action_mode": action_mode,
-                                "trigger": trigger,
-                                "retargeting": retargeting,
-                            }
-                            strategy_json = json.dumps(
-                                strategy_snapshot,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                                sort_keys=True,
-                            )
-                            strategy_hash = hashlib.sha256(strategy_json.encode("utf-8")).hexdigest()
-                            card_payload = {
-                                "aavid": str(aavid_int),
-                                "account_name": target_account_name,
-                                "ad_id": str(ad_id_int),
-                                "target_uid": target_uid,
-                                "plan_name": str(target.get("plan_name") or ""),
-                                "promotion_scene": promotion_scene,
-                                "plan_system": plan_system,
-                                "trigger_level": trigger_level,
-                                "product_id": product_id,
-                                "product_name": product_name,
-                                "material_id": material_id,
-                                "material_name": material_name,
-                                "strategy_id": str(st.get("id") or "__legacy__"),
-                                "strategy_name": st_label,
-                                "strategy_hash": strategy_hash,
-                                "trigger_snapshot": json.loads(trigger_snap),
-                                "query_snapshot": json.loads(query_snap),
-                                "retargeting": retargeting,
-                                "rule_snapshot": strategy_snapshot,
-                            }
-                            card_result = await asyncio.to_thread(create_retarget_task, card_payload)
-                            if card_result.get("success"):
-                                logger.info(
-                                    "%s 已创建飞书确认任务 material_id=%s task_uid=%s duplicate=%s",
-                                    _tag,
-                                    material_id,
-                                    (card_result.get("data") or {}).get("task_uid"),
-                                    bool(card_result.get("duplicate")),
-                                )
-                            else:
-                                logger.warning(
-                                    "%s 飞书确认任务创建失败 material_id=%s: %s",
-                                    _tag,
-                                    material_id,
-                                    card_result.get("message") or "未知错误",
-                                )
                             continue
 
                         if not auto_execute_allowed_in_current_environment():

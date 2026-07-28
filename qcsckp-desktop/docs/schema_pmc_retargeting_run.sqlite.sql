@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS pmc_retargeting_run (
   material_name TEXT,
   /* 素材名称：规则追投时来自大屏素材行 title（video_name）；其它入口可为空 */
 
+  materials_json TEXT,
+  /* 同一追投计划内的完整素材数组；material_id/material_name 保留首条用于旧页面兼容 */
+
   strategy_name TEXT,
   /* 策略展示名：与规则页策略 title 一致；旧数据或空时前端默认「策略 1」 */
 

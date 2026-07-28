@@ -49,7 +49,7 @@ try {
     throw $e;
 }
 $task = fetch_task_by_uid($pdo, (string)$task['task_uid'], $uid);
-foreach (['trigger_snapshot_json','query_snapshot_json','retargeting_json','rule_snapshot_json'] as $field) {
+foreach (['materials_json','trigger_snapshot_json','query_snapshot_json','retargeting_json','rule_snapshot_json'] as $field) {
     $task[str_replace('_json', '', $field)] = safe_json_decode((string)($task[$field] ?? ''));
     unset($task[$field]);
 }
