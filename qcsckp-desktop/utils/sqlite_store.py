@@ -447,6 +447,35 @@ class SQLiteStore:
                 ('uk_platform_log_sync_aavid', 'aavid'),
             ],
         },
+        # 前一日账户操作日报的发送记录；按工具账号、千川账户、日期和飞书接收位置幂等。
+        'operation_daily_report_delivery': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'delivery_key': 'TEXT',
+                'report_uid': 'TEXT NOT NULL',
+                'account_username': 'TEXT NOT NULL',
+                'aavid': 'TEXT NOT NULL',
+                'report_date': 'TEXT NOT NULL',
+                'delivery_mode': "TEXT NOT NULL DEFAULT 'scheduled'",
+                'receive_type': 'TEXT NOT NULL',
+                'receive_id': 'TEXT NOT NULL',
+                'message_id': 'TEXT',
+                'status': "TEXT NOT NULL DEFAULT 'pending'",
+                'event_count': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'sent_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_operation_daily_account_date', 'account_username, report_date'),
+                ('idx_operation_daily_aavid_date', 'aavid, report_date'),
+                ('idx_operation_daily_status', 'status, updated_at'),
+            ],
+            'unique_indexes': [
+                ('uk_operation_daily_delivery_key', 'delivery_key'),
+            ],
+        },
         # 全域调控任务（素材追投等，与 docs/schema_pmc_roi2_assist_task.sqlite.sql 一致）
         'pmc_roi2_assist_task': {
             'columns': {

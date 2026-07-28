@@ -36,6 +36,7 @@ from services.regulation_rule_runner import start_regulation_rule_runner_backgro
 from services.retargeting_rule_runner import start_retargeting_rule_runner_background_thread
 from services.retarget_task_worker import start_retarget_task_worker_background_thread
 from services.operation_log_monitor import start_platform_log_sync_background_thread
+from services.operation_daily_report import start_operation_daily_report_background_thread
 from services.control_panel_config import ensure_all_control_defaults
 
 
@@ -948,6 +949,9 @@ def main():
 
         # ===== 千川/巨量纵横后台操作日志：已发现页面每5分钟增量同步 =====
         start_platform_log_sync_background_thread()
+
+        # ===== 飞书昨日账户操作日报：按工具账号、千川账户和接收位置幂等发送 =====
+        start_operation_daily_report_background_thread()
 
         # ===== 规则化停投调度（见 services/regulation_rule_runner.py；enabled 见 rule_regulation.json，默认 10 分钟一轮）=====
         start_regulation_rule_runner_background_thread()

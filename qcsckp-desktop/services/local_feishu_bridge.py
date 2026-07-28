@@ -827,7 +827,7 @@ class LocalFeishuBridge:
         )
         return str((response.get("data") or {}).get("message_id") or "")
 
-    def send_task_cards(self, task: Dict[str, Any]) -> List[Dict[str, str]]:
+    def bound_targets(self) -> List[Tuple[str, str]]:
         profile = self.profile()
         targets: List[Tuple[str, str]] = []
         authorized = str(profile.get("authorized_open_id") or "").strip()
@@ -837,9 +837,17 @@ class LocalFeishuBridge:
             for group in profile.get("groups") or []:
                 if isinstance(group, dict) and str(group.get("chat_id") or "").strip():
                     targets.append(("chat_id", str(group["chat_id"]).strip()))
+        return targets
+
+    def send_bound_card(
+        self,
+        card: Dict[str, Any],
+        *,
+        targets: Optional[List[Tuple[str, str]]] = None,
+    ) -> List[Dict[str, str]]:
+        targets = list(targets) if targets is not None else self.bound_targets()
         if not targets:
             raise FeishuApiError("尚未绑定个人或接收群，请先完成机器人绑定")
-        card = build_task_card(task)
         sent: List[Dict[str, str]] = []
         errors: List[str] = []
         for receive_type, receive_id in targets:
@@ -858,6 +866,9 @@ class LocalFeishuBridge:
         if not sent:
             raise FeishuApiError("飞书卡片发送失败：" + ("；".join(errors) or "未返回消息ID"))
         return sent
+
+    def send_task_cards(self, task: Dict[str, Any]) -> List[Dict[str, str]]:
+        return self.send_bound_card(build_task_card(task))
 
     def update_task_cards(self, task_uid: str, *, expanded: bool = False) -> None:
         row = _task_row(task_uid, self.account_username)
@@ -1358,6 +1369,31 @@ def get_local_feishu_status() -> Dict[str, Any]:
             "profile": {},
         }
     return bridge.status()
+
+
+def current_local_feishu_account() -> str:
+    return _MANAGER.account
+
+
+def list_local_feishu_bound_targets() -> List[Tuple[str, str]]:
+    bridge = _MANAGER.bridge()
+    if bridge is None:
+        return []
+    return bridge.bound_targets()
+
+
+def send_local_feishu_bound_card(
+    card: Dict[str, Any],
+    *,
+    targets: Optional[List[Tuple[str, str]]] = None,
+) -> List[Dict[str, str]]:
+    bridge = _MANAGER.bridge()
+    if bridge is None:
+        raise FeishuApiError("请先登录工具账号并连接飞书")
+    status = bridge.status()
+    if not status.get("connected"):
+        raise FeishuApiError("飞书长连接尚未连接")
+    return bridge.send_bound_card(card, targets=targets)
 
 
 def save_local_feishu_config(config: Dict[str, Any]) -> Dict[str, Any]:

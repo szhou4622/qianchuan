@@ -97,7 +97,7 @@
         .card-body { padding: 18px; }
         .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
         label { display: block; margin-bottom: 6px; color: #c6d2e5; font-size: 12px; }
-        input[type="text"], input[type="password"] {
+        input[type="text"], input[type="password"], input[type="time"] {
             width: 100%;
             min-height: 40px;
             padding: 9px 11px;
@@ -201,6 +201,32 @@
             background: var(--panel-2);
         }
         .group code { color: #c9d8ec; word-break: break-all; }
+        .account-picker {
+            display: grid;
+            gap: 8px;
+            max-height: 190px;
+            margin-top: 9px;
+            padding: 10px;
+            overflow: auto;
+            border: 1px solid var(--line);
+            border-radius: 9px;
+            background: var(--panel-2);
+        }
+        .account-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 9px;
+            margin: 0;
+            padding: 7px 8px;
+            border-radius: 7px;
+            color: #d7e2f1;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .account-option:hover { background: #16243a; }
+        .account-option input { margin-top: 3px; }
+        .account-option span { min-width: 0; }
+        .account-option code { display: block; color: var(--muted); word-break: break-all; }
         ol { margin: 0; padding-left: 21px; }
         li { margin: 7px 0; color: #c8d3e4; }
         code.inline { padding: 2px 5px; border-radius: 5px; background: #081323; color: #b7eaff; }
@@ -293,6 +319,47 @@
                     <p class="feedback" id="groupFeedback" aria-live="polite"></p>
                 </div>
             </article>
+
+            <article class="card">
+                <div class="card-head">
+                    <h2><span class="step">4</span>昨日账户操作日报</h2>
+                    <button class="btn" id="sendDailyNow" type="button">立即发送昨日</button>
+                </div>
+                <div class="card-body">
+                    <div class="switch-row">
+                        <div>
+                            <h3>每天自动推送</h3>
+                            <p class="mini">工具当天启动较晚时，会在连接飞书后补发昨天的日报。</p>
+                        </div>
+                        <label class="switch" aria-label="每天自动推送昨日操作日报"><input id="dailyEnabled" type="checkbox"><span class="slider"></span></label>
+                    </div>
+                    <div class="form-grid">
+                        <div>
+                            <label for="dailyTime">每天发送时间</label>
+                            <input id="dailyTime" type="time" value="09:00">
+                        </div>
+                        <div>
+                            <label>日报范围</label>
+                            <p class="sub">昨天 00:00–23:59，按千川账户各发一张卡片。</p>
+                        </div>
+                    </div>
+                    <label style="margin-top:14px;">选择千川账户</label>
+                    <div class="account-picker" id="dailyAccounts">
+                        <p class="mini">正在读取账户</p>
+                    </div>
+                    <div class="switch-row" style="margin-top:10px;">
+                        <div>
+                            <h3>没有操作时也发送</h3>
+                            <p class="mini">用于确认日报任务每天正常运行。</p>
+                        </div>
+                        <label class="switch" aria-label="没有操作时也发送"><input id="dailySendEmpty" type="checkbox" checked><span class="slider"></span></label>
+                    </div>
+                    <div class="actions row end">
+                        <button class="btn primary" id="saveDaily" type="button">保存日报设置</button>
+                    </div>
+                    <p class="feedback" id="dailyFeedback" aria-live="polite"></p>
+                </div>
+            </article>
         </section>
 
         <aside class="stack">
@@ -351,6 +418,8 @@
     const ui = (id) => document.getElementById(id);
     let latest = null;
     let busy = false;
+    let dailyLoaded = false;
+    let dailyDirty = false;
 
     function api() {
         try { return window.top && window.top.pywebviewAPI; } catch (_) { return null; }
@@ -427,6 +496,30 @@
         if (latest.last_error) feedback('configFeedback', latest.last_error, false);
     }
 
+    function renderDaily(data) {
+        if (!data || !data.success || (dailyLoaded && dailyDirty)) return;
+        const config = data.config || {};
+        const accounts = Array.isArray(data.accounts) ? data.accounts : [];
+        const selected = Array.isArray(config.aavids) ? config.aavids.map(String) : [];
+        ui('dailyEnabled').checked = !!config.enabled;
+        ui('dailyTime').value = config.send_time || '09:00';
+        ui('dailySendEmpty').checked = config.send_empty !== false;
+        ui('dailyAccounts').innerHTML = accounts.length ? accounts.map(account => {
+            const aavid = String(account.aavid || '');
+            const checked = !selected.length || selected.includes(aavid);
+            return '<label class="account-option"><input class="daily-account" type="checkbox" value="' +
+                escapeHtml(aavid) + '"' + (checked ? ' checked' : '') + '><span>' +
+                escapeHtml(account.account_name || ('千川账户 ' + aavid)) +
+                '<code>' + escapeHtml(aavid) + '</code></span></label>';
+        }).join('') : '<p class="mini">尚未发现千川账户，请先完成一次采集。</p>';
+        document.querySelectorAll('.daily-account').forEach(input => {
+            input.addEventListener('change', () => { dailyDirty = true; });
+        });
+        ui('sendDailyNow').disabled = !latest || !latest.connected || !accounts.length;
+        dailyLoaded = true;
+        dailyDirty = false;
+    }
+
     function escapeHtml(value) {
         return String(value || '').replace(/[&<>"']/g, c => ({
             '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -439,7 +532,13 @@
             render({status: 'error', connected: false, last_error: '无法连接桌面端接口'});
             return;
         }
-        try { render(await bridge.getLocalFeishuStatus()); }
+        try {
+            const status = await bridge.getLocalFeishuStatus();
+            render(status);
+            if (typeof bridge.getOperationDailyReportConfig === 'function') {
+                renderDaily(await bridge.getOperationDailyReportConfig());
+            }
+        }
         catch (err) { render({status: 'error', connected: false, last_error: String(err)}); }
     }
 
@@ -530,6 +629,50 @@
             const bridge = await waitApi();
             const result = bridge ? await bridge.sendLocalFeishuTestCard() : {success:false, message:'无法连接桌面端接口'};
             feedback('actionFeedback', result.message, !!result.success);
+        });
+    });
+
+    function dailyPayload() {
+        return {
+            enabled: ui('dailyEnabled').checked,
+            send_time: ui('dailyTime').value || '09:00',
+            aavids: Array.from(document.querySelectorAll('.daily-account:checked')).map(input => input.value),
+            send_empty: ui('dailySendEmpty').checked
+        };
+    }
+
+    ['dailyEnabled', 'dailyTime', 'dailySendEmpty'].forEach(id => {
+        ui(id).addEventListener('change', () => { dailyDirty = true; });
+    });
+
+    ui('saveDaily').addEventListener('click', async () => {
+        await runButton(ui('saveDaily'), async () => {
+            const bridge = await waitApi();
+            const result = bridge && typeof bridge.saveOperationDailyReportConfig === 'function'
+                ? await bridge.saveOperationDailyReportConfig(dailyPayload())
+                : {success:false, message:'当前桌面端尚未提供操作日报接口'};
+            feedback('dailyFeedback', result.message, !!result.success);
+            if (result.success) {
+                dailyDirty = false;
+                dailyLoaded = false;
+                await refresh();
+            }
+        });
+    });
+
+    ui('sendDailyNow').addEventListener('click', async () => {
+        await runButton(ui('sendDailyNow'), async () => {
+            const bridge = await waitApi();
+            if (!bridge || typeof bridge.sendYesterdayOperationDailyReportNow !== 'function') {
+                return feedback('dailyFeedback', '当前桌面端尚未提供操作日报接口', false);
+            }
+            const saved = await bridge.saveOperationDailyReportConfig(dailyPayload());
+            if (!saved.success) return feedback('dailyFeedback', saved.message, false);
+            const result = await bridge.sendYesterdayOperationDailyReportNow();
+            feedback('dailyFeedback', result.message, !!result.success);
+            dailyDirty = false;
+            dailyLoaded = false;
+            await refresh();
         });
     });
 

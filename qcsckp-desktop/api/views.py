@@ -441,6 +441,25 @@ class Api:
 
         return send_local_feishu_test_card()
 
+    def getOperationDailyReportConfig(self):
+        from services.operation_daily_report import get_operation_daily_report_config
+
+        return get_operation_daily_report_config()
+
+    def saveOperationDailyReportConfig(self, config):
+        from services.operation_daily_report import save_operation_daily_report_config
+
+        return save_operation_daily_report_config(
+            config if isinstance(config, dict) else {}
+        )
+
+    def sendYesterdayOperationDailyReportNow(self):
+        from services.operation_daily_report import (
+            send_yesterday_operation_daily_report_now,
+        )
+
+        return send_yesterday_operation_daily_report_now()
+
     def get_app_version(self):
         """当前程序版本号（展示用，与 config.CURRENT_VERSION 一致）。"""
         from config import CURRENT_VERSION
