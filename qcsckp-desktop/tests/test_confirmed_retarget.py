@@ -25,7 +25,10 @@ from services import retarget_task_worker
 from services.run_services import (
     ServiceConfig,
     _choose_startup_target,
+    _is_qianchuan_login_url,
+    _known_promotion_target_keys,
     _load_last_target,
+    _promotion_target_key,
     _reuse_last_target_enabled,
     _save_last_target,
     _target_is_excluded,
@@ -787,6 +790,35 @@ class LocalTestGuardTests(unittest.TestCase):
         self.assertFalse(_target_is_excluded("1001", "2003", previous))
         self.assertFalse(_target_is_excluded("1002", "2002", previous))
         self.assertFalse(_target_is_excluded("1001", "2002", None))
+
+    def test_add_target_discovery_recognizes_existing_account_plan_pair(self):
+        known = _known_promotion_target_keys(
+            [
+                {"aadvid": "1001", "ad_id": "2001"},
+                {"aavid": "1001", "adId": "2002"},
+            ]
+        )
+        self.assertIn(_promotion_target_key("1001", "2001"), known)
+        self.assertIn(_promotion_target_key("1001", "2002"), known)
+        self.assertNotIn(_promotion_target_key("1001", "2003"), known)
+
+    def test_add_target_discovery_labels_login_urls(self):
+        self.assertTrue(
+            _is_qianchuan_login_url(
+                "https://login.jinritemai.com/passport/web/login/"
+            )
+        )
+        self.assertTrue(
+            _is_qianchuan_login_url(
+                "https://qianchuan.jinritemai.com/login"
+            )
+        )
+        self.assertFalse(
+            _is_qianchuan_login_url(
+                "https://qianchuan.jinritemai.com/uni-prom"
+            )
+        )
+        self.assertFalse(_is_qianchuan_login_url("about:blank"))
 
     def test_last_selected_target_takes_priority_on_restart(self):
         targets = [

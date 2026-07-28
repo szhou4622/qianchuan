@@ -156,6 +156,43 @@ def _target_is_excluded(
     )
 
 
+def _promotion_target_key(aavid: Any, ad_id: Any) -> Tuple[str, str]:
+    return (
+        str(aavid or "").strip(),
+        str(ad_id or "").strip(),
+    )
+
+
+def _known_promotion_target_keys(
+    targets: List[Dict[str, Any]],
+) -> set[Tuple[str, str]]:
+    keys: set[Tuple[str, str]] = set()
+    for target in targets:
+        key = _promotion_target_key(
+            target.get("aadvid") or target.get("aavid"),
+            target.get("ad_id") or target.get("adId"),
+        )
+        if key[0] and key[1]:
+            keys.add(key)
+    return keys
+
+
+def _is_qianchuan_login_url(url: Any) -> bool:
+    text = str(url or "").strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    if parsed.scheme in {"about", "data"}:
+        return False
+    host = str(parsed.netloc or "").lower()
+    path = str(parsed.path or "").lower()
+    return (
+        host != "qianchuan.jinritemai.com"
+        or "login" in path
+        or "passport" in path
+    )
+
+
 def _choose_startup_target(
     known_targets: List[Dict[str, Any]],
     remembered_target: Optional[Dict[str, Any]],
@@ -645,7 +682,10 @@ class ServiceController:
                 }
             self._target_discovery_status = {
                 "running": True,
-                "message": "请在新浏览器中打开一条直播或商品全域计划详情",
+                "message": (
+                    "已打开独立Chrome；如显示登录页，请先登录千川，"
+                    "再进入要监控的计划详情"
+                ),
                 "target": None,
             }
             self._target_discovery_thread = threading.Thread(
@@ -674,6 +714,9 @@ class ServiceController:
     async def _target_discovery_async(self) -> None:
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
+        known_target_keys = _known_promotion_target_keys(
+            list_promotion_targets(db=db)
+        )
         storage_state = (
             cfg.cookie_path
             if cfg.cookie_path and os.path.isfile(cfg.cookie_path)
@@ -698,6 +741,10 @@ class ServiceController:
         except Exception:
             pass
         try:
+            await fetcher.page.bring_to_front()
+        except Exception:
+            pass
+        try:
             target_url = None
             target_scene = None
             target_plan_system = "unknown"
@@ -706,6 +753,7 @@ class ServiceController:
             stable_candidate = None
             stable_count = 0
             last_probe_at = 0.0
+            last_ignored_existing = None
             deadline = time.time() + 600
             while time.time() < deadline:
                 try:
@@ -714,6 +762,16 @@ class ServiceController:
                 except Exception:
                     pass
                 cur = str(getattr(fetcher.page, "url", "") or "").strip()
+                if _is_qianchuan_login_url(cur):
+                    with self._lock:
+                        self._target_discovery_status["message"] = (
+                            "等待千川登录：请在新Chrome完成登录，"
+                            "然后进入要监控的计划详情"
+                        )
+                    stable_candidate = None
+                    stable_count = 0
+                    await asyncio.sleep(0.5)
+                    continue
                 if time.time() - last_probe_at >= 1.0:
                     await probe.observe_page(fetcher.page)
                     last_probe_at = time.time()
@@ -725,6 +783,23 @@ class ServiceController:
                             str(product_target["ad_id"]),
                             "product",
                         )
+                        candidate_key = _promotion_target_key(
+                            candidate[0],
+                            candidate[1],
+                        )
+                        if candidate_key in known_target_keys:
+                            stable_candidate = None
+                            stable_count = 0
+                            if candidate_key != last_ignored_existing:
+                                last_ignored_existing = candidate_key
+                                with self._lock:
+                                    self._target_discovery_status["message"] = (
+                                        "当前计划已在监控列表中，请在新浏览器中"
+                                        "打开另一条计划详情"
+                                    )
+                            await asyncio.sleep(0.5)
+                            continue
+                        last_ignored_existing = None
                         if candidate == stable_candidate:
                             stable_count += 1
                         else:
@@ -767,6 +842,24 @@ class ServiceController:
                         str(ad_id_probe),
                         str(scene_probe or ""),
                     )
+                    candidate_key = _promotion_target_key(
+                        candidate[0],
+                        candidate[1],
+                    )
+                    if scene_probe and candidate_key in known_target_keys:
+                        stable_candidate = None
+                        stable_count = 0
+                        if candidate_key != last_ignored_existing:
+                            last_ignored_existing = candidate_key
+                            with self._lock:
+                                self._target_discovery_status["message"] = (
+                                    "当前计划已在监控列表中，请在新浏览器中"
+                                    "打开另一条计划详情"
+                                )
+                        await asyncio.sleep(0.5)
+                        continue
+                    if scene_probe:
+                        last_ignored_existing = None
                     if scene_probe and candidate == stable_candidate:
                         stable_count += 1
                     elif scene_probe:
