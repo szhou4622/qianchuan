@@ -537,6 +537,43 @@ class JSApi:
     def sendLocalFeishuTestCard(self):
         return self.api.sendLocalFeishuTestCard()
 
+    def getOperationDailyReportConfig(self):
+        return self.api.getOperationDailyReportConfig()
+
+    def saveOperationDailyReportConfig(self, config):
+        return self.api.saveOperationDailyReportConfig(config)
+
+    def sendYesterdayOperationDailyReportNow(self):
+        return self.api.sendYesterdayOperationDailyReportNow()
+
+    # 直播 / 商品全域监控计划
+    #
+    # pywebview 只会向前端暴露 JSApi 上显式声明的方法。核心 Api 即使已经
+    # 实现相应接口，如果这里漏掉转发，页面也会一直等待而拿不到账户或计划。
+    def listPromotionTargets(self, enabled=None):
+        return self.api.listPromotionTargets(enabled)
+
+    def getPromotionTarget(self, targetUid=None):
+        return self.api.getPromotionTarget(targetUid)
+
+    def savePromotionTarget(self, data=None):
+        return self.api.savePromotionTarget(data)
+
+    def discoverPromotionTarget(self, pageUrl=None, pageText=None, planName=None):
+        return self.api.discoverPromotionTarget(pageUrl, pageText, planName)
+
+    def setPromotionTargetEnabled(self, targetUid=None, enabled=True):
+        return self.api.setPromotionTargetEnabled(targetUid, enabled)
+
+    def listPromotionTargetProducts(self, targetUid=None):
+        return self.api.listPromotionTargetProducts(targetUid)
+
+    def startPromotionTargetDiscovery(self):
+        return self.api.startPromotionTargetDiscovery()
+
+    def getPromotionTargetDiscoveryStatus(self):
+        return self.api.getPromotionTargetDiscoveryStatus()
+
     def checkAppVersion(self, currentVersion=None):
         return self.api.check_app_version(currentVersion)
 
