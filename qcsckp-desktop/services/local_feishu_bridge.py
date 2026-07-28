@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -260,38 +261,169 @@ class FeishuApiError(RuntimeError):
 
 
 def _build_feishu_long_connection_channel(
-    *, app_id: str, app_secret: str, log_level: Any
+    *,
+    app_id: str,
+    app_secret: str,
+    log_level: Any,
+    on_message: Optional[Any] = None,
+    on_card_action: Optional[Any] = None,
+    on_reconnecting: Optional[Any] = None,
+    on_reconnected: Optional[Any] = None,
+    on_error: Optional[Any] = None,
 ) -> Any:
-    """创建会立即确认卡片点击的飞书长连接。
+    """创建底层飞书长连接并同步确认卡片点击。
 
-    lark-oapi 1.7.1 的 FeishuChannel 会把卡片事件转交后台协程，但默认给
-    飞书返回空对象。飞书客户端会把这个空回执视为交互失败并显示 200671。
-    这里保留 SDK 的异步分发与安全去重，只把同步回执改成合法 toast，确保
-    在 3 秒时限内完成确认；真正的追投仍由本地队列异步复核执行。
+    直接注册 ``card.action.trigger``，在 SDK 的 WebSocket 收包线程内立即
+    返回合法 toast。业务处理放到独立线程，避免任何数据库或网络操作占用
+    飞书要求的 3 秒回执窗口。
     """
-    from lark_oapi.channel import FeishuChannel
+    import lark_oapi as lark
     from lark_oapi.event.callback.model.p2_card_action_trigger import (
         P2CardActionTriggerResponse,
     )
+    from lark_oapi.ws import Client as WsClient
 
-    class _ImmediateCardAckFeishuChannel(FeishuChannel):
-        def _on_p2_card_action_trigger(self, data: Any) -> Any:
-            super()._on_p2_card_action_trigger(data)
-            return P2CardActionTriggerResponse(
-                {
-                    "toast": {
-                        "type": "info",
-                        "content": "请求已收到，正在处理",
-                    }
+    def _normalize_message(data: Any) -> Any:
+        event = getattr(data, "event", None)
+        raw_message = getattr(event, "message", None)
+        raw_sender = getattr(event, "sender", None)
+        sender_id = getattr(raw_sender, "sender_id", None)
+        content = _loads(getattr(raw_message, "content", ""), {})
+        text = str(content.get("text") or "") if isinstance(content, dict) else ""
+        # 群消息里的 @机器人 会以占位符出现在 text 中，不参与绑定命令判断。
+        text = re.sub(r"@_user_\d+\s*", "", text).strip()
+        return SimpleNamespace(
+            message_id=str(getattr(raw_message, "message_id", "") or ""),
+            content_text=text,
+            sender=SimpleNamespace(
+                open_id=str(getattr(sender_id, "open_id", "") or "")
+            ),
+            chat_id=str(getattr(raw_message, "chat_id", "") or ""),
+            chat_type=str(getattr(raw_message, "chat_type", "") or ""),
+        )
+
+    def _normalize_card_action(data: Any) -> Any:
+        event = getattr(data, "event", None)
+        context = getattr(event, "context", None)
+        return SimpleNamespace(
+            action=getattr(event, "action", None),
+            operator=getattr(event, "operator", None),
+            message_id=str(getattr(context, "open_message_id", "") or ""),
+            chat_id=str(getattr(context, "open_chat_id", "") or ""),
+        )
+
+    def _run_callback(callback: Optional[Any], payload: Any, name: str) -> None:
+        if not callable(callback):
+            return
+        try:
+            callback(payload)
+        except Exception as exc:
+            logger.warning("[飞书长连接] %s处理失败: %s", name, exc)
+
+    def _message_handler(data: Any) -> None:
+        normalized = _normalize_message(data)
+        logger.info("[飞书长连接] 收到机器人消息事件")
+        threading.Thread(
+            target=_run_callback,
+            args=(on_message, normalized, "消息事件"),
+            daemon=True,
+            name="feishu-message-event",
+        ).start()
+
+    def _card_handler(data: Any) -> Any:
+        normalized = _normalize_card_action(data)
+        action = getattr(normalized, "action", None)
+        value = getattr(action, "value", None)
+        action_name = str(value.get("action") or "") if isinstance(value, dict) else ""
+        logger.info(
+            "[飞书长连接] 收到卡片点击，已立即回执 action=%s",
+            action_name or "unknown",
+        )
+        threading.Thread(
+            target=_run_callback,
+            args=(on_card_action, normalized, "卡片点击"),
+            daemon=True,
+            name="feishu-card-action",
+        ).start()
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {
+                    "type": "info",
+                    "content": "请求已收到，正在处理",
                 }
-            )
+            }
+        )
 
-    return _ImmediateCardAckFeishuChannel(
-        app_id=app_id,
-        app_secret=app_secret,
-        transport="ws",
-        log_level=log_level,
+    dispatcher = (
+        lark.EventDispatcherHandler.builder("", "", log_level)
+        .register_p2_im_message_receive_v1(_message_handler)
+        .register_p2_card_action_trigger(_card_handler)
+        .build()
     )
+    ws_client = WsClient(
+        app_id,
+        app_secret,
+        log_level=log_level,
+        event_handler=dispatcher,
+    )
+    ws_client.on_reconnecting = (
+        on_reconnecting if callable(on_reconnecting) else (lambda: None)
+    )
+    ws_client.on_reconnected = (
+        on_reconnected if callable(on_reconnected) else (lambda: None)
+    )
+
+    class _RawFeishuLongConnection:
+        def __init__(self, client: Any):
+            self._ws_client = client
+            self._dispatcher = dispatcher
+
+        def start(self) -> None:
+            try:
+                self._ws_client.start()
+            except Exception as exc:
+                if callable(on_error):
+                    on_error(exc)
+                raise
+
+        def stop(self, *, join_timeout: float = 5.0) -> None:
+            disconnect = getattr(self._ws_client, "_disconnect", None)
+            try:
+                from lark_oapi.ws import client as ws_client_module
+
+                ws_loop = getattr(ws_client_module, "loop", None)
+                cache = getattr(self._ws_client, "_cache", None)
+                cache_cron = getattr(cache, "_cron", None)
+                if cache_cron is not None and not cache_cron.done():
+                    if ws_loop is not None and ws_loop.is_running():
+                        ws_loop.call_soon_threadsafe(cache_cron.cancel)
+                    else:
+                        cache_cron.cancel()
+                if callable(disconnect) and ws_loop is not None:
+                    if ws_loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            disconnect(), ws_loop
+                        )
+                        try:
+                            future.result(timeout=min(2.0, join_timeout))
+                        except Exception:
+                            pass
+                    elif not ws_loop.is_closed():
+                        ws_loop.run_until_complete(disconnect())
+                if ws_loop is not None and ws_loop.is_running():
+                    ws_loop.call_soon_threadsafe(ws_loop.stop)
+            except Exception as exc:
+                logger.warning("[飞书长连接] 停止连接失败: %s", exc)
+
+        def _on_p2_card_action_trigger(self, data: Any) -> Any:
+            """仅供自动化测试验证同步回执，不参与生产分发。"""
+            return _card_handler(data)
+
+        def _on_p2_im_message_receive_v1(self, data: Any) -> None:
+            """仅供自动化测试验证原始消息适配，不参与生产分发。"""
+            _message_handler(data)
+
+    return _RawFeishuLongConnection(ws_client)
 
 
 def _connection_error_status(error: Any) -> str:
@@ -936,7 +1068,7 @@ class LocalFeishuBridge:
         except Exception as exc:
             logger.warning("[飞书长连接] 处理绑定消息失败: %s", exc)
 
-    async def _on_card_action(self, event: Any) -> None:
+    def _on_card_action(self, event: Any) -> None:
         action = getattr(event, "action", None)
         operator = getattr(event, "operator", None)
         value = getattr(action, "value", None)
@@ -962,6 +1094,10 @@ class LocalFeishuBridge:
                     )
                 except Exception:
                     pass
+            logger.info(
+                "[飞书长连接] 测试按钮处理完成 success=%s",
+                bool(test_result.get("success")),
+            )
             return
         result = handle_local_card_action(
             self.account_username,
@@ -983,6 +1119,11 @@ class LocalFeishuBridge:
                 self.send_private_text(open_id, str(result.get("message") or "本次操作未生效"))
             except Exception:
                 pass
+        logger.info(
+            "[飞书长连接] 卡片业务处理完成 action=%s success=%s",
+            action_name or "unknown",
+            bool(result.get("success")),
+        )
 
     def start(self) -> None:
         profile = self.profile(include_secret=True)
@@ -999,27 +1140,23 @@ class LocalFeishuBridge:
         def _entry() -> None:
             try:
                 from lark_oapi import LogLevel
-                from lark_oapi.channel import Events
 
                 channel = _build_feishu_long_connection_channel(
                     app_id=str(profile["app_id"]),
                     app_secret=str(profile["app_secret"]),
                     # INFO 会输出带短期连接票据的 WS URL，不允许进入用户日志。
                     log_level=LogLevel.CRITICAL,
-                )
-                channel.on(Events.MESSAGE, self._on_message)
-                channel.on(Events.CARD_ACTION, self._on_card_action)
-                channel.on(
-                    Events.RECONNECTING,
-                    lambda *_: self._set_connection_state("reconnecting"),
-                )
-                channel.on(
-                    Events.RECONNECTED,
-                    lambda *_: self._set_connection_state("connected"),
-                )
-                channel.on(
-                    Events.ERROR,
-                    lambda error: self._set_connection_state("error", str(error)),
+                    on_message=self._on_message,
+                    on_card_action=self._on_card_action,
+                    on_reconnecting=lambda: self._set_connection_state(
+                        "reconnecting"
+                    ),
+                    on_reconnected=lambda: self._set_connection_state(
+                        "connected"
+                    ),
+                    on_error=lambda error: self._set_connection_state(
+                        "error", str(error)
+                    ),
                 )
                 with self._lock:
                     self._channel = channel

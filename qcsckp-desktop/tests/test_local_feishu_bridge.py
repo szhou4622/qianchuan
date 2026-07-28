@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -293,16 +294,111 @@ class LocalFeishuBindingTests(unittest.TestCase):
     def test_card_action_returns_valid_immediate_ack(self):
         from lark_oapi import LogLevel
 
+        received = []
+        ready = threading.Event()
         channel = bridge._build_feishu_long_connection_channel(
             app_id="cli_test",
             app_secret="secret",
             log_level=LogLevel.CRITICAL,
+            on_card_action=lambda event: (
+                received.append(event),
+                ready.set(),
+            ),
         )
         try:
-            response = channel._on_p2_card_action_trigger(SimpleNamespace())
+            response = channel._on_p2_card_action_trigger(
+                SimpleNamespace(
+                    event=SimpleNamespace(
+                        operator=SimpleNamespace(open_id="ou_owner"),
+                        action=SimpleNamespace(
+                            value={"action": "connection_test", "nonce": "n1"}
+                        ),
+                        context=SimpleNamespace(
+                            open_message_id="om_test",
+                            open_chat_id="oc_test",
+                        ),
+                    )
+                )
+            )
             self.assertIsNotNone(response.toast)
             self.assertEqual("info", response.toast.type)
             self.assertIn("请求已收到", response.toast.content)
+            self.assertTrue(ready.wait(1.0))
+            self.assertEqual("om_test", received[0].message_id)
+            self.assertEqual(
+                "connection_test", received[0].action.value["action"]
+            )
+            dispatched = channel._dispatcher._do_without_validation(
+                json.dumps(
+                    {
+                        "schema": "2.0",
+                        "header": {
+                            "event_id": "evt_test",
+                            "event_type": "card.action.trigger",
+                            "create_time": "0",
+                            "token": "",
+                            "app_id": "cli_test",
+                            "tenant_key": "tenant_test",
+                        },
+                        "event": {
+                            "operator": {"open_id": "ou_owner"},
+                            "action": {
+                                "value": {
+                                    "action": "connection_test",
+                                    "nonce": "n2",
+                                }
+                            },
+                            "context": {
+                                "open_message_id": "om_dispatch",
+                                "open_chat_id": "oc_dispatch",
+                            },
+                        },
+                    }
+                ).encode("utf-8")
+            )
+            self.assertEqual("info", dispatched.toast.type)
+            self.assertIn("请求已收到", dispatched.toast.content)
+        finally:
+            channel.stop()
+
+    def test_raw_message_event_is_normalized_for_binding_handler(self):
+        from lark_oapi import LogLevel
+
+        received = []
+        ready = threading.Event()
+        channel = bridge._build_feishu_long_connection_channel(
+            app_id="cli_test",
+            app_secret="secret",
+            log_level=LogLevel.CRITICAL,
+            on_message=lambda message: (
+                received.append(message),
+                ready.set(),
+            ),
+        )
+        try:
+            channel._on_p2_im_message_receive_v1(
+                SimpleNamespace(
+                    event=SimpleNamespace(
+                        sender=SimpleNamespace(
+                            sender_id=SimpleNamespace(open_id="ou_owner")
+                        ),
+                        message=SimpleNamespace(
+                            message_id="om_bind",
+                            content=json.dumps(
+                                {"text": "@_user_1 绑定群 123456"},
+                                ensure_ascii=False,
+                            ),
+                            chat_id="oc_group",
+                            chat_type="group",
+                        ),
+                    )
+                )
+            )
+            self.assertTrue(ready.wait(1.0))
+            self.assertEqual("绑定群 123456", received[0].content_text)
+            self.assertEqual("ou_owner", received[0].sender.open_id)
+            self.assertEqual("oc_group", received[0].chat_id)
+            self.assertEqual("group", received[0].chat_type)
         finally:
             channel.stop()
 
