@@ -193,12 +193,19 @@ class LocalFeishuTaskTests(unittest.TestCase):
             }
         )
         raw = json.dumps(bridge.build_task_card(task), ensure_ascii=False)
+        card = bridge.build_task_card(task)
+        summary = card["elements"][0]["text"]["content"]
         self.assertIn("测试千川账户", raw)
         self.assertIn("商品全域测试计划", raw)
         self.assertIn("推商品", raw)
-        self.assertIn("传统全域", raw)
+        self.assertIn("全域", raw)
+        self.assertNotIn("传统全域", raw)
         self.assertIn("测试视频1", raw)
         self.assertIn("测试视频3", raw)
+        self.assertIn("\n账户ID：10001\n计划名称：商品全域测试计划", summary)
+        self.assertIn("\n计划ID：20002\n", summary)
+        self.assertIn("\n素材ID：70000\n", summary)
+        self.assertNotIn("\n   素材ID", summary)
 
 
 class LocalFeishuBindingTests(unittest.TestCase):

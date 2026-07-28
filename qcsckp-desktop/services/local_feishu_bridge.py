@@ -581,7 +581,7 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
     )
     scene_text = "推商品" if str(task.get("promotion_scene") or "live") == "product" else "推直播"
     plan_system_text = {
-        "global": "传统全域",
+        "global": "全域",
         "chengfang": "千川乘方",
         "unknown": "待确认",
     }.get(str(task.get("plan_system") or "unknown"), "待确认")
@@ -590,38 +590,48 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
     material_lines: List[str] = []
     for index, material in enumerate(materials):
         name = str(material.get("material_name") or "未命名素材")[:160]
-        line = f"{index + 1}. {name}\n   素材ID：`{material['material_id']}`"
+        line = f"{index + 1}. {name}\n素材ID：{material['material_id']}"
         product_name = str(material.get("product_name") or "")
         product_id = str(material.get("product_id") or "")
         if product_name or product_id:
-            line += f"\n   关联商品：{product_name or '未命名商品'}"
+            line += f"\n关联商品：{product_name or '未命名商品'}"
             if product_id:
-                line += f"（`{product_id}`）"
+                line += f"（{product_id}）"
         material_lines.append(line)
     trigger = task.get("trigger_snapshot") if isinstance(task.get("trigger_snapshot"), dict) else {}
     retargeting = task.get("retargeting") if isinstance(task.get("retargeting"), dict) else {}
-    product_line = ""
+    summary_lines = [
+        f"千川账户：{task.get('account_name') or '未命名账户'}",
+        f"账户ID：{task.get('aavid') or ''}",
+        f"计划名称：{task.get('plan_name') or '未命名计划'}",
+        f"计划ID：{task.get('ad_id') or ''}",
+        f"推广场景：{scene_text}",
+        f"计划体系：{plan_system_text}",
+        f"触发层级：{level_text}",
+    ]
     if task.get("product_id"):
-        product_line = (
-            f"\n**商品名称：** {task.get('product_name') or '未命名商品'}"
-            f"\n**商品ID：** `{task.get('product_id')}`"
+        summary_lines.extend(
+            [
+                f"商品名称：{task.get('product_name') or '未命名商品'}",
+                f"商品ID：{task.get('product_id')}",
+            ]
         )
+    summary_lines.extend(
+        [
+            "",
+            f"本卡追投素材（{len(material_lines)}条）：",
+            "\n".join(material_lines),
+            "",
+            f"策略：{task.get('strategy_name') or trigger.get('strategy_title') or '追投策略命中'}",
+        ]
+    )
     elements: List[Dict[str, Any]] = [
         {
-            "tag": "markdown",
-            "content": (
-                f"**千川账户：** {task.get('account_name') or '未命名账户'}"
-                f"\n**账户ID：** `{task.get('aavid') or ''}`"
-                f"\n**计划名称：** {task.get('plan_name') or '未命名计划'}"
-                f"\n**计划ID：** `{task.get('ad_id') or ''}`"
-                f"\n**推广场景：** {scene_text}"
-                f"\n**计划体系：** {plan_system_text}"
-                f"\n**触发层级：** {level_text}"
-                f"{product_line}"
-                f"\n\n**本卡追投素材（{len(material_lines)}条）：**"
-                f"\n{chr(10).join(material_lines)}"
-                f"\n\n**策略：** {task.get('strategy_name') or trigger.get('strategy_title') or '追投策略命中'}"
-            ),
+            "tag": "div",
+            "text": {
+                "tag": "plain_text",
+                "content": "\n".join(summary_lines),
+            },
         },
         {
             "tag": "markdown",
