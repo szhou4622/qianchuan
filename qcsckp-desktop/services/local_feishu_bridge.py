@@ -259,6 +259,41 @@ class FeishuApiError(RuntimeError):
     pass
 
 
+def _build_feishu_long_connection_channel(
+    *, app_id: str, app_secret: str, log_level: Any
+) -> Any:
+    """创建会立即确认卡片点击的飞书长连接。
+
+    lark-oapi 1.7.1 的 FeishuChannel 会把卡片事件转交后台协程，但默认给
+    飞书返回空对象。飞书客户端会把这个空回执视为交互失败并显示 200671。
+    这里保留 SDK 的异步分发与安全去重，只把同步回执改成合法 toast，确保
+    在 3 秒时限内完成确认；真正的追投仍由本地队列异步复核执行。
+    """
+    from lark_oapi.channel import FeishuChannel
+    from lark_oapi.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTriggerResponse,
+    )
+
+    class _ImmediateCardAckFeishuChannel(FeishuChannel):
+        def _on_p2_card_action_trigger(self, data: Any) -> Any:
+            super()._on_p2_card_action_trigger(data)
+            return P2CardActionTriggerResponse(
+                {
+                    "toast": {
+                        "type": "info",
+                        "content": "请求已收到，正在处理",
+                    }
+                }
+            )
+
+    return _ImmediateCardAckFeishuChannel(
+        app_id=app_id,
+        app_secret=app_secret,
+        transport="ws",
+        log_level=log_level,
+    )
+
+
 def _connection_error_status(error: Any) -> str:
     text = str(error or "").lower()
     if any(
@@ -964,12 +999,11 @@ class LocalFeishuBridge:
         def _entry() -> None:
             try:
                 from lark_oapi import LogLevel
-                from lark_oapi.channel import Events, FeishuChannel
+                from lark_oapi.channel import Events
 
-                channel = FeishuChannel(
+                channel = _build_feishu_long_connection_channel(
                     app_id=str(profile["app_id"]),
                     app_secret=str(profile["app_secret"]),
-                    transport="ws",
                     # INFO 会输出带短期连接票据的 WS URL，不允许进入用户日志。
                     log_level=LogLevel.CRITICAL,
                 )

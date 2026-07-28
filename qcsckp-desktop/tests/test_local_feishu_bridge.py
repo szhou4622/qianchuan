@@ -290,6 +290,22 @@ class LocalFeishuBindingTests(unittest.TestCase):
         )
         self.assertEqual("error", bridge._connection_error_status("network timeout"))
 
+    def test_card_action_returns_valid_immediate_ack(self):
+        from lark_oapi import LogLevel
+
+        channel = bridge._build_feishu_long_connection_channel(
+            app_id="cli_test",
+            app_secret="secret",
+            log_level=LogLevel.CRITICAL,
+        )
+        try:
+            response = channel._on_p2_card_action_trigger(SimpleNamespace())
+            self.assertIsNotNone(response.toast)
+            self.assertEqual("info", response.toast.type)
+            self.assertIn("请求已收到", response.toast.content)
+        finally:
+            channel.stop()
+
     def test_connection_test_button_is_one_time_and_owner_only(self):
         bridge._update_profile(
             "tool-user-a", {"authorized_open_id": "ou_owner"}
