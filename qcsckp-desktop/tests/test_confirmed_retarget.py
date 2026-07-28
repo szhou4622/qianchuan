@@ -44,6 +44,21 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class RetargetConfigTests(unittest.TestCase):
+    def test_card_account_name_is_resolved_per_target(self):
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                self.table = table
+                return {"user_info_name": "目标千川账户"}
+
+        store = FakeStore()
+        name = retargeting_rule_runner._account_name_for_target(
+            store,
+            {"aadvid": "10001", "ad_id": "30001"},
+            "全局标签",
+        )
+        self.assertEqual("目标千川账户", name)
+        self.assertEqual("pmc_ad_detail_basic", store.table)
+
     def test_existing_strategy_defaults_to_card_confirmation(self):
         cfg = _normalize_full(
             {

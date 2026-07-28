@@ -186,6 +186,30 @@ def _material_name_from_dashboard_row(row: Dict[str, Any]) -> str:
     return ""
 
 
+def _account_name_for_target(
+    db: SQLiteStore,
+    target: Dict[str, Any],
+    fallback: str = "",
+) -> str:
+    aavid = str(target.get("aadvid") or "").strip()
+    ad_id = str(target.get("ad_id") or "").strip()
+    if aavid:
+        account = db.select_one(
+            "pmc_ad_detail_basic",
+            fields="user_info_name",
+            where=(
+                {"aadvid": aavid, "ad_id": ad_id}
+                if ad_id
+                else {"aadvid": aavid}
+            ),
+            order_by="created_at DESC",
+        )
+        name = str((account or {}).get("user_info_name") or "").strip()
+        if name:
+            return name[:200]
+    return str(fallback or "").strip()[:200]
+
+
 def rate_limit_should_skip(
     db: SQLiteStore,
     material_id: str,
@@ -771,6 +795,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             plan_system = normalize_plan_system(
                 target.get("plan_system") or "unknown"
             )
+            target_account_name = _account_name_for_target(
+                db,
+                target,
+                account_name,
+            )
             if plan_system == "unknown":
                 logger.warning(
                     "%s 策略 %s 对应计划尚未确认是传统全域还是千川乘方，"
@@ -1077,7 +1106,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             strategy_hash = hashlib.sha256(strategy_json.encode("utf-8")).hexdigest()
                             card_payload = {
                                 "aavid": str(aavid_int),
-                                "account_name": account_name,
+                                "account_name": target_account_name,
                                 "ad_id": str(ad_id_int),
                                 "target_uid": target_uid,
                                 "plan_name": str(target.get("plan_name") or ""),

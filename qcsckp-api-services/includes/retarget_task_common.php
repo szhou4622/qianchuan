@@ -371,10 +371,25 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
     $levelText = (($task['trigger_level'] ?? 'material') === 'product') ? '商品级' : '素材级';
     $productLine = '';
     if (!empty($task['product_id'])) {
-        $productLine = "\n**商品：** " . (($task['product_name'] ?? '') ?: ($task['product_id'] ?? ''));
+        $productLine = "\n**商品名称：** " . (($task['product_name'] ?? '') ?: '未命名商品')
+            . "\n**商品ID：** `" . ($task['product_id'] ?? '') . '`';
     }
+    $accountName = trim((string)($task['account_name'] ?? '')) ?: '未命名账户';
+    $planName = trim((string)($task['plan_name'] ?? '')) ?: '未命名计划';
+    $materialName = trim((string)($task['material_name'] ?? '')) ?: '未命名素材';
     $elements = [
-        ['tag' => 'markdown', 'content' => "**千川账户：** " . (($task['account_name'] ?? '') ?: '未命名账户') . '（' . ($task['aavid'] ?? '') . "）\n**计划：** " . (($task['plan_name'] ?? '') ?: ($task['ad_id'] ?? '')) . "\n**推广场景：** " . $sceneText . "\n**计划体系：** " . $planSystemText . "\n**触发层级：** " . $levelText . $productLine . "\n**素材：** " . (($task['material_name'] ?? '') ?: ($task['material_id'] ?? '')) . "\n**策略：** " . $reason],
+        ['tag' => 'markdown', 'content' => "**千川账户：** " . $accountName
+            . "\n**账户ID：** `" . ($task['aavid'] ?? '') . '`'
+            . "\n**计划名称：** " . $planName
+            . "\n**计划ID：** `" . ($task['ad_id'] ?? '') . '`'
+            . "\n**推广场景：** " . $sceneText
+            . "\n**计划体系：** " . $planSystemText
+            . "\n**触发层级：** " . $levelText
+            . $productLine
+            . "\n\n**本卡追投素材（1条）：**"
+            . "\n1. " . $materialName
+            . "\n   素材ID：`" . ($task['material_id'] ?? '') . '`'
+            . "\n\n**策略：** " . $reason],
         ['tag' => 'markdown', 'content' => "**命中原因：** " . trigger_metric_summary($trigger) . "\n**追投参数：** " . retarget_method_summary($retargeting) . "\n**有效期至：** " . ($task['expires_at'] ?? '') . "\n**当前状态：** " . $statusText],
     ];
     if (!empty($task['result_message'])) {
@@ -402,7 +417,7 @@ function task_card(array $task, string $displayStatus = '', bool $expanded = fal
     }
     return [
         'config' => ['wide_screen_mode' => true, 'enable_forward' => false, 'update_multi' => true],
-        'header' => ['template' => $template, 'title' => ['tag' => 'plain_text', 'content' => '千川追投提醒 · ' . $statusText]],
+        'header' => ['template' => $template, 'title' => ['tag' => 'plain_text', 'content' => '千川追投提醒 · ' . $sceneText . ' · ' . $planSystemText . ' · ' . $statusText]],
         'elements' => $elements,
     ];
 }

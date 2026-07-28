@@ -438,6 +438,27 @@ class LocalIntegrationSuite:
             and isinstance(detail.body.get("card", {}).get("data", {}).get("elements"), list),
             "schema callback without token returns wrapped raw detail card",
         )
+        card_text = json.dumps(
+            detail.body.get("card", {}).get("data", {}),
+            ensure_ascii=False,
+        )
+        self.check(
+            all(
+                expected in card_text
+                for expected in [
+                    "本地账户10001",
+                    "账户ID",
+                    "本地测试计划",
+                    "计划ID",
+                    "推直播",
+                    "传统全域",
+                    "本卡追投素材（1条）",
+                    "本地素材20001",
+                    "素材ID",
+                ]
+            ),
+            "card shows account, plan, scene, system, and exact material",
+        )
         wrong_callback_token = self.schema_callback(
             task_uid,
             row["action_nonce"],
