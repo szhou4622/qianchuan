@@ -20,6 +20,8 @@ from playwright.async_api import Browser, BrowserContext, Page, Response, async_
 
 from config import DATA_DIR
 from services.fetcher import build_qianchuan_url_by_params
+from services.product_scene_adapter import goto_and_confirm_product_target
+from api.promotion_targets import extract_target_ids, normalize_scene
 from utils.common import require_executable_path
 from utils.log import logger
 
@@ -501,10 +503,25 @@ class QianChuanRegulationStopService:
         assist_task_id: str,
         stop_action: str,
         strategy_title: Optional[str] = None,
+        target_uid: Optional[str] = None,
+        promotion_scene: str = "live",
+        source_url: Optional[str] = None,
         reuse_session: bool = False,
         close_session: bool = True,
     ) -> RegulationRunResult:
         self._log_tag = regulation_log_tag(strategy_title=strategy_title)
+        try:
+            scene = normalize_scene(promotion_scene or "live")
+        except ValueError as e:
+            return self._make_result(
+                success=False,
+                message=str(e),
+                step="validate_scene",
+                aavid=aavid,
+                ad_id=ad_id,
+                assist_task_id=assist_task_id,
+                stop_action=stop_action,
+            )
         aid = str(assist_task_id).strip()
         act = str(stop_action or "").strip().lower()
         if act not in ("pause", "delete"):
@@ -534,6 +551,8 @@ class QianChuanRegulationStopService:
                 base_url=self._opt.base_url,
                 aavid=int(aavid),
                 ad_id=int(ad_id),
+                promotion_scene=scene,
+                source_url=source_url,
             )
         except Exception as e:
             return self._make_result(
@@ -565,8 +584,45 @@ class QianChuanRegulationStopService:
             if not reuse_session:
                 pop_handlers = await self._attach_popup_switcher()
                 logger.info("%s 打开投放详情页", self._log_tag)
-                await page.goto(fetch_url, wait_until="domcontentloaded", timeout=self._opt.goto_timeout_ms)
+                if scene == "product":
+                    target_error = await goto_and_confirm_product_target(
+                        page,
+                        fetch_url,
+                        expected_aavid=aavid,
+                        expected_ad_id=ad_id,
+                        timeout_ms=self._opt.goto_timeout_ms,
+                    )
+                    if target_error:
+                        return self._make_result(
+                            success=False,
+                            message=target_error,
+                            step="target_mismatch",
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            assist_task_id=aid,
+                            stop_action=act,
+                        )
+                else:
+                    await page.goto(
+                        fetch_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._opt.goto_timeout_ms,
+                    )
                 await asyncio.sleep(random.uniform(2.5, 4.0))
+                page_aavid, page_ad_id = extract_target_ids(page.url)
+                if scene != "product" and (
+                    str(page_aavid or "") != str(aavid)
+                    or str(page_ad_id or "") != str(ad_id)
+                ):
+                    return self._make_result(
+                        success=False,
+                        message="打开后的账户或计划与停投任务不一致，已安全停止",
+                        step="target_mismatch",
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        assist_task_id=aid,
+                        stop_action=act,
+                    )
                 err = await self._switch_to_assist_tab()
                 if err:
                     return self._make_result(
@@ -923,6 +979,9 @@ class QianChuanRegulationStopService:
         assist_task_id: str,
         stop_action: str,
         strategy_title: Optional[str] = None,
+        target_uid: Optional[str] = None,
+        promotion_scene: str = "live",
+        source_url: Optional[str] = None,
     ) -> RegulationRunResult:
         """
         打开投放详情并定位调控任务；由程序代为点击暂停/删除图标以弹出确认层，
@@ -930,6 +989,18 @@ class QianChuanRegulationStopService:
         batch_update_operation / batch_delete_operation；结束时 close() 浏览器。
         """
         self._log_tag = regulation_log_tag(strategy_title=strategy_title or "手动停投")
+        try:
+            scene = normalize_scene(promotion_scene or "live")
+        except ValueError as e:
+            return self._make_result(
+                success=False,
+                message=str(e),
+                step="validate_scene",
+                aavid=aavid,
+                ad_id=ad_id,
+                assist_task_id=assist_task_id,
+                stop_action=stop_action,
+            )
         aid = str(assist_task_id).strip()
         act = str(stop_action or "").strip().lower()
         if act not in ("pause", "delete"):
@@ -959,6 +1030,8 @@ class QianChuanRegulationStopService:
                 base_url=self._opt.base_url,
                 aavid=int(aavid),
                 ad_id=int(ad_id),
+                promotion_scene=scene,
+                source_url=source_url,
             )
         except Exception as e:
             return self._make_result(
@@ -989,8 +1062,46 @@ class QianChuanRegulationStopService:
 
             pop_handlers = await self._attach_popup_switcher()
             logger.info("%s 打开投放详情页（手动停投：程序弹窗，用户点确定）", self._log_tag)
-            await page.goto(fetch_url, wait_until="domcontentloaded", timeout=self._opt.goto_timeout_ms)
+            if scene == "product":
+                target_error = await goto_and_confirm_product_target(
+                    page,
+                    fetch_url,
+                    expected_aavid=aavid,
+                    expected_ad_id=ad_id,
+                    timeout_ms=self._opt.goto_timeout_ms,
+                )
+                if target_error:
+                    return self._make_result(
+                        success=False,
+                        message=target_error,
+                        step="target_mismatch",
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        assist_task_id=aid,
+                        stop_action=act,
+                    )
+            else:
+                await page.goto(
+                    fetch_url,
+                    wait_until="domcontentloaded",
+                    timeout=self._opt.goto_timeout_ms,
+                )
             await asyncio.sleep(random.uniform(2.5, 4.0))
+            page_aavid, page_ad_id = extract_target_ids(page.url)
+            if scene != "product" and (
+                str(page_aavid or "") != str(aavid)
+                or str(page_ad_id or "") != str(ad_id)
+            ):
+                return self._make_result(
+                    success=False,
+                    message="页面账户或计划与监控目标不一致，已阻止停投",
+                    detail=f"expected={aavid}/{ad_id}, actual={page_aavid}/{page_ad_id}, target={target_uid or ''}",
+                    step="target_mismatch",
+                    aavid=aavid,
+                    ad_id=ad_id,
+                    assist_task_id=aid,
+                    stop_action=act,
+                )
             err = await self._switch_to_assist_tab()
             if err:
                 return self._make_result(

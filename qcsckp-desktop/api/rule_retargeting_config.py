@@ -57,6 +57,10 @@ _RATE_TRIGGER_METRICS = frozenset(
 )
 ALLOWED_METHOD = frozenset({"volume", "cost_control"})
 ALLOWED_GOAL = frozenset({"net_roi", "live_room"})
+ALLOWED_ACTION_MODES = frozenset({"card_confirm", "auto_execute"})
+ALLOWED_TRIGGER_LEVELS = frozenset({"material", "product"})
+ALLOWED_CANDIDATE_SORTS = frozenset({"net_roi_desc"})
+MAX_CANDIDATE_LIMIT = 20
 
 # 追投间隔·时间范围（秒）：clamp 上下限与默认值（默认 24 小时窗口内最多 1 次）
 _MAX_INTERVAL_WINDOW_SECONDS = 720.0 * 3600.0
@@ -148,6 +152,15 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
     return {
         "id": _new_strategy_id(),
         "title": f"策略 {index + 1}",
+        # 旧配置允许暂时为空。运行时仅在“唯一启用目标”时兼容绑定；
+        # 新版前端保存时会显式选择监控计划。
+        "target_uid": "",
+        "trigger_level": "material",
+        "product_filter": [],
+        "candidate_trigger": _default_trigger(),
+        "candidate_sort": "net_roi_desc",
+        "candidate_limit": 1,
+        "action_mode": "card_confirm",
         "trigger": _default_trigger(),
         "retargeting": _default_retargeting(),
     }
@@ -608,13 +621,50 @@ def _normalize_strategy_entry(
         title = title[:_STRATEGY_TITLE_MAX_LEN]
     trig = _normalize_trigger(raw.get("trigger"))
     ret = _normalize_retargeting(raw.get("retargeting"))
+    action_mode = str(raw.get("action_mode") or "card_confirm").strip().lower()
+    if action_mode not in ALLOWED_ACTION_MODES:
+        action_mode = "card_confirm"
+    target_uid = str(raw.get("target_uid") or "").strip()
+    trigger_level = str(raw.get("trigger_level") or "material").strip().lower()
+    if trigger_level not in ALLOWED_TRIGGER_LEVELS:
+        trigger_level = "material"
+    product_filter_raw = raw.get("product_filter")
+    product_filter: List[str] = []
+    if isinstance(product_filter_raw, list):
+        seen_product_ids = set()
+        for value in product_filter_raw:
+            product_id = str(value or "").strip()
+            if product_id and product_id not in seen_product_ids:
+                seen_product_ids.add(product_id)
+                product_filter.append(product_id)
+    candidate_trigger = _normalize_trigger(raw.get("candidate_trigger"))
+    candidate_sort = str(raw.get("candidate_sort") or "net_roi_desc").strip().lower()
+    if candidate_sort not in ALLOWED_CANDIDATE_SORTS:
+        candidate_sort = "net_roi_desc"
+    try:
+        candidate_limit = int(raw.get("candidate_limit") or 1)
+    except (TypeError, ValueError):
+        candidate_limit = 1
+    candidate_limit = max(1, min(MAX_CANDIDATE_LIMIT, candidate_limit))
     if per_strategy_interval:
         rraw = raw.get("retargeting")
         if not isinstance(rraw, dict) or not isinstance(rraw.get("interval"), dict):
             ret["interval"] = copy.deepcopy(global_inv)
     else:
         ret["interval"] = copy.deepcopy(global_inv)
-    return {"id": sid, "title": title, "trigger": trig, "retargeting": ret}
+    return {
+        "id": sid,
+        "title": title,
+        "target_uid": target_uid,
+        "trigger_level": trigger_level,
+        "product_filter": product_filter,
+        "candidate_trigger": candidate_trigger,
+        "candidate_sort": candidate_sort,
+        "candidate_limit": candidate_limit,
+        "action_mode": action_mode,
+        "trigger": trig,
+        "retargeting": ret,
+    }
 
 
 def _disk_needs_strategy_migration_rewrite(raw: Optional[Dict[str, Any]]) -> bool:
@@ -633,6 +683,25 @@ def _disk_needs_strategy_migration_rewrite(raw: Optional[Dict[str, Any]]) -> boo
         return True
     if has_nonempty_strategies and ("trigger" in raw or "retargeting" in raw):
         return True
+    if has_nonempty_strategies:
+        for strategy in strats:
+            if not isinstance(strategy, dict):
+                return True
+            mode = str(strategy.get("action_mode") or "").strip().lower()
+            if mode not in ALLOWED_ACTION_MODES:
+                return True
+            if any(
+                key not in strategy
+                for key in (
+                    "target_uid",
+                    "trigger_level",
+                    "product_filter",
+                    "candidate_trigger",
+                    "candidate_sort",
+                    "candidate_limit",
+                )
+            ):
+                return True
     return False
 
 
@@ -815,6 +884,28 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
         for i, st in enumerate(strats):
             if not isinstance(st, dict):
                 return False, "追投策略项须为对象"
+            if not str(st.get("target_uid") or "").strip():
+                return False, f"策略{i + 1} 必须选择监控计划"
+            trigger_level = str(st.get("trigger_level") or "material").strip().lower()
+            if trigger_level not in ALLOWED_TRIGGER_LEVELS:
+                return False, f"策略{i + 1} 的触发层级无效"
+            candidate_sort = str(st.get("candidate_sort") or "net_roi_desc").strip().lower()
+            if candidate_sort not in ALLOWED_CANDIDATE_SORTS:
+                return False, f"策略{i + 1} 的候选素材排序方式无效"
+            try:
+                candidate_limit = int(st.get("candidate_limit", 1))
+            except (TypeError, ValueError):
+                return False, f"策略{i + 1} 的候选素材数量必须为整数"
+            if candidate_limit < 1 or candidate_limit > MAX_CANDIDATE_LIMIT:
+                return False, f"策略{i + 1} 的候选素材数量必须在 1 到 {MAX_CANDIDATE_LIMIT} 之间"
+            if trigger_level == "product" and not isinstance(st.get("candidate_trigger"), dict):
+                return False, f"策略{i + 1} 缺少候选素材条件"
+            product_filter = st.get("product_filter")
+            if product_filter is not None and not isinstance(product_filter, list):
+                return False, f"策略{i + 1} 的商品筛选必须为列表"
+            mode = str(st.get("action_mode") or "card_confirm").strip().lower()
+            if mode not in ALLOWED_ACTION_MODES:
+                return False, f"策略{i + 1} 的执行方式无效"
             r = st.get("retargeting")
             if not isinstance(r, dict):
                 return False, f"策略{i + 1} 缺少调控任务"

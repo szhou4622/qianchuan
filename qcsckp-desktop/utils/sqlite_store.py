@@ -22,7 +22,12 @@ class SQLiteStore:
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aadvid': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
                 'material_id': 'TEXT NOT NULL',
+                'product_ids_json': 'TEXT',
                 'video_name': 'TEXT',
                 'material_status': 'INTEGER',
                 'show_status': 'INTEGER',
@@ -58,6 +63,8 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_material_aadvid', 'aadvid'),
+                ('idx_material_target_created', 'target_uid, created_at'),
+                ('idx_material_target_material', 'target_uid, material_id'),
                 ('idx_material_stat_date', 'stat_date'),
                 ('idx_material_id', 'material_id'),
                 ('idx_material_video_type', 'video_type'),
@@ -71,6 +78,10 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aadvid': 'TEXT NOT NULL',
                 'ad_id': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'plan_name': 'TEXT',
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
                 'budget': 'TEXT',
                 'audience_coverage_count': 'TEXT',
                 'compensation_convert': 'TEXT',
@@ -83,11 +94,91 @@ class SQLiteStore:
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
             'indexes': [
+                ('idx_ad_detail_aadvid', 'aadvid'),
                 ('idx_ad_detail_ad_id', 'ad_id'),
             ],
-            # 业务唯一：同一广告主仅一行（与 insert_or_update unique_fields=['aadvid'] 一致）
+            'obsolete_indexes': [
+                'uk_pmc_ad_detail_basic_aadvid',
+            ],
+            # 业务唯一：同一广告主下允许多条计划，以账户 + 计划隔离。
             'unique_indexes': [
-                ('uk_pmc_ad_detail_basic_aadvid', 'aadvid'),
+                ('uk_pmc_ad_detail_basic_aadvid_adid', 'aadvid, ad_id'),
+            ],
+        },
+        # 账户内的直播/商品全域监控目标。target_uid 稳定派生自 aavid + ad_id。
+        'promotion_target': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'target_uid': 'TEXT NOT NULL',
+                'aadvid': 'TEXT NOT NULL',
+                'ad_id': 'TEXT NOT NULL',
+                'plan_name': 'TEXT',
+                'promotion_scene': "TEXT NOT NULL CHECK (promotion_scene IN ('live', 'product'))",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown' CHECK (plan_system IN ('global', 'chengfang', 'unknown'))",
+                'enabled': 'INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))',
+                'product_filter_mode': "TEXT NOT NULL DEFAULT 'all' CHECK (product_filter_mode IN ('all', 'selected'))",
+                'product_ids_json': 'TEXT',
+                'sanitized_page_url': 'TEXT',
+                'capability_json': 'TEXT',
+                'last_sync_at': 'TEXT',
+                'last_status': "TEXT NOT NULL DEFAULT 'pending'",
+                'last_error': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_promotion_target_account', 'aadvid'),
+                ('idx_promotion_target_enabled', 'enabled'),
+                ('idx_promotion_target_scene', 'promotion_scene'),
+                ('idx_promotion_target_system', 'plan_system'),
+            ],
+            'unique_indexes': [
+                ('uk_promotion_target_uid', 'target_uid'),
+                ('uk_promotion_target_account_plan', 'aadvid, ad_id'),
+            ],
+        },
+        # 商品全域计划中的商品快照。
+        'promotion_product': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'target_uid': 'TEXT NOT NULL',
+                'product_id': 'TEXT NOT NULL',
+                'product_name': 'TEXT',
+                'product_status': 'TEXT',
+                'image_url': 'TEXT',
+                'raw_json': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_promotion_product_target', 'target_uid'),
+                ('idx_promotion_product_name', 'product_name'),
+            ],
+            'unique_indexes': [
+                ('uk_promotion_product_target_product', 'target_uid, product_id'),
+            ],
+        },
+        # 商品与素材为多对多关系；同一素材可关联多个商品。
+        'promotion_material_product': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'target_uid': 'TEXT NOT NULL',
+                'material_id': 'TEXT NOT NULL',
+                'product_id': 'TEXT NOT NULL',
+                'material_name': 'TEXT',
+                'product_name': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_material_product_target_material', 'target_uid, material_id'),
+                ('idx_material_product_target_product', 'target_uid, product_id'),
+            ],
+            'unique_indexes': [
+                (
+                    'uk_material_product_target_material_product',
+                    'target_uid, material_id, product_id',
+                ),
             ],
         },
         # 追投执行流水（与 docs/schema_pmc_retargeting_run.sqlite.sql 一致；以本处为自动建表来源）
@@ -96,6 +187,12 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aavid': 'TEXT NOT NULL',
                 'ad_id': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'product_id': 'TEXT',
+                'product_name': 'TEXT',
+                'trigger_level': "TEXT NOT NULL DEFAULT 'material'",
                 'material_id': 'TEXT NOT NULL',
                 'material_name': 'TEXT',
                 'strategy_name': 'TEXT',
@@ -121,6 +218,7 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_pmc_retargeting_run_started', 'started_at'),
+                ('idx_pmc_retargeting_run_target_started', 'target_uid, started_at'),
                 ('idx_pmc_retargeting_run_account_material', 'aavid, material_id, started_at'),
                 ('idx_pmc_retargeting_run_status_time', 'status, started_at'),
             ],
@@ -129,6 +227,7 @@ class SQLiteStore:
         'pmc_retargeting_rate_limit': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'material_id': 'TEXT NOT NULL',
                 'limit_started_at': 'TEXT NOT NULL',
                 'use_count': 'INTEGER NOT NULL DEFAULT 0',
@@ -137,15 +236,23 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_pmc_retargeting_rate_limit_material_id', 'material_id'),
+                ('idx_pmc_retargeting_rate_limit_target', 'target_uid'),
+            ],
+            'obsolete_indexes': [
+                'uk_pmc_retargeting_rate_limit_material_id',
             ],
             'unique_indexes': [
-                ('uk_pmc_retargeting_rate_limit_material_id', 'material_id'),
+                (
+                    'uk_pmc_retargeting_rate_limit_target_material',
+                    'target_uid, material_id',
+                ),
             ],
         },
         # 规则追投限频（按策略）：per_strategy_rate_limit 启用时，每 (material_id, strategy_id) 一行
         'pmc_retargeting_rate_limit_strategy': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'material_id': 'TEXT NOT NULL',
                 'strategy_id': 'TEXT NOT NULL',
                 'limit_started_at': 'TEXT NOT NULL',
@@ -156,9 +263,16 @@ class SQLiteStore:
             'indexes': [
                 ('idx_pmc_rr_rl_strat_material', 'material_id'),
                 ('idx_pmc_rr_rl_strat_strategy', 'strategy_id'),
+                ('idx_pmc_rr_rl_strat_target', 'target_uid'),
+            ],
+            'obsolete_indexes': [
+                'uk_pmc_rr_rl_strat_mat_sid',
             ],
             'unique_indexes': [
-                ('uk_pmc_rr_rl_strat_mat_sid', 'material_id, strategy_id'),
+                (
+                    'uk_pmc_rr_rl_strat_target_mat_sid',
+                    'target_uid, material_id, strategy_id',
+                ),
             ],
         },
         # 规则化停投流水（与 docs/schema_pmc_regulation_run.sqlite.sql 一致）
@@ -167,6 +281,11 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aavid': 'TEXT NOT NULL',
                 'ad_id': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'product_id': 'TEXT',
+                'product_name': 'TEXT',
                 'assist_task_id': 'TEXT',
                 'task_name': 'TEXT',
                 'strategy_name': 'TEXT',
@@ -189,8 +308,108 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_pmc_regulation_run_started', 'started_at'),
+                ('idx_pmc_regulation_run_target_started', 'target_uid, started_at'),
                 ('idx_pmc_regulation_run_aavid_time', 'aavid, started_at'),
                 ('idx_pmc_regulation_run_status_time', 'status, started_at'),
+            ],
+        },
+        # 单账户统一操作流水：工具直执、记录浏览器、平台操作日志统一写入。
+        'account_operation_event': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'event_uid': 'TEXT NOT NULL',
+                'aavid': 'TEXT NOT NULL',
+                'ad_id': 'TEXT',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'promotion_scene': 'TEXT',
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'source': 'TEXT NOT NULL',
+                'action_type': 'TEXT NOT NULL',
+                'object_type': 'TEXT',
+                'object_id': 'TEXT',
+                'object_name': 'TEXT',
+                'plan_id': 'TEXT',
+                'plan_name': 'TEXT',
+                'material_id': 'TEXT',
+                'material_name': 'TEXT',
+                'product_id': 'TEXT',
+                'product_name': 'TEXT',
+                'regulate_task_id': 'TEXT',
+                'regulate_task_name': 'TEXT',
+                'operator_id': 'TEXT',
+                'operator_name': 'TEXT',
+                'status': 'TEXT NOT NULL',
+                'summary': 'TEXT',
+                'detail': 'TEXT',
+                'before_json': 'TEXT',
+                'after_json': 'TEXT',
+                'trigger_json': 'TEXT',
+                'request_json': 'TEXT',
+                'response_json': 'TEXT',
+                'raw_json': 'TEXT',
+                'cloud_task_id': 'TEXT',
+                'platform_event_id': 'TEXT',
+                'related_event_uid': 'TEXT',
+                'possible_duplicate': 'INTEGER NOT NULL DEFAULT 0 CHECK (possible_duplicate IN (0, 1))',
+                'occurred_at': 'TEXT NOT NULL',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_account_operation_aavid_time', 'aavid, occurred_at'),
+                ('idx_account_operation_target_time', 'target_uid, occurred_at'),
+                ('idx_account_operation_action_time', 'action_type, occurred_at'),
+                ('idx_account_operation_source_time', 'source, occurred_at'),
+                ('idx_account_operation_status_time', 'status, occurred_at'),
+                ('idx_account_operation_cloud_task', 'cloud_task_id'),
+                ('idx_account_operation_plan', 'aavid, plan_id'),
+                ('idx_account_operation_material', 'aavid, material_id'),
+                ('idx_account_operation_regulate_task', 'aavid, regulate_task_id'),
+            ],
+            'unique_indexes': [
+                ('uk_account_operation_event_uid', 'event_uid'),
+            ],
+        },
+        # 云端追投任务在本机的幂等结果缓存，防止领取租约恢复后重复追投。
+        'cloud_retarget_task_local': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'cloud_task_id': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'promotion_scene': 'TEXT',
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'status': 'TEXT NOT NULL',
+                'result_json': 'TEXT',
+                'claimed_at': 'TEXT',
+                'finished_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_cloud_retarget_local_status', 'status'),
+            ],
+            'unique_indexes': [
+                ('uk_cloud_retarget_local_task', 'cloud_task_id'),
+            ],
+        },
+        # 平台操作日志同步状态；每个账户保存覆盖范围、游标和最近错误。
+        'platform_log_sync_state': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'aavid': 'TEXT NOT NULL',
+                'coverage_from': 'TEXT',
+                'coverage_to': 'TEXT',
+                'last_sync_at': 'TEXT',
+                'last_status': 'TEXT NOT NULL DEFAULT \'not_configured\'',
+                'last_error': 'TEXT',
+                'discovered_page_url': 'TEXT',
+                'discovered_api_url': 'TEXT',
+                'discovered_request_json': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'unique_indexes': [
+                ('uk_platform_log_sync_aavid', 'aavid'),
             ],
         },
         # 全域调控任务（素材追投等，与 docs/schema_pmc_roi2_assist_task.sqlite.sql 一致）
@@ -200,6 +419,10 @@ class SQLiteStore:
                 'assist_task_id': 'TEXT NOT NULL',
                 'aadvid': 'TEXT NOT NULL',
                 'ad_id': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'product_ids_json': 'TEXT',
                 'task_name': 'TEXT',
                 'budget': 'TEXT',
                 'bid': 'TEXT',
@@ -252,10 +475,17 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_pmc_roi2_assist_aadvid', 'aadvid'),
+                ('idx_pmc_roi2_assist_target', 'target_uid'),
                 ('idx_pmc_roi2_assist_created', 'created_at'),
             ],
+            'obsolete_indexes': [
+                'uk_pmc_roi2_assist_task_assist_id',
+            ],
             'unique_indexes': [
-                ('uk_pmc_roi2_assist_task_assist_id', 'assist_task_id'),
+                (
+                    'uk_pmc_roi2_assist_target_task',
+                    'target_uid, assist_task_id',
+                ),
             ],
         },
     }
@@ -515,6 +745,7 @@ class SQLiteStore:
     def select_pmc_latest_per_material_in_last_hour_utc8(
         self,
         aadvid: Optional[str] = None,
+        target_uid: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         近 1 小时滚动窗口（与库表 created_at 语义一致）：
@@ -523,24 +754,35 @@ class SQLiteStore:
         """
         tbl = "pmc_promotion_material"
         window_where = "created_at > datetime('now', '+8 hours', '-1 hours')"
+        if target_uid:
+            sql = f"""
+            SELECT t.* FROM {tbl} t
+            INNER JOIN (
+              SELECT target_uid, material_id, MAX(id) AS max_id
+              FROM {tbl}
+              WHERE {window_where} AND target_uid = ?
+              GROUP BY target_uid, material_id
+            ) x ON t.id = x.max_id
+            """
+            return self.execute(sql, (str(target_uid),), fetch=True) or []
         if aadvid:
             sql = f"""
             SELECT t.* FROM {tbl} t
             INNER JOIN (
-              SELECT material_id, MAX(id) AS max_id
+              SELECT target_uid, material_id, MAX(id) AS max_id
               FROM {tbl}
               WHERE {window_where} AND aadvid = ?
-              GROUP BY material_id
+              GROUP BY target_uid, material_id
             ) x ON t.id = x.max_id
             """
             return self.execute(sql, (str(aadvid),), fetch=True) or []
         sql = f"""
             SELECT t.* FROM {tbl} t
             INNER JOIN (
-              SELECT material_id, MAX(id) AS max_id
+              SELECT target_uid, material_id, MAX(id) AS max_id
               FROM {tbl}
               WHERE {window_where}
-              GROUP BY material_id
+              GROUP BY target_uid, material_id
             ) x ON t.id = x.max_id
             """
         return self.execute(sql, fetch=True) or []
@@ -1400,6 +1642,14 @@ class SQLiteStore:
                     self._ensure_table_columns_match_schema(
                         table_name, table_schema['columns'], conn
                     )
+
+                    # 业务唯一键升级时先移除旧索引；DROP INDEX 不删除任何数据。
+                    if table_schema.get('obsolete_indexes'):
+                        for old_idx in table_schema['obsolete_indexes']:
+                            if not self._validate_sql_identifier(old_idx):
+                                logger.warning(f"跳过非法废弃索引名: {old_idx}")
+                                continue
+                            cursor.execute(f"DROP INDEX IF EXISTS {old_idx}")
 
                     # 创建索引
                     if 'indexes' in table_schema:

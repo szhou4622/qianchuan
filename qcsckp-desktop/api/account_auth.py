@@ -89,7 +89,25 @@ class AccountAuthApi:
         req = Request(_remote_url("/api/account.php"), data=payload)
         req.add_header("Content-Type", "application/json; charset=utf-8")
         req.add_header("Accept", "application/json")
-        return self._request_json(req)
+        result = self._request_json(req)
+        data = result.get("data") if isinstance(result, dict) else None
+        if result.get("success") and isinstance(data, dict):
+            try:
+                disabled = int(data.get("is_disabled") or 0) == 1
+            except Exception:
+                disabled = True
+            if not disabled and self._is_within_validity(data):
+                try:
+                    from services.cloud_retarget_client import register_device_session
+
+                    device = register_device_session(u, p)
+                    data["device_session_ready"] = bool(device.get("success"))
+                    if not device.get("success"):
+                        data["device_session_message"] = str(device.get("message") or "设备令牌申请失败")
+                except Exception as exc:
+                    data["device_session_ready"] = False
+                    data["device_session_message"] = str(exc)
+        return result
 
     @staticmethod
     def _parse_server_dt(s: Optional[str]) -> Optional[datetime]:

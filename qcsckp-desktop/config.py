@@ -56,12 +56,36 @@ PROJECT_ROOT = _get_project_root()
 CURRENT_VERSION = "0.1.6"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_text(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+
 # 常用目录
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
-LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+_data_dir_override = _env_text("QCSCKP_DATA_DIR")
+if _data_dir_override:
+    DATA_DIR = os.path.abspath(os.path.expandvars(os.path.expanduser(_data_dir_override)))
+    DATA_TEMP_DIR = os.path.join(DATA_DIR, "temp")
+    LOGS_DIR = os.path.join(DATA_DIR, "logs")
+else:
+    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+    DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
+    LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
+
+# 本地联调保护。默认全部关闭，正式版行为不变。
+TEST_MODE = _env_flag("QCSCKP_TEST_MODE")
+TEST_AAVID = _env_text("QCSCKP_TEST_AAVID")
+TEST_MATERIAL_ID = _env_text("QCSCKP_TEST_MATERIAL_ID")
+ALLOW_LIVE_RETARGET = _env_flag("QCSCKP_ALLOW_LIVE_RETARGET")
+LOCAL_TEST_SECRETS_FILE = _env_text("QCSCKP_LOCAL_TEST_SECRETS_FILE")
 
 def _pick_static_dir() -> str:
     """
@@ -121,7 +145,9 @@ SQLITE_BUSY_TIMEOUT_SEC = 30.0
 SQLITE_JOURNAL_MODE_WAL = True
 
 # 远程服务端基址（账号 / 版本等接口路径在 api/account_auth.py 拼接，见 dev_files 下 API 文档）
-API_BASE_URL = "https://qcscjk.shanghaijiyue.com"
+API_BASE_URL = (
+    _env_text("QCSCKP_API_BASE_URL") or "https://qcscjk.shanghaijiyue.com"
+).rstrip("/")
 
 # 千川素材云端备份
 PMC_CLOUD_BACKUP_PATH = "/api/pmc_promotion_backup.php"

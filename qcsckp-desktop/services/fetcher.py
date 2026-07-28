@@ -10,7 +10,7 @@ import platform
 import time
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunparse
 from urllib.request import Request, urlopen
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Response
@@ -25,7 +25,15 @@ from config import (
 from utils.clean_promotion import clean_pmc_promotion_data, clean_pmc_roi2_assist_task_data
 from utils.common import require_executable_path, build_qianchuan_url
 from services.control_panel_config import load_scrape_service_config
+from services.plan_system import normalize_plan_system
+from services.product_scene_adapter import extract_product_scene_snapshot
 from utils.log import logger
+from api.promotion_targets import (
+    LEGACY_TARGET_UID,
+    normalize_scene,
+    replace_material_product_links,
+    upsert_products,
+)
 
 
 class GlobalAuthExpiredError(Exception):
@@ -54,8 +62,44 @@ AD_ASSIST_LIST_REQUIRED_PREFIX = (
 AD_DETAIL_BASIC_PREFIX = (
     "https://qianchuan.jinritemai.com/ad/api/creation/v1/ad/ad-detail-basic"
 )
+AD_DETAIL_PLUS_PREFIX = (
+    "https://qianchuan.jinritemai.com/ad/api/creation/v1/ad/ad-detail-plus"
+)
 # 等待 ad-detail-basic 返回「投放中」的最长时间（秒），超时则本轮放弃
 AD_DETAIL_GATE_TIMEOUT_SEC = 10
+
+PRODUCT_MATERIAL_METRICS = (
+    "product_show_count_for_roi2",
+    "product_click_count_for_roi2",
+    "product_cvr_rate_for_roi2",
+    "product_convert_rate_for_roi2",
+    "total_pay_order_count_for_roi2",
+    "total_pay_order_gmv_include_coupon_for_roi2",
+    "total_pay_order_gmv_for_roi2",
+    "total_pay_order_coupon_amount_for_roi2",
+    "total_ecom_platform_subsidy_amount_for_roi2",
+    "stat_cost_for_roi2",
+    "total_prepay_and_pay_order_roi2",
+    "total_cost_per_pay_order_for_roi2",
+    "total_prepay_and_pay_settle_roi2_1h",
+    "total_order_settle_amount_for_roi2_1h",
+    "total_order_settle_count_for_roi2_1h",
+    "total_cost_per_pay_order_settle_for_roi2_1h",
+    "total_order_settle_amount_rate_for_roi2_1h",
+    "total_refund_order_gmv_for_roi2_1h_rate",
+)
+
+PRODUCT_MATERIAL_DIMENSIONS = (
+    "material_id",
+    "roi2_material_status",
+    "roi2_material_video_type",
+    "roi2_material_video_name",
+    "roi2_material_video_play_info",
+    "material_tag_list",
+    "roi2_material_show_status",
+    "roi2_material_show_status_reason",
+    "roi2_material_upload_time",
+)
 
 
 
@@ -87,10 +131,18 @@ class QianChuanFetcher:
         # 当前广告主ID、广告ID（来自页面 URL，用于匹配 ad-detail-basic）
         self._current_aadvid: Optional[str] = None
         self._current_adid: Optional[str] = None
+        self._current_target_uid: str = LEGACY_TARGET_UID
+        self._current_promotion_scene: str = "live"
+        self._current_plan_system: str = "unknown"
+        self._current_plan_name: str = ""
 
         # 投放中门控：仅当 ad-detail-basic 判定为投放中后才继续抓素材
         self._ad_detail_gate_queue: Optional[asyncio.Queue] = None
         self._ad_detail_gate_active: bool = False
+        self._delivery_gate_detail: Dict[str, Any] = {
+            "ok": False,
+            "reason": "not_checked",
+        }
         # fetch() 门控阶段写入 ad-detail-basic 表时使用（与当前页 URL 的 aavid 一致）
         self._sqlite_store: Optional[Any] = None
 
@@ -152,7 +204,7 @@ class QianChuanFetcher:
         )
         self.page = await self.context.new_page()
 
-    def _is_target_api(self, url: str) -> bool:
+    def _is_target_api(self, url: str, request_payload: Any = None) -> bool:
         """检查 URL 是否为目标 API 并包含有效的参数"""
         if not any(url.startswith(prefix) for prefix in API_PREFIXES):
             return False
@@ -170,9 +222,24 @@ class QianChuanFetcher:
         if self._current_aadvid and aavid_list[0] != self._current_aadvid:
             return False
 
-        # 验证 reqFrom 参数
+        # 旧版页面把 reqFrom 放在查询参数中；新版商品全域页改放在 POST JSON 正文中。
         req_from = query_params.get("reqFrom", [])
-        if not req_from or req_from[0] != "uni-prom-creative-tab-list":
+        req_from_value = req_from[0] if req_from else None
+        if not req_from_value and request_payload is not None:
+            payload = request_payload
+            if isinstance(payload, (bytes, bytearray)):
+                try:
+                    payload = payload.decode("utf-8", errors="replace")
+                except Exception:
+                    payload = None
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = None
+            if isinstance(payload, dict):
+                req_from_value = payload.get("reqFrom")
+        if req_from_value != "uni-prom-creative-tab-list":
             return False
 
         return True
@@ -191,8 +258,8 @@ class QianChuanFetcher:
         return True
 
     def _is_ad_detail_gate_url(self, url: str) -> bool:
-        """是否为当前账号/计划对应的 ad-detail-basic 请求（与页面 URL 中的 adId、aavid 一致）。"""
-        if not url.startswith(AD_DETAIL_BASIC_PREFIX):
+        """是否为当前计划详情请求；商品全域使用 ad-detail-plus。"""
+        if not url.startswith((AD_DETAIL_BASIC_PREFIX, AD_DETAIL_PLUS_PREFIX)):
             return False
         if not self._current_aadvid or not self._current_adid:
             return False
@@ -200,9 +267,12 @@ class QianChuanFetcher:
         q = parse_qs(parsed.query)
         adid = (q.get("adid") or q.get("adId") or [None])[0]
         aavid = (q.get("aavid") or q.get("aadvid") or [None])[0]
-        if not adid or not aavid:
+        if adid and str(adid) != str(self._current_adid):
             return False
-        return str(adid) == str(self._current_adid) and str(aavid) == str(self._current_aadvid)
+        if aavid and str(aavid) != str(self._current_aadvid):
+            return False
+        # 新版商品页可能把计划放在响应体而不是查询参数；响应回调还会再次核对 detail.id。
+        return True
 
     @staticmethod
     def _ad_detail_is_delivering(detail: Optional[dict]) -> bool:
@@ -260,6 +330,10 @@ class QianChuanFetcher:
         return {
             "aadvid": str(aadvid).strip(),
             "ad_id": str(ad_id).strip(),
+            "target_uid": self._current_target_uid,
+            "plan_name": self._current_plan_name,
+            "promotion_scene": self._current_promotion_scene,
+            "plan_system": self._current_plan_system,
             "budget": _s(detail.get("budget")),
             "audience_coverage_count": _s(detail.get("audienceCoverageCount")),
             "compensation_convert": _s(detail.get("compensationConvert")),
@@ -289,6 +363,9 @@ class QianChuanFetcher:
         detail = (data.get("data") or {}).get("adDetailInfo")
         if not isinstance(detail, dict):
             return
+        detail_id = str(detail.get("id") or detail.get("adId") or "").strip()
+        if detail_id and detail_id != str(self._current_adid or ""):
+            return
         ok = self._ad_detail_is_delivering(detail)
         name = detail.get("adDeliveryName")
         dtype = detail.get("adDeliveryType")
@@ -304,9 +381,12 @@ class QianChuanFetcher:
                     self._sqlite_store.insert_or_update(
                         table="pmc_ad_detail_basic",
                         data=row,
-                        unique_fields=["aadvid"],
+                        unique_fields=["aadvid", "ad_id"],
                         update_fields=[
-                            "ad_id",
+                            "target_uid",
+                            "plan_name",
+                            "promotion_scene",
+                            "plan_system",
                             "budget",
                             "audience_coverage_count",
                             "compensation_convert",
@@ -319,7 +399,8 @@ class QianChuanFetcher:
                         ],
                     )
                     logger.info(
-                        f"[数据库] ad-detail-basic 已写入/更新 aadvid={row.get('aadvid')} ad_id={row.get('ad_id')}"
+                        f"[数据库] ad-detail-basic 已写入/更新 target={row.get('target_uid')} "
+                        f"aadvid={row.get('aadvid')} ad_id={row.get('ad_id')}"
                     )
                     if (
                         self._cloud_backup_username
@@ -337,8 +418,16 @@ class QianChuanFetcher:
         """
         if not self._current_aadvid or not self._current_adid:
             logger.info("[抓取] URL 未包含 adId 与 aavid，跳过投放中门控")
+            self._delivery_gate_detail = {
+                "ok": True,
+                "reason": "ids_missing_gate_skipped",
+            }
             return True
         if not self._ad_detail_gate_queue:
+            self._delivery_gate_detail = {
+                "ok": True,
+                "reason": "gate_unavailable",
+            }
             return True
 
         logger.info(
@@ -355,6 +444,10 @@ class QianChuanFetcher:
                 logger.warning(
                     f"[抓取] {AD_DETAIL_GATE_TIMEOUT_SEC}s 内未拦截到投放中 ad-detail-basic，结束本轮"
                 )
+                self._delivery_gate_detail = {
+                    "ok": False,
+                    "reason": "detail_timeout",
+                }
                 return False
             try:
                 ok, name, dtype = await asyncio.wait_for(
@@ -364,12 +457,244 @@ class QianChuanFetcher:
             except asyncio.TimeoutError:
                 continue
             if ok:
+                self._delivery_gate_detail = {
+                    "ok": True,
+                    "reason": "delivering",
+                    "delivery_name": name,
+                    "delivery_type": dtype,
+                }
                 logger.info("[抓取] 已确认投放中，继续抓取素材列表")
                 return True
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "not_delivering",
+                "delivery_name": name,
+                "delivery_type": dtype,
+            }
             logger.warning(
                 f"[抓取] 当前非投放中（adDeliveryName={name!r}, adDeliveryType={dtype}），结束本轮"
             )
             return False
+
+    async def _check_product_delivery_gate(self, db=None) -> bool:
+        """商品页会默认加载另一条全店计划，须按目标 ad_id 主动只读复核。"""
+        if not self.page or not self._current_aadvid or not self._current_adid:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "ids_missing",
+            }
+            return False
+        try:
+            payload = await self.page.evaluate(
+                """async ({ aavid, adId }) => {
+                    const query = new URLSearchParams({ aavid, adid: adId });
+                    const response = await fetch(
+                        `/ad/api/creation/v1/ad/ad-detail-plus?${query.toString()}`,
+                        { credentials: "include" }
+                    );
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return await response.json();
+                }""",
+                {
+                    "aavid": str(self._current_aadvid),
+                    "adId": str(self._current_adid),
+                },
+            )
+        except Exception as exc:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "product_detail_error",
+                "message": str(exc),
+            }
+            logger.warning("[商品抓取] 目标计划详情读取失败：%s", exc)
+            return False
+
+        if not isinstance(payload, dict) or payload.get("status_code") != 0:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "product_detail_error",
+                "message": (
+                    payload.get("message")
+                    if isinstance(payload, dict)
+                    else "响应格式异常"
+                ),
+            }
+            return False
+        detail = (payload.get("data") or {}).get("adDetailInfo")
+        if not isinstance(detail, dict):
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "product_detail_missing",
+            }
+            return False
+        actual_ad_id = str(detail.get("id") or detail.get("adId") or "").strip()
+        if actual_ad_id != str(self._current_adid):
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "product_detail_mismatch",
+                "actual_ad_id": actual_ad_id,
+            }
+            return False
+
+        ok = self._ad_detail_is_delivering(detail)
+        name = detail.get("adDeliveryName")
+        dtype = detail.get("adDeliveryType")
+        self._delivery_gate_detail = {
+            "ok": bool(ok),
+            "reason": "delivering" if ok else "not_delivering",
+            "delivery_name": name,
+            "delivery_type": dtype,
+        }
+        if not ok:
+            logger.warning(
+                "[商品抓取] 当前非投放中（adDeliveryName=%r, adDeliveryType=%r）",
+                name,
+                dtype,
+            )
+            return False
+
+        row = self._build_pmc_ad_detail_basic_row(payload, detail)
+        if row and db:
+            try:
+                db.insert_or_update(
+                    table="pmc_ad_detail_basic",
+                    data=row,
+                    unique_fields=["aadvid", "ad_id"],
+                    update_fields=[
+                        "target_uid",
+                        "plan_name",
+                        "promotion_scene",
+                        "budget",
+                        "audience_coverage_count",
+                        "compensation_convert",
+                        "ecp_roi2_goal",
+                        "creative_type",
+                        "user_info_id",
+                        "user_info_name",
+                        "user_info_unique_id",
+                        "updated_at",
+                    ],
+                )
+                if self._cloud_backup_username and self._cloud_backup_password:
+                    self._pending_ad_detail_basic_cloud_row = dict(row)
+            except Exception as exc:
+                logger.warning("[商品抓取] 基础信息写入失败：%s", exc)
+        logger.info("[商品抓取] 已按目标计划 ID 确认投放中")
+        return True
+
+    def _build_product_material_request_body(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """构造商品全域素材只读查询；模板来自当前千川页面实际请求。"""
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        return {
+            "DataSetKey": "site_promotion_product_post_data_video",
+            "Metrics": list(PRODUCT_MATERIAL_METRICS),
+            "Filters": {
+                "ConditionRelationshipType": 1,
+                "Conditions": [
+                    {"Field": "query_type", "Operator": 7, "Values": ["all"]},
+                    {
+                        "Field": "roi2_material_type_v3",
+                        "Operator": 7,
+                        "Values": ["1001"],
+                    },
+                    {"Field": "marketing_goal", "Operator": 7, "Values": ["1"]},
+                    {
+                        "Field": "roi2_material_status",
+                        "Operator": 7,
+                        "Values": ["1"],
+                    },
+                    {
+                        "Field": "ad_id",
+                        "Operator": 7,
+                        "Values": [str(self._current_adid or "")],
+                    },
+                    {
+                        "Field": "roi2_material_video_type",
+                        "Operator": 7,
+                        "Values": ["11"],
+                    },
+                ],
+            },
+            "StartTime": f"{today} 00:00:00",
+            "EndTime": f"{today} 23:59:59",
+            "PageParams": {
+                "Limit": max(1, min(int(limit), 100)),
+                "Offset": max(0, int(offset)),
+            },
+            "OrderBy": [
+                {"Type": 2, "Field": "product_show_count_for_roi2"}
+            ],
+            "Dimensions": list(PRODUCT_MATERIAL_DIMENSIONS),
+            "reqFrom": "uni-prom-creative-tab-list",
+        }
+
+    async def _fetch_product_material_pages(self, db, timeout: int) -> None:
+        """按目标商品计划 ID 直接分页读取素材，避免页面默认切回其它计划。"""
+        offset = 0
+        page_size = 100
+        deadline = asyncio.get_running_loop().time() + max(30, int(timeout))
+        while True:
+            await self._raise_if_global_auth_expired()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("商品素材分页读取超时")
+            body = self._build_product_material_request_body(
+                offset=offset,
+                limit=page_size,
+            )
+            self._material_start_time = body["StartTime"]
+            self._material_end_time = body["EndTime"]
+            payload = await asyncio.wait_for(
+                self.page.evaluate(
+                    """async ({ aavid, body }) => {
+                        const query = new URLSearchParams({ aavid });
+                        const response = await fetch(
+                            `/ad/api/pmc/v1/uni-promotion/material/list-required?${query.toString()}`,
+                            {
+                                method: "POST",
+                                credentials: "include",
+                                headers: { "content-type": "application/json" },
+                                body: JSON.stringify(body)
+                            }
+                        );
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        return await response.json();
+                    }""",
+                    {
+                        "aavid": str(self._current_aadvid),
+                        "body": body,
+                    },
+                ),
+                timeout=min(remaining, 60),
+            )
+            if not isinstance(payload, dict) or payload.get("status_code") != 0:
+                message = (
+                    payload.get("message")
+                    if isinstance(payload, dict)
+                    else "响应格式异常"
+                )
+                raise RuntimeError(f"商品素材接口异常：{message}")
+            stats_data = (payload.get("data") or {}).get("statsData") or {}
+            rows = stats_data.get("rows") or []
+            await self._handle_material_response(payload, API_PREFIXES[0])
+            await self._save_to_database(db)
+            total = int(stats_data.get("totalCount") or 0)
+            offset += len(rows)
+            if not rows or (total > 0 and offset >= total):
+                break
+        logger.info(
+            "[商品抓取] 素材分页完成，共 %s 条",
+            len(self._material_data_dict),
+        )
 
     async def _detect_global_auth_expired_modal(self) -> bool:
         """
@@ -637,15 +962,20 @@ class QianChuanFetcher:
     async def _on_request(self, request):
         """拦截请求并获取 payload"""
         url = request.url
-
-        if not self._is_target_api(url):
-            return
-
-        # 获取 POST 请求的 payload，提取时间范围
+        payload = None
         try:
             post_data = request.post_data
             if post_data:
                 payload = json.loads(post_data)
+        except Exception:
+            payload = None
+
+        if not self._is_target_api(url, payload):
+            return
+
+        # 获取 POST 请求的 payload，提取时间范围
+        try:
+            if isinstance(payload, dict):
                 # 提取时间范围
                 self._material_start_time = payload.get("StartTime")
                 self._material_end_time = payload.get("EndTime")
@@ -657,8 +987,12 @@ class QianChuanFetcher:
     async def _on_response(self, response: Response):
         """拦截响应并处理"""
         url = response.url
-
-        if not self._is_target_api(url):
+        request_payload = None
+        try:
+            request_payload = response.request.post_data
+        except Exception:
+            pass
+        if not self._is_target_api(url, request_payload):
             return
 
         try:
@@ -787,6 +1121,26 @@ class QianChuanFetcher:
         ad_id = self._current_adid
         if not db or not aadvid or not ad_id:
             return
+        if self._current_promotion_scene == "product":
+            try:
+                snapshot = extract_product_scene_snapshot(raw_top)
+                products = snapshot.get("products") or []
+                if products:
+                    upsert_products(self._current_target_uid, products, db=db)
+                for material in snapshot.get("materials") or []:
+                    material_id = str(material.get("material_id") or "").strip()
+                    product_ids = material.get("product_ids") or []
+                    if not material_id or not product_ids:
+                        continue
+                    replace_material_product_links(
+                        self._current_target_uid,
+                        material_id,
+                        product_ids,
+                        material_name=str(material.get("material_name") or ""),
+                        db=db,
+                    )
+            except Exception as e:
+                logger.warning("[调控任务] 商品与素材关系写入失败: %s", e)
         try:
             rows = clean_pmc_roi2_assist_task_data(
                 raw_top, str(aadvid).strip(), str(ad_id).strip()
@@ -799,10 +1153,14 @@ class QianChuanFetcher:
 
         def _run() -> None:
             for row in rows:
+                row = dict(row)
+                row["target_uid"] = self._current_target_uid
+                row["promotion_scene"] = self._current_promotion_scene
+                row["plan_system"] = self._current_plan_system
                 db.insert_or_update(
                     table="pmc_roi2_assist_task",
-                    data=dict(row),
-                    unique_fields=["assist_task_id"],
+                    data=row,
+                    unique_fields=["target_uid", "assist_task_id"],
                     update_fields=None,
                 )
 
@@ -848,6 +1206,96 @@ class QianChuanFetcher:
             current_page = len(self._material_data_dict) // 100 + 1  # 假设每页100条
             logger.info(f"[抓取] 第{current_page}页: 获取 {new_count} 条新数据，累计 {self._material_current_count}/{total_count} 条（去重后）")
 
+    @staticmethod
+    def _extract_product_ids_from_material_row(row: Dict[str, Any]) -> List[str]:
+        """兼容不同商品全域响应结构，提取素材关联商品 ID。"""
+        product_keys = {
+            "productid",
+            "product_id",
+            "productids",
+            "product_ids",
+            "commodityid",
+            "commodity_id",
+            "goodsid",
+            "goods_id",
+            "pdid",
+        }
+        result: List[str] = []
+        seen = set()
+
+        def add(value: Any) -> None:
+            if isinstance(value, dict) and "value" in value:
+                value = value.get("value")
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped[:1] in ("[", "{"):
+                    try:
+                        add(json.loads(stripped))
+                        return
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                for part in stripped.split(","):
+                    text = part.strip()
+                    if text and text not in seen:
+                        seen.add(text)
+                        result.append(text)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            if isinstance(value, dict):
+                for key in ("id", "productId", "product_id", "commodityId", "goodsId"):
+                    if key in value:
+                        add(value.get(key))
+                return
+            if value is not None:
+                text = str(value).strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    result.append(text)
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    normalized = str(key or "").replace("-", "_").lower()
+                    if normalized in product_keys:
+                        add(child)
+                    elif isinstance(child, (dict, list, tuple)):
+                        walk(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    walk(child)
+
+        walk(row)
+        return result
+
+    @classmethod
+    def _extract_products_from_material_row(cls, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+        product_ids = cls._extract_product_ids_from_material_row(row)
+        if not product_ids:
+            return []
+        product_name = ""
+        dimensions = row.get("dimensions") if isinstance(row, dict) else {}
+        if isinstance(dimensions, dict):
+            for key in (
+                "productName",
+                "product_name",
+                "commodityName",
+                "goodsName",
+                "roi2ProductName",
+            ):
+                block = dimensions.get(key)
+                if isinstance(block, dict):
+                    block = block.get("value")
+                if block is not None and str(block).strip():
+                    product_name = str(block).strip()
+                    break
+        return [
+            {"product_id": product_id, "product_name": product_name}
+            for product_id in product_ids
+        ]
+
     async def _save_to_database(self, db):
         """每页数据抓取完成后立即清洗并入库（只入库新增数据）"""
         if not db or not self._material_data_dict:
@@ -873,13 +1321,47 @@ class QianChuanFetcher:
             now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for item in new_data:
                 item["aadvid"] = self._current_aadvid
+                item["target_uid"] = self._current_target_uid
+                item["ad_id"] = self._current_adid
+                item["promotion_scene"] = self._current_promotion_scene
+                item["plan_system"] = self._current_plan_system
                 item["stat_date"] = today
+                raw_row = self._material_data_dict.get(str(item.get("material_id") or "")) or {}
+                product_ids = self._extract_product_ids_from_material_row(raw_row)
+                item["product_ids_json"] = json.dumps(
+                    product_ids,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
 
             # 直接插入（不更新，允许重复数据）
+            missing_product_links: List[str] = []
             for item in new_data:
                 db.insert(
                     table="pmc_promotion_material",
                     data=item
+                )
+                if self._current_promotion_scene == "product":
+                    raw_row = self._material_data_dict.get(str(item.get("material_id") or "")) or {}
+                    products = self._extract_products_from_material_row(raw_row)
+                    if products:
+                        upsert_products(self._current_target_uid, products, db=db)
+                        replace_material_product_links(
+                            self._current_target_uid,
+                            item.get("material_id"),
+                            [x.get("product_id") for x in products],
+                            material_name=str(item.get("video_name") or ""),
+                            db=db,
+                        )
+                    else:
+                        missing_product_links.append(
+                            str(item.get("material_id") or "")
+                        )
+            if missing_product_links:
+                logger.warning(
+                    "[抓取] 本批有 %s 条商品全域素材未识别到商品关联；"
+                    "已保留既有关系，这些素材仍可参加素材级规则，但不参加商品级汇总",
+                    len(missing_product_links),
                 )
 
             # 更新已保存计数
@@ -1287,6 +1769,10 @@ class QianChuanFetcher:
         feishu_push_mode: str = "each_crawl",
         cloud_backup_username: Optional[str] = None,
         cloud_backup_password: Optional[str] = None,
+        target_uid: Optional[str] = None,
+        promotion_scene: str = "live",
+        plan_system: str = "unknown",
+        plan_name: Optional[str] = None,
     ) -> dict:
         """
         访问指定 URL 并抓取千川投放数据（自动翻页获取全部数据，不关闭浏览器）
@@ -1312,6 +1798,16 @@ class QianChuanFetcher:
         self._is_collecting = False
         self._last_saved_count = 0
         self._pending_ad_detail_basic_cloud_row = None
+        self._delivery_gate_detail = {
+            "ok": False,
+            "reason": "not_checked",
+        }
+        self._current_target_uid = str(target_uid or LEGACY_TARGET_UID).strip() or LEGACY_TARGET_UID
+        self._current_promotion_scene = normalize_scene(promotion_scene or "live")
+        self._current_plan_system = normalize_plan_system(
+            plan_system or "unknown"
+        )
+        self._current_plan_name = str(plan_name or "").strip()[:256]
 
         def _strip_opt(v: Optional[str]) -> Optional[str]:
             if v is None:
@@ -1346,41 +1842,68 @@ class QianChuanFetcher:
         self._current_aadvid = query_params.get("aavid", [None])[0]
         self._current_adid = query_params.get("adId", [None])[0] or query_params.get("adid", [None])[0]
 
-        # 投放中门控：须在 goto 前监听，以便捕获首屏 ad-detail-basic
-        self._sqlite_store = db
-        self._ad_detail_gate_queue = asyncio.Queue()
-        self._ad_detail_gate_active = True
-        self.page.on("response", self._on_response_ad_detail_gate)
-
         # 访问目标页面
         logger.info(f"[抓取] 正在访问: {url}")
         gate_ok = False
-        try:
+        if self._current_promotion_scene == "product":
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(random.uniform(3, 5))
             await self._raise_if_global_auth_expired()
-            gate_ok = await self._wait_for_ad_delivery_gate()
-        finally:
-            self._ad_detail_gate_active = False
+            gate_ok = await self._check_product_delivery_gate(db)
+        else:
+            # 直播门控：须在 goto 前监听，以便捕获首屏 ad-detail-basic。
+            self._sqlite_store = db
+            self._ad_detail_gate_queue = asyncio.Queue()
+            self._ad_detail_gate_active = True
+            self.page.on("response", self._on_response_ad_detail_gate)
             try:
-                self.page.remove_listener("response", self._on_response_ad_detail_gate)
-            except Exception:
-                pass
-            self._ad_detail_gate_queue = None
-            self._sqlite_store = None
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(random.uniform(3, 5))
+                await self._raise_if_global_auth_expired()
+                gate_ok = await self._wait_for_ad_delivery_gate()
+            finally:
+                self._ad_detail_gate_active = False
+                try:
+                    self.page.remove_listener("response", self._on_response_ad_detail_gate)
+                except Exception:
+                    pass
+                self._ad_detail_gate_queue = None
+                self._sqlite_store = None
 
         if not gate_ok:
             return await self._create_empty_result()
 
-        # 1. 切换到视频卡片 tab，并检测/应用投放详情自定义列（每轮执行，表头已齐则跳过）
-        await self._switch_to_video_tab()
-        await self._apply_promotion_detail_column_preset()
-        await self._raise_if_global_auth_expired()
+        if self._current_promotion_scene == "product":
+            await self._fetch_product_material_pages(db, timeout)
+            await self._finalize_pending_ad_detail_basic_cloud()
+            return {
+                "aadvid": self._current_aadvid,
+                "ad_id": self._current_adid,
+                "target_uid": self._current_target_uid,
+                "promotion_scene": self._current_promotion_scene,
+                "plan_system": self._current_plan_system,
+                "material_data": None,
+                "material_data_raw": self._material_data_dict,
+                "material_page_count": len(self._material_data_dict),
+                "material_total_count": self._material_total_count,
+                "material_time_range": {
+                    "start_time": self._material_start_time,
+                    "end_time": self._material_end_time,
+                },
+                "assist_task_count": 0,
+                "assist_task_total_count": 0,
+                "delivery_gate": dict(self._delivery_gate_detail),
+            }
 
-        # 2. 每轮先卸下再注册，避免上一轮未清理时重复绑定
+        # 素材 Tab 首次打开就会立即请求首屏数据，监听必须先于 Tab 切换注册。
         self._detach_fetch_listeners()
         self._attach_fetch_listeners()
         try:
+            # 1. 切换到视频卡片 tab，并检测/应用投放详情自定义列（每轮执行，表头已齐则跳过）
+            await self._switch_to_video_tab()
+            await self._apply_promotion_detail_column_preset()
+            await self._raise_if_global_auth_expired()
+
             # 3. 切换每页100条
             await self._switch_to_100_per_page()
             await self._raise_if_global_auth_expired()
@@ -1421,6 +1944,10 @@ class QianChuanFetcher:
             # 返回抓取结果
             return {
                 "aadvid": self._current_aadvid,
+                "ad_id": self._current_adid,
+                "target_uid": self._current_target_uid,
+                "promotion_scene": self._current_promotion_scene,
+                "plan_system": self._current_plan_system,
                 "material_data": None,  # 已经每页入库了，不需要返回
                 "material_data_raw": self._material_data_dict,
                 "material_page_count": len(self._material_data_dict),
@@ -1431,6 +1958,7 @@ class QianChuanFetcher:
                 },
                 "assist_task_count": len(self._assist_task_ids),
                 "assist_task_total_count": self._assist_total_count,
+                "delivery_gate": dict(self._delivery_gate_detail),
             }
         finally:
             self._detach_fetch_listeners()
@@ -1439,10 +1967,15 @@ class QianChuanFetcher:
         """创建空结果"""
         return {
             "aadvid": self._current_aadvid,
+            "ad_id": self._current_adid,
+            "target_uid": self._current_target_uid,
+            "promotion_scene": self._current_promotion_scene,
+            "plan_system": self._current_plan_system,
             "material_data": None,
             "material_data_raw": {},
             "material_page_count": 0,
             "material_total_count": 0,
+            "delivery_gate": dict(self._delivery_gate_detail),
             "material_time_range": {
                 "start_time": self._material_start_time,
                 "end_time": self._material_end_time,
@@ -1467,7 +2000,9 @@ def build_qianchuan_url_by_params(
     live_qcpx_mode: int = 0,
     umg: int = 2,
     uni_video_tab: int = 2,
-    usbt: int = 0
+    usbt: int = 0,
+    promotion_scene: str = "live",
+    source_url: Optional[str] = None,
 ) -> str:
     """
     根据参数构建千川 URL
@@ -1485,6 +2020,31 @@ def build_qianchuan_url_by_params(
     Returns:
         构建好的千川 URL
     """
+    scene = normalize_scene(promotion_scene or "live")
+    source_parsed = urlparse(str(source_url or "").strip())
+    if source_parsed.scheme in ("http", "https") and source_parsed.netloc:
+        base_url = urlunparse(
+            (
+                source_parsed.scheme,
+                source_parsed.netloc,
+                source_parsed.path,
+                "",
+                "",
+                "",
+            )
+        )
+        source_query = parse_qs(source_parsed.query)
+        try:
+            ct = int(source_query.get("ct", [ct])[0])
+        except (TypeError, ValueError):
+            pass
+        try:
+            live_qcpx_mode = int(
+                source_query.get("liveQcpxMode", [live_qcpx_mode])[0]
+            )
+        except (TypeError, ValueError):
+            pass
+
     # 获取今日日期
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     dr = f"{today},{today}"
@@ -1507,7 +2067,7 @@ def build_qianchuan_url_by_params(
         "usbt": usbt,
         "uniDetail": {
             "tb": "creative",
-            "edc": "liveRace",
+            "edc": "liveRace" if scene == "live" else "productRace",
             "cst": 0,
             "creativeTabAutoVideoChase": "",
             "uniTaskCenterAssistTaskScene": "",

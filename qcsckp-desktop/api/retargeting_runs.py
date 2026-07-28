@@ -23,8 +23,9 @@ from services.retargeting_rule_runner import (
     rate_limit_increment_manual_only,
     rate_limit_increment_manual_only_strategy,
     rate_limit_record_success,
-    resolve_ad_id_for_aavid,
 )
+from services.promotion_browser_lock import exclusive_browser_operation
+from services.plan_system import normalize_plan_system
 from services.retargeting_service import (
     QianChuanRetargetingService,
     RetargetingRunResult,
@@ -79,16 +80,29 @@ def _lookup_latest_material(db: SQLiteStore, material_id: str) -> Optional[Dict[
     return rows[0] if rows else None
 
 
-def _lookup_latest_material_full(db: SQLiteStore, material_id: str) -> Optional[Dict[str, Any]]:
+def _lookup_latest_material_full(
+    db: SQLiteStore,
+    material_id: str,
+    target_uid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """pmc_promotion_material 该素材最新一条（与采集入库字段一致），用于即刻追投 query_snapshot。"""
     mid = str(material_id).strip()
     if not mid:
         return None
-    rows = db.execute(
-        "SELECT * FROM pmc_promotion_material WHERE material_id = ? ORDER BY created_at DESC LIMIT 1",
-        (mid,),
-        fetch=True,
-    )
+    uid = str(target_uid or "").strip()
+    if uid:
+        rows = db.execute(
+            "SELECT * FROM pmc_promotion_material WHERE target_uid = ? AND material_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (uid, mid),
+            fetch=True,
+        )
+    else:
+        rows = db.execute(
+            "SELECT * FROM pmc_promotion_material WHERE material_id = ? ORDER BY created_at DESC LIMIT 1",
+            (mid,),
+            fetch=True,
+        )
     return rows[0] if rows else None
 
 
@@ -130,6 +144,10 @@ def _pmc_record_to_dashboard_material_row(
     return {
         "id": mid,
         "aadvid": r.get("aadvid"),
+        "targetUid": r.get("target_uid"),
+        "adId": r.get("ad_id"),
+        "promotionScene": r.get("promotion_scene"),
+        "productIds": r.get("product_ids_json"),
         "title": title,
         "createTime": ct,
         "currentCost": cost,
@@ -155,11 +173,16 @@ def _pmc_record_to_dashboard_material_row(
     }
 
 
-def _manual_query_snapshot_json(db: SQLiteStore, material_id: str, material_name: str) -> str:
+def _manual_query_snapshot_json(
+    db: SQLiteStore,
+    material_id: str,
+    material_name: str,
+    target_uid: Optional[str] = None,
+) -> str:
     """即刻追投：query 快照以本地库该素材最新一条为准（对齐规则追投 material_row 结构）。"""
     now = _beijing_now_str()
     mid = str(material_id).strip()
-    full = _lookup_latest_material_full(db, mid)
+    full = _lookup_latest_material_full(db, mid, target_uid)
     if not full:
         return _json_dumps(
             {
@@ -186,6 +209,7 @@ def run_immediate_retarget_prepare(
     *,
     material_id: str,
     retargeting: Optional[Dict[str, Any]] = None,
+    target_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     即刻追投：有头浏览器打开投放页、填表，不自动点击「提交」；成功后写 pmc_retargeting_run，
@@ -221,7 +245,8 @@ def run_immediate_retarget_prepare(
     ws, mc = _interval_window_and_max(rt)
 
     db = _store()
-    mat_row = _lookup_latest_material_full(db, mid)
+    requested_target_uid = str(target_uid or "").strip()
+    mat_row = _lookup_latest_material_full(db, mid, requested_target_uid or None)
     if not mat_row:
         return {
             "success": False,
@@ -230,14 +255,54 @@ def run_immediate_retarget_prepare(
 
     aavid_raw = mat_row.get("aadvid")
     aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
+    resolved_target_uid = str(
+        requested_target_uid or mat_row.get("target_uid") or ""
+    ).strip()
+    if not resolved_target_uid or resolved_target_uid == "legacy_unscoped":
+        return {
+            "success": False,
+            "message": "该素材未归属明确的监控计划，请先在“监控计划”中打开并识别计划",
+        }
+    target = db.select_one(
+        "promotion_target", where={"target_uid": resolved_target_uid}
+    )
+    if not target or not int(target.get("enabled") or 0):
+        return {
+            "success": False,
+            "message": "素材所属监控计划不存在或已停用，已阻止追投",
+        }
+    promotion_scene = str(target.get("promotion_scene") or "live").strip().lower()
+    plan_system = normalize_plan_system(target.get("plan_system") or "unknown")
+    if plan_system == "unknown":
+        return {
+            "success": False,
+            "message": "计划体系尚未识别，已阻止追投；请重新打开计划详情完成识别",
+        }
+    if plan_system == "chengfang":
+        return {
+            "success": False,
+            "message": "该计划属于千川乘方，乘方追投适配器尚未完成受控验证，已阻止提交",
+        }
+    source_url = str(target.get("sanitized_page_url") or "").strip() or None
+    target_ad_id = str(target.get("ad_id") or "").strip()
+    if (
+        str(target.get("aadvid") or "").strip() != aavid
+        or str(mat_row.get("ad_id") or "").strip() != target_ad_id
+    ):
+        return {
+            "success": False,
+            "message": "素材与监控计划不匹配，已阻止追投",
+        }
     material_name = ""
     vn = mat_row.get("video_name")
     if vn is not None:
         material_name = str(vn).strip()[:512]
 
-    q_snap = _manual_query_snapshot_json(db, mid, material_name)
+    q_snap = _manual_query_snapshot_json(
+        db, mid, material_name, resolved_target_uid
+    )
 
-    ad_id = resolve_ad_id_for_aavid(db, aavid) if aavid else None
+    ad_id = target_ad_id
     if not ad_id:
         now = _beijing_now_str()
         _insert_run(
@@ -245,6 +310,9 @@ def run_immediate_retarget_prepare(
             aavid=aavid or "",
             ad_id="",
             material_id=mid,
+            target_uid=resolved_target_uid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
             material_name=material_name,
             strategy_name=_strategy_name_immediate,
             regulate_task_id="",
@@ -275,6 +343,9 @@ def run_immediate_retarget_prepare(
             aavid=aavid or "",
             ad_id=str(ad_id),
             material_id=mid,
+            target_uid=resolved_target_uid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
             material_name=material_name,
             strategy_name=_strategy_name_immediate,
             regulate_task_id="",
@@ -308,12 +379,18 @@ def run_immediate_retarget_prepare(
                         browser_executable_path=_browser_executable_for_session,
                     )
                 )
-                r = await svc.run_prepare_for_manual_submit(
-                    aavid=aavid_int,
-                    ad_id=ad_id_int,
-                    material_id=mid,
-                    retargeting=rt,
-                )
+                async with exclusive_browser_operation(
+                    f"即刻追投:{resolved_target_uid}:{mid}"
+                ):
+                    r = await svc.run_prepare_for_manual_submit(
+                        aavid=aavid_int,
+                        ad_id=ad_id_int,
+                        material_id=mid,
+                        retargeting=rt,
+                        target_uid=resolved_target_uid,
+                        promotion_scene=promotion_scene,
+                        source_url=source_url,
+                    )
                 result_holder[0] = r
             except Exception:
                 logger.exception("[即刻追投] 线程内异常")
@@ -361,6 +438,9 @@ def run_immediate_retarget_prepare(
         aavid=str(r.aavid or aavid_int),
         ad_id=str(r.ad_id or ad_id_int),
         material_id=str(r.material_id or mid),
+        target_uid=resolved_target_uid,
+        promotion_scene=promotion_scene,
+        plan_system=plan_system,
         material_name=material_name,
         strategy_name=_strategy_name_immediate,
         regulate_task_id=str(r.regulate_task_id or ""),
@@ -386,11 +466,17 @@ def run_immediate_retarget_prepare(
             strats = cfg.get("strategies")
             st0 = strats[0] if isinstance(strats, list) and strats else {}
             sid = str((st0 or {}).get("id") or "").strip() or "__legacy__"
-            rate_limit_increment_manual_only_strategy(db, mid, sid, ws, mc)
+            rate_limit_increment_manual_only_strategy(
+                db, mid, sid, ws, mc, resolved_target_uid
+            )
             ws_g, mc_g = _interval_from_root_cfg(cfg)
-            rate_limit_record_success(db, mid, ws_g, mc_g)
+            rate_limit_record_success(
+                db, mid, ws_g, mc_g, resolved_target_uid
+            )
         else:
-            rate_limit_increment_manual_only(db, mid, ws, mc)
+            rate_limit_increment_manual_only(
+                db, mid, ws, mc, resolved_target_uid
+            )
 
     return {
         "success": bool(r.success),
@@ -400,6 +486,9 @@ def run_immediate_retarget_prepare(
         "material_id": str(r.material_id or mid),
         "aavid": str(r.aavid or aavid_int),
         "ad_id": str(r.ad_id or ad_id_int),
+        "target_uid": resolved_target_uid,
+        "promotion_scene": promotion_scene,
+        "plan_system": plan_system,
         "app_version": CURRENT_VERSION,
     }
 

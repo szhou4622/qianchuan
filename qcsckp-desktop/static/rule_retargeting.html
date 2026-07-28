@@ -781,7 +781,7 @@
                 </div>
                 <div class="min-w-0">
                     <div class="text-lg font-semibold text-white tracking-tight drop-shadow-sm">规则化追投</div>
-                    <div class="text-[11px] text-slate-500 mt-0.5 max-w-xl leading-relaxed">多策略 · 多条件组 · 监测达标即自动追投</div>
+                    <div class="text-[11px] text-slate-500 mt-0.5 max-w-xl leading-relaxed">多策略 · 多条件组 · 监测达标提醒 · 飞书确认后追投</div>
                 </div>
             </div>
             <div class="flex flex-wrap items-center gap-3 sm:gap-4 shrink-0">
@@ -1006,6 +1006,30 @@
                 </div>
 
                 <div id="tabPaneConfig" class="flex flex-col gap-6">
+                <section id="liveRetargetPreflightPanel" class="rr-section hidden space-y-4 border border-amber-500/25 bg-amber-950/10">
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                            <div class="rr-section-title">
+                                <span class="rr-accent-bar" aria-hidden="true"></span>
+                                <i data-lucide="shield-check" class="w-4 h-4 text-amber-400/90"></i>
+                                本地真实追投验收准备
+                            </div>
+                            <p class="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                                此处只做只读检查，不会开启真实追投；最终授权仍需你明确确认。
+                            </p>
+                        </div>
+                        <button type="button" id="btnRefreshLivePreflight"
+                                class="btn-ghost inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-slate-200 text-xs font-medium">
+                            <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i> 刷新检查
+                        </button>
+                    </div>
+                    <div id="livePreflightSummary" class="rounded-lg border border-slate-700/70 bg-slate-950/35 px-3 py-2.5 text-xs text-slate-300"></div>
+                    <div id="livePreflightChecks" class="grid grid-cols-1 lg:grid-cols-2 gap-2.5"></div>
+                    <div id="livePreflightStrategiesWrap" class="hidden pt-1">
+                        <div class="rr-label mb-2">卡片将展示的追投参数</div>
+                        <div id="livePreflightStrategies" class="space-y-2"></div>
+                    </div>
+                </section>
                 <!-- 运行配置：浏览器 + 追投次数限制 -->
                 <section class="rr-section space-y-4">
                     <div class="rr-section-title">
@@ -1090,6 +1114,65 @@
                     <p id="strategyValidationBanner" class="text-[11px] text-rose-400/95 hidden leading-relaxed max-w-3xl" role="alert"></p>
                 </div>
 
+                <section class="rr-section space-y-3" id="sectionStrategyTarget">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="list-checks" class="w-4 h-4 text-cyan-400/90"></i>
+                        监控计划与触发层级
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] grid grid-cols-1 md:grid-cols-2 gap-3 max-w-3xl">
+                        <label class="block">
+                            <span class="rr-label">监控计划</span>
+                            <select id="strategyTargetUid" class="rr-input rr-input--flush">
+                                <option value="">请选择监控计划</option>
+                            </select>
+                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先在“监控计划”页面添加计划。</span>
+                        </label>
+                        <label class="block">
+                            <span class="rr-label">触发层级</span>
+                            <select id="strategyTriggerLevel" class="rr-input rr-input--flush">
+                                <option value="material">逐条素材判断</option>
+                                <option value="product">按商品汇总后判断</option>
+                            </select>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">商品级仅适用于推商品计划；实际执行还要求计划体系已识别且适配器已验证。</span>
+                        </label>
+                        <div id="productStrategyFields" class="hidden md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <label class="block md:col-span-2">
+                                <span class="rr-label">只判断这些商品（可选）</span>
+                                <input id="strategyProductFilter" type="hidden" value="">
+                                <div id="strategyProductOptions" class="mt-1 grid grid-cols-1 md:grid-cols-2 gap-2 rounded-lg border border-slate-700/50 bg-slate-950/35 p-2 text-xs text-slate-300">
+                                    <span class="text-slate-600">选择推商品监控计划后显示商品；不勾选时沿用监控计划的商品范围。</span>
+                                </div>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">候选素材指标</span>
+                                <select id="candidateMetric" class="rr-input rr-input--flush">
+                                    <option value="costDiff">时段消耗</option>
+                                    <option value="netRoi">净成交ROI</option>
+                                    <option value="netAmount">净成交金额</option>
+                                    <option value="overallPayRoi">整体支付ROI</option>
+                                    <option value="overallAmount">整体成交金额</option>
+                                </select>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">候选条件</span>
+                                <div class="flex gap-2">
+                                    <select id="candidateOp" class="rr-input rr-input--flush w-[8rem]">
+                                        <option value="gt">大于</option><option value="gte">大于等于</option>
+                                        <option value="lt">小于</option><option value="lte">小于等于</option>
+                                    </select>
+                                    <input id="candidateValue" type="number" step="0.01" class="rr-input rr-input--flush" value="0">
+                                </div>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">最多选择素材</span>
+                                <input id="candidateLimit" type="number" min="1" max="20" step="1" class="rr-input rr-input--flush" value="1">
+                                <span class="text-[11px] text-slate-600 mt-1.5 block">按净成交ROI从高到低，默认取1条。</span>
+                            </label>
+                        </div>
+                    </div>
+                </section>
+
                 <!-- 分策略限频：每条策略独立的滑动窗口计数 -->
                 <section id="sectionStrategyRunConfig" class="rr-section space-y-3 hidden">
                     <div class="rr-section-title">
@@ -1147,7 +1230,13 @@
                     </div>
 
                     <div class="pl-[calc(0.5rem+3px)] space-y-3">
-                    <div class="rr-label">追投方式</div>
+                    <div class="rr-label">执行方式</div>
+                    <div class="flex flex-wrap gap-2.5">
+                        <button type="button" data-action-mode="card_confirm" class="action-mode-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">飞书确认后追投</button>
+                        <button type="button" data-action-mode="auto_execute" class="action-mode-btn seg-btn px-4 py-2 rounded-lg text-sm">自动追投</button>
+                    </div>
+                    <p class="text-[11px] text-slate-600 leading-relaxed max-w-2xl">默认先发送30分钟有效的飞书卡片；指定用户点击“确认追投”后，桌面工具复核规则并直接执行。</p>
+                    <div class="rr-label pt-2">追投方式</div>
                     <div class="flex flex-wrap gap-2.5">
                         <button type="button" data-method="volume" class="method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">放量追投</button>
                         <button type="button" data-method="cost_control" class="method-btn seg-btn px-4 py-2 rounded-lg text-sm">控成本追投</button>
@@ -1544,6 +1633,86 @@
             return null;
         }
 
+        async function refreshLiveRetargetPreflight() {
+            const panel = document.getElementById('liveRetargetPreflightPanel');
+            const summary = document.getElementById('livePreflightSummary');
+            const checksRoot = document.getElementById('livePreflightChecks');
+            const strategiesWrap = document.getElementById('livePreflightStrategiesWrap');
+            const strategiesRoot = document.getElementById('livePreflightStrategies');
+            if (!panel || !summary || !checksRoot || !strategiesWrap || !strategiesRoot) return;
+            const api = getApi();
+            if (!api || !api.getLiveRetargetPreflight) return;
+            let result = null;
+            try {
+                result = await api.getLiveRetargetPreflight();
+            } catch (error) {
+                result = { success: false, test_mode: true, message: String(error) };
+            }
+            if (!result || !result.test_mode) {
+                panel.classList.add('hidden');
+                return;
+            }
+            panel.classList.remove('hidden');
+            checksRoot.replaceChildren();
+            strategiesRoot.replaceChildren();
+            const ready = !!result.ready_to_execute;
+            const readyToArm = !!result.ready_to_arm;
+            summary.textContent = ready
+                ? '所有检查已通过，一次性真实追投授权已开启。'
+                : (readyToArm
+                    ? '基础检查已通过；真实追投开关仍保持关闭，等待你的最终确认。'
+                    : ((result && result.message) || '还有检查项未通过，请按下面提示处理。'));
+            summary.className = 'rounded-lg border px-3 py-2.5 text-xs ' + (
+                ready
+                    ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-200'
+                    : (readyToArm
+                        ? 'border-amber-500/35 bg-amber-950/25 text-amber-200'
+                        : 'border-rose-500/35 bg-rose-950/20 text-rose-200')
+            );
+            (Array.isArray(result.checks) ? result.checks : []).forEach((item) => {
+                const row = document.createElement('div');
+                const isGateWaiting = item && item.key === 'live_gate' && !item.ok && readyToArm;
+                row.className = 'flex items-start gap-2.5 rounded-lg border px-3 py-2.5 ' + (
+                    item && item.ok
+                        ? 'border-emerald-500/20 bg-emerald-950/15'
+                        : (isGateWaiting
+                            ? 'border-amber-500/20 bg-amber-950/15'
+                            : 'border-rose-500/20 bg-rose-950/15')
+                );
+                const icon = document.createElement('span');
+                icon.className = 'text-sm leading-5 shrink-0 ' + (
+                    item && item.ok ? 'text-emerald-400' : (isGateWaiting ? 'text-amber-400' : 'text-rose-400')
+                );
+                icon.textContent = item && item.ok ? '✓' : (isGateWaiting ? '○' : '!');
+                const text = document.createElement('div');
+                text.className = 'min-w-0';
+                const label = document.createElement('div');
+                label.className = 'text-xs font-medium text-slate-200';
+                label.textContent = String((item && item.label) || '检查项');
+                const detail = document.createElement('div');
+                detail.className = 'text-[11px] text-slate-500 mt-0.5 break-words leading-relaxed';
+                detail.textContent = String((item && item.detail) || '');
+                text.append(label, detail);
+                row.append(icon, text);
+                checksRoot.appendChild(row);
+            });
+            const strategies = Array.isArray(result.strategies) ? result.strategies : [];
+            strategiesWrap.classList.toggle('hidden', strategies.length === 0);
+            strategies.forEach((strategy) => {
+                const row = document.createElement('div');
+                row.className = 'rounded-lg border border-slate-700/60 bg-slate-950/30 px-3 py-2.5';
+                const title = document.createElement('div');
+                title.className = 'text-xs font-medium text-slate-200';
+                title.textContent = String(strategy.title || '未命名策略');
+                const detail = document.createElement('div');
+                detail.className = 'text-[11px] text-slate-500 mt-1 leading-relaxed';
+                detail.textContent = String(strategy.summary || '') + '；卡片有效期 ' + String(strategy.card_expiry || '30分钟');
+                row.append(title, detail);
+                strategiesRoot.appendChild(row);
+            });
+            try { lucide.createIcons(); } catch (_) {}
+        }
+
         /** 优先父页 toast；否则用 js/messagebox.js 的 appAlert（不使用原生 alert） */
         function notifyErr(msg) {
             if (window.showMsgBox) window.showMsgBox(msg, 'error');
@@ -1634,6 +1803,8 @@
         }
 
         let strategiesState = [];
+        let promotionTargetsState = [];
+        let promotionTargetProductsState = {};
         let activeStrategyIndex = 0;
         /** 正在改名的策略下标，非 null 时该 Tab 显示为输入框 */
         let strategyRenameIndex = null;
@@ -1652,6 +1823,101 @@
                 group_combine: 'or',
                 groups: [{ join: 'and', conditions: [{ metric: 'costDiff', op: 'gt', value: 0 }] }],
             };
+        }
+
+        function defaultCandidateTriggerPayload() {
+            return {
+                group_combine: 'or',
+                groups: [{ join: 'and', conditions: [{ metric: 'costDiff', op: 'gt', value: 0 }] }],
+            };
+        }
+
+        function candidateTriggerFromDom() {
+            const metric = document.getElementById('candidateMetric')?.value || 'costDiff';
+            const op = document.getElementById('candidateOp')?.value || 'gt';
+            const raw = parseFloat(document.getElementById('candidateValue')?.value || '0');
+            return {
+                group_combine: 'or',
+                groups: [{ join: 'and', conditions: [{ metric, op, value: Number.isFinite(raw) ? raw : 0 }] }],
+            };
+        }
+
+        function firstCandidateCondition(trigger) {
+            return trigger?.groups?.[0]?.conditions?.[0] || { metric: 'costDiff', op: 'gt', value: 0 };
+        }
+
+        function syncProductStrategyVisibility() {
+            const level = document.getElementById('strategyTriggerLevel')?.value || 'material';
+            document.getElementById('productStrategyFields')?.classList.toggle('hidden', level !== 'product');
+            const uid = document.getElementById('strategyTargetUid')?.value || '';
+            const target = promotionTargetsState.find(x => x.target_uid === uid);
+            const hint = document.getElementById('strategyTargetScene');
+            if (hint) {
+                hint.textContent = target
+                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '传统全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
+                    : '请先在“监控计划”页面添加计划。';
+            }
+            renderStrategyProductOptions();
+        }
+
+        function renderStrategyProductOptions() {
+            const host = document.getElementById('strategyProductOptions');
+            const hidden = document.getElementById('strategyProductFilter');
+            if (!host || !hidden) return;
+            const uid = document.getElementById('strategyTargetUid')?.value || '';
+            const target = promotionTargetsState.find(x => x.target_uid === uid);
+            const selected = new Set(String(hidden.value || '').split(',').map(x => x.trim()).filter(Boolean));
+            const products = promotionTargetProductsState[uid] || [];
+            if (!target || target.promotion_scene !== 'product') {
+                host.innerHTML = '<span class="text-slate-600">商品级规则仅适用于推商品监控计划。</span>';
+                return;
+            }
+            if (!products.length) {
+                host.innerHTML = '<span class="text-slate-600">尚未采集到商品。先启动服务完成一次只读采集；不勾选时沿用监控计划的商品范围。</span>';
+                return;
+            }
+            host.innerHTML = products.map(product => {
+                const id = String(product.product_id || '');
+                const name = String(product.product_name || '未命名商品');
+                return `<label class="flex items-start gap-2 rounded-md bg-slate-900/65 border border-slate-700/40 px-2.5 py-2 cursor-pointer">
+                    <input type="checkbox" data-strategy-product-id="${escapeHtml(id)}" class="mt-0.5" ${selected.has(id) ? 'checked' : ''}>
+                    <span class="min-w-0 break-all">${escapeHtml(name)}<br><span class="text-[10px] text-slate-600">${escapeHtml(id)}</span></span>
+                </label>`;
+            }).join('');
+            host.querySelectorAll('[data-strategy-product-id]').forEach(box => {
+                box.addEventListener('change', () => {
+                    hidden.value = Array.from(host.querySelectorAll('[data-strategy-product-id]:checked'))
+                        .map(item => item.getAttribute('data-strategy-product-id') || '')
+                        .filter(Boolean)
+                        .join(',');
+                    rrScheduleDirtyCheck();
+                });
+            });
+        }
+
+        async function loadPromotionTargetOptions(api) {
+            if (!api?.listPromotionTargets) return;
+            const res = await api.listPromotionTargets(true);
+            promotionTargetsState = Array.isArray(res?.data) ? res.data : [];
+            const productEntries = await Promise.all(promotionTargetsState.map(async target => {
+                if (target.promotion_scene !== 'product' || !api.listPromotionTargetProducts) {
+                    return [target.target_uid, []];
+                }
+                const productRes = await api.listPromotionTargetProducts(target.target_uid);
+                return [target.target_uid, Array.isArray(productRes?.data) ? productRes.data : []];
+            }));
+            promotionTargetProductsState = Object.fromEntries(productEntries);
+            const select = document.getElementById('strategyTargetUid');
+            if (!select) return;
+            const current = select.value;
+            const htmlEsc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            })[c]);
+            select.innerHTML = '<option value="">请选择监控计划</option>' + promotionTargetsState.map(x =>
+                `<option value="${htmlEsc(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '传统全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${htmlEsc(x.plan_name || x.ad_id)}｜${htmlEsc(x.aadvid)}</option>`
+            ).join('');
+            if (current) select.value = current;
+            syncProductStrategyVisibility();
         }
 
         function defaultRetargetingPayload(intervalObj) {
@@ -1741,6 +2007,13 @@
                 strategiesState.push({
                     id: genStrategyId(),
                     title: defaultStrategyTitle(0),
+                    target_uid: '',
+                    trigger_level: 'material',
+                    product_filter: [],
+                    candidate_trigger: defaultCandidateTriggerPayload(),
+                    candidate_sort: 'net_roi_desc',
+                    candidate_limit: 1,
+                    action_mode: 'card_confirm',
                     trigger: defaultTriggerPayload(),
                     retargeting: defaultRetargetingPayload(),
                 });
@@ -1754,6 +2027,9 @@
                 document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
             const goal =
                 document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
+            const actionMode =
+                document.querySelector('.action-mode-btn.seg-btn-active')?.getAttribute('data-action-mode') ||
+                'card_confirm';
             const volBudget = document.getElementById('volBudget').value.trim();
             const volDur = parseFloat(document.getElementById('volDuration').value);
             const cur = strategiesState[activeStrategyIndex];
@@ -1802,6 +2078,14 @@
             strategiesState[activeStrategyIndex] = {
                 id: cur.id || genStrategyId(),
                 title: cur.title || defaultStrategyTitle(activeStrategyIndex),
+                target_uid: document.getElementById('strategyTargetUid')?.value || '',
+                trigger_level: document.getElementById('strategyTriggerLevel')?.value === 'product' ? 'product' : 'material',
+                product_filter: (document.getElementById('strategyProductFilter')?.value || '')
+                    .split(',').map(x => x.trim()).filter(Boolean),
+                candidate_trigger: candidateTriggerFromDom(),
+                candidate_sort: 'net_roi_desc',
+                candidate_limit: Math.max(1, Math.min(20, parseInt(document.getElementById('candidateLimit')?.value || '1', 10) || 1)),
+                action_mode: actionMode,
                 trigger: trig,
                 retargeting: ret,
             };
@@ -1941,6 +2225,13 @@
             strategiesState.push({
                 id: genStrategyId(),
                 title: defaultStrategyTitle(newIdx),
+                target_uid: '',
+                trigger_level: 'material',
+                product_filter: [],
+                candidate_trigger: defaultCandidateTriggerPayload(),
+                candidate_sort: 'net_roi_desc',
+                candidate_limit: 1,
+                action_mode: 'card_confirm',
                 trigger: defaultTriggerPayload(),
                 retargeting: defaultRetargetingPayload(),
             });
@@ -1954,7 +2245,23 @@
         function applyStrategyToDom(index, opts) {
             const s = strategiesState[index];
             if (!s) return;
+            const targetSelect = document.getElementById('strategyTargetUid');
+            if (targetSelect) targetSelect.value = s.target_uid || '';
+            const levelSelect = document.getElementById('strategyTriggerLevel');
+            if (levelSelect) levelSelect.value = s.trigger_level === 'product' ? 'product' : 'material';
+            const productFilter = document.getElementById('strategyProductFilter');
+            if (productFilter) productFilter.value = Array.isArray(s.product_filter) ? s.product_filter.join(',') : '';
+            const candidate = firstCandidateCondition(s.candidate_trigger || defaultCandidateTriggerPayload());
+            if (document.getElementById('candidateMetric')) document.getElementById('candidateMetric').value = candidate.metric || 'costDiff';
+            if (document.getElementById('candidateOp')) document.getElementById('candidateOp').value = candidate.op || 'gt';
+            if (document.getElementById('candidateValue')) document.getElementById('candidateValue').value = candidate.value != null ? candidate.value : 0;
+            if (document.getElementById('candidateLimit')) document.getElementById('candidateLimit').value = s.candidate_limit || 1;
+            syncProductStrategyVisibility();
             const t = s.trigger || defaultTriggerPayload();
+            const actionMode = s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm';
+            document.querySelectorAll('.action-mode-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-action-mode') === actionMode);
+            });
             mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
             _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
             renderTriggerGroups(_groupsRef);
@@ -2124,6 +2431,20 @@
                 activeStrategyIndex = i;
                 applyStrategyToDom(i);
                 clearAllRetargetingFieldErrors();
+                const targetUid = document.getElementById('strategyTargetUid')?.value || '';
+                const triggerLevel = document.getElementById('strategyTriggerLevel')?.value || 'material';
+                const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
+                if (!selectedTarget || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
+                    renderStrategyTabs();
+                    const targetEl = document.getElementById('strategyTargetUid');
+                    const msg = !selectedTarget ? '请先为策略选择监控计划' : '商品级策略只能选择推商品计划';
+                    return {
+                        ok: false,
+                        vt: { ok: true },
+                        vr: { ok: false, firstMsg: msg, firstScrollEl: targetEl },
+                        failedStrategyIndex: i,
+                    };
+                }
                 const vt = validateTriggerConditions();
                 const vr = validateRetargetingFields();
                 if (!vt.ok || !vr.ok) {
@@ -2505,6 +2826,13 @@
             const strategies = strategiesState.map((s) => ({
                 id: s.id,
                 title: s.title,
+                target_uid: s.target_uid || '',
+                trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
+                product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
+                candidate_trigger: s.candidate_trigger || defaultCandidateTriggerPayload(),
+                candidate_sort: 'net_roi_desc',
+                candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
+                action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
                 trigger: s.trigger,
                 retargeting: {
                     ...s.retargeting,
@@ -2811,6 +3139,13 @@
                     return {
                         id: s.id || genStrategyId(),
                         title: (s.title || '').trim() || defaultStrategyTitle(i),
+                        target_uid: s.target_uid || '',
+                        trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
+                        product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
+                        candidate_trigger: s.candidate_trigger || defaultCandidateTriggerPayload(),
+                        candidate_sort: 'net_roi_desc',
+                        candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
+                        action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
                         trigger: s.trigger || defaultTriggerPayload(),
                         retargeting: {
                             ...(s.retargeting || defaultRetargetingPayload(gInv)),
@@ -2825,6 +3160,13 @@
                     {
                         id: genStrategyId(),
                         title: defaultStrategyTitle(0),
+                        target_uid: '',
+                        trigger_level: 'material',
+                        product_filter: [],
+                        candidate_trigger: defaultCandidateTriggerPayload(),
+                        candidate_sort: 'net_roi_desc',
+                        candidate_limit: 1,
+                        action_mode: 'card_confirm',
                         trigger: t,
                         retargeting: { ...r, interval: gInv },
                     },
@@ -2925,6 +3267,13 @@
                 b.classList.add('seg-btn-active');
                 syncMethodPanels();
                 validateRetargetingFields();
+                rrScheduleDirtyCheck();
+            });
+        });
+        document.querySelectorAll('.action-mode-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                document.querySelectorAll('.action-mode-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
                 rrScheduleDirtyCheck();
             });
         });
@@ -3289,6 +3638,7 @@
             if (res && res.success) {
                 notifyOk('配置保存成功');
                 rrMarkSavedSnapshot();
+                await refreshLiveRetargetPreflight();
             } else {
                 const msg = (res && res.message) || '保存失败';
                 notifyErr(msg);
@@ -3300,6 +3650,19 @@
             if (!api) return;
             const res = await api.getRuleRetargetingConfig();
             applyData(res);
+            await refreshLiveRetargetPreflight();
+        });
+
+        document.getElementById('btnRefreshLivePreflight')?.addEventListener('click', refreshLiveRetargetPreflight);
+        document.getElementById('strategyTargetUid')?.addEventListener('change', () => {
+            const filter = document.getElementById('strategyProductFilter');
+            if (filter) filter.value = '';
+            syncProductStrategyVisibility();
+            rrScheduleDirtyCheck();
+        });
+        document.getElementById('strategyTriggerLevel')?.addEventListener('change', () => {
+            syncProductStrategyVisibility();
+            rrScheduleDirtyCheck();
         });
 
         ensureRrDdGlobalClose();
@@ -3324,6 +3687,13 @@
             {
                 id: genStrategyId(),
                 title: defaultStrategyTitle(0),
+                target_uid: '',
+                trigger_level: 'material',
+                product_filter: [],
+                candidate_trigger: defaultCandidateTriggerPayload(),
+                candidate_sort: 'net_roi_desc',
+                candidate_limit: 1,
+                action_mode: 'card_confirm',
                 trigger: defaultTriggerPayload(),
                 retargeting: defaultRetargetingPayload(),
             },
@@ -3337,9 +3707,11 @@
         (async function init() {
             const api = await waitForApi();
             if (api) {
+                await loadPromotionTargetOptions(api);
                 const res = await api.getRuleRetargetingConfig();
                 applyData(res);
                 if (!res || res.success === false) rrMarkSavedSnapshot();
+                await refreshLiveRetargetPreflight();
             } else {
                 document.getElementById('btnHeadless').classList.add('seg-btn-active');
                 document.getElementById('btnHeadful').classList.remove('seg-btn-active');

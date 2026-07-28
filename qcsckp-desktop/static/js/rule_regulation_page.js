@@ -306,9 +306,15 @@
     function clearAllFieldErrors() {
         clearTriggerConditionError();
         clearTriggerCondFieldErrors();
+        const targetErr = document.getElementById('errRegulationTarget');
+        if (targetErr) {
+            targetErr.textContent = '';
+            targetErr.classList.add('hidden');
+        }
     }
 
     let strategiesState = [];
+    let promotionTargetsState = [];
     let activeStrategyIndex = 0;
     let strategyRenameIndex = null;
 
@@ -319,6 +325,42 @@
     function genStrategyId() {
         if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
         return 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+    }
+
+    function escapeTargetHtml(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        })[c]);
+    }
+
+    function syncRegulationTargetHint() {
+        const uid = document.getElementById('regStrategyTargetUid')?.value || '';
+        const target = promotionTargetsState.find((x) => x.target_uid === uid);
+        const hint = document.getElementById('regStrategyTargetScene');
+        if (hint) {
+            hint.textContent = target
+                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '传统全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
+                : '请先在“监控计划”页面添加并启用计划。';
+        }
+        const err = document.getElementById('errRegulationTarget');
+        if (err && uid) {
+            err.textContent = '';
+            err.classList.add('hidden');
+        }
+    }
+
+    async function loadRegulationTargetOptions(api) {
+        if (!api?.listPromotionTargets) return;
+        const res = await api.listPromotionTargets(true);
+        promotionTargetsState = Array.isArray(res?.data) ? res.data : [];
+        const select = document.getElementById('regStrategyTargetUid');
+        if (!select) return;
+        const current = select.value;
+        select.innerHTML = '<option value="">请选择监控计划</option>' + promotionTargetsState.map((x) =>
+            `<option value="${escapeTargetHtml(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '传统全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${escapeTargetHtml(x.plan_name || x.ad_id)}｜${escapeTargetHtml(x.aadvid)}</option>`
+        ).join('');
+        if (current) select.value = current;
+        syncRegulationTargetHint();
     }
 
     function defaultTriggerPayload() {
@@ -587,6 +629,27 @@
             activeStrategyIndex = i;
             applyStrategyToDom(i);
             clearAllFieldErrors();
+            const targetUid = document.getElementById('regStrategyTargetUid')?.value || '';
+            if (!targetUid) {
+                const targetErr = document.getElementById('errRegulationTarget');
+                if (targetErr) {
+                    targetErr.textContent = '请选择本策略所属的监控计划';
+                    targetErr.classList.remove('hidden');
+                }
+                renderStrategyTabs();
+                applyStrategyToDom(i);
+                if (targetErr) {
+                    targetErr.textContent = '请选择本策略所属的监控计划';
+                    targetErr.classList.remove('hidden');
+                }
+                scrollRgValidationTargetIntoView(document.getElementById('regStrategyTargetUid'));
+                activeStrategyIndex = i;
+                return {
+                    ok: false,
+                    vt: { ok: false, firstMsg: '请选择监控计划' },
+                    failedStrategyIndex: i,
+                };
+            }
             const vt = validateTriggerConditions();
             if (!vt.ok) {
                 renderStrategyTabs();
@@ -611,6 +674,7 @@
             strategiesState.push({
                 id: genStrategyId(),
                 title: defaultStrategyTitle(0),
+                target_uid: '',
                 trigger: defaultTriggerPayload(),
                 regulation_stop_action: 'pause',
             });
@@ -628,6 +692,7 @@
         strategiesState[activeStrategyIndex] = {
             id: cur.id || genStrategyId(),
             title: cur.title || defaultStrategyTitle(activeStrategyIndex),
+            target_uid: document.getElementById('regStrategyTargetUid')?.value || '',
             trigger: trig,
             regulation_stop_action: stopAct,
         };
@@ -649,6 +714,7 @@
             strategies: strategiesState.map((s) => ({
                 id: s.id,
                 title: s.title,
+                target_uid: s.target_uid || '',
                 trigger: s.trigger,
                 regulation_stop_action: s.regulation_stop_action === 'delete' ? 'delete' : 'pause',
             })),
@@ -898,6 +964,7 @@
         strategiesState.push({
             id: genStrategyId(),
             title: defaultStrategyTitle(newIdx),
+            target_uid: '',
             trigger: defaultTriggerPayload(),
             regulation_stop_action: 'pause',
         });
@@ -922,6 +989,9 @@
     function applyStrategyToDom(index) {
         const s = strategiesState[index];
         if (!s) return;
+        const targetSelect = document.getElementById('regStrategyTargetUid');
+        if (targetSelect) targetSelect.value = s.target_uid || '';
+        syncRegulationTargetHint();
         const t = s.trigger || defaultTriggerPayload();
         mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
         _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
@@ -950,6 +1020,7 @@
             strategiesState = data.strategies.map((s, i) => ({
                 id: s.id || genStrategyId(),
                 title: (s.title || '').trim() || defaultStrategyTitle(i),
+                target_uid: s.target_uid || '',
                 trigger: s.trigger || defaultTriggerPayload(),
                 regulation_stop_action: normStrategyStopAct(s.regulation_stop_action),
             }));
@@ -959,6 +1030,7 @@
                 {
                     id: genStrategyId(),
                     title: defaultStrategyTitle(0),
+                    target_uid: '',
                     trigger: t,
                     regulation_stop_action: normStrategyStopAct(undefined),
                 },
@@ -1055,6 +1127,10 @@
         }
 
         document.getElementById('groupCombineMount').addEventListener('input', () => rgScheduleDirtyCheck());
+        document.getElementById('regStrategyTargetUid')?.addEventListener('change', () => {
+            syncRegulationTargetHint();
+            rgScheduleDirtyCheck();
+        });
 
         document.getElementById('btnReload').addEventListener('click', async () => {
             const api = await waitForApi();
@@ -1063,6 +1139,7 @@
                 return;
             }
             try {
+                await loadRegulationTargetOptions(api);
                 const data = await api.getRuleRegulationConfig();
                 applyData(data);
                 notifyOk('已重新加载');
@@ -1279,6 +1356,7 @@
         const api = await waitForApi();
         if (api && api.getRuleRegulationConfig) {
             try {
+                await loadRegulationTargetOptions(api);
                 const data = await api.getRuleRegulationConfig();
                 applyData(data);
             } catch (e) {

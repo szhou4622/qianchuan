@@ -385,6 +385,27 @@
 
         /* 右侧主体 */
         .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+        .test-env-banner {
+            display: none;
+            flex: none;
+            min-height: 38px;
+            padding: 9px 16px;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            color: #fef3c7;
+            background: #78350f;
+            border-bottom: 1px solid #f59e0b;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: .01em;
+        }
+        .test-env-banner.is-visible { display: flex; }
+        .test-env-banner.is-armed {
+            color: #fff1f2;
+            background: #881337;
+            border-bottom-color: #fb7185;
+        }
 
         .iframe-container {
             position: relative;
@@ -473,6 +494,10 @@
                 <i data-lucide="play-circle"></i>
                 <span>服务控制</span>
             </div>
+            <div class="menu-item" data-page="promotion-targets" data-title="监控计划">
+                <i data-lucide="list-checks"></i>
+                <span>监控计划</span>
+            </div>
             <div class="menu-item" data-page="rule-retargeting" data-title="规则化追投">
                 <i data-lucide="crosshair"></i>
                 <span>规则化追投</span>
@@ -480,6 +505,10 @@
             <div class="menu-item" data-page="rule-regulation" data-title="规则化停投">
                 <i data-lucide="sliders-horizontal"></i>
                 <span>规则化停投</span>
+            </div>
+            <div class="menu-item" data-page="operation-events" data-title="账户操作流水">
+                <i data-lucide="logs"></i>
+                <span>账户操作流水</span>
             </div>
             <div class="menu-item" data-page="tutorial" data-title="使用教程">
                 <i data-lucide="book-open"></i>
@@ -594,6 +623,7 @@
 
     <!-- 右侧主体（使用教程为独立 tutorial.html 占位页，见 static/tutorial.html） -->
     <main class="main">
+        <div class="test-env-banner" id="testEnvironmentBanner" role="status"></div>
         <div class="iframe-container">
             <div id="iframeLoading" class="iframe-loading-overlay" hidden aria-busy="false">
                 <div class="iframe-loading-inner">
@@ -633,14 +663,37 @@
         // 优先使用官方 ready 事件（更稳定），同时保留轮询兜底
         window.addEventListener('pywebviewready', function () {
             exposePywebviewAPI();
+            refreshEnvironmentBanner();
             if (typeof refreshVersionUI === 'function') refreshVersionUI();
-            if (typeof verifySavedSessionOnStartup === 'function') verifySavedSessionOnStartup();
+            if (typeof initializeAccountSessionOnStartup === 'function') initializeAccountSessionOnStartup();
         });
 
         (function initPywebviewAPI() {
             if (exposePywebviewAPI()) return;
             setTimeout(initPywebviewAPI, 100);
         })();
+
+        async function refreshEnvironmentBanner() {
+            const banner = document.getElementById('testEnvironmentBanner');
+            try {
+                const api = window.pywebview?.api || window.pywebviewAPI;
+                if (!api?.getEnvironmentInfo) return;
+                const info = await api.getEnvironmentInfo();
+                if (!info?.test_mode) return;
+                const target = info.test_aavid && info.test_material_id
+                    ? `白名单账户 ${info.test_aavid} · 素材 ${info.test_material_id}`
+                    : '尚未锁定真实追投白名单';
+                const armed = !!info.live_retarget_armed && !info.live_retarget_consumed;
+                banner.classList.add('is-visible');
+                banner.classList.toggle('is-armed', armed);
+                banner.textContent = armed
+                    ? `测试1版 · 真实追投一次性开关已开启 · ${target}`
+                    : `测试1版 · 本地隔离环境 · 真实追投关闭 · ${target}`;
+            } catch (error) {
+                console.warn('读取测试环境状态失败', error);
+            }
+        }
+        setInterval(refreshEnvironmentBanner, 5000);
 
         const menuItems = document.querySelectorAll('.menu-item');
         const iframeLoading = document.getElementById('iframeLoading');
@@ -649,8 +702,10 @@
         const pageMap = {
             'dashboard': 'dashboard.html',
             'control': 'control.html',
+            'promotion-targets': 'promotion_targets.html',
             'rule-retargeting': 'rule_retargeting.html',
             'rule-regulation': 'rule_regulation.html',
+            'operation-events': 'operation_events.html',
             'tutorial': 'tutorial.html'
         };
 
@@ -1124,7 +1179,11 @@
         loginModal.addEventListener('click', (e) => {
             if (e.target === loginModal) closeLoginModal();
         });
-        document.getElementById('btnLogout').addEventListener('click', () => {
+        document.getElementById('btnLogout').addEventListener('click', async () => {
+            try {
+                const api = await waitTopApi();
+                if (api && typeof api.clearDeviceSession === 'function') await api.clearDeviceSession();
+            } catch (_) {}
             clearAuthSession();
             updateSidebarUserUI();
             closeLoginModal();
@@ -1387,6 +1446,57 @@
                 }
                 saveAuthLast({
                     username: sess.username,
+                    valid_from: d.valid_from,
+                    valid_until: d.valid_until,
+                    is_disabled: d.is_disabled,
+                    verifiedAt: Date.now(),
+                });
+                updateSidebarUserUI();
+                notifyIframeAuthChanged();
+            } catch (_) {
+                updateSidebarUserUI();
+            }
+        }
+
+        /**
+         * 本地测试版使用运行环境里随机生成的隔离账号自动登录。
+         * 正式环境没有该能力，仍保持原账号登录流程。
+         */
+        async function initializeAccountSessionOnStartup() {
+            if (readAuthSession()) {
+                await verifySavedSessionOnStartup();
+                return;
+            }
+            const api = await waitTopApi();
+            if (!api || typeof api.getLocalTestLoginCredentials !== 'function') {
+                updateSidebarUserUI();
+                return;
+            }
+            let credentials = null;
+            try {
+                credentials = await api.getLocalTestLoginCredentials();
+            } catch (_) {
+                updateSidebarUserUI();
+                return;
+            }
+            if (!credentials || !credentials.success || !credentials.username || !credentials.password) {
+                updateSidebarUserUI();
+                return;
+            }
+            try {
+                const res = await api.verifyAccountLogin(credentials.username, credentials.password);
+                if (!res || !res.success) {
+                    updateSidebarUserUI();
+                    return;
+                }
+                const d = res.data || {};
+                if (d.is_disabled === 1 || !isWithinValidityLogin(d)) {
+                    updateSidebarUserUI();
+                    return;
+                }
+                saveAuthSession(credentials.username, credentials.password);
+                saveAuthLast({
+                    username: credentials.username,
                     valid_from: d.valid_from,
                     valid_until: d.valid_until,
                     is_disabled: d.is_disabled,

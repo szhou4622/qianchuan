@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>账户操作流水</title>
+  <style>
+    :root { color-scheme: dark; font-family: "Microsoft YaHei", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: #e2e8f0; background: #08111f; }
+    .page { padding: 22px; }
+    .head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px; }
+    h1 { margin:0; font-size:22px; color:#f8fafc; }
+    .sub { color:#8494aa; font-size:12px; margin-top:6px; }
+    .panel { background:#101b2d; border:1px solid #26364e; border-radius:14px; padding:14px; margin-bottom:14px; }
+    .filters { display:grid; grid-template-columns: 1.25fr repeat(6,minmax(110px,1fr)) 1.4fr; gap:10px; align-items:end; }
+    label { display:block; color:#8fa1b8; font-size:11px; margin-bottom:5px; }
+    input, select, button { font:inherit; }
+    input, select { width:100%; height:36px; padding:0 10px; color:#e2e8f0; background:#07101d; border:1px solid #33445e; border-radius:8px; outline:none; }
+    input:focus, select:focus { border-color:#38bdf8; box-shadow:0 0 0 2px #38bdf825; }
+    .actions { display:flex; gap:8px; }
+    button { height:36px; padding:0 13px; border:0; border-radius:8px; cursor:pointer; color:#e2e8f0; background:#24344b; }
+    button.primary { background:#0284c7; color:white; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .sync { display:flex; flex-wrap:wrap; gap:14px; color:#91a3b9; font-size:12px; }
+    .sync b { color:#dbeafe; font-weight:600; }
+    .sync .bad { color:#fda4af; }
+    .empty { padding:64px 20px; text-align:center; color:#71839b; }
+    .table-wrap { overflow:auto; border-radius:11px; border:1px solid #26364e; }
+    table { width:100%; border-collapse:collapse; min-width:1100px; background:#0d1727; }
+    th { position:sticky; top:0; z-index:1; padding:11px 12px; text-align:left; color:#8fa1b8; font-size:11px; background:#142136; border-bottom:1px solid #2a3a52; }
+    td { padding:11px 12px; font-size:12px; border-bottom:1px solid #1d2a3e; vertical-align:top; }
+    tr:hover td { background:#112038; }
+    .pill { display:inline-flex; padding:2px 8px; border-radius:999px; background:#20324a; color:#bfdbfe; font-size:11px; }
+    .ok { color:#86efac; } .fail { color:#fda4af; } .muted { color:#7f91aa; }
+    .link { height:auto; padding:0; background:transparent; color:#38bdf8; }
+    .pager { display:flex; justify-content:flex-end; align-items:center; gap:10px; padding-top:12px; color:#8fa1b8; font-size:12px; }
+    .modal-bg { position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:24px; background:#020617cc; z-index:20; }
+    .modal-bg.open { display:flex; }
+    .modal { width:min(820px,95vw); max-height:88vh; overflow:auto; background:#111c2e; border:1px solid #33445e; border-radius:15px; padding:18px; box-shadow:0 25px 70px #0009; }
+    .modal-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
+    .detail-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .detail-card { padding:10px; border-radius:9px; background:#091322; border:1px solid #24344b; }
+    .detail-card .k { color:#7f91aa; font-size:11px; margin-bottom:4px; }
+    .detail-card .v { color:#e2e8f0; font-size:12px; word-break:break-all; white-space:pre-wrap; }
+    .wide { grid-column:1/-1; }
+    @media(max-width:1100px){ .filters{grid-template-columns:repeat(3,1fr);} }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="head">
+      <div><h1>账户操作流水</h1><div class="sub">一次只查看一个千川账户，工具操作与后台日志统一呈现。</div></div>
+      <div class="actions"><button class="primary" id="recordBtn" disabled>打开千川并记录操作</button><button id="exportBtn" disabled>导出当前结果</button></div>
+    </div>
+    <div class="panel filters">
+      <div><label>千川账户</label><select id="aavid"><option value="">请选择账户</option></select></div>
+      <div><label>开始日期</label><input type="date" id="dateFrom"></div>
+      <div><label>结束日期</label><input type="date" id="dateTo"></div>
+      <div><label>操作类型</label><select id="action"><option value="">全部</option><option value="retarget">追投</option><option value="stop">停投</option><option value="plan_create">新建计划</option><option value="plan_copy">复制计划</option><option value="plan_enable">启用计划</option><option value="plan_disable">暂停计划</option><option value="plan_delete">删除计划</option><option value="budget_update">修改预算</option><option value="bid_update">修改出价</option><option value="roi_update">修改ROI</option><option value="other">其他</option></select></div>
+      <div><label>来源</label><select id="source"><option value="">全部</option><option value="tool_direct">工具执行</option><option value="browser_observed">记录浏览器</option><option value="platform_log">后台日志</option></select></div>
+      <div><label>结果</label><select id="status"><option value="">全部</option><option value="success">成功</option><option value="failed">失败</option><option value="executing">执行中</option><option value="requested">已请求</option><option value="unknown">未知</option></select></div>
+      <div><label>操作人</label><input id="operator" placeholder="姓名或ID"></div>
+      <div><label>关键词</label><div class="actions"><input id="q" placeholder="计划、素材或任务ID"><button class="primary" id="searchBtn">查询</button></div></div>
+    </div>
+    <div class="panel sync" id="syncState"><span>请选择账户后查看同步状态</span></div>
+    <div class="table-wrap">
+      <table><thead><tr><th>操作时间</th><th>场景</th><th>计划</th><th>操作</th><th>对象</th><th>操作人</th><th>来源</th><th>结果</th><th>摘要</th><th></th></tr></thead><tbody id="tbody"></tbody></table>
+      <div class="empty" id="empty">请选择一个千川账户</div>
+    </div>
+    <div class="pager"><span id="pageInfo">第 1 页</span><button id="prev">上一页</button><button id="next">下一页</button></div>
+  </div>
+  <div class="modal-bg" id="modal"><div class="modal"><div class="modal-head"><strong>操作详情</strong><button id="closeModal">关闭</button></div><div class="detail-grid" id="detail"></div></div></div>
+  <script>
+    const state={page:1,pageSize:50,total:0};
+    const $=id=>document.getElementById(id);
+    function api(){ return window.top.pywebviewAPI || window.pywebview?.api; }
+    async function waitApi(){ for(let i=0;i<100;i++){const x=api();if(x)return x;await new Promise(r=>setTimeout(r,100));}return null; }
+    function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+    function iso(d){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${day}`;}
+    function filters(){return {aavid:$('aavid').value,date_from:$('dateFrom').value,date_to:$('dateTo').value,action_type:$('action').value,source:$('source').value,status:$('status').value,operator:$('operator').value.trim(),q:$('q').value.trim()};}
+    function statusText(v){return ({success:'成功',failed:'失败',executing:'执行中',requested:'已请求',unknown:'未知'})[v]||v||'—';}
+    function sourceText(v,platformId){const base=({tool_direct:'工具执行',browser_observed:'记录浏览器',platform_log:'后台日志'})[v]||v||'—';return platformId&&v!=='platform_log'?`${base}（后台已核验）`:base;}
+    function sceneText(v){return v==='product'?'推商品':v==='live'?'推直播':'旧数据';}
+    function systemText(v){return v==='global'?'传统全域':v==='chengfang'?'千川乘方':'待确认';}
+    async function loadAccounts(){const a=await waitApi();if(!a)return;const r=await a.listOperationAccounts();if(!r?.success)return;for(const id of r.items||[]){const o=document.createElement('option');o.value=id;o.textContent=id;$('aavid').appendChild(o);}}
+    async function loadSync(){const aid=$('aavid').value;if(!aid)return;const r=await (await waitApi()).getOperationSyncState(aid);const d=r?.data||{};const labels={ok:'同步正常',partial:'仅完成部分补录',empty:'最近30天暂无记录',login_required:'需要重新登录千川',not_configured:'尚未发现后台日志接口',error:'同步失败'};const bad=d.last_status!=='ok';$('syncState').innerHTML=`<span>后台日志：<b class="${bad?'bad':''}">${esc(labels[d.last_status]||d.last_status||'未知')}</b></span><span>覆盖：<b>${esc(d.coverage_from||'—')} 至 ${esc(d.coverage_to||'—')}</b></span><span>最后同步：<b>${esc(d.last_sync_at||'—')}</b></span>${d.last_error?`<span class="bad">${esc(d.last_error)}</span>`:''}`;}
+    async function load(){const f=filters();if(!f.aavid){$('tbody').innerHTML='';$('empty').style.display='block';$('exportBtn').disabled=true;return;}const r=await (await waitApi()).listOperationEvents(f.aavid,f.date_from,f.date_to,f.action_type,f.source,f.status,f.operator,f.q,state.page,state.pageSize);if(!r?.success){$('empty').textContent=r?.message||'读取失败';$('empty').style.display='block';return;}state.total=r.total||0;$('exportBtn').disabled=false;$('empty').style.display=state.total?'none':'block';$('empty').textContent='当前筛选条件下没有操作记录';$('tbody').innerHTML=(r.items||[]).map(x=>`<tr><td>${esc(x.occurred_at)}</td><td>${esc(`${sceneText(x.promotion_scene)} · ${systemText(x.plan_system)}`)}</td><td>${esc(x.plan_name||x.ad_id||x.plan_id||'—')}<div class="muted">${esc(x.target_uid&&x.target_uid!=='legacy_unscoped'?x.target_uid:'')}</div></td><td><span class="pill">${esc(x.action_label)}</span></td><td>${esc(x.object_name||x.object_id||'—')}<div class="muted">${esc(x.object_id||'')}</div></td><td>${esc(x.operator_name||x.operator_id||'工具')}</td><td>${esc(sourceText(x.source,x.platform_event_id))}${x.possible_duplicate?'<div class="muted">可能重复</div>':''}</td><td class="${x.status==='success'?'ok':x.status==='failed'?'fail':''}">${esc(statusText(x.status))}</td><td>${esc(x.summary||'—')}</td><td><button class="link" data-id="${x.id}">详情</button></td></tr>`).join('');const pages=Math.max(1,Math.ceil(state.total/state.pageSize));$('pageInfo').textContent=`第 ${state.page} / ${pages} 页 · ${state.total} 条`;$('prev').disabled=state.page<=1;$('next').disabled=state.page>=pages;document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>detail(b.dataset.id));await loadSync();}
+    async function detail(id){const r=await (await waitApi()).getOperationEventDetail(id,$('aavid').value);if(!r?.success)return;const d=r.data||{};const cards=[['账户',d.aavid],['监控目标',d.target_uid],['推广场景',sceneText(d.promotion_scene)],['计划体系',systemText(d.plan_system)],['操作时间',d.occurred_at],['操作',d.action_type],['结果',d.status],['对象',`${d.object_type||''} ${d.object_name||d.object_id||''}`],['计划',`${d.plan_name||''} ${d.plan_id||d.ad_id||''}`.trim()],['商品',`${d.product_name||''} ${d.product_id||''}`.trim()],['素材',`${d.material_name||''} ${d.material_id||''}`.trim()],['调控任务',`${d.regulate_task_name||''} ${d.regulate_task_id||''}`.trim()],['飞书任务',d.cloud_task_id],['后台记录ID',d.platform_event_id],['操作人',d.operator_name||d.operator_id||'工具'],['摘要',d.summary],['失败/说明',d.detail],['执行前参数',d.before_json],['执行后参数',d.after_json],['触发规则',d.trigger_json],['请求参数',d.request_json],['返回结果',d.response_json],['后台原始记录',d.raw_json]];$('detail').innerHTML=cards.map(([k,v])=>`<div class="detail-card ${String(v||'').length>90?'wide':''}"><div class="k">${esc(k)}</div><div class="v">${esc(v||'—')}</div></div>`).join('');$('modal').classList.add('open');}
+    async function exportCsv(){const f=filters();const r=await (await waitApi()).exportOperationEventsCsv(f.aavid,f.date_from,f.date_to,f.action_type,f.source,f.status,f.operator,f.q);if(!r?.success){alert(r?.message||'导出失败');return;}const blob=new Blob([r.content],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=r.filename||'账户操作流水.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+    async function toggleRecord(){const a=await waitApi();if($('recordBtn').dataset.running==='1'){await a.stopOperationRecordBrowser();}else{const aid=$('aavid').value;if(!aid)return;const r=await a.startOperationRecordBrowser(aid);if(!r?.success)alert(r?.message||'打开失败');}setTimeout(refreshRecordStatus,500);}
+    async function refreshRecordStatus(){const a=await waitApi();if(!a?.getOperationRecordBrowserStatus)return;const r=await a.getOperationRecordBrowserStatus();const d=r?.data||{};$('recordBtn').dataset.running=d.running?'1':'0';$('recordBtn').textContent=d.running?'停止记录模式':'打开千川并记录操作';$('recordBtn').title=d.message||'';$('recordBtn').disabled=!$('aavid').value;}
+    $('searchBtn').onclick=()=>{state.page=1;load();};$('aavid').onchange=()=>{state.page=1;$('recordBtn').disabled=!$('aavid').value;load();};$('prev').onclick=()=>{state.page--;load();};$('next').onclick=()=>{state.page++;load();};$('exportBtn').onclick=exportCsv;$('recordBtn').onclick=toggleRecord;$('closeModal').onclick=()=>$('modal').classList.remove('open');$('modal').onclick=e=>{if(e.target===$('modal'))$('modal').classList.remove('open');};for(const id of ['q','operator']){$(id).onkeydown=e=>{if(e.key==='Enter')$('searchBtn').click();};}
+    const now=new Date(),from=new Date(now);from.setDate(from.getDate()-6);$('dateFrom').value=iso(from);$('dateTo').value=iso(now);loadAccounts();refreshRecordStatus();setInterval(refreshRecordStatus,3000);
+  </script>
+</body>
+</html>

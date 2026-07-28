@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>监控计划</title>
+  <style>
+    :root{color-scheme:dark;font-family:"Microsoft YaHei",system-ui,sans-serif}
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;background:#08111f;color:#e2e8f0}
+    .page{padding:24px;max-width:1280px;margin:auto}.head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px}
+    h1{margin:0;font-size:22px;color:#f8fafc}.sub{margin-top:7px;color:#8494aa;font-size:12px;line-height:1.7}
+    button,input,select{font:inherit}button{height:38px;border:0;border-radius:9px;padding:0 15px;background:#263750;color:#e2e8f0;cursor:pointer}
+    button.primary{background:#0284c7;color:white}button:disabled{opacity:.45;cursor:not-allowed}
+    .notice{display:none;margin-bottom:14px;padding:12px 14px;border:1px solid #1d4ed866;background:#17255466;border-radius:11px;color:#bfdbfe;font-size:12px}
+    .notice.show{display:block}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+    .card{background:#101b2d;border:1px solid #26364e;border-radius:14px;padding:16px}.card.off{opacity:.65}
+    .row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.name{font-weight:700;color:#f8fafc;word-break:break-all}
+    .meta{margin-top:6px;color:#8295ae;font-size:11px;line-height:1.8}.pill{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:11px;background:#153552;color:#7dd3fc}
+    .pill.product{background:#3b2850;color:#d8b4fe}.status{margin-top:13px;padding:10px;border-radius:9px;background:#091322;color:#8fa1b8;font-size:11px;line-height:1.7}
+    .status.ok{color:#86efac}.status.bad{color:#fda4af}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}
+    label{font-size:11px;color:#8fa1b8}input,select{width:100%;height:36px;margin-top:5px;padding:0 10px;border:1px solid #33445e;border-radius:8px;background:#07101d;color:#e2e8f0;outline:none}
+    input:focus,select:focus{border-color:#38bdf8}.wide{grid-column:1/-1}.actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}
+    .products{grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;max-height:180px;overflow:auto;padding:9px;border:1px solid #26364e;border-radius:9px;background:#091322}
+    .product-check{display:flex;align-items:flex-start;gap:7px;margin:0;padding:6px 7px;border-radius:7px;background:#101b2d;color:#cbd5e1;font-size:11px;line-height:1.45}
+    .product-check input{width:14px;height:14px;margin:1px 0 0;flex:none}.product-check span{word-break:break-all}.product-empty{grid-column:1/-1;color:#71839b;font-size:11px}
+    .empty{padding:80px 20px;text-align:center;color:#71839b;background:#0d1727;border:1px dashed #2b3b54;border-radius:14px}
+    @media(max-width:850px){.grid{grid-template-columns:1fr}.head{flex-direction:column}.form{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="head">
+      <div>
+        <h1>监控计划</h1>
+        <div class="sub">最多同时监控10条推直播或推商品计划。点击添加后，在新打开的千川浏览器里进入计划详情，工具会分别识别推广场景与计划体系。</div>
+      </div>
+      <button class="primary" id="discover">打开千川添加计划</button>
+    </div>
+    <div class="notice" id="notice"></div>
+    <div class="grid" id="list"></div>
+    <div class="empty" id="empty">还没有监控计划，请先从千川详情页添加。</div>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id);
+    const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const api=()=>window.top.pywebviewAPI||window.pywebview?.api;
+    async function waitApi(){for(let i=0;i<100;i++){const a=api();if(a)return a;await new Promise(r=>setTimeout(r,100));}return null}
+    function message(text,bad=false){$('notice').textContent=text||'';$('notice').classList.toggle('show',!!text);$('notice').style.borderColor=bad?'#be123c88':'#1d4ed866';}
+    function statusText(x){return ({ok:'同步正常',pending:'等待首次同步',paused:'计划已暂停',not_delivering:'计划未在投放',error:'同步异常',capability_mismatch:'页面能力未识别'})[x]||x||'等待首次同步'}
+    function sceneText(x){return x==='product'?'推商品':x==='live'?'推直播':'未知场景'}
+    function systemText(x){return x==='global'?'传统全域':x==='chengfang'?'千川乘方':'体系待确认'}
+    async function load(){
+      const a=await waitApi(); const r=await a.listPromotionTargets();
+      const rows=r?.data||[]; $('empty').style.display=rows.length?'none':'block';
+      const productResults=await Promise.all(rows.map(async x=>{
+        if(x.promotion_scene!=='product')return [x.target_uid,[]];
+        const result=await a.listPromotionTargetProducts(x.target_uid);
+        return [x.target_uid,result?.data||[]];
+      }));
+      const productsByTarget=Object.fromEntries(productResults);
+      $('list').innerHTML=rows.map(x=>{
+        const selected=new Set(x.product_ids||[]);
+        const products=productsByTarget[x.target_uid]||[];
+        const bad=['error','capability_mismatch','paused','not_delivering'].includes(x.last_status);
+        return `<section class="card ${x.enabled?'':'off'}" data-uid="${esc(x.target_uid)}">
+          <div class="row"><div><div class="name">${esc(x.plan_name||'未命名计划')}</div>
+          <div class="meta">账户 ${esc(x.aadvid)} · 计划 ${esc(x.ad_id)}<br>${esc(x.target_uid)}</div></div>
+          <span class="pill ${x.promotion_scene==='product'?'product':''}">${sceneText(x.promotion_scene)} · ${systemText(x.plan_system)}</span></div>
+          <div class="status ${bad?'bad':x.last_status==='ok'?'ok':''}">${esc(statusText(x.last_status))} · 最后同步 ${esc(x.last_sync_at||'—')}${x.last_error?`<br>${esc(x.last_error)}`:''}</div>
+          <div class="form">
+            <label>计划名称<input data-field="plan_name" value="${esc(x.plan_name||'')}"></label>
+            <label>启用状态<select data-field="enabled"><option value="1" ${x.enabled?'selected':''}>启用监控</option><option value="0" ${x.enabled?'':'selected'}>暂停监控</option></select></label>
+            ${x.promotion_scene==='product'?`<label>商品范围<select data-field="product_filter_mode"><option value="all" ${x.product_filter_mode==='all'?'selected':''}>全部商品</option><option value="selected" ${x.product_filter_mode==='selected'?'selected':''}>只关注指定商品</option></select></label>
+            <div></div><div class="products">${products.length?products.map(p=>`<label class="product-check"><input type="checkbox" data-product-id="${esc(p.product_id)}" ${selected.has(String(p.product_id))?'checked':''}><span>${esc(p.product_name||'未命名商品')}<br><span class="meta">${esc(p.product_id)}</span></span></label>`).join(''):'<div class="product-empty">首次采集成功后，这里会显示可勾选的商品。</div>'}</div>`:''}
+          </div>
+          <div class="actions"><button data-save>保存设置</button></div>
+        </section>`;
+      }).join('');
+      document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>save(btn.closest('.card')));
+    }
+    async function save(card){
+      const uid=card.dataset.uid; const a=await waitApi(); const one=await a.getPromotionTarget(uid);
+      if(!one?.success){message(one?.message||'读取计划失败',true);return}
+      const d=one.data; d.plan_name=card.querySelector('[data-field=plan_name]').value.trim();
+      d.enabled=card.querySelector('[data-field=enabled]').value==='1';
+      const mode=card.querySelector('[data-field=product_filter_mode]');
+      if(mode)d.product_filter_mode=mode.value;
+      if(mode)d.product_ids=Array.from(card.querySelectorAll('[data-product-id]:checked')).map(x=>x.dataset.productId);
+      const r=await a.savePromotionTarget(d); message(r?.success?'设置已保存':(r?.message||'保存失败'),!r?.success); if(r?.success)load();
+    }
+    async function discover(){
+      const a=await waitApi(); const r=await a.startPromotionTargetDiscovery();
+      message(r?.message||'请在新浏览器中进入计划详情',!r?.success);
+      if(!r?.success)return; $('discover').disabled=true;
+      const timer=setInterval(async()=>{const s=await a.getPromotionTargetDiscoveryStatus();message(s?.message||'正在等待千川计划详情',!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;if(s?.target)load();}},1000);
+    }
+    $('discover').onclick=discover; load(); setInterval(load,15000);
+  </script>
+</body>
+</html>

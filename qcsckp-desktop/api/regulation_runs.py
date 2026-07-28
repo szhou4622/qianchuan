@@ -17,6 +17,8 @@ from api.retargeting_runs import _json_dumps
 from api.rule_regulation_config import load_rule_regulation_config
 from config import CURRENT_VERSION
 from services.regulation_rule_runner import _insert_regulation_run
+from services.promotion_browser_lock import exclusive_browser_operation
+from services.plan_system import normalize_plan_system
 from services.regulation_service import (
     QianChuanRegulationStopService,
     RegulationRunResult,
@@ -154,7 +156,7 @@ def query_pmc_regulation_runs_page(
     """
     tbl = "pmc_regulation_run"
     fields = (
-        "id, aavid, ad_id, assist_task_id, task_name, strategy_name, stop_action, "
+        "id, aavid, ad_id, target_uid, promotion_scene, assist_task_id, task_name, strategy_name, stop_action, "
         "started_at, ended_at, duration_ms, status, step, message, trigger_source, created_at, "
         "query_snapshot_json"
     )
@@ -294,6 +296,48 @@ def run_immediate_regulation_stop_prepare(
     aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
     ad_id = str(ad_id_raw).strip() if ad_id_raw is not None else ""
     task_name_row = str(roi_row.get("task_name") or "").strip()[:512]
+    target_uid = str(roi_row.get("target_uid") or "legacy_unscoped").strip()
+    promotion_scene = str(roi_row.get("promotion_scene") or "live").strip().lower()
+    if promotion_scene not in ("live", "product"):
+        promotion_scene = "live"
+    plan_system = normalize_plan_system(roi_row.get("plan_system") or "unknown")
+    source_url: Optional[str] = None
+    if target_uid and target_uid != "legacy_unscoped":
+        target_rows = db.execute(
+            "SELECT * FROM promotion_target WHERE target_uid = ? LIMIT 1",
+            (target_uid,),
+            fetch=True,
+        )
+        if not target_rows:
+            return {
+                "success": False,
+                "message": "该调控任务所属监控计划已不存在，已阻止停投",
+            }
+        target_row = dict(target_rows[0])
+        target_plan_system = normalize_plan_system(
+            target_row.get("plan_system") or "unknown"
+        )
+        if (
+            str(target_row.get("aadvid") or "") != aavid
+            or str(target_row.get("ad_id") or "") != ad_id
+            or str(target_row.get("promotion_scene") or "live") != promotion_scene
+            or target_plan_system != plan_system
+        ):
+            return {
+                "success": False,
+                "message": "调控任务与监控计划不匹配，已阻止停投",
+            }
+        source_url = str(target_row.get("sanitized_page_url") or "").strip() or None
+    if plan_system == "unknown":
+        return {
+            "success": False,
+            "message": "计划体系尚未识别，已阻止停投；请重新打开计划详情完成识别",
+        }
+    if plan_system == "chengfang":
+        return {
+            "success": False,
+            "message": "该计划属于千川乘方，乘方停投适配器尚未完成受控验证，已阻止提交",
+        }
 
     q_snap = _manual_regulation_query_snapshot_from_roi2_row(aid_in, roi_row)
     trig_snap = _json_dumps(
@@ -310,6 +354,9 @@ def run_immediate_regulation_stop_prepare(
             db,
             aavid=aavid or "",
             ad_id=ad_id or "",
+            target_uid=target_uid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
             task_name=task_name_row or "",
             strategy_name=strategy_name,
             assist_task_id=aid_in,
@@ -339,6 +386,9 @@ def run_immediate_regulation_stop_prepare(
             db,
             aavid=aavid or "",
             ad_id=ad_id,
+            target_uid=target_uid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
             task_name=task_name_row or "",
             strategy_name=strategy_name,
             assist_task_id=aid_in,
@@ -372,13 +422,19 @@ def run_immediate_regulation_stop_prepare(
                         browser_executable_path=_browser_executable_for_session,
                     )
                 )
-                r = await svc.run_prepare_for_manual_stop(
-                    aavid=aavid_int,
-                    ad_id=ad_id_int,
-                    assist_task_id=aid_in,
-                    stop_action=act,
-                    strategy_title=strategy_name,
-                )
+                async with exclusive_browser_operation(
+                    f"手动停投:{target_uid}:{aid_in}"
+                ):
+                    r = await svc.run_prepare_for_manual_stop(
+                        aavid=aavid_int,
+                        ad_id=ad_id_int,
+                        assist_task_id=aid_in,
+                        stop_action=act,
+                        strategy_title=strategy_name,
+                        target_uid=target_uid,
+                        promotion_scene=promotion_scene,
+                        source_url=source_url,
+                    )
                 result_holder[0] = r
             except Exception:
                 logger.exception("[手动停投] 线程内异常")
@@ -435,6 +491,9 @@ def run_immediate_regulation_stop_prepare(
         db,
         aavid=str(r.aavid or aavid_int),
         ad_id=str(r.ad_id or ad_id_int),
+        target_uid=target_uid,
+        promotion_scene=promotion_scene,
+        plan_system=plan_system,
         task_name=task_name_row or "",
         strategy_name=strategy_name,
         assist_task_id=str(r.assist_task_id or aid_in),
@@ -462,5 +521,8 @@ def run_immediate_regulation_stop_prepare(
         "assist_task_id": str(r.assist_task_id or aid_in),
         "aavid": str(r.aavid or aavid_int),
         "ad_id": str(r.ad_id or ad_id_int),
+        "target_uid": target_uid,
+        "promotion_scene": promotion_scene,
+        "plan_system": plan_system,
         "app_version": CURRENT_VERSION,
     }

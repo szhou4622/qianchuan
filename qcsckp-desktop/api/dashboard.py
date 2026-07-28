@@ -25,7 +25,12 @@ class DashboardApi:
         from utils.sqlite_store import SQLiteStore
         self.db = SQLiteStore()
 
-    def get_material_history_recent(self, material_id: str, limit: int = 200) -> Dict[str, Any]:
+    def get_material_history_recent(
+        self,
+        material_id: str,
+        limit: int = 200,
+        target_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         获取素材最近 N 条历史点（按 created_at），用于前端折线图轮询刷新。
         限制：最多200条，且日期必须大于今日00:00:00（+8时区）
@@ -46,10 +51,15 @@ class DashboardApi:
             now_beijing = datetime.utcnow() + timedelta(hours=8)
             today_start = now_beijing.replace(hour=0, minute=0, second=0, microsecond=0)
 
+            where = "material_id = ? AND created_at > ?"
+            params: tuple = (material_id, today_start.strftime('%Y-%m-%d %H:%M:%S'))
+            if target_uid:
+                where += " AND target_uid = ?"
+                params += (str(target_uid).strip(),)
             rows = self.db.select(
                 table='pmc_promotion_material',
-                where="material_id = ? AND created_at > ?",
-                params=(material_id, today_start.strftime('%Y-%m-%d %H:%M:%S')),
+                where=where,
+                params=params,
                 order_by='created_at DESC',
                 limit=limit
             )
@@ -87,8 +97,15 @@ class DashboardApi:
             traceback.print_exc()
             return {"success": False, "data": [], "message": str(e)}
 
-    def get_table_data(self, period: str = "1h", sort_by: str = "costDiff", sort_order: str = "desc",
-                      page: int = 1, page_size: int = 50) -> Dict[str, Any]:
+    def get_table_data(
+        self,
+        period: str = "1h",
+        sort_by: str = "costDiff",
+        sort_order: str = "desc",
+        page: int = 1,
+        page_size: int = 50,
+        target_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         获取表格数据 - 按周期查询素材的首尾差值
 
@@ -149,14 +166,22 @@ class DashboardApi:
                 order_direction = 'ASC'
 
             # 一次查询获取所有数据，然后 Python 切片分页
+            target_uid = str(target_uid or "").strip()
+            target_filter_sql = " AND target_uid = ?" if target_uid else ""
             sql = f"""
             WITH RawData AS (
                 SELECT * FROM pmc_promotion_material
                 WHERE created_at >= datetime('now', '+8 hours', '{time_str}')
+                {target_filter_sql}
             ),
             WindowedData AS (
                 SELECT
+                    COALESCE(target_uid, 'legacy_unscoped') as target_uid,
                     material_id,
+                    LAST_VALUE(ad_id) OVER w as ad_id,
+                    LAST_VALUE(promotion_scene) OVER w as promotion_scene,
+                    LAST_VALUE(plan_system) OVER w as plan_system,
+                    LAST_VALUE(product_ids_json) OVER w as product_ids_json,
                     LAST_VALUE(aadvid) OVER w as aadvid,
                     LAST_VALUE(video_name) OVER w as video_name,
                     LAST_VALUE(material_status) OVER w as material_status,
@@ -182,17 +207,26 @@ class DashboardApi:
                     LAST_VALUE(overall_click_count) OVER w as e_clk,
                     LAST_VALUE(overall_ctr) OVER w as e_ctr,
                     LAST_VALUE(overall_conversion_rate) OVER w as e_cconv,
-                    MIN(created_at) OVER (PARTITION BY material_id) as period_start_time,
-                    MAX(created_at) OVER (PARTITION BY material_id) as period_end_time
+                    MIN(created_at) OVER (
+                        PARTITION BY COALESCE(target_uid, 'legacy_unscoped'), material_id
+                    ) as period_start_time,
+                    MAX(created_at) OVER (
+                        PARTITION BY COALESCE(target_uid, 'legacy_unscoped'), material_id
+                    ) as period_end_time
                 FROM RawData
                 WINDOW w AS (
-                    PARTITION BY material_id
+                    PARTITION BY COALESCE(target_uid, 'legacy_unscoped'), material_id
                     ORDER BY created_at ASC
                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
                 )
             )
             SELECT
+                target_uid,
                 material_id,
+                ad_id,
+                promotion_scene,
+                plan_system,
+                product_ids_json,
                 aadvid,
                 video_name,
                 material_status,
@@ -221,11 +255,15 @@ class DashboardApi:
                 period_start_time,
                 period_end_time
             FROM WindowedData
-            GROUP BY material_id
+            GROUP BY target_uid, material_id
             ORDER BY {order_by_field} {order_direction};
             """
 
-            all_results = self.db.execute(sql, fetch=True)
+            all_results = self.db.execute(
+                sql,
+                params=(target_uid,) if target_uid else None,
+                fetch=True,
+            )
             rows_list = [dict(r) for r in (all_results or [])]
 
             if rows_list:
@@ -263,8 +301,19 @@ class DashboardApi:
             # 转换为前端需要的格式
             data = []
             for row in results:
+                try:
+                    product_ids = json.loads(row.get('product_ids_json') or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    product_ids = []
+                if not isinstance(product_ids, list):
+                    product_ids = []
                 data.append({
                     'id': row.get('material_id'),
+                    'targetUid': row.get('target_uid') or 'legacy_unscoped',
+                    'adId': row.get('ad_id'),
+                    'promotionScene': row.get('promotion_scene') or 'live',
+                    'planSystem': row.get('plan_system') or 'unknown',
+                    'productIds': [str(v) for v in product_ids if str(v or '').strip()],
                     'aadvid': row.get('aadvid'),
                     'title': row.get('video_name', '未命名'),
                     'materialStatus': row.get('material_status'),
@@ -522,6 +571,7 @@ class DashboardApi:
         regulation_full_scan: bool = False,
         assist_updated_within_minutes: Optional[int] = None,
         search: Optional[str] = None,
+        target_uid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         全域调控任务（pmc_roi2_assist_task）列表，分页排序。
@@ -572,6 +622,10 @@ class DashboardApi:
             if aadvid_s:
                 where_clauses.insert(0, "aadvid = ?")
                 params.append(aadvid_s)
+            target_uid_s = (target_uid or "").strip()
+            if target_uid_s:
+                where_clauses.insert(0, "target_uid = ?")
+                params.insert(0, target_uid_s)
             if ad_delivery_type is not None:
                 where_clauses.append("ad_delivery_type = ?")
                 params.append(int(ad_delivery_type))
@@ -599,6 +653,10 @@ class DashboardApi:
             SELECT
                 id,
                 assist_task_id,
+                target_uid,
+                promotion_scene,
+                plan_system,
+                product_ids_json,
                 aadvid,
                 ad_id,
                 task_name,

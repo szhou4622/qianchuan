@@ -1,0 +1,656 @@
+# -*- coding: utf-8 -*-
+import copy
+import os
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+from api.operation_events import (
+    _normalize_occurred_at,
+    export_operation_events_csv,
+    get_operation_event,
+    ingest_platform_log_rows,
+    normalize_action_type,
+    prune_operation_events,
+    query_operation_events_page,
+    upsert_operation_event,
+)
+from api.rule_retargeting_config import _normalize_full
+from services.cloud_retarget_client import report_retarget_task
+from services import local_test_guard
+from services import retarget_task_worker
+from services.run_services import (
+    ServiceConfig,
+    _choose_startup_target,
+    _load_last_target,
+    _reuse_last_target_enabled,
+    _save_last_target,
+    _target_is_excluded,
+    _trusted_startup_discovery,
+)
+from services.operation_log_monitor import (
+    _classify_write,
+    _extract_platform_rows,
+    _explicit_has_more,
+    _paginate_body,
+    _paginate_url,
+    _prepare_replay_body,
+    _with_30_day_body,
+)
+from services.retarget_task_worker import _snapshot_hash, _strategy_hash, _strategy_snapshot
+from services import retargeting_rule_runner
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+
+class RetargetConfigTests(unittest.TestCase):
+    def test_existing_strategy_defaults_to_card_confirmation(self):
+        cfg = _normalize_full(
+            {
+                "enabled": True,
+                "strategies": [
+                    {
+                        "id": "s1",
+                        "title": "旧策略",
+                        "trigger": {"group_combine": "or", "groups": []},
+                        "retargeting": {"method": "volume", "volume": {"total_budget_yuan": 100}},
+                    }
+                ],
+            }
+        )
+        self.assertEqual("card_confirm", cfg["strategies"][0]["action_mode"])
+
+    def test_auto_execute_is_preserved(self):
+        cfg = _normalize_full(
+            {
+                "strategies": [
+                    {
+                        "id": "s1",
+                        "action_mode": "auto_execute",
+                        "trigger": {},
+                        "retargeting": {},
+                    }
+                ]
+            }
+        )
+        self.assertEqual("auto_execute", cfg["strategies"][0]["action_mode"])
+
+    def test_local_test_environment_blocks_auto_execute(self):
+        with patch.object(retargeting_rule_runner, "TEST_MODE", True):
+            self.assertFalse(retargeting_rule_runner.auto_execute_allowed_in_current_environment())
+        with patch.object(retargeting_rule_runner, "TEST_MODE", False):
+            self.assertTrue(retargeting_rule_runner.auto_execute_allowed_in_current_environment())
+
+    def test_strategy_snapshot_hash_detects_parameter_tampering(self):
+        strategy = {
+            "id": "s1",
+            "title": "策略",
+            "action_mode": "card_confirm",
+            "trigger": {"groups": []},
+            "retargeting": {"method": "volume", "volume": {"total_budget_yuan": 100}},
+        }
+        snapshot = copy.deepcopy(_strategy_snapshot(strategy))
+        self.assertEqual(_strategy_hash(strategy), _snapshot_hash(snapshot))
+        snapshot["retargeting"]["volume"]["total_budget_yuan"] = 999
+        self.assertNotEqual(_strategy_hash(strategy), _snapshot_hash(snapshot))
+
+
+class OperationEventTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        init_sqlite_schema(database=self.db_path)
+        self.db = SQLiteStore(database=self.db_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_event_uid_is_idempotent_and_accounts_are_separate(self):
+        event = {
+            "event_uid": "task:1",
+            "aavid": "1001",
+            "source": "tool_direct",
+            "action_type": "retarget",
+            "status": "requested",
+            "summary": "第一次",
+            "occurred_at": "2026-07-22 10:00:00",
+        }
+        upsert_operation_event(event, self.db)
+        event.update({"status": "success", "summary": "已完成"})
+        upsert_operation_event(event, self.db)
+        upsert_operation_event({**event, "event_uid": "task:2", "aavid": "1002"}, self.db)
+        rows = self.db.select("account_operation_event", where={"aavid": "1001"})
+        self.assertEqual(1, len(rows))
+        self.assertEqual("success", rows[0]["status"])
+        self.assertEqual("已完成", rows[0]["summary"])
+
+    def test_action_normalization(self):
+        self.assertEqual("retarget", normalize_action_type("创建素材追投任务"))
+        self.assertEqual(
+            "stop",
+            normalize_action_type(
+                "操作内容：素材追投，调控状态：调控中 -> 调控手动关闭"
+            ),
+        )
+        self.assertEqual("plan_create", normalize_action_type("新建计划"))
+        self.assertEqual("budget_update", normalize_action_type("调整日预算"))
+        self.assertEqual("other", normalize_action_type("查看报表"))
+
+    def test_platform_timestamp_accepts_milliseconds(self):
+        self.assertEqual("2023-11-15 06:13:20", _normalize_occurred_at(1700000000000))
+
+    def test_filters_csv_and_detail_keep_account_isolation(self):
+        base = {
+            "source": "tool_direct",
+            "action_type": "retarget",
+            "status": "success",
+            "operator_name": "审批人甲",
+            "object_name": "素材A",
+            "occurred_at": "2026-07-22 10:00:00",
+        }
+        upsert_operation_event({**base, "event_uid": "one", "aavid": "1001"}, self.db)
+        upsert_operation_event({**base, "event_uid": "two", "aavid": "1002"}, self.db)
+        with patch("api.operation_events.init_sqlite_schema"), patch(
+            "api.operation_events.SQLiteStore", return_value=self.db
+        ), patch("api.operation_events.migrate_legacy_operation_runs", return_value=0):
+            total, rows = query_operation_events_page(
+                aavid="1001", source="tool_direct", action_type="retarget", status="success", operator="审批人", q="素材A"
+            )
+            csv_text = export_operation_events_csv(aavid="1001")
+            own = get_operation_event(rows[0]["id"], "1001")
+            foreign = get_operation_event(rows[0]["id"], "1002")
+        self.assertEqual(1, total)
+        self.assertEqual("1001", rows[0]["aavid"])
+        self.assertTrue(csv_text.startswith("\ufeff"))
+        self.assertEqual(2, len(csv_text.splitlines()))
+        self.assertIsNotNone(own)
+        self.assertIsNone(foreign)
+
+    def test_date_filter_possible_duplicate_and_180_day_cleanup(self):
+        base = {
+            "aavid": "1001",
+            "source": "tool_direct",
+            "action_type": "budget_update",
+            "status": "success",
+            "object_id": "plan-1",
+            "occurred_at": "2026-07-22 10:00:00",
+        }
+        upsert_operation_event({**base, "event_uid": "direct-1"}, self.db)
+        upsert_operation_event({**base, "event_uid": "direct-2"}, self.db)
+        with patch("api.operation_events.init_sqlite_schema"), patch(
+            "api.operation_events.SQLiteStore", return_value=self.db
+        ), patch("api.operation_events.migrate_legacy_operation_runs", return_value=0):
+            ingest_platform_log_rows(
+                "1001",
+                [
+                    {
+                        "id": "platform-1",
+                        "operation_name": "修改预算",
+                        "object_id": "plan-1",
+                        "operation_time": "2026-07-22 10:00:30",
+                    }
+                ],
+            )
+            total, rows = query_operation_events_page(
+                aavid="1001", date_from="2026-07-22", date_to="2026-07-22"
+            )
+        self.assertEqual(3, total)
+        platform = next(row for row in rows if row["source"] == "platform_log")
+        self.assertEqual(1, platform["possible_duplicate"])
+        direct_rows = [row for row in rows if row["source"] == "tool_direct"]
+        self.assertTrue(all(row["possible_duplicate"] == 1 for row in direct_rows))
+
+        old_time = (datetime.now() - timedelta(days=181)).strftime("%Y-%m-%d %H:%M:%S")
+        upsert_operation_event(
+            {
+                **base,
+                "event_uid": "too-old",
+                "object_id": "plan-old",
+                "occurred_at": old_time,
+            },
+            self.db,
+        )
+        with patch("api.operation_events.init_sqlite_schema"), patch(
+            "api.operation_events.SQLiteStore", return_value=self.db
+        ):
+            deleted = prune_operation_events(180)
+        self.assertEqual(1, deleted)
+        self.assertIsNone(self.db.select_one("account_operation_event", where={"event_uid": "too-old"}))
+
+    def test_clear_platform_match_merges_into_one_effective_operation(self):
+        upsert_operation_event(
+            {
+                "event_uid": "direct-clear",
+                "aavid": "1001",
+                "source": "tool_direct",
+                "action_type": "retarget",
+                "object_type": "material",
+                "object_id": "material-1",
+                "object_name": "素材一",
+                "material_id": "material-1",
+                "material_name": "素材一",
+                "regulate_task_id": "task-1",
+                "status": "success",
+                "occurred_at": "2026-07-22 10:00:00",
+            },
+            self.db,
+        )
+        with patch("api.operation_events.init_sqlite_schema"), patch(
+            "api.operation_events.SQLiteStore", return_value=self.db
+        ), patch("api.operation_events.migrate_legacy_operation_runs", return_value=0):
+            ingest_platform_log_rows(
+                "1001",
+                [
+                    {
+                        "id": "platform-clear",
+                        "operation_name": "创建素材追投任务",
+                        "material_id": "material-1",
+                        "operation_time": "2026-07-22 10:00:20",
+                        "operator_name": "审批人",
+                    }
+                ],
+            )
+            total, rows = query_operation_events_page(aavid="1001")
+            csv_text = export_operation_events_csv(aavid="1001")
+        self.assertEqual(1, total)
+        self.assertEqual("direct-clear", rows[0]["event_uid"])
+        self.assertEqual("platform-clear", rows[0]["platform_event_id"])
+        self.assertEqual("material-1", rows[0]["material_id"])
+        self.assertEqual("task-1", rows[0]["regulate_task_id"])
+        self.assertIn("调控任务ID", csv_text)
+
+
+class PlatformLogMonitorTests(unittest.TestCase):
+    def test_extracts_log_rows_and_classifies_plan_writes(self):
+        rows = [
+            {"operation_name": "修改预算", "operation_time": "2026-07-22 10:00:00", "operator_name": "张三"}
+        ]
+        self.assertEqual(rows, _extract_platform_rows({"data": {"list": rows}}))
+        self.assertEqual("plan_copy", _classify_write("https://x.test/campaign/copy", {}))
+        self.assertEqual("plan_disable", _classify_write("https://x.test/update", {"opt_status": "disable"}))
+
+    def test_30_day_replay_only_changes_existing_date_fields(self):
+        original = {"page": 1, "start_time": 1700000000000, "end_time": 1700100000000, "nested": {"name": "x"}}
+        changed = _with_30_day_body(original)
+        self.assertEqual(1, changed["page"])
+        self.assertEqual("x", changed["nested"]["name"])
+        self.assertIsInstance(changed["start_time"], int)
+        self.assertLess(changed["start_time"], changed["end_time"])
+        body, headers = _prepare_replay_body('{"start_date":"2026-07-01","end_date":"2026-07-02"}')
+        self.assertIsInstance(body, dict)
+        self.assertIn("application/json", headers["Content-Type"])
+
+    def test_log_backfill_paginates_only_existing_fields(self):
+        url, supported = _paginate_url(
+            "https://example.test/log/list?page=1&page_size=20&account=1001", 3
+        )
+        self.assertTrue(supported)
+        self.assertIn("page=3", url)
+        self.assertIn("page_size=100", url)
+        unchanged, unsupported = _paginate_url(
+            "https://example.test/log/list?account=1001", 3
+        )
+        self.assertFalse(unsupported)
+        self.assertEqual("https://example.test/log/list?account=1001", unchanged)
+        body, body_supported = _paginate_body(
+            {"filters": {"date": "2026-07-01"}, "page_no": 1, "limit": 20},
+            "application/json",
+            4,
+        )
+        self.assertTrue(body_supported)
+        self.assertEqual(4, body["page_no"])
+        self.assertEqual(100, body["limit"])
+        self.assertFalse(_explicit_has_more({"data": {"has_more": False}}))
+
+
+class CloudClientTests(unittest.TestCase):
+    def test_result_report_includes_claim_token(self):
+        with patch("services.cloud_retarget_client._token", return_value="device-token"), patch(
+            "services.cloud_retarget_client._request", return_value={"success": True}
+        ) as request:
+            response = report_retarget_task("task-1", "a" * 64, "executing", message="执行中")
+        self.assertTrue(response["success"])
+        payload = request.call_args.kwargs["payload"]
+        self.assertEqual("a" * 64, payload["claim_token"])
+        self.assertEqual("executing", payload["status"])
+
+
+class RetargetWorkerValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.strategy = {
+            "id": "s1",
+            "title": "策略1",
+            "action_mode": "card_confirm",
+            "trigger": {"groups": []},
+            "retargeting": {
+                "method": "volume",
+                "volume": {"total_budget_yuan": 100, "duration_hours": 0.5},
+            },
+        }
+        snapshot = retarget_task_worker._strategy_snapshot(self.strategy)
+        self.task = {
+            "strategy_id": "s1",
+            "strategy_hash": retarget_task_worker._snapshot_hash(snapshot),
+            "rule_snapshot": snapshot,
+            "aavid": "10001",
+            "ad_id": "30001",
+            "material_id": "20001",
+            "retargeting": copy.deepcopy(snapshot["retargeting"]),
+        }
+
+    def validate(
+        self,
+        *,
+        current_strategy=None,
+        current_ad_id="30001",
+        trigger_passed=True,
+        rate_limited=False,
+    ):
+        strategy = current_strategy or copy.deepcopy(self.strategy)
+        cfg = {
+            "enabled": True,
+            "trigger_query_period": "1h",
+            "per_strategy_rate_limit": False,
+            "strategies": [strategy],
+        }
+        with patch(
+            "services.retarget_task_worker.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retarget_task_worker.resolve_ad_id_for_aavid",
+            return_value=current_ad_id,
+        ), patch(
+            "services.retarget_task_worker.os.path.isfile",
+            return_value=True,
+        ), patch(
+            "services.retarget_task_worker._latest_material_row",
+            return_value={"aadvid": "10001", "id": "20001"},
+        ), patch(
+            "services.retarget_task_worker.evaluate_trigger",
+            return_value=trigger_passed,
+        ), patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 1),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_should_skip",
+            return_value=rate_limited,
+        ), patch(
+            "services.retarget_task_worker.assert_test_scope",
+        ):
+            return retarget_task_worker._validate_task(self.task, object())
+
+    def test_strategy_change_blocks_execution(self):
+        changed = copy.deepcopy(self.strategy)
+        changed["retargeting"]["volume"]["total_budget_yuan"] = 200
+        with self.assertRaisesRegex(RuntimeError, "策略参数已经变更"):
+            self.validate(current_strategy=changed)
+
+    def test_account_mismatch_blocks_execution(self):
+        with self.assertRaisesRegex(RuntimeError, "账户或广告ID"):
+            self.validate(current_ad_id="99999")
+
+    def test_material_no_longer_matches_blocks_execution(self):
+        with self.assertRaisesRegex(RuntimeError, "不满足追投规则"):
+            self.validate(trigger_passed=False)
+
+    def test_rate_limit_blocks_execution(self):
+        with self.assertRaisesRegex(RuntimeError, "次数上限"):
+            self.validate(rate_limited=True)
+
+    def validate_target_plan_system(self, plan_system):
+        strategy = copy.deepcopy(self.strategy)
+        strategy["target_uid"] = "target-1"
+        snapshot = retarget_task_worker._strategy_snapshot(strategy)
+        task = {
+            **self.task,
+            "target_uid": "target-1",
+            "promotion_scene": "live",
+            "plan_system": plan_system,
+            "strategy_hash": retarget_task_worker._snapshot_hash(snapshot),
+            "rule_snapshot": snapshot,
+        }
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {
+                        "target_uid": "target-1",
+                        "aadvid": "10001",
+                        "ad_id": "30001",
+                        "promotion_scene": "live",
+                        "plan_system": plan_system,
+                        "last_status": "ok",
+                        "enabled": 1,
+                    }
+                return None
+
+        with patch(
+            "services.retarget_task_worker.load_rule_retargeting_config",
+            return_value={
+                "enabled": True,
+                "trigger_query_period": "1h",
+                "strategies": [strategy],
+            },
+        ), patch("services.retarget_task_worker.assert_test_scope"):
+            return retarget_task_worker._validate_task(task, FakeStore())
+
+    def test_unknown_plan_system_blocks_execution(self):
+        with self.assertRaisesRegex(RuntimeError, "计划体系尚未确认"):
+            self.validate_target_plan_system("unknown")
+
+    def test_chengfang_plan_system_blocks_unverified_adapter(self):
+        with self.assertRaisesRegex(RuntimeError, "千川乘方计划尚未通过"):
+            self.validate_target_plan_system("chengfang")
+
+
+class LocalTestGuardTests(unittest.TestCase):
+    def test_scraper_cookie_uses_the_isolated_data_directory(self):
+        self.assertEqual(
+            os.path.join(local_test_guard.DATA_DIR, "qcookie.json"),
+            ServiceConfig().cookie_path,
+        )
+
+    def test_last_crawl_target_is_saved_without_the_full_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_file = os.path.join(tmp, "last_crawl_target.json")
+            self.assertTrue(_save_last_target("1001", "2002", target_file))
+            self.assertEqual(
+                {"aavid": "1001", "adId": "2002"},
+                _load_last_target(target_file),
+            )
+            self.assertFalse(_save_last_target("not-an-account", "2002", target_file))
+
+    def test_target_reselection_disables_remembered_target_for_one_launch(self):
+        with patch.dict(os.environ, {"QCSCKP_FORCE_TARGET_RESELECT": "1"}):
+            self.assertFalse(_reuse_last_target_enabled())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_reuse_last_target_enabled())
+
+    def test_target_reselection_excludes_only_the_previous_target(self):
+        previous = {"aavid": "1001", "adId": "2002"}
+        self.assertTrue(_target_is_excluded("1001", "2002", previous))
+        self.assertFalse(_target_is_excluded("1001", "2003", previous))
+        self.assertFalse(_target_is_excluded("1002", "2002", previous))
+        self.assertFalse(_target_is_excluded("1001", "2002", None))
+
+    def test_last_selected_target_takes_priority_on_restart(self):
+        targets = [
+            {"aadvid": "1001", "ad_id": "2001", "promotion_scene": "live"},
+            {"aadvid": "1001", "ad_id": "2002", "promotion_scene": "product"},
+        ]
+        selected = _choose_startup_target(
+            targets,
+            {"aavid": "1001", "adId": "2002"},
+        )
+        self.assertEqual("2002", selected["ad_id"])
+        self.assertEqual("product", selected["promotion_scene"])
+
+    def test_product_restart_trusts_stored_target_not_page_default(self):
+        discovered = _trusted_startup_discovery(
+            {
+                "aadvid": "1001",
+                "ad_id": "2002",
+                "promotion_scene": "product",
+                "plan_name": "商品全域计划",
+            },
+            "https://qianchuan.jinritemai.com/uni-prom?aavid=1001&adId=2002",
+        )
+        self.assertEqual("1001", discovered["aavid"])
+        self.assertEqual("2002", discovered["ad_id"])
+        self.assertEqual("product", discovered["promotion_scene"])
+        self.assertEqual("商品全域计划", discovered["plan_name"])
+
+    def test_local_test_credentials_are_loaded_only_from_external_runtime_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_file = os.path.join(tmp, "secrets.local.json")
+            with open(secret_file, "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"test_account":{"username":"local_test","password":"random-local-password"},'
+                    '"feishu_app":{"app_secret":"must-not-be-returned"}}'
+                )
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                LOCAL_TEST_SECRETS_FILE=secret_file,
+            ):
+                result = local_test_guard.load_local_test_login_credentials()
+        self.assertTrue(result["success"])
+        self.assertEqual("local_test", result["username"])
+        self.assertEqual("random-local-password", result["password"])
+        self.assertNotIn("feishu_app", result)
+
+        with patch.multiple(
+            local_test_guard,
+            TEST_MODE=False,
+            LOCAL_TEST_SECRETS_FILE=secret_file,
+        ):
+            disabled = local_test_guard.load_local_test_login_credentials()
+        self.assertFalse(disabled["success"])
+
+    def test_scope_filters_to_one_account_and_material(self):
+        with patch.multiple(
+            local_test_guard,
+            TEST_MODE=True,
+            TEST_AAVID="1001",
+            TEST_MATERIAL_ID="2001",
+        ):
+            local_test_guard.assert_test_scope("1001", "2001")
+            self.assertTrue(
+                local_test_guard.row_is_in_test_scope({"aadvid": "1001", "id": "2001"})
+            )
+            self.assertFalse(
+                local_test_guard.row_is_in_test_scope({"aadvid": "1002", "id": "2001"})
+            )
+            with self.assertRaisesRegex(RuntimeError, "账户"):
+                local_test_guard.assert_test_scope("1002", "2001")
+
+    def test_live_permission_can_only_be_consumed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            consumed = os.path.join(tmp, "live_retarget_consumed.json")
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                TEST_AAVID="1001",
+                TEST_MATERIAL_ID="2001",
+                ALLOW_LIVE_RETARGET=True,
+                DATA_DIR=tmp,
+                CONSUMED_FILE=consumed,
+            ):
+                local_test_guard.consume_live_retarget_once("task-1", "1001", "2001")
+                self.assertTrue(os.path.isfile(consumed))
+                with self.assertRaisesRegex(RuntimeError, "已被消费"):
+                    local_test_guard.consume_live_retarget_once("task-1", "1001", "2001")
+
+    def test_live_permission_defaults_to_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                TEST_AAVID="1001",
+                TEST_MATERIAL_ID="2001",
+                ALLOW_LIVE_RETARGET=False,
+                DATA_DIR=tmp,
+                CONSUMED_FILE=os.path.join(tmp, "gate.json"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "未开启"):
+                    local_test_guard.consume_live_retarget_once("task-1", "1001", "2001")
+
+    def test_preflight_is_ready_before_final_live_authorization(self):
+        config = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "id": "s1",
+                    "title": "受控验收策略",
+                    "target_uid": "target-test",
+                    "action_mode": "card_confirm",
+                    "trigger": {"group_combine": "or", "groups": []},
+                    "retargeting": {
+                        "method": "volume",
+                        "volume": {
+                            "total_budget_yuan": 100,
+                            "duration_hours": 0.5,
+                        },
+                    },
+                }
+            ],
+        }
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {
+                        "target_uid": "target-test",
+                        "aadvid": "1001",
+                        "ad_id": "3001",
+                        "promotion_scene": "product",
+                        "plan_system": "global",
+                        "plan_name": "测试全域计划",
+                        "enabled": 1,
+                    }
+                if table == "pmc_ad_detail_basic":
+                    return {"user_info_name": "测试账户"}
+                if table == "pmc_promotion_material":
+                    return {"video_name": "测试素材"}
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "qcookie.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                TEST_AAVID="1001",
+                TEST_MATERIAL_ID="2001",
+                ALLOW_LIVE_RETARGET=False,
+                DATA_DIR=tmp,
+                CONSUMED_FILE=os.path.join(tmp, "live_retarget_consumed.json"),
+            ), patch(
+                "api.rule_retargeting_config.load_rule_retargeting_config",
+                return_value=config,
+            ), patch(
+                "api.rule_retargeting_config.validate_rule_retargeting_config",
+                return_value=(True, ""),
+            ), patch(
+                "services.cloud_retarget_client.load_device_session",
+                return_value={"username": "tester", "token": "device-token"},
+            ), patch(
+                "services.retargeting_rule_runner.resolve_ad_id_for_aavid",
+                return_value="3001",
+            ), patch(
+                "utils.sqlite_store.init_sqlite_schema",
+            ), patch(
+                "utils.sqlite_store.SQLiteStore",
+                return_value=FakeStore(),
+            ):
+                result = local_test_guard.build_live_retarget_preflight()
+
+        self.assertTrue(result["ready_to_arm"])
+        self.assertFalse(result["ready_to_execute"])
+        self.assertEqual("测试账户", result["account_name"])
+        self.assertEqual("测试素材", result["material_name"])
+        self.assertIn("预算 100 元", result["strategies"][0]["summary"])
+
+
+if __name__ == "__main__":
+    unittest.main()

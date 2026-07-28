@@ -519,6 +519,27 @@
                     </p>
                 </div>
 
+                <!-- 3 监控计划 -->
+                <section class="rr-section space-y-3" id="sectionRegulationTarget">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="crosshair" class="w-4 h-4 text-sky-400/90"></i>
+                        监控计划
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <label class="block max-w-2xl">
+                            <span class="rr-label">本策略所属计划</span>
+                            <select id="regStrategyTargetUid" class="rr-input w-full text-xs">
+                                <option value="">请选择监控计划</option>
+                            </select>
+                        </label>
+                        <p id="regStrategyTargetScene" class="text-[11px] text-slate-500">
+                            请先在“监控计划”页面添加并启用计划。
+                        </p>
+                        <p id="errRegulationTarget" class="rr-field-err hidden" role="alert"></p>
+                    </div>
+                </section>
+
                 <!-- 3 监测指标 -->
                 <section class="rr-section space-y-3" id="sectionTriggerRegulation">
                     <div class="flex flex-wrap items-center justify-between gap-2 gap-y-2">

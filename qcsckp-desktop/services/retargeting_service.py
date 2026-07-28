@@ -30,7 +30,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
 
 from config import DATA_DIR
+from api.promotion_targets import extract_target_ids, normalize_scene
 from services.fetcher import build_qianchuan_url_by_params
+from services.product_scene_adapter import (
+    find_visible_exact_text,
+    goto_and_confirm_product_target,
+)
 from utils.common import require_executable_path
 from utils.log import logger
 
@@ -259,17 +264,21 @@ class QianChuanRetargetingService:
 
     # ---------- 页面操作（与 fetcher 一致：先素材 Tab 再视频） ----------
 
-    async def _switch_to_video_tab(self) -> Optional[str]:
+    async def _switch_to_video_tab(self, promotion_scene: str = "live") -> Optional[str]:
         page = self.page
         if not page:
             return "页面不存在"
+        scene = normalize_scene(promotion_scene or "live")
         try:
-            sucai_tab = await page.query_selector(
-                'div[class*="ovui-tabs__nav-list"] >> div[class*="oc-new-badge"]:has-text("素材")'
-            )
-            if sucai_tab:
-                await sucai_tab.click()
-                await asyncio.sleep(random.uniform(0.8, 1.5))
+            for tab_text in ("素材", "创意"):
+                sucai_tab = await page.query_selector(
+                    'div[class*="ovui-tabs__nav-list"] '
+                    f'>> div[class*="oc-new-badge"]:has-text("{tab_text}")'
+                )
+                if sucai_tab:
+                    await sucai_tab.click()
+                    await asyncio.sleep(random.uniform(0.8, 1.5))
+                    break
 
             video_tab = page.locator(
                 'div[class*="oc-radio-group-button"] >> div[class*="ovui-radio-item"]:has-text("视频")'
@@ -282,7 +291,16 @@ class QianChuanRetargetingService:
                 return None
             else:
                 logger.warning("%s 未找到视频选项卡", self._log_tag)
-                return "未找到视频选项卡"
+                if scene == "product":
+                    # 商品全域部分页面直接展示素材表，不再有二级“视频”选项。
+                    has_material_table = (
+                        await page.locator('div[class*="ovui-table__body-wrapper"]').count() > 0
+                        and await page.locator('div[class*="oc-filter-input-filter"] input').count() > 0
+                    )
+                    if has_material_table:
+                        logger.info("%s 商品全域页面直接展示素材表，继续执行", self._log_tag)
+                        return None
+                return "未识别到当前场景的素材列表，已安全停止"
         except Exception as e:
             logger.warning("%s 切换视频选项卡失败: %s", self._log_tag, e)
             return f"切换视频选项卡失败: {e}"
@@ -411,15 +429,29 @@ class QianChuanRetargetingService:
         await asyncio.sleep(random.uniform(0.2, 0.5))
         return None
 
+    @staticmethod
+    async def _find_visible_button(page: Page, text: str) -> Optional[Any]:
+        """兼容直播旧表单和商品新弹层，返回文本完全匹配的可见按钮。"""
+        buttons = page.locator("button").filter(has_text=text)
+        count = await buttons.count()
+        for index in range(count - 1, -1, -1):
+            candidate = buttons.nth(index)
+            try:
+                if await candidate.is_visible() and (
+                    await candidate.inner_text()
+                ).strip() == text:
+                    return candidate
+            except Exception:
+                continue
+        return None
+
     async def _click_submit_and_wait_assist(self, page: Page) -> Tuple[Optional[str], str, str]:
         """
         在点击「提交」**之前**注册 expect_response，仅等待本次点击触发的 create-uni-prom-assist-task
         响应；with 结束后等待器移除，不会误用上一轮响应。
         返回 (简短错误信息, detail, 调控任务 id)；成功时 (None, "", tid)。
         """
-        btn = await page.query_selector(
-            'div[class*="footer-wrapper"] >> div[class*="oc-button-wrap"] >> button:has-text("提交")'
-        )
+        btn = await self._find_visible_button(page, "提交")
         if not btn:
             return "未找到提交按钮", "", ""
         timeout_ms = min(max(self._opt.goto_timeout_ms, 30_000), 120_000)
@@ -448,9 +480,7 @@ class QianChuanRetargetingService:
         create-uni-prom-assist-task 响应。超时、JSON 解析与业务失败判定与 _click_submit_and_wait_assist 一致。
         返回 (简短错误信息, detail, 调控任务 id)；成功时 (None, "", tid)。
         """
-        btn = await page.query_selector(
-            'div[class*="footer-wrapper"] >> div[class*="oc-button-wrap"] >> button:has-text("提交")'
-        )
+        btn = await self._find_visible_button(page, "提交")
         if not btn:
             return "未找到提交按钮", "", ""
         timeout_ms = min(max(self._opt.goto_timeout_ms, 30_000), 120_000)
@@ -529,7 +559,10 @@ class QianChuanRetargetingService:
     # ---------- 校验 ----------
 
     @staticmethod
-    def _validate_retargeting_payload(r: Dict[str, Any]) -> Optional[str]:
+    def _validate_retargeting_payload(
+        r: Dict[str, Any],
+        promotion_scene: str = "live",
+    ) -> Optional[str]:
         if not isinstance(r, dict):
             return "retargeting 须为对象"
         method = str(r.get("method") or "volume").strip().lower()
@@ -541,18 +574,25 @@ class QianChuanRetargetingService:
             if tb is None or (isinstance(tb, str) and not str(tb).strip()):
                 return "放量追投须填写调控总预算 total_budget_yuan"
             try:
-                float(tb)
+                budget_value = float(tb)
             except Exception:
                 return "调控总预算须为数字"
             dh = vol.get("duration_hours")
             if dh is None or (isinstance(dh, str) and not str(dh).strip()):
                 return "放量追投须填写调控时长 duration_hours"
             try:
-                float(dh)
+                duration_value = float(dh)
             except Exception:
                 return "调控时长须为数字"
+            if normalize_scene(promotion_scene or "live") == "product":
+                if budget_value < 100:
+                    return "商品全域调控预算不得低于100元"
+                if duration_value < 0.5 or duration_value > 24:
+                    return "商品全域调控时长须在0.5至24小时之间"
             return None
         if method == "cost_control":
+            if normalize_scene(promotion_scene or "live") == "product":
+                return "当前商品全域素材追投页面仅支持调控预算和时长，暂不支持控成本追投"
             cc = r.get("cost_control") or {}
             if not isinstance(cc, dict):
                 return "retargeting.cost_control 须为对象"
@@ -570,6 +610,8 @@ class QianChuanRetargetingService:
                     except Exception:
                         return f"{k} 须为数字"
             elif og == "live_room":
+                if normalize_scene(promotion_scene or "live") == "product":
+                    return "商品全域不支持直播间成交出价，请改用净成交ROI目标"
                 lr = cc.get("live_room") or {}
                 if not isinstance(lr, dict):
                     return "cost_control.live_room 须为对象"
@@ -587,6 +629,223 @@ class QianChuanRetargetingService:
         return f"未知追投方式 method: {method}"
 
     # ---------- 主流程 ----------
+
+    @staticmethod
+    async def _click_last_visible(locator: Any) -> bool:
+        count = await locator.count()
+        for index in range(count - 1, -1, -1):
+            candidate = locator.nth(index)
+            if await candidate.is_visible():
+                try:
+                    await candidate.click(timeout=5_000)
+                except Exception:
+                    # 千川右下角智能助手可能覆盖弹层底部按钮；目标已经按
+                    # 精确角色/文本定位时，直接触发该元素自身的 click，
+                    # 避免坐标点击仍被浮层截获。
+                    await candidate.evaluate("element => element.click()")
+                return True
+        return False
+
+    async def _open_product_retarget_dialog(
+        self,
+        page: Page,
+        ad_id: Any,
+    ) -> Optional[str]:
+        """从商品自选的精确计划行打开「素材追投」新建任务表单。"""
+        plan_id = str(ad_id or "").strip()
+        id_text = await find_visible_exact_text(
+            page,
+            f"ID：{plan_id}",
+            timeout_ms=min(self._opt.goto_timeout_ms, 15_000),
+        )
+        if id_text is None:
+            return f"商品自选列表未找到计划 {plan_id}"
+        plan_row = id_text.locator("xpath=ancestor::tr[1]")
+        if await plan_row.count() < 1:
+            return f"无法定位商品计划 {plan_id} 的操作行"
+        row_text = (await plan_row.inner_text() or "").strip()
+        if "投放中" not in row_text:
+            return f"商品计划 {plan_id} 当前不是投放中状态"
+
+        retarget_label = plan_row.get_by_text("素材追投", exact=True)
+        try:
+            await retarget_label.first.wait_for(
+                state="visible",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return f"商品计划 {plan_id} 未提供素材追投入口"
+        assist_task = retarget_label.first.locator(
+            "xpath=ancestor::*[contains(@class,'assist-task')][1]"
+        )
+        if await assist_task.count() < 1:
+            return f"商品计划 {plan_id} 的素材追投入口结构无法识别"
+        await assist_task.hover()
+        plus_icon = assist_task.locator(
+            'iconpark-icon[name="oc-icon-plus"]'
+        )
+        try:
+            await plus_icon.first.wait_for(
+                state="visible",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return f"商品计划 {plan_id} 的新建追投按钮不可用"
+        await plus_icon.first.click()
+        try:
+            await page.get_by_text("新建调控任务", exact=True).last.wait_for(
+                state="visible",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+            await page.get_by_text("添加视频", exact=True).last.wait_for(
+                state="visible",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return "商品素材追投表单未正常打开"
+        return None
+
+    async def _select_product_material(
+        self,
+        page: Page,
+        material_id: str,
+    ) -> Optional[str]:
+        """在商品追投弹层中按精确素材ID选择一条视频。"""
+        mid = str(material_id or "").strip()
+        add_video = page.get_by_text("添加视频", exact=True)
+        if not await self._click_last_visible(add_video):
+            return "商品素材追投表单未找到「添加视频」"
+
+        search_input = page.locator(
+            'input[placeholder="输入视频名称/ID后回车搜索"]'
+        )
+        try:
+            await search_input.last.wait_for(
+                state="visible",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return "商品素材选择器未找到视频搜索框"
+        # 弹层先绘制行骨架，再异步补齐素材可选状态；过早读取会把可用
+        # 素材误判为 disabled。
+        await page.wait_for_timeout(2_000)
+
+        material_matches = page.get_by_text(f"素材ID: {mid}", exact=True)
+        already_visible = False
+        for index in range(await material_matches.count() - 1, -1, -1):
+            if await material_matches.nth(index).is_visible():
+                already_visible = True
+                break
+        if not already_visible:
+            await search_input.last.fill(mid)
+            await search_input.last.press("Enter")
+            try:
+                await material_matches.last.wait_for(
+                    state="visible",
+                    timeout=min(self._opt.goto_timeout_ms, 20_000),
+                )
+            except Exception:
+                return f"商品计划未找到素材 ID：{mid}"
+            await page.wait_for_timeout(1_000)
+
+        material_row = None
+        disabled_row = None
+        for index in range(await material_matches.count() - 1, -1, -1):
+            text_candidate = material_matches.nth(index)
+            if not await text_candidate.is_visible():
+                continue
+            row_candidate = text_candidate.locator("xpath=ancestor::tr[1]")
+            label_candidate = row_candidate.locator("label.ovui-checkbox")
+            label_class = (
+                await label_candidate.first.get_attribute("class")
+                if await label_candidate.count() > 0
+                else ""
+            ) or ""
+            if "ovui-checkbox--disabled" not in label_class:
+                material_row = row_candidate
+                break
+            if disabled_row is None:
+                disabled_row = row_candidate
+        if material_row is None:
+            material_row = disabled_row
+        if material_row is None:
+            return f"无法定位商品素材 {mid} 的选择行"
+        if await material_row.count() < 1:
+            return f"无法定位商品素材 {mid} 的选择行"
+
+        checkbox_input = material_row.locator('input[type="checkbox"]')
+        if await checkbox_input.count() > 0:
+            try:
+                checkbox_label = checkbox_input.first.locator(
+                    "xpath=ancestor::label[1]"
+                )
+                label_class = (
+                    await checkbox_label.get_attribute("class")
+                    if await checkbox_label.count() > 0
+                    else ""
+                ) or ""
+                if "ovui-checkbox--disabled" in label_class:
+                    try:
+                        await page.wait_for_function(
+                            """label => !String(label && label.className || "")
+                                .includes("ovui-checkbox--disabled")""",
+                            await checkbox_label.element_handle(),
+                            timeout=min(self._opt.goto_timeout_ms, 8_000),
+                        )
+                    except Exception:
+                        return f"商品素材 {mid} 当前不可追投（选择框禁用）"
+                # 点击组件 label，让千川自身的选择事件更新「已选」计数；
+                # 直接 check 隐藏 input 只会改变原生属性，不会更新业务状态。
+                if await checkbox_label.count() > 0:
+                    await checkbox_label.click()
+                else:
+                    await checkbox_input.first.evaluate("element => element.click()")
+                if not await checkbox_input.first.is_checked():
+                    return f"商品素材 {mid} 未被选中"
+            except Exception:
+                return f"商品素材 {mid} 的选择框无法勾选"
+        else:
+            checkbox_inner = material_row.locator(
+                'div[class*="ovui-checkbox__inner"]'
+            )
+            if await checkbox_inner.count() < 1:
+                return f"商品素材 {mid} 没有可用的选择框"
+            await checkbox_inner.first.click(force=True)
+
+        selector_modal = search_input.last.locator(
+            "xpath=ancestor::div["
+            "contains(concat(' ',normalize-space(@class),' '),' ovui-modal ')"
+            "][1]"
+        )
+        if await selector_modal.count() < 1:
+            return "商品素材选择弹层结构无法识别"
+        try:
+            await page.wait_for_function(
+                """() => /已选\\s*[1-9]\\d*\\s*\\/\\s*20/.test(
+                    document.body ? document.body.innerText : ""
+                )""",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return f"商品素材 {mid} 勾选后未进入已选列表"
+
+        confirm = selector_modal.get_by_role("button", name="确定", exact=True)
+        if not await self._click_last_visible(confirm):
+            return "商品素材选择器未找到「确定」按钮"
+        try:
+            await selector_modal.wait_for(
+                state="hidden",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+            await page.wait_for_function(
+                """() => /已添加[：:]\\s*[1-9]\\d*\\s*\\/\\s*20/.test(
+                    document.body ? document.body.innerText : ""
+                )""",
+                timeout=min(self._opt.goto_timeout_ms, 15_000),
+            )
+        except Exception:
+            return f"商品素材 {mid} 选择结果未写入追投表单"
+        return None
 
     async def _search_material_and_open_dialog(self, page: Page, material_id: str) -> Optional[str]:
         mid = str(material_id).strip()
@@ -661,6 +920,35 @@ class QianChuanRetargetingService:
             return e4
         return None
 
+    async def _run_product_volume(
+        self,
+        page: Page,
+        r: Dict[str, Any],
+    ) -> Optional[str]:
+        """填写商品全域素材追投表单；实际页面只有预算、时长和任务名称。"""
+        vol = r.get("volume") or {}
+        e1 = await self._fill_labeled_number_input(
+            page,
+            "调控预算",
+            vol.get("total_budget_yuan"),
+        )
+        if e1:
+            return e1
+        e2 = await self._fill_labeled_number_input(
+            page,
+            "调控时长",
+            vol.get("duration_hours"),
+        )
+        if e2:
+            return e2
+        e3 = await self._append_task_name_suffix(
+            page,
+            _resolve_task_name_suffix(r),
+        )
+        if e3:
+            return e3
+        return None
+
     async def _run_cost_control(self, page: Page, r: Dict[str, Any]) -> Optional[str]:
         cc = r.get("cost_control") or {}
         og = str(cc.get("optimization_goal") or "net_roi").strip().lower()
@@ -706,6 +994,9 @@ class QianChuanRetargetingService:
         material_id: str,
         retargeting: Dict[str, Any],
         strategy_title: Optional[str] = None,
+        target_uid: Optional[str] = None,
+        promotion_scene: str = "live",
+        source_url: Optional[str] = None,
         reuse_session: bool = False,
         close_session: bool = True,
     ) -> RetargetingRunResult:
@@ -719,8 +1010,20 @@ class QianChuanRetargetingService:
         """
         self._log_tag = retarget_log_tag(strategy_title=strategy_title, immediate=False)
         rdict = retargeting if isinstance(retargeting, dict) else {}
+        try:
+            scene = normalize_scene(promotion_scene or "live")
+        except ValueError as e:
+            return self._make_result(
+                success=False,
+                message=str(e),
+                step="validate_scene",
+                retargeting=rdict,
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=material_id,
+            )
 
-        vmsg = self._validate_retargeting_payload(rdict)
+        vmsg = self._validate_retargeting_payload(rdict, scene)
         if vmsg:
             return self._make_result(
                 success=False,
@@ -738,6 +1041,8 @@ class QianChuanRetargetingService:
                 base_url=self._opt.base_url,
                 aavid=int(aavid),
                 ad_id=int(ad_id),
+                promotion_scene=scene,
+                source_url=source_url,
             )
         except Exception as e:
             return self._make_result(
@@ -771,25 +1076,69 @@ class QianChuanRetargetingService:
                 if not reuse_session:
                     pop_handlers = await self._attach_popup_switcher()
                     logger.info("%s 正在打开投放详情页", self._log_tag)
-                    await page.goto(fetch_url, wait_until="domcontentloaded", timeout=self._opt.goto_timeout_ms)
+                    if scene == "product":
+                        target_error = await goto_and_confirm_product_target(
+                            page,
+                            fetch_url,
+                            expected_aavid=aavid,
+                            expected_ad_id=ad_id,
+                            timeout_ms=self._opt.goto_timeout_ms,
+                        )
+                        if target_error:
+                            return self._make_result(
+                                success=False,
+                                message=target_error,
+                                step="target_mismatch",
+                                retargeting=rdict,
+                                aavid=aavid,
+                                ad_id=ad_id,
+                                material_id=material_id,
+                            )
+                    else:
+                        await page.goto(
+                            fetch_url,
+                            wait_until="domcontentloaded",
+                            timeout=self._opt.goto_timeout_ms,
+                        )
                     await asyncio.sleep(random.uniform(2.5, 4.0))
 
-                    err = await self._switch_to_video_tab()
-                    if err:
+                    page_aavid, page_ad_id = extract_target_ids(page.url)
+                    if scene != "product" and (
+                        str(page_aavid or "") != str(aavid)
+                        or str(page_ad_id or "") != str(ad_id)
+                    ):
                         return self._make_result(
                             success=False,
-                            message=err,
-                            step="switch_to_video_tab",
+                            message="打开后的账户或计划与任务不一致，已安全停止",
+                            step="target_mismatch",
                             retargeting=rdict,
                             aavid=aavid,
                             ad_id=ad_id,
                             material_id=material_id,
                         )
+
+                    if scene != "product":
+                        err = await self._switch_to_video_tab(scene)
+                        if err:
+                            return self._make_result(
+                                success=False,
+                                message=err,
+                                step="switch_to_video_tab",
+                                retargeting=rdict,
+                                aavid=aavid,
+                                ad_id=ad_id,
+                                material_id=material_id,
+                            )
                 else:
                     await self._dismiss_dialog_before_next_material(page)
                     logger.info("%s 复用浏览器会话，处理下一条素材", self._log_tag)
 
-                err = await self._search_material_and_open_dialog(page, material_id)
+                if scene == "product":
+                    err = await self._open_product_retarget_dialog(page, ad_id)
+                    if not err:
+                        err = await self._select_product_material(page, material_id)
+                else:
+                    err = await self._search_material_and_open_dialog(page, material_id)
                 if err:
                     return self._make_result(
                         success=False,
@@ -803,7 +1152,10 @@ class QianChuanRetargetingService:
 
                 method = str(rdict.get("method") or "volume").strip().lower()
                 if method == "volume":
-                    err2 = await self._run_volume(page, rdict)
+                    if scene == "product":
+                        err2 = await self._run_product_volume(page, rdict)
+                    else:
+                        err2 = await self._run_volume(page, rdict)
                 else:
                     err2 = await self._run_cost_control(page, rdict)
 
@@ -869,6 +1221,9 @@ class QianChuanRetargetingService:
         material_id: str,
         retargeting: Dict[str, Any],
         strategy_title: Optional[str] = None,
+        target_uid: Optional[str] = None,
+        promotion_scene: str = "live",
+        source_url: Optional[str] = None,
     ) -> RetargetingRunResult:
         """
         打开投放页、搜索素材并填好追投表单；**不由程序**点击「提交」。
@@ -878,8 +1233,20 @@ class QianChuanRetargetingService:
         """
         self._log_tag = retarget_log_tag(strategy_title=strategy_title, immediate=True)
         rdict = retargeting if isinstance(retargeting, dict) else {}
+        try:
+            scene = normalize_scene(promotion_scene or "live")
+        except ValueError as e:
+            return self._make_result(
+                success=False,
+                message=str(e),
+                step="validate_scene",
+                retargeting=rdict,
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=material_id,
+            )
 
-        vmsg = self._validate_retargeting_payload(rdict)
+        vmsg = self._validate_retargeting_payload(rdict, scene)
         if vmsg:
             return self._make_result(
                 success=False,
@@ -897,6 +1264,8 @@ class QianChuanRetargetingService:
                 base_url=self._opt.base_url,
                 aavid=int(aavid),
                 ad_id=int(ad_id),
+                promotion_scene=scene,
+                source_url=source_url,
             )
         except Exception as e:
             return self._make_result(
@@ -929,22 +1298,66 @@ class QianChuanRetargetingService:
             try:
                 pop_handlers = await self._attach_popup_switcher()
                 logger.info("%s 正在打开投放详情页", self._log_tag)
-                await page.goto(fetch_url, wait_until="domcontentloaded", timeout=self._opt.goto_timeout_ms)
+                if scene == "product":
+                    target_error = await goto_and_confirm_product_target(
+                        page,
+                        fetch_url,
+                        expected_aavid=aavid,
+                        expected_ad_id=ad_id,
+                        timeout_ms=self._opt.goto_timeout_ms,
+                    )
+                    if target_error:
+                        return self._make_result(
+                            success=False,
+                            message=target_error,
+                            step="target_mismatch",
+                            retargeting=rdict,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=material_id,
+                        )
+                else:
+                    await page.goto(
+                        fetch_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._opt.goto_timeout_ms,
+                    )
                 await asyncio.sleep(random.uniform(2.5, 4.0))
-
-                err = await self._switch_to_video_tab()
-                if err:
+                page_aavid, page_ad_id = extract_target_ids(page.url)
+                if scene != "product" and (
+                    str(page_aavid or "") != str(aavid)
+                    or str(page_ad_id or "") != str(ad_id)
+                ):
                     return self._make_result(
                         success=False,
-                        message=err,
-                        step="switch_to_video_tab",
+                        message="打开后的账户或计划与监控目标不一致，已安全停止",
+                        detail=f"target={target_uid or ''}",
+                        step="target_mismatch",
                         retargeting=rdict,
                         aavid=aavid,
                         ad_id=ad_id,
                         material_id=material_id,
                     )
 
-                err = await self._search_material_and_open_dialog(page, material_id)
+                if scene != "product":
+                    err = await self._switch_to_video_tab(scene)
+                    if err:
+                        return self._make_result(
+                            success=False,
+                            message=err,
+                            step="switch_to_video_tab",
+                            retargeting=rdict,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=material_id,
+                        )
+
+                if scene == "product":
+                    err = await self._open_product_retarget_dialog(page, ad_id)
+                    if not err:
+                        err = await self._select_product_material(page, material_id)
+                else:
+                    err = await self._search_material_and_open_dialog(page, material_id)
                 if err:
                     return self._make_result(
                         success=False,
@@ -958,7 +1371,10 @@ class QianChuanRetargetingService:
 
                 method = str(rdict.get("method") or "volume").strip().lower()
                 if method == "volume":
-                    err2 = await self._run_volume(page, rdict)
+                    if scene == "product":
+                        err2 = await self._run_product_volume(page, rdict)
+                    else:
+                        err2 = await self._run_volume(page, rdict)
                 else:
                     err2 = await self._run_cost_control(page, rdict)
 
@@ -1038,5 +1454,3 @@ def retargeting_block_from_full_config(full_config: Dict[str, Any]) -> Dict[str,
     """从完整 JSON 中取出 retargeting 节点（不存在则空对象）。"""
     r = full_config.get("retargeting")
     return r if isinstance(r, dict) else {}
-
-

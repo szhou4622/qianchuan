@@ -6,7 +6,7 @@ import sys
 import webbrowser
 from typing import Any
 from urllib.parse import urlparse
-from utils.sqlite_store import init_sqlite_schema
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 from .dashboard import DashboardApi
 from .account_auth import AccountAuthApi
 from services.run_services import get_service_controller
@@ -18,18 +18,27 @@ class Api:
     def __init__(self):
         """初始化所有 API 模块"""
         init_sqlite_schema()
+        self.db = SQLiteStore()
+        from .promotion_targets import migrate_legacy_target_scope
+
+        migrate_legacy_target_scope(db=self.db)
         self.dashboard = DashboardApi()
         self.service = get_service_controller()
         self.account_auth = AccountAuthApi()
 
     # ========== 大屏相关 API ==========
 
-    def get_material_history_recent(self, material_id: str, limit: int = 200):
+    def get_material_history_recent(
+        self,
+        material_id: str,
+        limit: int = 200,
+        target_uid: str = None,
+    ):
         """获取素材最近 N 条历史点（按 created_at）"""
-        return self.dashboard.get_material_history_recent(material_id, limit)
+        return self.dashboard.get_material_history_recent(material_id, limit, target_uid)
 
     def get_table_data(self, period: str = "1h", sort_by: str = "costDiff", sort_order: str = "desc",
-                      page: int = 1, page_size: int = 50):
+                      page: int = 1, page_size: int = 50, target_uid: str = None):
         """
         获取表格数据（按周期查询素材首尾差值）
 
@@ -43,7 +52,132 @@ class Api:
         Returns:
             表格数据
         """
-        return self.dashboard.get_table_data(period, sort_by, sort_order, page, page_size)
+        return self.dashboard.get_table_data(
+            period,
+            sort_by,
+            sort_order,
+            page,
+            page_size,
+            target_uid,
+        )
+
+    # ========== 直播 / 商品全域监控计划 ==========
+
+    def listPromotionTargets(self, enabled=None):
+        from .promotion_targets import list_promotion_targets
+
+        try:
+            enabled_filter = None
+            if enabled is not None:
+                enabled_filter = (
+                    str(enabled).strip().lower() not in ("", "0", "false", "no", "off")
+                    if isinstance(enabled, str)
+                    else bool(enabled)
+                )
+            return {
+                "success": True,
+                "data": list_promotion_targets(enabled=enabled_filter, db=self.db),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "data": []}
+
+    def getPromotionTarget(self, target_uid=None):
+        from .promotion_targets import get_promotion_target
+
+        try:
+            target = get_promotion_target(target_uid, db=self.db)
+            if not target:
+                return {"success": False, "message": "监控计划不存在"}
+            return {"success": True, "data": target}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def savePromotionTarget(self, data=None):
+        from .promotion_targets import upsert_promotion_target
+
+        try:
+            return {
+                "success": True,
+                "data": upsert_promotion_target(data or {}, db=self.db),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def discoverPromotionTarget(self, page_url=None, page_text=None, plan_name=None):
+        from .promotion_targets import (
+            detect_promotion_scene,
+            extract_target_ids,
+            upsert_promotion_target,
+        )
+
+        try:
+            url = str(page_url or "").strip()
+            aavid, ad_id = extract_target_ids(url)
+            scene = detect_promotion_scene(url, page_text=str(page_text or ""))
+            if not aavid or not ad_id:
+                return {
+                    "success": False,
+                    "message": "当前页面未识别到账户或计划，请打开千川计划详情页后再试",
+                }
+            if not scene:
+                return {
+                    "success": False,
+                    "message": "无法确认是直播还是商品全域计划，已安全停止添加",
+                }
+            target = upsert_promotion_target(
+                {
+                    "aavid": aavid,
+                    "ad_id": ad_id,
+                    "plan_name": plan_name or "",
+                    "promotion_scene": scene,
+                    "page_url": url,
+                    "enabled": True,
+                },
+                db=self.db,
+            )
+            return {"success": True, "data": target}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def setPromotionTargetEnabled(self, target_uid=None, enabled=True):
+        from .promotion_targets import set_promotion_target_enabled
+
+        try:
+            target = set_promotion_target_enabled(
+                target_uid,
+                (
+                    str(enabled).strip().lower() not in ("", "0", "false", "no", "off")
+                    if isinstance(enabled, str)
+                    else bool(enabled)
+                ),
+                db=self.db,
+            )
+            return {"success": True, "data": target}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def listPromotionTargetProducts(self, target_uid=None):
+        from .promotion_targets import list_target_products
+
+        try:
+            return {
+                "success": True,
+                "data": list_target_products(target_uid, db=self.db),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "data": []}
+
+    def startPromotionTargetDiscovery(self):
+        try:
+            return self.service.start_target_discovery()
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def getPromotionTargetDiscoveryStatus(self):
+        try:
+            return self.service.target_discovery_status()
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
     def get_top20_by_cost(self, hours: int = 1):
         """
@@ -77,11 +211,12 @@ class Api:
         page_size: int = 50,
         search: str = None,
         ad_delivery_type: int = None,
+        target_uid: str = None,
     ):
         """调控任务表（pmc_roi2_assist_task）分页数据，供大屏侧栏展示。"""
         return self.dashboard.get_roi2_assist_table_data(
             aadvid, sort_by, sort_order, page, page_size,
-            search=search, ad_delivery_type=ad_delivery_type
+            search=search, ad_delivery_type=ad_delivery_type, target_uid=target_uid
         )
 
     # ========== 服务控制相关 API ==========
@@ -250,6 +385,11 @@ class Api:
         """
         return self.account_auth.verify_login(username, password)
 
+    def clearDeviceSession(self):
+        from services.cloud_retarget_client import clear_device_session
+
+        return clear_device_session()
+
     def get_app_version(self):
         """当前程序版本号（展示用，与 config.CURRENT_VERSION 一致）。"""
         from config import CURRENT_VERSION
@@ -344,6 +484,23 @@ class Api:
         out = dict(saved)
         out["success"] = True
         return out
+
+    def getLiveRetargetPreflight(self):
+        """本地真实追投验收前的只读清单；正式环境不启用。"""
+        from services.local_test_guard import build_live_retarget_preflight
+
+        try:
+            return build_live_retarget_preflight()
+        except Exception as exc:
+            return {
+                "success": False,
+                "test_mode": True,
+                "ready_to_arm": False,
+                "ready_to_execute": False,
+                "message": str(exc),
+                "checks": [],
+                "strategies": [],
+            }
 
     # ========== 规则化调控配置 ==========
 
@@ -521,7 +678,126 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
-    def runImmediateRetargetPrepare(self, material_id=None, retargeting=None):
+    # ========== 单账户统一操作流水 ==========
+
+    def listOperationAccounts(self):
+        from .operation_events import list_operation_accounts
+
+        try:
+            return {"success": True, "items": list_operation_accounts()}
+        except Exception as e:
+            return {"success": False, "message": str(e), "items": []}
+
+    def listOperationEvents(
+        self,
+        aavid=None,
+        date_from=None,
+        date_to=None,
+        action_type=None,
+        source=None,
+        status=None,
+        operator=None,
+        q=None,
+        target_uid=None,
+        page=1,
+        page_size=50,
+    ):
+        from .operation_events import query_operation_events_page
+
+        try:
+            total, items = query_operation_events_page(
+                aavid=aavid,
+                date_from=date_from,
+                date_to=date_to,
+                action_type=action_type,
+                source=source,
+                status=status,
+                operator=operator,
+                q=q,
+                target_uid=target_uid,
+                page=page,
+                page_size=page_size,
+            )
+            return {
+                "success": True,
+                "items": items,
+                "total": total,
+                "page": max(1, int(page or 1)),
+                "pageSize": max(1, min(5000, int(page_size or 50))),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e), "items": [], "total": 0}
+
+    def getOperationEventDetail(self, event_id=None, aavid=None):
+        from .operation_events import get_operation_event
+
+        try:
+            row = get_operation_event(event_id, aavid)
+            return {"success": bool(row), "data": row, "message": "" if row else "记录不存在"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def getOperationSyncState(self, aavid=None):
+        from .operation_events import operation_sync_state
+
+        try:
+            return {"success": True, "data": operation_sync_state(aavid)}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def exportOperationEventsCsv(
+        self,
+        aavid=None,
+        date_from=None,
+        date_to=None,
+        action_type=None,
+        source=None,
+        status=None,
+        operator=None,
+        q=None,
+        target_uid=None,
+    ):
+        from .operation_events import export_operation_events_csv
+
+        try:
+            content = export_operation_events_csv(
+                aavid=aavid,
+                date_from=date_from,
+                date_to=date_to,
+                action_type=action_type,
+                source=source,
+                status=status,
+                operator=operator,
+                q=q,
+                target_uid=target_uid,
+            )
+            return {"success": True, "filename": f"千川账户_{aavid}_操作流水.csv", "content": content}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def startOperationRecordBrowser(self, aavid=None):
+        from services.operation_log_monitor import start_record_browser
+
+        aid = str(aavid or "").strip()
+        if not aid:
+            return {"success": False, "message": "请先选择千川账户"}
+        row = self.db.select_one("pmc_ad_detail_basic", where={"aadvid": aid})
+        ad_id = str((row or {}).get("ad_id") or "")
+        if not ad_id:
+            return {"success": False, "message": "该账户尚无广告ID，请先启动一次采集"}
+        return start_record_browser(aid, ad_id)
+
+    def stopOperationRecordBrowser(self):
+        from services.operation_log_monitor import stop_record_browser
+
+        return stop_record_browser()
+
+    def getOperationRecordBrowserStatus(self):
+        from services.operation_log_monitor import record_browser_status
+
+        return record_browser_status()
+
+    def runImmediateRetargetPrepare(self, material_id=None, retargeting=None, target_uid=None):
         """
         即刻追投：有头浏览器打开投放页并填表，不自动提交；成功写库并限频 +1（不重置窗口起点）。
         """
@@ -531,6 +807,7 @@ class Api:
             return run_immediate_retarget_prepare(
                 material_id=material_id or "",
                 retargeting=retargeting if isinstance(retargeting, dict) else None,
+                target_uid=target_uid,
             )
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -548,4 +825,3 @@ class Api:
             )
         except Exception as e:
             return {"success": False, "message": str(e)}
-

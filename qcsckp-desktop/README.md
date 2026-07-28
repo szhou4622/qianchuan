@@ -139,6 +139,9 @@ qcsckp/
 3. **数据库越来越大**  
    确认已开启 SQLite 裁剪环境变量，并按业务量调整 `SQLITE_PRUNE_MAX_ROWS`。
 
+4. **飞书卡片没有发送或点击后不执行**
+   先确认服务端已配置飞书自建应用、公开 HTTPS 回调、唯一授权 Open ID 和接收目标，再在桌面端重新登录以取得设备令牌。完整部署和验收步骤见 `../qcsckp-api-services/doc/FEISHU_RETARGET_SETUP.md`。
+
 ---
 
 ## 版本

@@ -29,6 +29,8 @@ from services.regulation_service import (
     QianChuanRegulationStopService,
     regulation_log_tag,
 )
+from services.promotion_browser_lock import exclusive_browser_operation
+from services.plan_system import normalize_plan_system
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -55,8 +57,14 @@ _assist_task_locks: Dict[str, asyncio.Lock] = {}
 _assist_task_locks_guard = asyncio.Lock()
 
 
-async def _lock_for_assist_task(aid: str) -> asyncio.Lock:
-    k = str(aid).strip() or "__empty__"
+async def _lock_for_assist_task(
+    aid: str,
+    target_uid: Optional[str] = None,
+) -> asyncio.Lock:
+    k = (
+        f"{str(target_uid or 'legacy_unscoped').strip()}:"
+        f"{str(aid).strip() or '__empty__'}"
+    )
     async with _assist_task_locks_guard:
         if k not in _assist_task_locks:
             _assist_task_locks[k] = asyncio.Lock()
@@ -102,11 +110,59 @@ def _task_name_from_assist_row(row: Dict[str, Any]) -> str:
     return s[:512] if s else ""
 
 
+def _product_fields_from_assist_row(
+    db: SQLiteStore,
+    row: Dict[str, Any],
+    target_uid: str,
+) -> tuple[str, str]:
+    raw = row.get("product_ids_json")
+    try:
+        product_ids = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        product_ids = []
+    if not isinstance(product_ids, list):
+        product_ids = []
+    ids = list(dict.fromkeys(str(x or "").strip() for x in product_ids if str(x or "").strip()))
+    if not ids:
+        return "", ""
+    names: List[str] = []
+    for product_id in ids:
+        product = db.select_one(
+            "promotion_product",
+            fields="product_name",
+            where={"target_uid": target_uid, "product_id": product_id},
+        )
+        name = str((product or {}).get("product_name") or "").strip()
+        if name:
+            names.append(name)
+    return ",".join(ids), "、".join(names)
+
+
+def has_completed_stop(
+    db: SQLiteStore,
+    target_uid: str,
+    assist_task_id: str,
+) -> bool:
+    rows = db.execute(
+        "SELECT id FROM pmc_regulation_run "
+        "WHERE target_uid=? AND assist_task_id=? AND status IN (1,2) "
+        "ORDER BY id DESC LIMIT 1",
+        (str(target_uid or "legacy_unscoped"), str(assist_task_id or "")),
+        fetch=True,
+    ) or []
+    return bool(rows)
+
+
 def _insert_regulation_run(
     db: SQLiteStore,
     *,
     aavid: str,
     ad_id: str,
+    target_uid: str = "legacy_unscoped",
+    promotion_scene: str = "live",
+    plan_system: str = "unknown",
+    product_id: str = "",
+    product_name: str = "",
     task_name: str = "",
     strategy_name: str = "",
     assist_task_id: str = "",
@@ -132,6 +188,11 @@ def _insert_regulation_run(
     data: Dict[str, Any] = {
         "aavid": aavid,
         "ad_id": ad_id,
+        "target_uid": str(target_uid or "legacy_unscoped"),
+        "promotion_scene": str(promotion_scene or "live"),
+        "plan_system": normalize_plan_system(plan_system or "unknown"),
+        "product_id": str(product_id or "").strip() or None,
+        "product_name": str(product_name or "").strip() or None,
         "assist_task_id": str(assist_task_id or "").strip() or None,
         "task_name": _tn if _tn else None,
         "strategy_name": _sn,
@@ -151,7 +212,39 @@ def _insert_regulation_run(
         "trigger_source": (str(trigger_source or "scheduler").strip()[:64] or "scheduler"),
         "app_version": CURRENT_VERSION,
     }
-    db.insert(table="pmc_regulation_run", data=data)
+    run_id = db.insert(table="pmc_regulation_run", data=data)
+    try:
+        from api.operation_events import upsert_operation_event
+
+        upsert_operation_event(
+            {
+                "event_uid": f"regulation_run:{run_id}",
+                "aavid": aavid,
+                "ad_id": ad_id,
+                "target_uid": str(target_uid or "legacy_unscoped"),
+                "promotion_scene": str(promotion_scene or "live"),
+                "plan_system": normalize_plan_system(plan_system or "unknown"),
+                "product_id": str(product_id or "").strip(),
+                "product_name": str(product_name or "").strip(),
+                "source": "tool_direct",
+                "action_type": "stop",
+                "object_type": "assist_task",
+                "object_id": str(assist_task_id or ""),
+                "object_name": _tn,
+                "plan_id": ad_id,
+                "regulate_task_id": str(assist_task_id or ""),
+                "status": "success" if status in (1, 2) else "failed",
+                "summary": message or "停投",
+                "detail": detail,
+                "request": {"stop_action": stop_action},
+                "trigger_json": trigger_snapshot_json,
+                "response": {"step": step},
+                "occurred_at": ended_at,
+            },
+            db,
+        )
+    except Exception:
+        logger.exception("%s 统一操作流水写入失败 run_id=%s", regulation_log_tag(scheduler=True), run_id)
 
 
 async def run_one_cycle(db: SQLiteStore) -> None:
@@ -233,6 +326,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
     sem = asyncio.Semaphore(max_p)
     browser_rule = bool(cfg.get("browser_headless", True))
+    enabled_targets = db.select("promotion_target", where={"enabled": 1})
 
     async def process_strategy(st: Dict[str, Any]) -> None:
         async with sem:
@@ -246,10 +340,27 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             stop_action = str(st.get("regulation_stop_action") or "pause").strip().lower()
             if stop_action not in ("pause", "delete"):
                 stop_action = "pause"
+            strategy_target_uid = str(st.get("target_uid") or "").strip()
+            if not strategy_target_uid:
+                if len(enabled_targets) == 1:
+                    strategy_target_uid = str(
+                        enabled_targets[0].get("target_uid") or ""
+                    ).strip()
+                elif len(enabled_targets) > 1:
+                    logger.warning(
+                        "%s 未选择监控计划，当前有多条启用计划，已安全跳过",
+                        _tag,
+                    )
+                    return
 
             hit_rows: List[Dict[str, Any]] = []
             for row in rows:
                 if not isinstance(row, dict):
+                    continue
+                if (
+                    strategy_target_uid
+                    and str(row.get("target_uid") or "") != strategy_target_uid
+                ):
                     continue
                 if evaluate_trigger_roi2_assist(trigger, row):
                     hit_rows.append(row)
@@ -267,6 +378,21 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     task_name = _task_name_from_assist_row(row)
                     aavid_raw = row.get("aadvid")
                     aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
+                    target_uid = str(row.get("target_uid") or "legacy_unscoped").strip()
+                    promotion_scene = str(row.get("promotion_scene") or "live").strip()
+                    ad_id = str(row.get("ad_id") or "").strip()
+                    target = db.select_one(
+                        "promotion_target",
+                        where={"target_uid": target_uid},
+                    ) or {}
+                    plan_system = normalize_plan_system(
+                        target.get("plan_system")
+                        or row.get("plan_system")
+                        or "unknown"
+                    )
+                    product_id, product_name = _product_fields_from_assist_row(
+                        db, row, target_uid
+                    )
 
                     eval_snap = build_trigger_evaluation_snapshot_roi2_assist(trigger, row)
                     trigger_snap = _json_dumps(
@@ -295,6 +421,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             db,
                             aavid=aavid or "",
                             ad_id="",
+                            target_uid=target_uid,
+                            promotion_scene=promotion_scene,
+                            plan_system=plan_system,
+                            product_id=product_id,
+                            product_name=product_name,
                             task_name=task_name,
                             strategy_name=st_label,
                             assist_task_id="",
@@ -315,15 +446,108 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         logger.info("%s 跳过：无 assist_task_id", _tag)
                         continue
 
-                    task_lock = await _lock_for_assist_task(assist_task_id)
+                    task_lock = await _lock_for_assist_task(assist_task_id, target_uid)
                     async with task_lock:
-                        ad_id = resolve_ad_id_for_aavid(db, aavid) if aavid else None
+                        if has_completed_stop(db, target_uid, assist_task_id):
+                            logger.info(
+                                "%s 已有成功停投流水，幂等跳过 target=%s assist_task_id=%s",
+                                _tag,
+                                target_uid,
+                                assist_task_id,
+                            )
+                            continue
+                        if target_uid != "legacy_unscoped":
+                            target_matches = (
+                                bool(target)
+                                and bool(target.get("enabled"))
+                                and str(target.get("aadvid") or "") == aavid
+                                and str(target.get("ad_id") or "") == ad_id
+                                and str(target.get("promotion_scene") or "live")
+                                == promotion_scene
+                            )
+                            if not target_matches:
+                                now = _beijing_now_str()
+                                _insert_regulation_run(
+                                    db,
+                                    aavid=aavid or "",
+                                    ad_id=ad_id,
+                                    target_uid=target_uid,
+                                    promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
+                                    product_id=product_id,
+                                    product_name=product_name,
+                                    task_name=task_name,
+                                    strategy_name=st_label,
+                                    assist_task_id=assist_task_id,
+                                    stop_action=stop_action,
+                                    started_at=now,
+                                    ended_at=now,
+                                    duration_ms=0,
+                                    status=-1,
+                                    step="target_mismatch",
+                                    message="调控任务与监控计划不匹配或计划已停用，已阻止停投",
+                                    detail="",
+                                    rule_full_json=rule_full_json,
+                                    trigger_snapshot_json=trigger_snap,
+                                    query_snapshot_json=query_snap,
+                                    headless=headless_cfg,
+                                    browser_headless_rule=browser_rule,
+                                )
+                                continue
+                            if promotion_scene == "product":
+                                try:
+                                    capability = json.loads(
+                                        target.get("capability_json") or "{}"
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                    json.JSONDecodeError,
+                                ):
+                                    capability = {}
+                                if not isinstance(capability, dict) or not bool(
+                                    capability.get("regulation_execute")
+                                ):
+                                    logger.warning(
+                                        "%s 商品计划的任务列表和结束入口尚未通过"
+                                        "受控任务验证，本轮不执行自动停投 "
+                                        "target=%s assist_task_id=%s",
+                                        _tag,
+                                        target_uid,
+                                        assist_task_id,
+                                    )
+                                    continue
+                            if plan_system == "unknown":
+                                logger.warning(
+                                    "%s 计划体系尚未识别，本轮不执行自动停投 "
+                                    "target=%s assist_task_id=%s",
+                                    _tag,
+                                    target_uid,
+                                    assist_task_id,
+                                )
+                                continue
+                            if plan_system == "chengfang":
+                                logger.warning(
+                                    "%s 千川乘方停投适配器尚未通过受控验证，本轮不执行 "
+                                    "target=%s assist_task_id=%s",
+                                    _tag,
+                                    target_uid,
+                                    assist_task_id,
+                                )
+                                continue
+                        if not ad_id and aavid and target_uid == "legacy_unscoped":
+                            ad_id = resolve_ad_id_for_aavid(db, aavid)
                         if not ad_id:
                             now = _beijing_now_str()
                             _insert_regulation_run(
                                 db,
                                 aavid=aavid or "",
                                 ad_id="",
+                                target_uid=target_uid,
+                                promotion_scene=promotion_scene,
+                                plan_system=plan_system,
+                                product_id=product_id,
+                                product_name=product_name,
                                 task_name=task_name,
                                 strategy_name=st_label,
                                 assist_task_id=assist_task_id,
@@ -352,6 +576,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 db,
                                 aavid=aavid or "",
                                 ad_id=str(ad_id),
+                                target_uid=target_uid,
+                                promotion_scene=promotion_scene,
+                                plan_system=plan_system,
+                                product_id=product_id,
+                                product_name=product_name,
                                 task_name=task_name,
                                 strategy_name=st_label,
                                 assist_task_id=assist_task_id,
@@ -374,15 +603,21 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         started_at = _beijing_now_str()
                         t0 = time.time()
                         try:
-                            result = await svc.run(
-                                aavid=aavid_int,
-                                ad_id=ad_id_int,
-                                assist_task_id=assist_task_id,
-                                stop_action=stop_action,
-                                strategy_title=st_label,
-                                reuse_session=False,
-                                close_session=False,
-                            )
+                            async with exclusive_browser_operation(
+                                f"停投:{target_uid}:{assist_task_id}"
+                            ):
+                                result = await svc.run(
+                                    aavid=aavid_int,
+                                    ad_id=ad_id_int,
+                                    assist_task_id=assist_task_id,
+                                    stop_action=stop_action,
+                                    strategy_title=st_label,
+                                    target_uid=target_uid,
+                                    promotion_scene=promotion_scene,
+                                    source_url=target.get("sanitized_page_url") or None,
+                                    reuse_session=False,
+                                    close_session=False,
+                                )
                         except Exception:
                             ended_at = _beijing_now_str()
                             dur = int((time.time() - t0) * 1000)
@@ -390,6 +625,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 db,
                                 aavid=str(aavid_int),
                                 ad_id=str(ad_id_int),
+                                target_uid=target_uid,
+                                promotion_scene=promotion_scene,
+                                plan_system=plan_system,
+                                product_id=product_id,
+                                product_name=product_name,
                                 task_name=task_name,
                                 strategy_name=st_label,
                                 assist_task_id=assist_task_id,
@@ -426,6 +666,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             db,
                             aavid=str(result.aavid or aavid_int),
                             ad_id=str(result.ad_id or ad_id_int),
+                            target_uid=target_uid,
+                            promotion_scene=promotion_scene,
+                            plan_system=plan_system,
+                            product_id=product_id,
+                            product_name=product_name,
                             task_name=task_name,
                             strategy_name=st_label,
                             assist_task_id=str(result.assist_task_id or assist_task_id),

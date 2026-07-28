@@ -136,6 +136,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
     return {
         "id": _new_strategy_id(),
         "title": f"策略 {index + 1}",
+        "target_uid": "",
         "trigger": _normalize_trigger_roi2(None),
         "regulation_stop_action": "pause",
     }
@@ -173,7 +174,13 @@ def _normalize_strategy_entry(
     else:
         rsa_src = "pause"
     rsa = _normalize_regulation_stop_action(rsa_src)
-    return {"id": sid, "title": title, "trigger": trig, "regulation_stop_action": rsa}
+    return {
+        "id": sid,
+        "title": title,
+        "target_uid": str(raw.get("target_uid") or "").strip(),
+        "trigger": trig,
+        "regulation_stop_action": rsa,
+    }
 
 
 def _normalize_full(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -269,6 +276,8 @@ def validate_rule_regulation_config(data: Dict[str, Any]) -> Tuple[bool, str]:
         for i, st in enumerate(strats):
             if not isinstance(st, dict):
                 return False, f"策略{i + 1} 项须为对象"
+            if enabled and not str(st.get("target_uid") or "").strip():
+                return False, f"策略{i + 1}：启用停投前请选择监控计划"
             rsa = _normalize_regulation_stop_action(st.get("regulation_stop_action"))
             if rsa not in ALLOWED_REGULATION_STOP_ACTION:
                 return False, f"策略{i + 1} 停投执行方式无效"

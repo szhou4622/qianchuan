@@ -19,11 +19,23 @@ import webview
 from ctypes.util import find_library
 from api import Api
 # 项目配置
-from config import PROJECT_ROOT, DATA_DIR, DATA_TEMP_DIR, STATIC_DIR, CURRENT_VERSION
+from config import (
+    PROJECT_ROOT,
+    DATA_DIR,
+    DATA_TEMP_DIR,
+    STATIC_DIR,
+    CURRENT_VERSION,
+    TEST_MODE,
+    TEST_AAVID,
+    TEST_MATERIAL_ID,
+    ALLOW_LIVE_RETARGET,
+)
 from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread
 from services.webhook_push_runtime import start_webhook_push_background_threads
 from services.regulation_rule_runner import start_regulation_rule_runner_background_thread
 from services.retargeting_rule_runner import start_retargeting_rule_runner_background_thread
+from services.retarget_task_worker import start_retarget_task_worker_background_thread
+from services.operation_log_monitor import start_platform_log_sync_background_thread
 from services.control_panel_config import ensure_all_control_defaults
 
 
@@ -495,11 +507,30 @@ class JSApi:
     def verifyAccountLogin(self, username, password):
         return self.api.verify_account_login(username, password)
 
+    def getLocalTestLoginCredentials(self):
+        from services.local_test_guard import load_local_test_login_credentials
+
+        return load_local_test_login_credentials()
+
+    def clearDeviceSession(self):
+        return self.api.clearDeviceSession()
+
     def checkAppVersion(self, currentVersion=None):
         return self.api.check_app_version(currentVersion)
 
     def getAppVersion(self):
         return self.api.get_app_version()
+
+    def getEnvironmentInfo(self):
+        return {
+            "test_mode": bool(TEST_MODE),
+            "test_aavid": str(TEST_AAVID or ""),
+            "test_material_id": str(TEST_MATERIAL_ID or ""),
+            "live_retarget_armed": bool(ALLOW_LIVE_RETARGET),
+            "live_retarget_consumed": os.path.isfile(
+                os.path.join(DATA_DIR, "live_retarget_consumed.json")
+            ),
+        }
 
     def performAppUpdate(self, download_url):
         return self.api.perform_app_update(download_url)
@@ -512,6 +543,9 @@ class JSApi:
 
     def setRuleRetargetingConfig(self, config=None):
         return self.api.setRuleRetargetingConfig(config)
+
+    def getLiveRetargetPreflight(self):
+        return self.api.getLiveRetargetPreflight()
 
     def getRuleRegulationConfig(self):
         return self.api.getRuleRegulationConfig()
@@ -576,6 +610,56 @@ class JSApi:
 
     def getRegulationRunDetail(self, run_id=None):
         return self.api.getRegulationRunDetail(run_id)
+
+    def listOperationAccounts(self):
+        return self.api.listOperationAccounts()
+
+    def listOperationEvents(
+        self,
+        aavid=None,
+        date_from=None,
+        date_to=None,
+        action_type=None,
+        source=None,
+        status=None,
+        operator=None,
+        q=None,
+        page=1,
+        page_size=50,
+    ):
+        return self.api.listOperationEvents(
+            aavid, date_from, date_to, action_type, source, status, operator, q, page, page_size
+        )
+
+    def getOperationEventDetail(self, event_id=None, aavid=None):
+        return self.api.getOperationEventDetail(event_id, aavid)
+
+    def getOperationSyncState(self, aavid=None):
+        return self.api.getOperationSyncState(aavid)
+
+    def exportOperationEventsCsv(
+        self,
+        aavid=None,
+        date_from=None,
+        date_to=None,
+        action_type=None,
+        source=None,
+        status=None,
+        operator=None,
+        q=None,
+    ):
+        return self.api.exportOperationEventsCsv(
+            aavid, date_from, date_to, action_type, source, status, operator, q
+        )
+
+    def startOperationRecordBrowser(self, aavid=None):
+        return self.api.startOperationRecordBrowser(aavid)
+
+    def stopOperationRecordBrowser(self):
+        return self.api.stopOperationRecordBrowser()
+
+    def getOperationRecordBrowserStatus(self):
+        return self.api.getOperationRecordBrowserStatus()
 
 
 # ==================== 屏幕信息获取 ====================
@@ -743,8 +827,12 @@ def main():
         storage_path = os.path.join(DATA_DIR, "storage")
         os.makedirs(storage_path, exist_ok=True)
 
+        window_title = f"千川素材看盘工具 v{CURRENT_VERSION}"
+        if TEST_MODE:
+            window_title += " · 测试1版（本地测试）"
+
         window = webview.create_window(
-            title=f"千川素材看盘工具 v{CURRENT_VERSION}",
+            title=window_title,
             url=index_url,
             width=width,
             height=height,
@@ -785,6 +873,46 @@ def main():
         # ===== 服务管理页默认配置（data/control_panel.json）=====
         ensure_all_control_defaults()
 
+        # Local-test-only convenience for handing the visible QianChuan login
+        # window to the user without putting credentials on the command line.
+        if TEST_MODE and os.getenv("QCSCKP_AUTO_START_SERVICE", "").strip() == "1":
+            def _auto_start_local_test_service():
+                time.sleep(1.0)
+                try:
+                    creds = js_api.getLocalTestLoginCredentials()
+                    if not creds.get("success"):
+                        print(
+                            "[TEST] Auto-start skipped: "
+                            f"{creds.get('message') or 'local credentials unavailable'}"
+                        )
+                        return
+                    try:
+                        interval = max(
+                            5,
+                            int(os.getenv("QCSCKP_AUTO_START_INTERVAL", "600")),
+                        )
+                    except Exception:
+                        interval = 600
+                    result = js_api.startService(
+                        interval,
+                        True,
+                        creds.get("username"),
+                        creds.get("password"),
+                    )
+                    print(
+                        "[TEST] Scraper auto-start requested: "
+                        f"success={result.get('success', True)} "
+                        f"phase={result.get('phase', '')}"
+                    )
+                except Exception as exc:
+                    print(f"[TEST] Scraper auto-start failed: {exc}")
+
+            threading.Thread(
+                target=_auto_start_local_test_service,
+                daemon=True,
+                name="qcsckp-test-auto-start",
+            ).start()
+
         # ===== SQLite：后台裁剪旧数据（不阻塞窗口；策略见 config / sqlite_prune_scheduler）=====
         start_sqlite_prune_background_thread()
 
@@ -793,6 +921,12 @@ def main():
 
         # ===== 规则化追投调度（见 services/retargeting_rule_runner.py；enabled 见 rule_retargeting.json）=====
         start_retargeting_rule_runner_background_thread()
+
+        # ===== 飞书卡片已批准追投：云端任务领取、复核与执行 =====
+        start_retarget_task_worker_background_thread()
+
+        # ===== 千川/巨量纵横后台操作日志：已发现页面每5分钟增量同步 =====
+        start_platform_log_sync_background_thread()
 
         # ===== 规则化停投调度（见 services/regulation_rule_runner.py；enabled 见 rule_regulation.json，默认 10 分钟一轮）=====
         start_regulation_rule_runner_background_thread()

@@ -4,7 +4,7 @@
 职责：
 - 以线程方式启动/停止抓取服务（避免阻塞 GUI）
 - Headful 浏览器，允许用户手动登录千川
-- 监控当前页面 URL，当识别到详情页并解析到 aavid/adId 后才开始抓取
+- 监控当前页面；直播从详情 URL 识别，商品全域从主计划接口只读识别
 - 轮询抓取并入库 SQLite
 - 服务管理配置见 data/control_panel.json（crawl / feishu_table / robot）
 - 日志写入 data/service.log，并提供读取末尾 N 行的方法给前端展示
@@ -13,17 +13,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlparse, parse_qs
 
 from utils.log import logger as app_logger
 from utils.sqlite_store import SQLiteStore
 from services.fetcher import QianChuanFetcher, build_qianchuan_url_by_params, GlobalAuthExpiredError
+from services.promotion_browser_lock import exclusive_browser_operation
+from services.promotion_readonly_probe import PromotionReadOnlyProbe
+from services.plan_system import detect_plan_system, normalize_plan_system
+from api.promotion_targets import (
+    detect_confirmed_detail_scene,
+    detect_promotion_scene,
+    extract_plan_name,
+    list_promotion_targets,
+    make_target_uid,
+    replace_material_product_links,
+    update_target_sync_state,
+    upsert_products,
+    upsert_promotion_target,
+)
 from services.control_panel_config import (
     load_scrape_service_config,
     save_scrape_service_config,
@@ -40,10 +55,172 @@ from config import PROJECT_ROOT, DATA_DIR, LOGS_DIR, DB_FILE
 
 # 轮询抓取阶段：浏览器持续运行超过此时长则关闭并用 Cookie 重建，缓解长时间运行内存增长（秒）
 POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
+LAST_TARGET_FILE = os.path.join(DATA_DIR, "last_crawl_target.json")
+PROMOTION_PROBE_FILE = os.path.join(DATA_DIR, "promotion_readonly_probe.json")
+
+
+def _persist_product_snapshot(
+    db: SQLiteStore,
+    target_uid: str,
+    snapshot: Optional[Dict[str, Any]],
+) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    products = snapshot.get("products") or []
+    if products:
+        upsert_products(target_uid, products, db=db)
+    for material in snapshot.get("materials") or []:
+        if not isinstance(material, dict):
+            continue
+        material_id = str(material.get("material_id") or "").strip()
+        product_ids = material.get("product_ids") or []
+        if not material_id or not product_ids:
+            continue
+        replace_material_product_links(
+            target_uid,
+            material_id,
+            product_ids,
+            material_name=str(material.get("material_name") or ""),
+            db=db,
+        )
 
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _load_last_target(path: Optional[str] = None):
+    target_path = path or LAST_TARGET_FILE
+    try:
+        with open(target_path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    aavid = str(data.get("aavid") or "").strip()
+    ad_id = str(data.get("adId") or data.get("ad_id") or "").strip()
+    if not aavid.isdigit() or not ad_id.isdigit():
+        return None
+    return {"aavid": aavid, "adId": ad_id}
+
+
+def _save_last_target(aavid, ad_id, path: Optional[str] = None) -> bool:
+    aavid_text = str(aavid or "").strip()
+    ad_id_text = str(ad_id or "").strip()
+    if not aavid_text.isdigit() or not ad_id_text.isdigit():
+        return False
+    target_path = path or LAST_TARGET_FILE
+    parent = os.path.dirname(os.path.abspath(target_path))
+    os.makedirs(parent, exist_ok=True)
+    temp_path = target_path + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"aavid": aavid_text, "adId": ad_id_text},
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+        os.replace(temp_path, target_path)
+        return True
+    except Exception:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _reuse_last_target_enabled() -> bool:
+    return os.getenv("QCSCKP_FORCE_TARGET_RESELECT", "").strip() != "1"
+
+
+def _target_is_excluded(
+    aavid: Any,
+    ad_id: Any,
+    excluded_target: Optional[Dict[str, Any]],
+) -> bool:
+    if not excluded_target:
+        return False
+    return (
+        str(aavid or "").strip() == str(excluded_target.get("aavid") or "").strip()
+        and str(ad_id or "").strip()
+        == str(
+            excluded_target.get("adId")
+            or excluded_target.get("ad_id")
+            or ""
+        ).strip()
+    )
+
+
+def _choose_startup_target(
+    known_targets: List[Dict[str, Any]],
+    remembered_target: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if remembered_target:
+        remembered_aavid = str(remembered_target.get("aavid") or "").strip()
+        remembered_ad_id = str(
+            remembered_target.get("adId")
+            or remembered_target.get("ad_id")
+            or ""
+        ).strip()
+        for target in known_targets:
+            if (
+                str(target.get("aadvid") or target.get("aavid") or "").strip()
+                == remembered_aavid
+                and str(target.get("ad_id") or target.get("adId") or "").strip()
+                == remembered_ad_id
+            ):
+                return target
+        if remembered_aavid and remembered_ad_id:
+            return {
+                "aadvid": remembered_aavid,
+                "ad_id": remembered_ad_id,
+                "promotion_scene": "live",
+                "plan_system": "unknown",
+                "sanitized_page_url": "",
+            }
+    return known_targets[0] if known_targets else None
+
+
+def _trusted_startup_discovery(
+    startup_target: Optional[Dict[str, Any]],
+    startup_url: str,
+) -> Optional[Dict[str, Any]]:
+    """Reuse a stored monitor target without trusting the product page's default plan."""
+    if not startup_target:
+        return None
+    aavid = str(
+        startup_target.get("aadvid") or startup_target.get("aavid") or ""
+    ).strip()
+    ad_id = str(
+        startup_target.get("ad_id") or startup_target.get("adId") or ""
+    ).strip()
+    promotion_scene = str(
+        startup_target.get("promotion_scene") or ""
+    ).strip().lower()
+    if not (aavid.isdigit() and ad_id.isdigit()):
+        return None
+    if promotion_scene not in {"live", "product"}:
+        return None
+    return {
+        "url": str(
+            startup_target.get("sanitized_page_url")
+            or startup_target.get("page_url")
+            or startup_url
+            or ""
+        ).strip(),
+        "aavid": aavid,
+        "ad_id": ad_id,
+        "promotion_scene": promotion_scene,
+        "plan_system": normalize_plan_system(
+            startup_target.get("plan_system") or "unknown"
+        ),
+        "plan_name": str(startup_target.get("plan_name") or "").strip(),
+        "snapshot": {},
+    }
 
 
 def _parse_query_and_fragment(url: str) -> dict:
@@ -76,6 +253,7 @@ def _feishu_hourly_push_window_sync(
     personal_base_token: str,
     table_id: str,
     aadvid: Optional[str],
+    target_uid: Optional[str],
     last_window_end: Optional[str],
     log_fn,
 ) -> Tuple[Optional[str], int]:
@@ -95,7 +273,10 @@ def _feishu_hourly_push_window_sync(
         return last_window_end, 0
 
     aid = (aadvid or "").strip() or None
-    rows = db.select_pmc_latest_per_material_in_last_hour_utc8(aadvid=aid)
+    rows = db.select_pmc_latest_per_material_in_last_hour_utc8(
+        aadvid=aid,
+        target_uid=(target_uid or "").strip() or None,
+    )
     if not rows:
         log_fn(
             "[飞书·整点] 周期内（created_at > datetime('now', '+8 hours', '-1 hours')）无数据，跳过同步"
@@ -125,7 +306,7 @@ class ServiceConfig:
     interval: int = 600
     round_timeout: int = 600
     headless: bool = False  # 必须 False（有头）
-    cookie_path: str = "data/qcookie.json"
+    cookie_path: str = os.path.join(DATA_DIR, "qcookie.json")
     db_path: str = DB_FILE
     auto_start: bool = False
     wait_url_prefix: str = "https://qianchuan.jinritemai.com/uni-prom/deta"
@@ -167,6 +348,12 @@ class ServiceController:
         # 启动服务时校验通过的账号密码，仅内存保存，用于入库后云端备份 API（不写盘）
         self._cloud_backup_username: Optional[str] = None
         self._cloud_backup_password: str = ""
+        self._target_discovery_thread: Optional[threading.Thread] = None
+        self._target_discovery_status: dict = {
+            "running": False,
+            "message": "",
+            "target": None,
+        }
 
         # 飞书「整点推送」：避免重复推同一小时窗口（进程内；重启后会从当前整点窗口重新判断）
         self._feishu_hourly_last_window_end: Optional[str] = None
@@ -358,6 +545,7 @@ class ServiceController:
         fp: Optional[str],
         ft: Optional[str],
         aadvid: Optional[str],
+        target_uid: Optional[str] = None,
     ) -> None:
         cfg = load_feishu_bitable_panel_config()
         if cfg.get("push_mode") != "hourly_latest":
@@ -367,7 +555,14 @@ class ServiceController:
 
         def _run():
             return _feishu_hourly_push_window_sync(
-                db, fa, fp, ft, aadvid, self._feishu_hourly_last_window_end, self._log
+                db,
+                fa,
+                fp,
+                ft,
+                aadvid,
+                target_uid,
+                self._feishu_hourly_last_window_end,
+                self._log,
             )
 
         new_last, _n = await asyncio.to_thread(_run)
@@ -395,6 +590,205 @@ class ServiceController:
         self._stop_event.set()
         self._log("[服务] 已发起停止")
         return self.status()
+
+    def start_target_discovery(self) -> dict:
+        """打开独立有头浏览器，用户进入计划详情后自动登记监控目标。"""
+        with self._lock:
+            if (
+                self._target_discovery_thread is not None
+                and self._target_discovery_thread.is_alive()
+            ):
+                return {
+                    "success": True,
+                    **self._target_discovery_status,
+                }
+            self._target_discovery_status = {
+                "running": True,
+                "message": "请在新浏览器中打开一条直播或商品全域计划详情",
+                "target": None,
+            }
+            self._target_discovery_thread = threading.Thread(
+                target=self._target_discovery_entry,
+                name="promotion-target-discovery",
+                daemon=True,
+            )
+            self._target_discovery_thread.start()
+        return {"success": True, **self._target_discovery_status}
+
+    def target_discovery_status(self) -> dict:
+        with self._lock:
+            return {"success": True, **dict(self._target_discovery_status)}
+
+    def _target_discovery_entry(self) -> None:
+        try:
+            asyncio.run(self._target_discovery_async())
+        except Exception as e:
+            with self._lock:
+                self._target_discovery_status = {
+                    "running": False,
+                    "message": f"识别失败：{e}",
+                    "target": None,
+                }
+
+    async def _target_discovery_async(self) -> None:
+        cfg = ServiceConfig().normalize_paths()
+        db = SQLiteStore(database=cfg.db_path)
+        storage_state = (
+            cfg.cookie_path
+            if cfg.cookie_path and os.path.isfile(cfg.cookie_path)
+            else None
+        )
+        fetcher = QianChuanFetcher(headless=False, storage_state=storage_state)
+        await fetcher._init_browser()
+        probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
+        probe.attach(fetcher.page)
+        # 已有登录态时先进入计划列表，避免登录页自动跳回上次打开的旧计划并被误登记。
+        discovery_start_url = (
+            "https://qianchuan.jinritemai.com/uni-prom"
+            if storage_state
+            else cfg.open_url
+        )
+        try:
+            await fetcher.page.goto(
+                discovery_start_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+        except Exception:
+            pass
+        try:
+            target_url = None
+            target_scene = None
+            target_plan_system = "unknown"
+            target_page_text = ""
+            product_snapshot: Dict[str, Any] = {}
+            stable_candidate = None
+            stable_count = 0
+            last_probe_at = 0.0
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                try:
+                    if fetcher.context and fetcher.context.pages:
+                        fetcher.page = fetcher.context.pages[-1]
+                except Exception:
+                    pass
+                cur = str(getattr(fetcher.page, "url", "") or "").strip()
+                if time.time() - last_probe_at >= 1.0:
+                    await probe.observe_page(fetcher.page)
+                    last_probe_at = time.time()
+                if urlparse(cur).path == "/uni-prom":
+                    product_target = probe.confirmed_product_target()
+                    if product_target:
+                        candidate = (
+                            str(product_target["aavid"]),
+                            str(product_target["ad_id"]),
+                            "product",
+                        )
+                        if candidate == stable_candidate:
+                            stable_count += 1
+                        else:
+                            stable_candidate = candidate
+                            stable_count = 1
+                        if stable_count >= 3:
+                            target_url = cur
+                            target_scene = "product"
+                            target_plan_system = normalize_plan_system(
+                                product_target.get("plan_system") or "unknown"
+                            )
+                            aavid_probe = str(product_target["aavid"])
+                            ad_id_probe = str(product_target["ad_id"])
+                            product_snapshot = dict(
+                                product_target.get("snapshot") or {}
+                            )
+                            target_page_text = ""
+                            break
+                        await asyncio.sleep(0.5)
+                        continue
+                aavid_probe, ad_id_probe = _extract_aavid_adid(cur)
+                if (
+                    cur
+                    and cur.startswith(cfg.wait_url_prefix)
+                    and aavid_probe
+                    and ad_id_probe
+                ):
+                    try:
+                        page_text = await fetcher.page.locator("body").inner_text(
+                            timeout=3000
+                        )
+                    except Exception:
+                        page_text = ""
+                    scene_probe = detect_confirmed_detail_scene(
+                        cur,
+                        page_text=page_text,
+                    )
+                    candidate = (
+                        str(aavid_probe),
+                        str(ad_id_probe),
+                        str(scene_probe or ""),
+                    )
+                    if scene_probe and candidate == stable_candidate:
+                        stable_count += 1
+                    elif scene_probe:
+                        stable_candidate = candidate
+                        stable_count = 1
+                    else:
+                        stable_candidate = None
+                        stable_count = 0
+                    if scene_probe and stable_count >= 3:
+                        target_url = cur
+                        target_scene = scene_probe
+                        target_plan_system = detect_plan_system(
+                            page_text=page_text
+                        )
+                        target_page_text = page_text
+                        break
+                await asyncio.sleep(0.5)
+            if not target_url:
+                raise RuntimeError("10分钟内未识别到计划详情页")
+            if target_scene == "product" and stable_candidate:
+                aavid, ad_id = stable_candidate[0], stable_candidate[1]
+            else:
+                aavid, ad_id = _extract_aavid_adid(target_url)
+            if not target_scene:
+                raise RuntimeError("无法确认当前计划是直播还是商品全域")
+            try:
+                page_title = await fetcher.page.title()
+            except Exception:
+                page_title = ""
+            plan_name = extract_plan_name(
+                page_text=target_page_text,
+                page_title=page_title,
+                ad_id=ad_id,
+            )
+            if target_scene == "product":
+                plan = product_snapshot.get("plan") or {}
+                plan_name = str(plan.get("plan_name") or plan_name).strip()[:256]
+            target = upsert_promotion_target(
+                {
+                    "aavid": aavid,
+                    "ad_id": ad_id,
+                    "plan_name": plan_name,
+                    "promotion_scene": target_scene,
+                    "plan_system": target_plan_system,
+                    "page_url": target_url,
+                    "enabled": True,
+                    "last_status": "pending",
+                },
+                db=db,
+            )
+            if target_scene == "product":
+                _persist_product_snapshot(db, target["target_uid"], product_snapshot)
+            if fetcher.context:
+                _ensure_data_dir()
+                await fetcher.context.storage_state(path=cfg.cookie_path)
+            with self._lock:
+                self._target_discovery_status = {
+                    "running": False,
+                    "message": "监控计划已添加",
+                    "target": target,
+                }
+        finally:
+            await fetcher.close()
 
     # ---------------- thread main ----------------
     def _thread_entry(self):
@@ -430,6 +824,8 @@ class ServiceController:
         # 首次/登录阶段必须可见窗口，与「无头」选项无关
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state_path)
         await fetcher._init_browser()
+        probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
+        probe.attach(fetcher.page)
 
         # ---------------- 新开标签页/弹窗处理 ----------------
         # 千川页面某些按钮会触发新开标签页；如果不切换 page，会一直读到旧 page.url
@@ -445,6 +841,7 @@ class ServiceController:
             with active_page_lock:
                 active_page = new_page
                 fetcher.page = new_page
+            probe.attach(new_page)
             self._log(f"[浏览器] 检测到新标签页，已切换（url={getattr(new_page, 'url', '')}）")
 
         def _on_new_page(p):
@@ -465,8 +862,34 @@ class ServiceController:
             pass
 
         # 打开一个起始页，让用户手动登录
+        startup_url = cfg.open_url
+        known_targets = list_promotion_targets(enabled=True, db=db)
+        reuse_last_target = _reuse_last_target_enabled()
+        last_target = _load_last_target()
+        remembered_target = last_target if reuse_last_target else None
+        excluded_target = last_target if not reuse_last_target else None
+        startup_target = _choose_startup_target(
+            known_targets,
+            remembered_target,
+        )
+        if storage_state_path and not reuse_last_target:
+            # 用户明确要求重新选择时，从计划列表开始，不能自动复用数据库里的首个旧目标。
+            startup_url = "https://qianchuan.jinritemai.com/uni-prom"
+        elif storage_state_path and (startup_target or remembered_target):
+            try:
+                target_data = startup_target
+                startup_url = build_qianchuan_url_by_params(
+                    base_url=cfg.base_url,
+                    aavid=int(target_data["aadvid"]),
+                    ad_id=int(target_data["ad_id"]),
+                    promotion_scene=target_data.get("promotion_scene") or "live",
+                    source_url=target_data.get("sanitized_page_url") or None,
+                )
+            except Exception:
+                startup_url = cfg.open_url
+
         try:
-            await fetcher.page.goto(cfg.open_url, wait_until="domcontentloaded", timeout=60000)
+            await fetcher.page.goto(startup_url, wait_until="domcontentloaded", timeout=60000)
         except Exception:
             # 即便打开失败也继续等待用户操作
             pass
@@ -476,8 +899,21 @@ class ServiceController:
             self._phase = "waiting_login"
             self._message = "等待识别 URL（进入投放详情页后自动开始抓取）"
 
-        target_url = await self._wait_for_target_url(fetcher, cfg)
-        if not target_url:
+        discovered = None
+        if storage_state_path and reuse_last_target and startup_target:
+            discovered = _trusted_startup_discovery(startup_target, startup_url)
+            if discovered:
+                self._log(
+                    "[服务] 已复用选定的监控计划；每轮采集仍会按精确账户和计划号重新校验"
+                )
+        if not discovered:
+            discovered = await self._wait_for_target_url(
+                fetcher,
+                cfg,
+                probe=probe,
+                excluded_target=excluded_target,
+            )
+        if not discovered:
             self._log("[服务] 已停止（未进入详情页）")
             with self._lock:
                 self._phase = "stopped"
@@ -485,12 +921,107 @@ class ServiceController:
             await fetcher.close()
             return
 
-        aavid, ad_id = _extract_aavid_adid(target_url)
+        target_url = str(discovered.get("url") or "").strip()
+        aavid = str(discovered.get("aavid") or "").strip()
+        ad_id = str(discovered.get("ad_id") or "").strip()
+        try:
+            page_text = await fetcher.page.locator("body").inner_text(timeout=3000)
+        except Exception:
+            page_text = ""
+        try:
+            page_title = await fetcher.page.title()
+        except Exception:
+            page_title = ""
+        plan_name = str(discovered.get("plan_name") or "").strip()
+        if not plan_name:
+            plan_name = extract_plan_name(
+                page_text=page_text,
+                page_title=page_title,
+                ad_id=ad_id,
+            )
+        promotion_scene = str(
+            discovered.get("promotion_scene") or ""
+        ).strip()
+        if not promotion_scene:
+            promotion_scene = detect_confirmed_detail_scene(
+                target_url,
+                page_text=page_text,
+            )
+        if not promotion_scene:
+            for known in known_targets:
+                if (
+                    str(known.get("aadvid") or "") == str(aavid or "")
+                    and str(known.get("ad_id") or "") == str(ad_id or "")
+                ):
+                    promotion_scene = known.get("promotion_scene")
+                    break
+        if not promotion_scene:
+            self._log("[服务] 当前详情页无法确认是直播还是商品全域计划，已安全停止")
+            with self._lock:
+                self._phase = "error"
+                self._message = "无法识别推广场景，请打开直播或商品全域计划详情页"
+            await fetcher.close()
+            return
+        plan_system = normalize_plan_system(
+            discovered.get("plan_system") or "unknown"
+        )
+        if plan_system == "unknown":
+            plan_system = detect_plan_system(
+                page_text=page_text,
+                payload=discovered.get("snapshot"),
+            )
+        if plan_system == "unknown":
+            for known in known_targets:
+                if (
+                    str(known.get("aadvid") or "") == str(aavid or "")
+                    and str(known.get("ad_id") or "") == str(ad_id or "")
+                ):
+                    plan_system = normalize_plan_system(
+                        known.get("plan_system") or "unknown"
+                    )
+                    break
+        target = upsert_promotion_target(
+            {
+                "target_uid": make_target_uid(aavid, ad_id),
+                "aavid": aavid,
+                "ad_id": ad_id,
+                "plan_name": plan_name,
+                "promotion_scene": promotion_scene,
+                "plan_system": plan_system,
+                "page_url": target_url,
+                "enabled": True,
+                "last_status": "pending",
+            },
+            db=db,
+        )
+        if promotion_scene == "product":
+            _persist_product_snapshot(
+                db,
+                target["target_uid"],
+                discovered.get("snapshot"),
+            )
+        _save_last_target(aavid, ad_id)
         with self._lock:
-            self._last_target = {"aavid": aavid, "adId": ad_id, "url": target_url}
+            self._last_target = {
+                "targetUid": target["target_uid"],
+                "aavid": aavid,
+                "adId": ad_id,
+                "promotionScene": promotion_scene,
+                "planSystem": plan_system,
+                "planName": target.get("plan_name") or "",
+                "url": target_url,
+            }
             self._phase = "starting"
-            self._message = f"已识别目标（aavid={aavid}, adId={ad_id}），保存 cookies 并重启浏览器..."
-        self._log(f"[服务] 识别到目标：aavid={aavid}, adId={ad_id}，准备保存 cookies 并重启")
+            self._message = (
+                f"已识别{('推商品' if promotion_scene == 'product' else '推直播')}计划，"
+                f"体系={plan_system}，"
+                "保存登录状态并启动轮询..."
+            )
+        self._log(
+            f"[服务] 识别到目标：target={target['target_uid']} aavid={aavid}, "
+            f"adId={ad_id}, scene={promotion_scene}, system={plan_system}，"
+            "准备保存 cookies 并重启"
+        )
 
         # -------- 阶段切换：识别成功后先保存 cookies，然后关闭当前浏览器，再用 cookies 重启抓取 --------
         try:
@@ -514,6 +1045,8 @@ class ServiceController:
                     base_url=cfg.base_url,
                     aavid=int(aavid),
                     ad_id=int(ad_id),
+                    promotion_scene=promotion_scene,
+                    source_url=target.get("sanitized_page_url") or target_url,
                 )
         except Exception as e:
             self._log(f"[URL] 构建抓取URL失败：{e}")
@@ -580,20 +1113,6 @@ class ServiceController:
 
             first_poll = False
 
-            # 每次抓取前重新构建 URL（日期可能已变化）
-            current_aavid = self._last_target.get("aavid")
-            current_ad_id = self._last_target.get("adId")
-            try:
-                if current_aavid and current_ad_id:
-                    fetch_url = build_qianchuan_url_by_params(
-                        base_url=cfg.base_url,
-                        aavid=int(current_aavid),
-                        ad_id=int(current_ad_id),
-                    )
-            except Exception as e:
-                self._log(f"[URL] 重新构建抓取URL失败：{e}")
-                continue
-
             scrape_cfg = load_scrape_service_config()
             new_headless = bool(scrape_cfg.get("headless_poll", True))
             if self._active_poll_headless is not None and new_headless != self._active_poll_headless:
@@ -635,22 +1154,207 @@ class ServiceController:
                 self._log("[服务] 轮询浏览器已按周期重启，继续抓取")
 
             try:
-                self._log("[抓取] 开始一轮抓取")
+                targets = list_promotion_targets(enabled=True, db=db)
+                if not targets:
+                    self._log("[抓取] 没有启用的监控计划，本轮跳过")
+                    self._last_fetch_time = time.time()
+                    continue
+                self._log(f"[抓取] 开始一轮抓取，共 {len(targets)} 条监控计划")
                 fa, fp, ft = snapshot_feishu_bitable_for_fetch()
                 fs_panel = load_feishu_bitable_panel_config()
                 fpm = fs_panel.get("push_mode") or "each_crawl"
-                await fetcher.fetch(
-                    fetch_url,
-                    db=db,
-                    timeout=int(cfg.round_timeout),
-                    feishu_app_token=fa,
-                    feishu_personal_base_token=fp,
-                    feishu_table_id=ft,
-                    feishu_push_mode=fpm,
-                    cloud_backup_username=self._cloud_backup_username,
-                    cloud_backup_password=self._cloud_backup_password,
-                )
-                # 保存 cookie
+                for target_index, current_target in enumerate(targets, start=1):
+                    if self._stop_event.is_set():
+                        break
+                    current_aavid = str(current_target.get("aadvid") or "").strip()
+                    current_ad_id = str(current_target.get("ad_id") or "").strip()
+                    current_uid = str(current_target.get("target_uid") or "").strip()
+                    current_scene = str(
+                        current_target.get("promotion_scene") or "live"
+                    ).strip()
+                    current_plan_system = normalize_plan_system(
+                        current_target.get("plan_system") or "unknown"
+                    )
+                    try:
+                        fetch_url = build_qianchuan_url_by_params(
+                            base_url=cfg.base_url,
+                            aavid=int(current_aavid),
+                            ad_id=int(current_ad_id),
+                            promotion_scene=current_scene,
+                            source_url=current_target.get("sanitized_page_url") or None,
+                        )
+                    except Exception as e:
+                        update_target_sync_state(
+                            current_uid,
+                            status="error",
+                            error=f"构建抓取地址失败：{e}",
+                            db=db,
+                        )
+                        self._log(
+                            f"[抓取 {target_index}/{len(targets)}] "
+                            f"{current_target.get('plan_name') or current_ad_id} 地址构建失败：{e}"
+                        )
+                        continue
+                    with self._lock:
+                        self._last_target = {
+                            "targetUid": current_uid,
+                            "aavid": current_aavid,
+                            "adId": current_ad_id,
+                            "promotionScene": current_scene,
+                            "planSystem": current_plan_system,
+                            "planName": current_target.get("plan_name") or "",
+                            "url": fetch_url,
+                        }
+                        self._message = (
+                            f"抓取中（{target_index}/{len(targets)}："
+                            f"{current_target.get('plan_name') or current_ad_id}）"
+                        )
+                    self._fetch_url = fetch_url
+                    self._log(
+                        f"[抓取 {target_index}/{len(targets)}] 开始 "
+                        f"target={current_uid} scene={current_scene} "
+                        f"system={current_plan_system}"
+                    )
+                    try:
+                        async with exclusive_browser_operation(
+                            f"采集:{current_uid}",
+                            timeout_seconds=max(60, int(cfg.round_timeout)),
+                        ):
+                            result = await fetcher.fetch(
+                                fetch_url,
+                                db=db,
+                                timeout=int(cfg.round_timeout),
+                                feishu_app_token=fa,
+                                feishu_personal_base_token=fp,
+                                feishu_table_id=ft,
+                                feishu_push_mode=fpm,
+                                cloud_backup_username=self._cloud_backup_username,
+                                cloud_backup_password=self._cloud_backup_password,
+                                target_uid=current_uid,
+                                promotion_scene=current_scene,
+                                plan_system=current_plan_system,
+                                plan_name=current_target.get("plan_name") or "",
+                            )
+                        material_count = int(result.get("material_total_count") or 0)
+                        delivery_gate = result.get("delivery_gate") or {}
+                        delivery_reason = str(
+                            delivery_gate.get("reason") or ""
+                        ).strip()
+                        delivery_name = str(
+                            delivery_gate.get("delivery_name") or ""
+                        ).strip()
+                        product_link_count = db.count(
+                            "promotion_material_product",
+                            where={"target_uid": current_uid},
+                        )
+                        if delivery_reason == "not_delivering":
+                            target_status = (
+                                "paused" if "暂停" in delivery_name else "not_delivering"
+                            )
+                            existing_capability = current_target.get("capability")
+                            if not isinstance(existing_capability, dict):
+                                existing_capability = {}
+                            update_target_sync_state(
+                                current_uid,
+                                status=target_status,
+                                error=(
+                                    f"计划当前状态：{delivery_name or '非投放中'}；"
+                                    "已禁止追投，未执行任何写操作"
+                                ),
+                                capability={
+                                    "material_read": bool(
+                                        existing_capability.get("material_read")
+                                    ),
+                                    "product_relation": (
+                                        current_scene == "live"
+                                        or product_link_count > 0
+                                    ),
+                                    "retarget_execute": False,
+                                    "regulation_execute": False,
+                                },
+                                db=db,
+                            )
+                            self._log(
+                                f"[抓取 {target_index}/{len(targets)}] "
+                                f"计划当前为{delivery_name or '非投放中'}，已安全跳过"
+                            )
+                        elif current_scene == "product" and material_count <= 0:
+                            update_target_sync_state(
+                                current_uid,
+                                status="capability_mismatch",
+                                error="商品全域页面未识别到素材接口，本轮未执行任何写操作",
+                                capability={
+                                    "material_read": False,
+                                    "product_relation": product_link_count > 0,
+                                    "retarget_execute": False,
+                                    "regulation_execute": False,
+                                },
+                                db=db,
+                            )
+                            self._log(
+                                f"[抓取 {target_index}/{len(targets)}] 商品页面能力未识别，已安全跳过"
+                            )
+                        else:
+                            existing_capability = current_target.get("capability")
+                            if not isinstance(existing_capability, dict):
+                                existing_capability = {}
+                            update_target_sync_state(
+                                current_uid,
+                                status="ok",
+                                synced=True,
+                                capability={
+                                    "material_read": True,
+                                    "product_relation": (
+                                        current_scene == "live" or product_link_count > 0
+                                    ),
+                                    # 商品追投表单经独立只读探测确认后保留能力标记；
+                                    # 常规素材轮询不能替代该探测，也不能擅自打开能力。
+                                    "retarget_execute": bool(
+                                        existing_capability.get("retarget_execute")
+                                    ),
+                                    # 商品任务列表/结束入口须在真实受控任务创建后
+                                    # 另行探测；未确认前自动停投保持关闭。
+                                    "regulation_execute": bool(
+                                        existing_capability.get("regulation_execute")
+                                    ),
+                                },
+                                db=db,
+                            )
+                            self._log(
+                                f"[抓取 {target_index}/{len(targets)}] 完成，素材 {material_count} 条"
+                            )
+                        try:
+                            await self._maybe_feishu_hourly_push_after_fetch(
+                                db,
+                                fa,
+                                fp,
+                                ft,
+                                current_aavid or None,
+                                current_uid or None,
+                            )
+                        except Exception as e:
+                            self._log(f"[飞书·整点] 检查/同步异常（已忽略）：{e}")
+                    except GlobalAuthExpiredError:
+                        raise
+                    except Exception as e:
+                        update_target_sync_state(
+                            current_uid,
+                            status="error",
+                            error=str(e),
+                            db=db,
+                        )
+                        self._log(
+                            f"[抓取 {target_index}/{len(targets)}] 异常：{e}"
+                        )
+                    finally:
+                        try:
+                            fetcher._material_total_count = 0
+                            fetcher._material_current_count = 0
+                            fetcher._reset_assist_fetch_state()
+                        except Exception:
+                            pass
+
+                # 整轮结束后保存一次 Cookie。
                 try:
                     if fetcher.context:
                         _ensure_data_dir()
@@ -658,13 +1362,7 @@ class ServiceController:
                 except Exception:
                     pass
                 self._last_fetch_time = time.time()
-                self._log(f"[抓取] 完成")
-                try:
-                    await self._maybe_feishu_hourly_push_after_fetch(
-                        db, fa, fp, ft, str(current_aavid or "").strip() or None
-                    )
-                except Exception as e:
-                    self._log(f"[飞书·整点] 检查/同步异常（已忽略）：{e}")
+                self._log("[抓取] 本轮全部监控计划处理完成")
                 # 本轮已结束，清空进度计数；否则 status 里一直带着上一轮的 current/total，
                 # 前端会永远走「抓取中」分支，无法显示轮询间隔内的「等待中 / 倒计时」。
                 # 调控任务进度也需清零，否则会残留 797/797，顶栏一直显示「采集中」而无法进入倒计时。
@@ -700,8 +1398,19 @@ class ServiceController:
                 self._message = "已停止"
         await fetcher.close()
 
-    async def _wait_for_target_url(self, fetcher: QianChuanFetcher, cfg: ServiceConfig) -> Optional[str]:
+    async def _wait_for_target_url(
+        self,
+        fetcher: QianChuanFetcher,
+        cfg: ServiceConfig,
+        *,
+        probe: Optional[PromotionReadOnlyProbe] = None,
+        excluded_target: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         prefix = (cfg.wait_url_prefix or "").strip()
+        stable_candidate = None
+        stable_count = 0
+        last_probe_at = 0.0
+        excluded_candidate_reported = False
         while not self._stop_event.is_set():
             try:
                 # 注意：fetcher.page 可能被 “新标签页” 回调更新
@@ -709,10 +1418,101 @@ class ServiceController:
             except Exception:
                 cur = ""
 
+            if probe and time.time() - last_probe_at >= 1.0:
+                await probe.observe_page(fetcher.page)
+                last_probe_at = time.time()
+
+            # 商品全域实际页面保持在 /uni-prom，主计划 ID 来自 ad-detail-plus /
+            # shop-prom/get-config。只有主计划接口和唯一账户 ID 同时确认时才登记。
+            if probe and urlparse(cur).path == "/uni-prom":
+                product_target = probe.confirmed_product_target()
+                if product_target:
+                    candidate = (
+                        str(product_target["aavid"]),
+                        str(product_target["ad_id"]),
+                        "product",
+                    )
+                    if _target_is_excluded(
+                        product_target["aavid"],
+                        product_target["ad_id"],
+                        excluded_target,
+                    ):
+                        stable_candidate = None
+                        stable_count = 0
+                        if not excluded_candidate_reported:
+                            self._log(
+                                "[服务] 当前仍是上一次计划；重新选择模式正在等待另一条计划"
+                            )
+                            with self._lock:
+                                self._message = (
+                                    "请在千川中选择另一条状态为“投放中”的商品全域计划"
+                                )
+                            excluded_candidate_reported = True
+                        await asyncio.sleep(0.5)
+                        continue
+                    if candidate == stable_candidate:
+                        stable_count += 1
+                    else:
+                        stable_candidate = candidate
+                        stable_count = 1
+                    if stable_count >= 3:
+                        return {
+                            **product_target,
+                            "url": cur,
+                        }
+                    await asyncio.sleep(0.5)
+                    continue
+
             if cur and (not prefix or cur.startswith(prefix)):
                 aavid, ad_id = _extract_aavid_adid(cur)
                 if aavid and ad_id:
-                    return cur
+                    try:
+                        page_text = await fetcher.page.locator("body").inner_text(
+                            timeout=3000
+                        )
+                    except Exception:
+                        page_text = ""
+                    scene = detect_confirmed_detail_scene(
+                        cur,
+                        page_text=page_text,
+                    )
+                    candidate = (str(aavid), str(ad_id), str(scene or ""))
+                    if scene and _target_is_excluded(
+                        aavid,
+                        ad_id,
+                        excluded_target,
+                    ):
+                        stable_candidate = None
+                        stable_count = 0
+                        if not excluded_candidate_reported:
+                            self._log(
+                                "[服务] 当前仍是上一次计划；重新选择模式正在等待另一条计划"
+                            )
+                            with self._lock:
+                                self._message = (
+                                    "请在千川中选择另一条状态为“投放中”的计划"
+                                )
+                            excluded_candidate_reported = True
+                    elif scene and candidate == stable_candidate:
+                        stable_count += 1
+                    elif scene:
+                        stable_candidate = candidate
+                        stable_count = 1
+                    else:
+                        stable_candidate = None
+                        stable_count = 0
+                    if scene and stable_count >= 3:
+                        return {
+                            "url": cur,
+                            "aavid": str(aavid),
+                            "ad_id": str(ad_id),
+                            "promotion_scene": scene,
+                            "plan_system": detect_plan_system(
+                                page_text=page_text
+                            ),
+                            "plan_name": "",
+                            "snapshot": {},
+                        }
 
             await asyncio.sleep(0.5)
         return None
@@ -726,4 +1526,3 @@ def get_service_controller() -> ServiceController:
     if _GLOBAL_CONTROLLER is None:
         _GLOBAL_CONTROLLER = ServiceController()
     return _GLOBAL_CONTROLLER
-
