@@ -922,6 +922,8 @@ class LocalTestGuardTests(unittest.TestCase):
                         "plan_system": "global",
                         "plan_name": "测试全域计划",
                         "enabled": 1,
+                        "last_status": "ok",
+                        "capability_json": '{"retarget_execute": true}',
                     }
                 if table == "pmc_ad_detail_basic":
                     return {"user_info_name": "测试账户"}
@@ -965,6 +967,87 @@ class LocalTestGuardTests(unittest.TestCase):
         self.assertEqual("测试账户", result["account_name"])
         self.assertEqual("测试素材", result["material_name"])
         self.assertIn("预算 100 元", result["strategies"][0]["summary"])
+
+    def test_preflight_rejects_pending_monitor_target(self):
+        config = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "id": "s1",
+                    "title": "受控验收策略",
+                    "target_uid": "target-test",
+                    "action_mode": "card_confirm",
+                    "trigger": {"group_combine": "or", "groups": []},
+                    "retargeting": {
+                        "method": "volume",
+                        "volume": {
+                            "total_budget_yuan": 100,
+                            "duration_hours": 0.5,
+                        },
+                    },
+                }
+            ],
+        }
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {
+                        "target_uid": "target-test",
+                        "aadvid": "1001",
+                        "ad_id": "3001",
+                        "promotion_scene": "product",
+                        "plan_system": "global",
+                        "plan_name": "测试全域计划",
+                        "enabled": 1,
+                        "last_status": "pending",
+                        "capability_json": '{"retarget_execute": true}',
+                    }
+                if table == "pmc_ad_detail_basic":
+                    return {"user_info_name": "测试账户"}
+                if table == "pmc_promotion_material":
+                    return {"video_name": "测试素材"}
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "qcookie.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                TEST_AAVID="1001",
+                TEST_MATERIAL_ID="2001",
+                ALLOW_LIVE_RETARGET=False,
+                DATA_DIR=tmp,
+                CONSUMED_FILE=os.path.join(tmp, "live_retarget_consumed.json"),
+            ), patch(
+                "api.rule_retargeting_config.load_rule_retargeting_config",
+                return_value=config,
+            ), patch(
+                "api.rule_retargeting_config.validate_rule_retargeting_config",
+                return_value=(True, ""),
+            ), patch(
+                "services.cloud_retarget_client.load_device_session",
+                return_value={"username": "tester", "token": "device-token"},
+            ), patch(
+                "services.retargeting_rule_runner.resolve_ad_id_for_aavid",
+                return_value="3001",
+            ), patch(
+                "utils.sqlite_store.init_sqlite_schema",
+            ), patch(
+                "utils.sqlite_store.SQLiteStore",
+                return_value=FakeStore(),
+            ):
+                result = local_test_guard.build_live_retarget_preflight()
+
+        self.assertFalse(result["ready_to_arm"])
+        status_check = next(
+            item
+            for item in result["checks"]
+            if item["key"] == "monitor_target_status"
+        )
+        self.assertFalse(status_check["ok"])
+        self.assertIn("pending", status_check["detail"])
 
 
 if __name__ == "__main__":

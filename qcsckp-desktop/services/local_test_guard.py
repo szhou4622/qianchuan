@@ -211,6 +211,11 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
     material_name = ""
     material_found = False
     account_name = ""
+    monitor_target_found = False
+    monitor_target_enabled = False
+    monitor_target_account_matches = False
+    monitor_target_status = ""
+    retarget_capability_ready = False
     if target_ready:
         try:
             init_sqlite_schema()
@@ -227,10 +232,18 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
                 target_uid = next(iter(strategy_target_ids))
                 target_row = db.select_one(
                     "promotion_target",
-                    where={"target_uid": target_uid, "enabled": 1},
+                    where={"target_uid": target_uid},
                 )
             if target_row:
-                if str(target_row.get("aadvid") or "").strip() == TEST_AAVID:
+                monitor_target_found = True
+                monitor_target_enabled = bool(target_row.get("enabled"))
+                monitor_target_account_matches = (
+                    str(target_row.get("aadvid") or "").strip() == TEST_AAVID
+                )
+                monitor_target_status = str(
+                    target_row.get("last_status") or ""
+                ).strip().lower()
+                if monitor_target_account_matches:
                     ad_id = str(target_row.get("ad_id") or "").strip()
                     promotion_scene = str(
                         target_row.get("promotion_scene") or "live"
@@ -240,7 +253,20 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
                     )
                     plan_name = str(target_row.get("plan_name") or "").strip()
                 else:
-                    target_uid = ""
+                    ad_id = ""
+                if promotion_scene == "product":
+                    try:
+                        capability = json.loads(
+                            target_row.get("capability_json") or "{}"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        capability = {}
+                    retarget_capability_ready = bool(
+                        isinstance(capability, dict)
+                        and capability.get("retarget_execute")
+                    )
+                else:
+                    retarget_capability_ready = True
             else:
                 # 仅兼容升级前的单计划配置；新配置会由规则校验要求 target_uid。
                 ad_id = str(resolve_ad_id_for_aavid(db, TEST_AAVID) or "")
@@ -275,6 +301,46 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
         except Exception as exc:
             add_check("local_data", "本地账户数据", False, f"读取失败：{exc}")
     add_check(
+        "monitor_target",
+        "监控计划",
+        bool(
+            monitor_target_found
+            and monitor_target_enabled
+            and monitor_target_account_matches
+        ),
+        (
+            f"{plan_name or target_uid} 已启用且属于白名单账户"
+            if (
+                monitor_target_found
+                and monitor_target_enabled
+                and monitor_target_account_matches
+            )
+            else (
+                "监控计划已停用"
+                if monitor_target_found and not monitor_target_enabled
+                else (
+                    "监控计划与白名单账户不一致"
+                    if monitor_target_found and not monitor_target_account_matches
+                    else "策略关联的监控计划不存在"
+                )
+            )
+        ),
+    )
+    add_check(
+        "monitor_target_status",
+        "监控计划投放状态",
+        monitor_target_status == "ok",
+        (
+            "最近一次同步确认计划正在投放"
+            if monitor_target_status == "ok"
+            else (
+                f"当前状态为 {monitor_target_status}，请重新同步并确认计划正在投放"
+                if monitor_target_status
+                else "尚未同步到可执行的投放状态"
+            )
+        ),
+    )
+    add_check(
         "ad_mapping",
         "账户与广告ID映射",
         bool(ad_id),
@@ -299,6 +365,20 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
                 "已识别为千川乘方；乘方适配器尚未完成受控验证"
                 if plan_system == "chengfang"
                 else "计划体系尚未识别，请重新打开计划详情"
+            )
+        ),
+    )
+    add_check(
+        "retarget_capability",
+        "追投表单能力",
+        retarget_capability_ready,
+        (
+            "当前计划的追投表单已通过本机只读探测"
+            if retarget_capability_ready
+            else (
+                "商品计划的追投表单尚未通过本机探测"
+                if promotion_scene == "product"
+                else "当前计划尚未确认可执行追投"
             )
         ),
     )
