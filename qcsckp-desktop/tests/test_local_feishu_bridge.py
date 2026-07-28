@@ -450,5 +450,46 @@ class LocalFeishuBindingTests(unittest.TestCase):
         self.assertEqual(secret, bridge._profile_for("tool-user-a", include_secret=True)["app_secret"])
 
 
+class LocalFeishuSessionRestoreTests(unittest.TestCase):
+    class Manager:
+        def __init__(self):
+            self.account = ""
+            self.activated = []
+
+        def activate(self, username):
+            self.account = str(username)
+            self.activated.append(str(username))
+
+    def test_device_session_restores_account_without_password(self):
+        manager = self.Manager()
+        with (
+            patch.object(bridge, "_MANAGER", manager),
+            patch(
+                "services.cloud_retarget_client.load_device_session",
+                return_value={"username": "local_test", "token": "device-token"},
+            ),
+        ):
+            self.assertTrue(
+                bridge.restore_local_feishu_account_from_device_session()
+            )
+            self.assertEqual("local_test", bridge.current_local_feishu_account())
+            self.assertEqual(["local_test"], manager.activated)
+
+    def test_incomplete_device_session_does_not_restore_account(self):
+        manager = self.Manager()
+        with (
+            patch.object(bridge, "_MANAGER", manager),
+            patch(
+                "services.cloud_retarget_client.load_device_session",
+                return_value={"username": "local_test", "token": ""},
+            ),
+        ):
+            self.assertFalse(
+                bridge.restore_local_feishu_account_from_device_session()
+            )
+            self.assertEqual("", manager.account)
+            self.assertEqual([], manager.activated)
+
+
 if __name__ == "__main__":
     unittest.main()

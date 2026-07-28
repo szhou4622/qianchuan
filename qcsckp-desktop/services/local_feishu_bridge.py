@@ -1347,10 +1347,29 @@ def deactivate_local_feishu_account() -> None:
     _MANAGER.deactivate()
 
 
+def restore_local_feishu_account_from_device_session() -> bool:
+    """桌面端重启后，使用已签发的设备会话恢复对应工具账号的飞书连接。"""
+    if _MANAGER.account:
+        return True
+    try:
+        from services.cloud_retarget_client import load_device_session
+
+        session = load_device_session()
+    except Exception:
+        return False
+    username = str((session or {}).get("username") or "").strip()
+    token = str((session or {}).get("token") or "").strip()
+    if not username or not token:
+        return False
+    _MANAGER.activate(username)
+    return bool(_MANAGER.account)
+
+
 def selected_task_backend() -> str:
     override = str(os.getenv("QCSCKP_RETARGET_TASK_BACKEND") or "").strip().lower()
     if override in {"local_ws", "cloud_http"}:
         return override
+    restore_local_feishu_account_from_device_session()
     account = _MANAGER.account
     if account:
         return str(_profile_for(account).get("backend") or "local_ws")
@@ -1358,6 +1377,7 @@ def selected_task_backend() -> str:
 
 
 def get_local_feishu_status() -> Dict[str, Any]:
+    restore_local_feishu_account_from_device_session()
     bridge = _MANAGER.bridge()
     if bridge is None:
         return {
@@ -1372,6 +1392,7 @@ def get_local_feishu_status() -> Dict[str, Any]:
 
 
 def current_local_feishu_account() -> str:
+    restore_local_feishu_account_from_device_session()
     return _MANAGER.account
 
 

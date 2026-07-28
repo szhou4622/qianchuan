@@ -214,6 +214,13 @@ def save_operation_daily_report_config(config: Dict[str, Any]) -> Dict[str, Any]
         saved = _save_profile_config(account, config if isinstance(config, dict) else {})
     except (RuntimeError, ValueError) as exc:
         return {"success": False, "message": str(exc)}
+    logger.info(
+        "[操作日报] 配置已保存 account=%s enabled=%s time=%s aavids=%s",
+        account,
+        saved.get("enabled"),
+        saved.get("send_time"),
+        ",".join(saved.get("aavids") or []),
+    )
     return {"success": True, "message": "昨日操作日报设置已保存", "config": saved}
 
 
@@ -636,10 +643,22 @@ def start_operation_daily_report_background_thread() -> None:
         SCHEDULER_STARTED = True
 
     def _loop() -> None:
+        logger.info("[操作日报] 后台线程已启动，每30秒检查一次")
         time.sleep(8)
         while True:
             try:
-                run_operation_daily_report_scheduler_once()
+                result = run_operation_daily_report_scheduler_once()
+                if not result.get("success") and not result.get("skipped"):
+                    logger.warning(
+                        "[操作日报] 定时发送未完成: %s",
+                        result.get("message") or result,
+                    )
+                elif int(result.get("sent_count") or 0) > 0:
+                    logger.info(
+                        "[操作日报] 定时发送完成 date=%s sent=%s",
+                        result.get("report_date"),
+                        result.get("sent_count"),
+                    )
             except Exception as exc:
                 logger.warning("[操作日报] 定时检查失败: %s", exc)
             time.sleep(30)
