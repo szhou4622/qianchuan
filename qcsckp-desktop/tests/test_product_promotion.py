@@ -3,7 +3,7 @@ import asyncio
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from api.promotion_targets import (
     detect_confirmed_detail_scene,
@@ -289,6 +289,161 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual("browser", result.step)
         self.assertNotIn("尚不支持", result.message)
+
+    def test_product_capability_probe_never_submits(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+
+        async def ensure_browser():
+            service.page = object()
+
+        service._ensure_browser = ensure_browser
+        service._attach_popup_switcher = AsyncMock(return_value=[])
+        service._detach_popup_switcher = lambda _handlers: None
+        service._open_product_retarget_dialog = AsyncMock(return_value=None)
+        service._select_product_material = AsyncMock(return_value=None)
+        service._click_submit_and_wait_assist = AsyncMock()
+        service.close = AsyncMock()
+
+        with patch(
+            "services.retargeting_service.goto_and_confirm_product_target",
+            new=AsyncMock(return_value=None),
+        ):
+            result = asyncio.run(
+                service.probe_product_retarget_capability(
+                    aavid=10001,
+                    ad_id=20001,
+                    material_id="m1",
+                    target_uid="target-1",
+                    source_url=(
+                        "https://qianchuan.jinritemai.com/uni-prom"
+                        "?aavid=10001&adId=20001"
+                    ),
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual("capability_probe", result.step)
+        self.assertIn("未点击提交", result.message)
+        service._open_product_retarget_dialog.assert_awaited_once()
+        service._select_product_material.assert_awaited_once_with(
+            service.page,
+            "m1",
+        )
+        service._click_submit_and_wait_assist.assert_not_awaited()
+        service.close.assert_awaited_once()
+
+    def test_product_material_selection_passes_wait_argument_by_keyword(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+        wait_arguments = []
+
+        class Locator:
+            def __init__(self, kind, page):
+                self.kind = kind
+                self.page = page
+
+            @property
+            def first(self):
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def nth(self, _index):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def wait_for(self, **_kwargs):
+                return None
+
+            async def fill(self, _value):
+                return None
+
+            async def press(self, _key):
+                return None
+
+            async def is_visible(self):
+                return True
+
+            async def get_attribute(self, _name):
+                if self.kind == "label":
+                    return "ovui-checkbox ovui-checkbox--md"
+                return ""
+
+            async def is_checked(self):
+                return self.page.checked
+
+            async def click(self, **_kwargs):
+                if self.kind == "label":
+                    self.page.checked = True
+
+            async def evaluate(self, _script):
+                self.page.checked = True
+
+            async def element_handle(self):
+                return object()
+
+            def locator(self, selector):
+                if self.kind == "search":
+                    return self.page.modal
+                if self.kind == "material":
+                    return self.page.row
+                if self.kind == "row":
+                    if selector == 'input[type="checkbox"]':
+                        return self.page.checkbox
+                    if selector == "label.ovui-checkbox":
+                        return self.page.label
+                if self.kind == "checkbox":
+                    return self.page.label
+                return Locator("generic", self.page)
+
+            def get_by_role(self, _role, **_kwargs):
+                return Locator("confirm", self.page)
+
+        class Page:
+            def __init__(self):
+                self.checked = False
+                self.modal = Locator("modal", self)
+                self.search = Locator("search", self)
+                self.row = Locator("row", self)
+                self.checkbox = Locator("checkbox", self)
+                self.label = Locator("label", self)
+
+            def locator(self, _selector):
+                return self.search
+
+            def get_by_text(self, text, **_kwargs):
+                if str(text).startswith("素材ID:"):
+                    return Locator("material", self)
+                return Locator("generic", self)
+
+            async def wait_for_timeout(self, _timeout):
+                return None
+
+            async def wait_for_function(
+                self,
+                _expression,
+                *,
+                arg=None,
+                timeout=None,
+            ):
+                wait_arguments.append((arg, timeout))
+                return True
+
+        page = Page()
+        service._click_last_visible = AsyncMock(return_value=True)
+        error = asyncio.run(
+            service._select_product_materials(page, ["material-1"])
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual([1, 1], [item[0] for item in wait_arguments])
 
     def test_product_material_request_accepts_req_from_in_post_body(self):
         fetcher = QianChuanFetcher()
@@ -583,6 +738,32 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertTrue(refreshed["capability"]["retarget_execute"])
         self.assertTrue(refreshed["capability"]["product_relation"])
         self.assertEqual("global", refreshed["plan_system"])
+
+    def test_partial_target_refresh_preserves_sync_status_and_error(self):
+        original = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "商品计划",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "enabled": True,
+                "last_status": "ok",
+                "last_error": "已核验说明",
+            },
+            db=self.db,
+        )
+        refreshed = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "promotion_scene": "product",
+                "enabled": True,
+            },
+            db=self.db,
+        )
+        self.assertEqual(original["last_status"], refreshed["last_status"])
+        self.assertEqual(original["last_error"], refreshed["last_error"])
 
     def test_product_and_material_relations_are_isolated_by_target(self):
         left = self._target(1)

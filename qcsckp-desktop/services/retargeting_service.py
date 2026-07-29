@@ -802,7 +802,7 @@ class QianChuanRetargetingService:
                             await page.wait_for_function(
                                 """label => !String(label && label.className || "")
                                     .includes("ovui-checkbox--disabled")""",
-                                await checkbox_label.element_handle(),
+                                arg=await checkbox_label.element_handle(),
                                 timeout=min(self._opt.goto_timeout_ms, 8_000),
                             )
                         except Exception:
@@ -832,7 +832,7 @@ class QianChuanRetargetingService:
                         const match = text.match(/已选\\s*(\\d+)\\s*\\/\\s*20/);
                         return !!match && Number(match[1]) >= Number(expected);
                     }""",
-                    selected_count,
+                    arg=selected_count,
                     timeout=min(self._opt.goto_timeout_ms, 15_000),
                 )
             except Exception:
@@ -853,7 +853,7 @@ class QianChuanRetargetingService:
                     const match = text.match(/已添加[：:]\\s*(\\d+)\\s*\\/\\s*20/);
                     return !!match && Number(match[1]) === Number(expected);
                 }""",
-                form_total,
+                arg=form_total,
                 timeout=min(self._opt.goto_timeout_ms, 15_000),
             )
         except Exception:
@@ -1469,6 +1469,114 @@ class QianChuanRetargetingService:
                 )
             finally:
                 self._detach_popup_switcher(pop_handlers)
+        finally:
+            await self.close()
+
+    async def probe_product_retarget_capability(
+        self,
+        *,
+        aavid: int,
+        ad_id: int,
+        material_id: str,
+        target_uid: Optional[str] = None,
+        source_url: Optional[str] = None,
+    ) -> RetargetingRunResult:
+        """只读验证商品计划的素材追投入口和素材选择器，绝不点击提交。"""
+        self._log_tag = "[商品追投能力验证]"
+        mid = str(material_id or "").strip()
+        if not mid:
+            return self._make_result(
+                success=False,
+                message="能力验证缺少素材ID",
+                step="validate",
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=mid,
+            )
+        try:
+            fetch_url = build_qianchuan_url_by_params(
+                base_url=self._opt.base_url,
+                aavid=int(aavid),
+                ad_id=int(ad_id),
+                promotion_scene="product",
+                source_url=source_url,
+            )
+        except Exception as exc:
+            return self._make_result(
+                success=False,
+                message="构建商品计划地址失败",
+                detail=str(exc),
+                step="build_url",
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=mid,
+            )
+
+        try:
+            await self._ensure_browser()
+            page = self.page
+            if not page:
+                return self._make_result(
+                    success=False,
+                    message="能力验证浏览器未初始化",
+                    step="browser",
+                    aavid=aavid,
+                    ad_id=ad_id,
+                    material_id=mid,
+                )
+            pop_handlers: List[Any] = []
+            try:
+                pop_handlers = await self._attach_popup_switcher()
+                target_error = await goto_and_confirm_product_target(
+                    page,
+                    fetch_url,
+                    expected_aavid=aavid,
+                    expected_ad_id=ad_id,
+                    timeout_ms=self._opt.goto_timeout_ms,
+                )
+                if target_error:
+                    return self._make_result(
+                        success=False,
+                        message=target_error,
+                        step="target_mismatch",
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        material_id=mid,
+                    )
+                await asyncio.sleep(random.uniform(1.0, 1.8))
+                error = await self._open_product_retarget_dialog(page, ad_id)
+                if not error:
+                    error = await self._select_product_material(page, mid)
+                if error:
+                    return self._make_result(
+                        success=False,
+                        message=error,
+                        step="capability_probe",
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        material_id=mid,
+                    )
+                return self._make_result(
+                    success=True,
+                    message="商品追投表单能力验证通过（未点击提交）",
+                    step="capability_probe",
+                    aavid=aavid,
+                    ad_id=ad_id,
+                    material_id=mid,
+                )
+            finally:
+                self._detach_popup_switcher(pop_handlers)
+        except Exception:
+            logger.exception("%s 验证异常", self._log_tag)
+            return self._make_result(
+                success=False,
+                message="商品追投表单能力验证异常",
+                detail=traceback.format_exc()[:8000],
+                step="exception",
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=mid,
+            )
         finally:
             await self.close()
 

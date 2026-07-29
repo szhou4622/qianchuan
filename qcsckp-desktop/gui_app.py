@@ -568,6 +568,9 @@ class JSApi:
     def listPromotionTargetProducts(self, targetUid=None):
         return self.api.listPromotionTargetProducts(targetUid)
 
+    def probePromotionTargetRetargetCapability(self, targetUid=None):
+        return self.api.probePromotionTargetRetargetCapability(targetUid)
+
     def startPromotionTargetDiscovery(self):
         return self.api.startPromotionTargetDiscovery()
 

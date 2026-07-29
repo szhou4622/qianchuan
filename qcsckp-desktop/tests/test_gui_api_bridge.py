@@ -18,6 +18,9 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.discoverPromotionTarget.return_value = {"success": True}
         self.core.setPromotionTargetEnabled.return_value = {"success": True}
         self.core.listPromotionTargetProducts.return_value = {"success": True, "data": []}
+        self.core.probePromotionTargetRetargetCapability.return_value = {
+            "success": True
+        }
         self.core.startPromotionTargetDiscovery.return_value = {"success": True}
         self.core.getPromotionTargetDiscoveryStatus.return_value = {"running": False}
 
@@ -46,6 +49,10 @@ class JSApiBridgeTests(unittest.TestCase):
             {"success": True, "data": []},
         )
         self.assertEqual(
+            self.bridge.probePromotionTargetRetargetCapability("target-1"),
+            {"success": True},
+        )
+        self.assertEqual(
             self.bridge.startPromotionTargetDiscovery(),
             {"success": True},
         )
@@ -66,6 +73,9 @@ class JSApiBridgeTests(unittest.TestCase):
             "target-1", False
         )
         self.core.listPromotionTargetProducts.assert_called_once_with("target-1")
+        self.core.probePromotionTargetRetargetCapability.assert_called_once_with(
+            "target-1"
+        )
         self.core.startPromotionTargetDiscovery.assert_called_once_with()
         self.core.getPromotionTargetDiscoveryStatus.assert_called_once_with()
 
@@ -118,6 +128,17 @@ class JSApiBridgeTests(unittest.TestCase):
             reload_handler.index("await loadPromotionTargetOptions(api);"),
             reload_handler.index("await api.getRuleRetargetingConfig();"),
         )
+
+    def test_monitor_page_exposes_plan_system_and_safe_capability_probe(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "promotion_targets.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('data-field="plan_system"', page)
+        self.assertIn("验证追投能力", page)
+        self.assertIn("probePromotionTargetRetargetCapability", page)
+        self.assertIn("不会点击提交", page)
 
 
 if __name__ == "__main__":

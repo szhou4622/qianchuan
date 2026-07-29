@@ -167,6 +167,119 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e), "data": []}
 
+    def probePromotionTargetRetargetCapability(
+        self,
+        target_uid=None,
+        material_id=None,
+    ):
+        """只读打开商品追投表单并选择一条素材；不填写预算、不点击提交。"""
+        import asyncio
+        import json
+
+        from .promotion_targets import (
+            get_promotion_target,
+            update_target_sync_state,
+        )
+        from .rule_retargeting_config import load_rule_retargeting_config
+        from services.plan_system import normalize_plan_system
+        from services.promotion_browser_lock import exclusive_browser_operation
+        from services.retargeting_service import QianChuanRetargetingService
+
+        uid = str(target_uid or "").strip()
+        target = get_promotion_target(uid, db=self.db)
+        if not target:
+            return {"success": False, "message": "监控计划不存在"}
+        if not target.get("enabled"):
+            return {"success": False, "message": "请先启用监控计划"}
+        if str(target.get("promotion_scene") or "") != "product":
+            return {"success": False, "message": "当前只需验证推商品计划的追投表单"}
+        if normalize_plan_system(target.get("plan_system") or "unknown") != "global":
+            return {
+                "success": False,
+                "message": "请先把计划体系明确设置为“全域”；千川乘方不能使用该验证入口",
+            }
+        if str(target.get("last_status") or "").strip().lower() != "ok":
+            return {
+                "success": False,
+                "message": "计划当前不是正常投放状态，不能验证追投入口",
+            }
+        requested_material_id = str(material_id or "").strip()
+        material_where = {"target_uid": uid}
+        if requested_material_id:
+            material_where["material_id"] = requested_material_id
+        material = self.db.select_one(
+            "pmc_promotion_material",
+            fields="material_id",
+            where=material_where,
+            order_by=(
+                "prepay_pay_settle_1h DESC, stat_cost DESC, "
+                "updated_at DESC, id DESC"
+            ),
+        )
+        probe_material_id = str(
+            (material or {}).get("material_id") or ""
+        ).strip()
+        if not probe_material_id:
+            return {
+                "success": False,
+                "message": (
+                    "指定素材不属于该计划"
+                    if requested_material_id
+                    else "该计划尚未采集到素材，无法验证追投入口"
+                ),
+            }
+        try:
+            aavid = int(str(target.get("aadvid") or "").strip())
+            ad_id = int(str(target.get("ad_id") or "").strip())
+        except (TypeError, ValueError):
+            return {"success": False, "message": "计划的账户ID或计划ID无效"}
+
+        cfg = load_rule_retargeting_config()
+
+        async def run_probe():
+            service = QianChuanRetargetingService.from_rule_file_dict(cfg)
+            async with exclusive_browser_operation(f"商品追投能力验证:{uid}"):
+                return await service.probe_product_retarget_capability(
+                    aavid=aavid,
+                    ad_id=ad_id,
+                    material_id=probe_material_id,
+                    target_uid=uid,
+                    source_url=target.get("sanitized_page_url") or None,
+                )
+
+        try:
+            result = asyncio.run(run_probe())
+        except Exception as exc:
+            return {"success": False, "message": f"能力验证异常：{exc}"}
+        if not result.success:
+            return {
+                "success": False,
+                "message": result.message,
+                "data": result.asdict(),
+            }
+
+        capability = target.get("capability")
+        if not isinstance(capability, dict):
+            try:
+                capability = json.loads(target.get("capability_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                capability = {}
+        capability = dict(capability or {})
+        capability["retarget_execute"] = True
+        update_target_sync_state(
+            uid,
+            status="ok",
+            error="",
+            capability=capability,
+            db=self.db,
+        )
+        return {
+            "success": True,
+            "message": result.message,
+            "data": result.asdict(),
+            "target": get_promotion_target(uid, db=self.db),
+        }
+
     def startPromotionTargetDiscovery(self):
         try:
             return self.service.start_target_discovery()

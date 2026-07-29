@@ -351,6 +351,16 @@ def upsert_promotion_target(
             capability = {}
     if not isinstance(capability, dict):
         capability = {}
+    last_status_source = (
+        data.get("last_status")
+        if "last_status" in data
+        else (existing.get("last_status") if existing else "pending")
+    )
+    last_error_source = (
+        data.get("last_error")
+        if "last_error" in data
+        else (existing.get("last_error") if existing else "")
+    )
     row = {
         "target_uid": target_uid,
         "aadvid": aavid,
@@ -367,8 +377,8 @@ def upsert_promotion_target(
         "product_ids_json": _json_dumps(product_ids),
         "sanitized_page_url": page_url,
         "capability_json": _json_dumps(capability),
-        "last_status": str(data.get("last_status") or "pending").strip()[:64],
-        "last_error": str(data.get("last_error") or "").strip()[:2000],
+        "last_status": str(last_status_source or "pending").strip()[:64],
+        "last_error": str(last_error_source or "").strip()[:2000],
     }
     store.insert_or_update(
         "promotion_target",

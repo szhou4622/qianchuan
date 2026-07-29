@@ -1814,6 +1814,17 @@ def _create_local_retarget_task_for(
         return {"success": False, "message": "请先登录工具账号并配置飞书长连接"}
     if require_connected:
         status = bridge.status()
+        # 桌面端启动时，规则线程和飞书长连接线程会同时启动。首轮规则
+        # 可能比 WebSocket 握手早几秒命中；在后台发送线程中短暂等待，
+        # 避免把本应发送的首张提醒直接丢到下一轮。
+        deadline = time.monotonic() + 10.0
+        while (
+            not status.get("connected")
+            and str(status.get("status") or "") in {"connecting", "reconnecting"}
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.2)
+            status = bridge.status()
         if not status.get("connected"):
             return {
                 "success": False,

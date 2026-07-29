@@ -70,23 +70,36 @@
           <div class="form">
             <label>计划名称<input data-field="plan_name" value="${esc(x.plan_name||'')}"></label>
             <label>启用状态<select data-field="enabled"><option value="1" ${x.enabled?'selected':''}>启用监控</option><option value="0" ${x.enabled?'':'selected'}>暂停监控</option></select></label>
+            <label>计划体系<select data-field="plan_system"><option value="unknown" ${x.plan_system==='unknown'?'selected':''}>待确认</option><option value="global" ${x.plan_system==='global'?'selected':''}>全域</option><option value="chengfang" ${x.plan_system==='chengfang'?'selected':''}>千川乘方</option></select></label>
             ${x.promotion_scene==='product'?`<label>商品范围<select data-field="product_filter_mode"><option value="all" ${x.product_filter_mode==='all'?'selected':''}>全部商品</option><option value="selected" ${x.product_filter_mode==='selected'?'selected':''}>只关注指定商品</option></select></label>
             <div></div><div class="products">${products.length?products.map(p=>`<label class="product-check"><input type="checkbox" data-product-id="${esc(p.product_id)}" ${selected.has(String(p.product_id))?'checked':''}><span>${esc(p.product_name||'未命名商品')}<br><span class="meta">${esc(p.product_id)}</span></span></label>`).join(''):'<div class="product-empty">首次采集成功后，这里会显示可勾选的商品。</div>'}</div>`:''}
           </div>
-          <div class="actions"><button data-save>保存设置</button></div>
+          <div class="actions">${x.promotion_scene==='product'&&x.plan_system==='global'?`<button data-probe>${x.capability?.retarget_execute?'追投能力已验证':'验证追投能力'}</button>`:''}<button data-save>保存设置</button></div>
         </section>`;
       }).join('');
       document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>save(btn.closest('.card')));
+      document.querySelectorAll('[data-probe]').forEach(btn=>btn.onclick=()=>probe(btn.closest('.card'),btn));
     }
     async function save(card){
       const uid=card.dataset.uid; const a=await waitApi(); const one=await a.getPromotionTarget(uid);
       if(!one?.success){message(one?.message||'读取计划失败',true);return}
       const d=one.data; d.plan_name=card.querySelector('[data-field=plan_name]').value.trim();
       d.enabled=card.querySelector('[data-field=enabled]').value==='1';
+      d.plan_system=card.querySelector('[data-field=plan_system]').value;
       const mode=card.querySelector('[data-field=product_filter_mode]');
       if(mode)d.product_filter_mode=mode.value;
       if(mode)d.product_ids=Array.from(card.querySelectorAll('[data-product-id]:checked')).map(x=>x.dataset.productId);
       const r=await a.savePromotionTarget(d); message(r?.success?'设置已保存':(r?.message||'保存失败'),!r?.success); if(r?.success)load();
+    }
+    async function probe(card,btn){
+      const a=await waitApi(); if(!a?.probePromotionTargetRetargetCapability){message('当前版本不支持能力验证',true);return}
+      btn.disabled=true; message('正在只读验证追投表单，不会点击提交……');
+      try{
+        const r=await a.probePromotionTargetRetargetCapability(card.dataset.uid);
+        message(r?.message||(r?.success?'验证通过':'验证失败'),!r?.success);
+        if(r?.success)load();
+      }catch(e){message(String(e?.message||e),true)}
+      finally{btn.disabled=false}
     }
     async function discover(){
       const a=await waitApi(); const r=await a.startPromotionTargetDiscovery();
