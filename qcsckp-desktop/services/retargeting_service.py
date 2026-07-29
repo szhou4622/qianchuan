@@ -168,9 +168,10 @@ def _resolve_path(p: Optional[str]) -> Optional[str]:
     return os.path.join(DATA_DIR, s)
 
 
-def _default_storage_state_path() -> Optional[str]:
-    cand = os.path.join(DATA_DIR, "qcookie.json")
-    return cand if os.path.isfile(cand) else None
+def _default_storage_state_path() -> Any:
+    from services.qianchuan_session import load_qianchuan_storage_state
+
+    return load_qianchuan_storage_state()
 
 
 @dataclass
@@ -178,8 +179,8 @@ class RetargetingSessionOptions:
     """浏览器会话：与单次追投任务无关，适合放在 __init__。"""
 
     headless: bool = True
-    storage_state: Optional[str] = None
-    """Playwright storage_state JSON；None 则若存在 data/qcookie.json 则加载。"""
+    storage_state: Any = None
+    """Playwright storage_state；None时读取当前工具账号的DPAPI加密会话。"""
     base_url: str = DEFAULT_BASE_URL
     browser_executable_path: Optional[str] = None
     goto_timeout_ms: int = 60_000
@@ -250,7 +251,7 @@ class QianChuanRetargetingService:
         if ss is None:
             self._storage_state = _default_storage_state_path()
         else:
-            self._storage_state = _resolve_path(ss)
+            self._storage_state = ss if isinstance(ss, dict) else _resolve_path(ss)
 
         self._playwright = None
         self.browser: Optional[Browser] = None
@@ -1849,7 +1850,7 @@ class QianChuanRetargetingService:
         cls,
         full_config: Dict[str, Any],
         *,
-        storage_state_override: Optional[str] = None,
+        storage_state_override: Any = None,
         base_url: Optional[str] = None,
     ) -> "QianChuanRetargetingService":
         headless = bool(full_config.get("browser_headless", True))

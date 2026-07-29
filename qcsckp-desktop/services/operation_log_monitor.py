@@ -20,6 +20,12 @@ from api.operation_events import (
     upsert_operation_event,
 )
 from config import DATA_DIR
+from services.promotion_browser_lock import exclusive_browser_operation
+from services.qianchuan_session import (
+    automation_session_ready,
+    current_session_owner,
+    load_qianchuan_storage_state,
+)
 from services.fetcher import QianChuanFetcher, build_qianchuan_url_by_params
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -476,13 +482,17 @@ async def _handle_response(response: Any, aavid: str, page: Any) -> None:
         logger.exception("[账户操作流水] 解析浏览器响应失败")
 
 
-async def _run_record_browser(aavid: str, ad_id: str, stop_event: threading.Event) -> None:
+async def _run_record_browser_unlocked(
+    aavid: str,
+    ad_id: str,
+    stop_event: threading.Event,
+) -> None:
     global _monitor_status
-    cookie = os.path.join(DATA_DIR, "qcookie.json")
-    if not os.path.isfile(cookie):
+    storage_state = load_qianchuan_storage_state()
+    if storage_state is None:
         _monitor_status = {"running": False, "aavid": aavid, "message": "请先在服务控制中登录千川"}
         return
-    fetcher = QianChuanFetcher(headless=False, storage_state=cookie)
+    fetcher = QianChuanFetcher(headless=False, storage_state=storage_state)
     try:
         await fetcher._init_browser()
         page = fetcher.page
@@ -509,6 +519,19 @@ async def _run_record_browser(aavid: str, ad_id: str, stop_event: threading.Even
         await fetcher.close()
         if _monitor_status.get("running"):
             _monitor_status = {"running": False, "aavid": aavid, "message": "记录模式已结束"}
+
+
+async def _run_record_browser(
+    aavid: str,
+    ad_id: str,
+    stop_event: threading.Event,
+) -> None:
+    async with exclusive_browser_operation(
+        f"人工操作记录:{aavid}:{ad_id}",
+        priority=30,
+        timeout_seconds=900,
+    ):
+        await _run_record_browser_unlocked(aavid, ad_id, stop_event)
 
 
 def start_record_browser(aavid: Any, ad_id: Any) -> Dict[str, Any]:
@@ -541,12 +564,25 @@ def record_browser_status() -> Dict[str, Any]:
     return {"success": True, "data": dict(_monitor_status)}
 
 
-async def _sync_one(aavid: str, page_url: str, api_url: str = "", request_json: Any = "") -> None:
-    cookie = os.path.join(DATA_DIR, "qcookie.json")
-    if not os.path.isfile(cookie):
+async def _sync_one_unlocked(
+    aavid: str,
+    page_url: str,
+    api_url: str = "",
+    request_json: Any = "",
+) -> None:
+    gate = automation_session_ready()
+    if not gate.get("ready"):
+        update_platform_sync_state(
+            aavid,
+            last_status="login_required",
+            last_error=str(gate.get("message") or "千川登录状态失效或不存在"),
+        )
+        return
+    storage_state = load_qianchuan_storage_state()
+    if storage_state is None:
         update_platform_sync_state(aavid, last_status="login_required", last_error="千川登录状态失效或不存在")
         return
-    fetcher = QianChuanFetcher(headless=True, storage_state=cookie)
+    fetcher = QianChuanFetcher(headless=True, storage_state=storage_state)
     try:
         sync_started = _now()
         await fetcher._init_browser()
@@ -637,14 +673,39 @@ async def _sync_one(aavid: str, page_url: str, api_url: str = "", request_json: 
         await fetcher.close()
 
 
+async def _sync_one(
+    aavid: str,
+    page_url: str,
+    api_url: str = "",
+    request_json: Any = "",
+) -> None:
+    async with exclusive_browser_operation(
+        f"账户操作日志同步:{aavid}",
+        priority=40,
+        timeout_seconds=900,
+    ):
+        await _sync_one_unlocked(aavid, page_url, api_url, request_json)
+
+
 async def platform_log_sync_loop() -> None:
     init_sqlite_schema()
     await asyncio.sleep(20)
     while True:
         try:
+            owner = current_session_owner()
+            if not owner:
+                await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+                continue
             rows = SQLiteStore().execute(
-                "SELECT aavid,discovered_page_url,discovered_api_url,discovered_request_json "
-                "FROM platform_log_sync_state WHERE discovered_page_url IS NOT NULL AND discovered_page_url<>''",
+                "SELECT s.aavid,s.discovered_page_url,s.discovered_api_url,"
+                "s.discovered_request_json "
+                "FROM platform_log_sync_state s "
+                "JOIN qianchuan_account a ON a.account_uid=s.account_uid "
+                "WHERE a.enabled=1 AND a.report_enabled=1 "
+                "AND a.owner_username=? "
+                "AND s.discovered_page_url IS NOT NULL "
+                "AND s.discovered_page_url<>''",
+                (owner,),
                 fetch=True,
             ) or []
             for row in rows:

@@ -201,6 +201,11 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     payload.update(
         {
             "task_uid": str(row.get("task_uid") or ""),
+            "qianchuan_account_uid": str(
+                row.get("qianchuan_account_uid")
+                or payload.get("qianchuan_account_uid")
+                or ""
+            ),
             "status": str(row.get("status") or "pending"),
             "action_nonce": str(row.get("action_nonce") or ""),
             "expires_at": str(row.get("expires_at") or ""),
@@ -1143,8 +1148,13 @@ class LocalFeishuBridge:
             raise FeishuApiError("飞书卡片发送失败：" + ("；".join(errors) or "未返回消息ID"))
         return sent
 
-    def send_task_cards(self, task: Dict[str, Any]) -> List[Dict[str, str]]:
-        return self.send_bound_card(build_task_card(task))
+    def send_task_cards(
+        self,
+        task: Dict[str, Any],
+        *,
+        targets: Optional[List[Tuple[str, str]]] = None,
+    ) -> List[Dict[str, str]]:
+        return self.send_bound_card(build_task_card(task), targets=targets)
 
     def update_task_cards(self, task_uid: str, *, expanded: bool = False) -> None:
         row = _task_row(task_uid, self.account_username)
@@ -1852,6 +1862,41 @@ def _create_local_retarget_task_for(
         or not re.fullmatch(r"[a-f0-9]{64}", required["strategy_hash"])
     ):
         return {"success": False, "message": "账户、计划、素材或策略快照不完整"}
+    from services.qianchuan_accounts import (
+        bind_target_account_scope,
+        ensure_qianchuan_account,
+        resolve_account_feishu_targets,
+    )
+    from utils.sqlite_store import SQLiteStore
+
+    task_store = SQLiteStore(database=DB_FILE)
+    qianchuan_account = ensure_qianchuan_account(
+        required["aavid"],
+        account_name=payload.get("account_name") or "",
+        owner_username=account,
+        db=task_store,
+    )
+    target, _target_account = bind_target_account_scope(
+        required["target_uid"],
+        owner_username=account,
+        db=task_store,
+    )
+    if target and str(target.get("aadvid") or "") != required["aavid"]:
+        return {"success": False, "message": "监控计划与千川账户不一致"}
+    if target and str(target.get("account_uid") or "") != str(
+        qianchuan_account.get("account_uid") or ""
+    ):
+        return {"success": False, "message": "监控计划不属于当前工具账号的千川账户"}
+    supplied_account_uid = str(
+        payload.get("qianchuan_account_uid") or ""
+    ).strip()
+    if supplied_account_uid and supplied_account_uid != str(
+        qianchuan_account.get("account_uid") or ""
+    ):
+        return {"success": False, "message": "千川账户归属与提醒快照不一致"}
+    if not qianchuan_account.get("enabled"):
+        return {"success": False, "message": "该千川账户已停用"}
+    payload["qianchuan_account_uid"] = qianchuan_account["account_uid"]
     payload["materials"] = materials
     payload["candidate_materials"] = materials
     payload["retarget_groups"] = []
@@ -1881,12 +1926,14 @@ def _create_local_retarget_task_for(
         try:
             conn.execute(
                 "INSERT INTO local_retarget_task("
-                "task_uid,account_username,active_dedupe_key,status,action_nonce,"
+                "task_uid,account_username,qianchuan_account_uid,"
+                "active_dedupe_key,status,action_nonce,"
                 "payload_json,expires_at,created_at,updated_at"
-                ") VALUES(?,?,?,'pending',?,?,?,?,?)",
+                ") VALUES(?,?,?,?,'pending',?,?,?,?,?)",
                 (
                     task_uid,
                     account,
+                    qianchuan_account["account_uid"],
                     dedupe,
                     nonce,
                     _json(payload),
@@ -1918,7 +1965,21 @@ def _create_local_retarget_task_for(
     row = _task_row(task_uid, account)
     task = _task_payload(row or {})
     try:
-        messages = bridge.send_task_cards(task)
+        route_targets = (
+            resolve_account_feishu_targets(
+                required["aavid"],
+                owner_username=account,
+                db=task_store,
+            )
+            if qianchuan_account.get("route_mode") == "custom"
+            else None
+        )
+        try:
+            messages = bridge.send_task_cards(task, targets=route_targets)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            messages = bridge.send_task_cards(task)
     except Exception as exc:
         conn = _db()
         try:

@@ -437,12 +437,47 @@ def _validate_task(
     )
     if not target_uid or target_uid == "legacy_unscoped":
         raise RuntimeError("旧版未归属任务仅供查看，不能执行追投")
+    from services.qianchuan_accounts import bind_target_account_scope
+
     target: Dict[str, Any] = (
         db.select_one("promotion_target", where={"target_uid": target_uid})
         or {}
     )
-    if not target or not bool(target.get("enabled")):
-        raise RuntimeError("监控计划已删除或停用")
+    legacy_test_double = bool(target) and "account_uid" not in target
+    account = None
+    if target and not legacy_test_double:
+        target, account = bind_target_account_scope(
+            target_uid,
+            owner_username=task.get("account_username"),
+            db=db,
+        )
+        target = target or {}
+    if (
+        not target
+        or not bool(target.get("enabled"))
+        or (
+            not legacy_test_double
+            and str(target.get("capacity_state") or "") != "active"
+        )
+        or (
+            not legacy_test_double
+            and (not account or not bool(account.get("enabled")))
+        )
+    ):
+        raise RuntimeError("监控计划已删除、停用或正在等待监控容量")
+    if (
+        not legacy_test_double
+        and str((account or {}).get("owner_username") or "").strip().casefold()
+        != str(task.get("account_username") or "").strip().casefold()
+    ):
+        raise RuntimeError("追投任务不属于当前工具账号")
+    task_account_uid = str(task.get("qianchuan_account_uid") or "").strip()
+    if (
+        task_account_uid
+        and not legacy_test_double
+        and task_account_uid != str(target.get("account_uid") or "")
+    ):
+        raise RuntimeError("追投任务的千川账户归属已被篡改")
     if str(target.get("last_status") or "").strip().lower() != "ok":
         raise RuntimeError("监控计划当前不是投放中状态，已阻止追投")
     if (
@@ -469,7 +504,20 @@ def _validate_task(
     strategy_target_uid = str(strategy.get("target_uid") or "")
     if strategy_target_uid and strategy_target_uid != target_uid:
         raise RuntimeError("追投策略已改为其他监控计划")
-    if not os.path.isfile(os.path.join(DATA_DIR, "qcookie.json")):
+    from services.qianchuan_session import (
+        automation_session_ready,
+        has_qianchuan_session,
+    )
+
+    session_gate = automation_session_ready(task.get("account_username"))
+    legacy_cookie_ready = os.path.isfile(os.path.join(DATA_DIR, "qcookie.json"))
+    if str(session_gate.get("status") or "") == "login_required":
+        raise RuntimeError("千川登录状态已失效，请重新登录后等待新提醒")
+    if (
+        not session_gate.get("ready")
+        and not legacy_cookie_ready
+        and not has_qianchuan_session()
+    ):
         raise RuntimeError("千川登录状态不存在，请在服务控制中重新登录")
 
     period = str(cfg.get("trigger_query_period") or "1h")
@@ -729,7 +777,8 @@ async def _execute_task(
     try:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
         async with exclusive_browser_operation(
-            f"飞书确认追投:{target_uid}:{','.join(material_ids)}"
+            f"飞书确认追投:{target_uid}:{','.join(material_ids)}",
+            priority=10,
         ):
             # 推商品和推直播统一按“一个素材组＝一条追投计划”提交；
             # 单素材组仍是原有的单素材追投，多素材组最多20条。

@@ -52,6 +52,12 @@ NAME_KEYS = {
     "goodsName",
     "materialName",
     "title",
+    "advertiserName",
+    "advertiser_name",
+    "userInfoName",
+    "user_info_name",
+    "accountName",
+    "account_name",
 }
 SCENE_KEYS = {
     "scene",
@@ -103,6 +109,7 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
     queue: List[tuple[str, Any]] = [("$", payload)]
     fields: List[Dict[str, str]] = []
     plan_candidates: List[Dict[str, Any]] = []
+    account_candidates: List[Dict[str, str]] = []
     seen_fields = set()
     nodes = 0
 
@@ -158,6 +165,32 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
                 }
                 if plan and plan not in plan_candidates and len(plan_candidates) < 30:
                     plan_candidates.append(plan)
+            account_id = (
+                candidate.get("aavid")
+                or candidate.get("advertiserId")
+            )
+            account_name = (
+                candidate.get("advertiserName")
+                or candidate.get("advertiser_name")
+                or candidate.get("userInfoName")
+                or candidate.get("user_info_name")
+                or candidate.get("accountName")
+                or candidate.get("account_name")
+            )
+            if (
+                account_id
+                and str(account_id).isdigit()
+                and account_name
+            ):
+                account = {
+                    "aavid": str(account_id),
+                    "account_name": str(account_name)[:256],
+                }
+                if (
+                    account not in account_candidates
+                    and len(account_candidates) < 100
+                ):
+                    account_candidates.append(account)
             for key, one in value.items():
                 lower = str(key).lower()
                 if any(part in lower for part in SENSITIVE_KEY_PARTS):
@@ -175,6 +208,7 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
         else [],
         "fields": fields,
         "plan_candidates": plan_candidates,
+        "account_candidates": account_candidates,
         "nodes_scanned": nodes,
     }
 
@@ -307,6 +341,20 @@ class PromotionReadOnlyProbe:
         snapshots = [item.get("product_snapshot") or {} for item in items]
         return merge_product_scene_snapshots(snapshots)
 
+    def authorized_accounts(self) -> List[Dict[str, str]]:
+        """返回只读响应中明确同时出现账户ID和账户名称的候选账户。"""
+        result: Dict[str, Dict[str, str]] = {}
+        for item in list(self._apis.values()) + list(self._requests.values()):
+            for account in item.get("account_candidates") or []:
+                aid = str((account or {}).get("aavid") or "").strip()
+                name = str((account or {}).get("account_name") or "").strip()
+                if aid.isdigit() and name:
+                    result[aid] = {
+                        "aavid": aid,
+                        "account_name": name[:256],
+                    }
+        return list(result.values())
+
     def confirmed_product_target(self) -> Optional[Dict[str, Any]]:
         """返回当前商品全域页已由主计划接口确认的目标。"""
         product_context = False
@@ -381,6 +429,7 @@ class PromotionReadOnlyProbe:
                 "top_keys": [],
                 "fields": [],
                 "plan_candidates": [],
+                "account_candidates": [],
                 "nodes_scanned": 0,
             }
             post_data = request.post_data

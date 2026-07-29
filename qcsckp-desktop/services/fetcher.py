@@ -106,13 +106,13 @@ PRODUCT_MATERIAL_DIMENSIONS = (
 class QianChuanFetcher:
     """千川投放数据抓取器"""
 
-    def __init__(self, headless: bool = True, storage_state: str = None):
+    def __init__(self, headless: bool = True, storage_state: Any = None):
         """
         初始化抓取器
 
         Args:
             headless: 是否使用无头模式运行浏览器
-            storage_state: 登录状态文件路径（JSON格式）
+            storage_state: Playwright登录状态对象或兼容的JSON文件路径
         """
         self.headless = headless
         self.storage_state = storage_state
@@ -132,6 +132,7 @@ class QianChuanFetcher:
         self._current_aadvid: Optional[str] = None
         self._current_adid: Optional[str] = None
         self._current_target_uid: str = LEGACY_TARGET_UID
+        self._current_account_uid: str = ""
         self._current_promotion_scene: str = "live"
         self._current_plan_system: str = "unknown"
         self._current_plan_name: str = ""
@@ -433,6 +434,7 @@ class QianChuanFetcher:
 
         return {
             "aadvid": str(aadvid).strip(),
+            "account_uid": self._current_account_uid,
             "ad_id": str(ad_id).strip(),
             "target_uid": self._current_target_uid,
             "plan_name": self._current_plan_name,
@@ -487,6 +489,7 @@ class QianChuanFetcher:
                         data=row,
                         unique_fields=["aadvid", "ad_id"],
                         update_fields=[
+                            "account_uid",
                             "target_uid",
                             "plan_name",
                             "promotion_scene",
@@ -667,6 +670,7 @@ class QianChuanFetcher:
                     data=row,
                     unique_fields=["aadvid", "ad_id"],
                     update_fields=[
+                        "account_uid",
                         "target_uid",
                         "plan_name",
                         "promotion_scene",
@@ -1303,6 +1307,7 @@ class QianChuanFetcher:
         def _run() -> None:
             for row in rows:
                 row = dict(row)
+                row["account_uid"] = self._current_account_uid
                 row["target_uid"] = self._current_target_uid
                 row["promotion_scene"] = self._current_promotion_scene
                 row["plan_system"] = self._current_plan_system
@@ -2080,6 +2085,19 @@ class QianChuanFetcher:
         query_params = parse_qs(parsed.query)
         self._current_aadvid = query_params.get("aavid", [None])[0]
         self._current_adid = query_params.get("adId", [None])[0] or query_params.get("adid", [None])[0]
+        self._current_account_uid = ""
+        if db and self._current_target_uid != LEGACY_TARGET_UID:
+            try:
+                target = db.select_one(
+                    "promotion_target",
+                    fields="account_uid",
+                    where={"target_uid": self._current_target_uid},
+                ) or {}
+                self._current_account_uid = str(
+                    target.get("account_uid") or ""
+                ).strip()
+            except Exception:
+                self._current_account_uid = ""
 
         # 访问目标页面
         logger.info(f"[抓取] 正在访问: {url}")

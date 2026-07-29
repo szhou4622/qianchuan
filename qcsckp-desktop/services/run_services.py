@@ -29,6 +29,19 @@ from services.promotion_browser_lock import exclusive_browser_operation
 from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.product_scene_adapter import scope_product_scene_snapshot
 from services.plan_system import detect_plan_system, normalize_plan_system
+from services.qianchuan_accounts import (
+    record_target_duration,
+    schedulable_promotion_targets,
+    upsert_authorized_accounts,
+)
+from services.qianchuan_session import (
+    load_qianchuan_storage_state,
+    mark_qianchuan_session_available,
+    mark_qianchuan_session_invalid,
+    migrate_legacy_qcookie,
+    save_context_storage_state,
+    session_status as qianchuan_session_status,
+)
 from api.promotion_targets import (
     detect_confirmed_detail_scene,
     detect_promotion_scene,
@@ -58,6 +71,9 @@ from utils.common import browser_runtime_info
 
 # 轮询抓取阶段：浏览器持续运行超过此时长则关闭并用 Cookie 重建，缓解长时间运行内存增长（秒）
 POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
+# 自动监控按“整轮开始到下一轮开始”最多 5 分钟调度；整轮本身过长时立即进入下一轮，
+# 由九分钟容量预算和十分钟延迟告警负责降级，避免“整轮耗时 + 配置等待”叠加。
+AUTO_MONITOR_INTERVAL_SEC = 5 * 60
 LAST_TARGET_FILE = os.path.join(DATA_DIR, "last_crawl_target.json")
 PROMOTION_PROBE_FILE = os.path.join(DATA_DIR, "promotion_readonly_probe.json")
 
@@ -419,6 +435,7 @@ class ServiceController:
         # 轮询抓取就绪（用于 status 等）
         self._fetch_ready = False
         self._last_fetch_time: float = 0  # 上次抓取完成的时间戳（秒）
+        self._last_round_started_time: float = 0  # 上一轮自动监控开始时间
 
         # 启动服务时校验通过的账号密码，仅内存保存，用于入库后云端备份 API（不写盘）
         self._cloud_backup_username: Optional[str] = None
@@ -532,16 +549,9 @@ class ServiceController:
             browser_info = browser_runtime_info(
                 str(scrape_status_cfg.get("browser_executable_path") or "").strip() or None
             )
-            cookie_path = ServiceConfig().normalize_paths().cookie_path
-            cookie_exists = bool(cookie_path and os.path.isfile(cookie_path))
-            cookie_updated_at = ""
-            if cookie_exists:
-                try:
-                    cookie_updated_at = datetime.fromtimestamp(
-                        os.path.getmtime(cookie_path)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                except OSError:
-                    cookie_updated_at = ""
+            session = qianchuan_session_status()
+            cookie_exists = bool(session.get("available"))
+            cookie_updated_at = str(session.get("updated_at") or "")
             if self._phase == "waiting_login":
                 login_status = "等待在可见Chrome中完成登录"
             elif cookie_exists:
@@ -606,6 +616,8 @@ class ServiceController:
                     "status": login_status,
                     "cookie_saved": cookie_exists,
                     "cookie_updated_at": cookie_updated_at,
+                    "encrypted": bool(session.get("encrypted")),
+                    "owner_username": str(session.get("owner_username") or ""),
                 },
             }
 
@@ -625,12 +637,12 @@ class ServiceController:
 
     @staticmethod
     def _effective_interval_sec(cfg: ServiceConfig) -> int:
-        """轮询间隔（秒）：每轮从 control_panel.json → crawl 读取。"""
+        """自动监控间隔（秒）：允许更快调试，但正式轮询不会慢于每5分钟启动一轮。"""
         try:
             base = int(load_scrape_service_config().get("interval_seconds") or cfg.interval)
         except Exception:
             base = cfg.interval
-        return max(5, base)
+        return max(5, min(base, AUTO_MONITOR_INTERVAL_SEC))
 
     def setFeishuBitableConfig(
         self,
@@ -749,16 +761,15 @@ class ServiceController:
                 }
 
     async def _target_discovery_async(self) -> None:
+        # 这是用户控制的只读Chrome，可能停留10分钟等待选计划；不长期占用
+        # 自动化队列，否则会阻塞已确认追投。实际采集和所有写操作仍走全局锁。
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
+        migrate_legacy_qcookie()
         known_target_keys = _known_promotion_target_keys(
             list_promotion_targets(db=db)
         )
-        storage_state = (
-            cfg.cookie_path
-            if cfg.cookie_path and os.path.isfile(cfg.cookie_path)
-            else None
-        )
+        storage_state = load_qianchuan_storage_state()
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state)
         await fetcher._init_browser()
         probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
@@ -947,11 +958,12 @@ class ServiceController:
                 },
                 db=db,
             )
+            upsert_authorized_accounts(probe.authorized_accounts(), db=db)
             if target_scene == "product":
                 _persist_product_snapshot(db, target["target_uid"], product_snapshot)
             if fetcher.context:
-                _ensure_data_dir()
-                await fetcher.context.storage_state(path=cfg.cookie_path)
+                await save_context_storage_state(fetcher.context)
+                mark_qianchuan_session_available()
             with self._lock:
                 self._target_discovery_status = {
                     "running": False,
@@ -990,8 +1002,8 @@ class ServiceController:
             self._message = "初始化浏览器..."
 
         db = SQLiteStore(database=cfg.db_path)
-        # 首次启动可能没有 cookie 文件；只有存在时才传入 storage_state，避免 playwright 报错
-        storage_state_path = cfg.cookie_path if (cfg.cookie_path and os.path.exists(cfg.cookie_path)) else None
+        migrate_legacy_qcookie()
+        storage_state_path = load_qianchuan_storage_state()
         # 首次/登录阶段必须可见窗口，与「无头」选项无关
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state_path)
         await fetcher._init_browser()
@@ -1165,6 +1177,7 @@ class ServiceController:
             },
             db=db,
         )
+        upsert_authorized_accounts(probe.authorized_accounts(), db=db)
         if promotion_scene == "product":
             _persist_product_snapshot(
                 db,
@@ -1197,8 +1210,8 @@ class ServiceController:
         # -------- 阶段切换：识别成功后先保存 cookies，然后关闭当前浏览器，再用 cookies 重启抓取 --------
         try:
             if fetcher.context:
-                _ensure_data_dir()
-                await fetcher.context.storage_state(path=cfg.cookie_path)
+                await save_context_storage_state(fetcher.context)
+                mark_qianchuan_session_available()
                 self._log(f"[Cookie] 已保存")
         except Exception as e:
             self._log(f"[Cookie] 保存失败（仍继续重启）：{e}")
@@ -1237,7 +1250,7 @@ class ServiceController:
         except Exception:
             pass
 
-        storage_state_path = cfg.cookie_path if (cfg.cookie_path and os.path.exists(cfg.cookie_path)) else None
+        storage_state_path = load_qianchuan_storage_state()
         fetcher = QianChuanFetcher(headless=headless_mode, storage_state=storage_state_path)
         await fetcher._init_browser()
         self._active_poll_headless = headless_mode
@@ -1270,7 +1283,9 @@ class ServiceController:
                 if first_poll:
                     break
                 interval_sec = self._effective_interval_sec(cfg)
-                last = self._last_fetch_time
+                # 用“上一轮开始时间”调度，而不是在整轮完成后再完整等待一次。
+                # 当一轮耗时超过五分钟时，下一轮会在短暂让出事件循环后立即开始。
+                last = self._last_round_started_time or self._last_fetch_time
                 if last > 0 and (time.time() - last) >= interval_sec:
                     break
                 if last <= 0:
@@ -1283,6 +1298,7 @@ class ServiceController:
                 break
 
             first_poll = False
+            self._last_round_started_time = time.time()
 
             scrape_cfg = load_scrape_service_config()
             new_headless = bool(scrape_cfg.get("headless_poll", True))
@@ -1295,7 +1311,7 @@ class ServiceController:
                     await fetcher.close()
                 except Exception:
                     pass
-                storage_state_path = cfg.cookie_path if (cfg.cookie_path and os.path.exists(cfg.cookie_path)) else None
+                storage_state_path = load_qianchuan_storage_state()
                 fetcher = QianChuanFetcher(headless=new_headless, storage_state=storage_state_path)
                 await fetcher._init_browser()
                 self._fetcher = fetcher
@@ -1309,15 +1325,14 @@ class ServiceController:
                 )
                 try:
                     if fetcher.context:
-                        _ensure_data_dir()
-                        await fetcher.context.storage_state(path=cfg.cookie_path)
+                        await save_context_storage_state(fetcher.context)
                 except Exception as e:
                     self._log(f"[Cookie] 周期重启前保存失败（仍继续重启）：{e}")
                 try:
                     await fetcher.close()
                 except Exception:
                     pass
-                storage_state_path = cfg.cookie_path if (cfg.cookie_path and os.path.exists(cfg.cookie_path)) else None
+                storage_state_path = load_qianchuan_storage_state()
                 fetcher = QianChuanFetcher(headless=new_headless, storage_state=storage_state_path)
                 await fetcher._init_browser()
                 self._fetcher = fetcher
@@ -1325,7 +1340,7 @@ class ServiceController:
                 self._log("[服务] 轮询浏览器已按周期重启，继续抓取")
 
             try:
-                targets = list_promotion_targets(enabled=True, db=db)
+                targets = schedulable_promotion_targets(db=db)
                 if not targets:
                     self._log("[抓取] 没有启用的监控计划，本轮跳过")
                     self._last_fetch_time = time.time()
@@ -1391,6 +1406,7 @@ class ServiceController:
                         f"target={current_uid} scene={current_scene} "
                         f"system={current_plan_system}"
                     )
+                    target_started_at = time.monotonic()
                     try:
                         patch_target_sync_state(
                             current_uid,
@@ -1406,6 +1422,7 @@ class ServiceController:
                         async with exclusive_browser_operation(
                             f"采集:{current_uid}",
                             timeout_seconds=max(60, int(cfg.round_timeout)),
+                            priority=30,
                         ):
                             result = await fetcher.fetch(
                                 fetch_url,
@@ -1556,6 +1573,14 @@ class ServiceController:
                         )
                     finally:
                         try:
+                            record_target_duration(
+                                current_uid,
+                                int((time.monotonic() - target_started_at) * 1000),
+                                db=db,
+                            )
+                        except Exception:
+                            pass
+                        try:
                             patch_target_sync_state(
                                 current_uid,
                                 status=None,
@@ -1576,11 +1601,11 @@ class ServiceController:
                 # 整轮结束后保存一次 Cookie。
                 try:
                     if fetcher.context:
-                        _ensure_data_dir()
-                        await fetcher.context.storage_state(path=cfg.cookie_path)
+                        await save_context_storage_state(fetcher.context)
                 except Exception:
                     pass
                 self._last_fetch_time = time.time()
+                mark_qianchuan_session_available()
                 self._log("[抓取] 本轮全部监控计划处理完成")
                 # 本轮已结束，清空进度计数；否则 status 里一直带着上一轮的 current/total，
                 # 前端会永远走「抓取中」分支，无法显示轮询间隔内的「等待中 / 倒计时」。
@@ -1593,6 +1618,7 @@ class ServiceController:
                     pass
             except GlobalAuthExpiredError:
                 auto_stopped_auth_expired = True
+                mark_qianchuan_session_invalid("千川全域投放授权已失效")
                 self._log("[服务] 检测到千川「全域投放授权已失效」弹窗，抓取已自动终止；请在平台重新授权后重启服务。")
                 try:
                     fetcher._material_total_count = 0

@@ -30,6 +30,7 @@ from services.regulation_service import (
     regulation_log_tag,
 )
 from services.promotion_browser_lock import exclusive_browser_operation
+from services.qianchuan_accounts import schedulable_promotion_targets
 from services.plan_system import normalize_plan_system
 from services.promotion_capability import (
     check_target_capability,
@@ -96,14 +97,31 @@ def _revalidate_stop_candidate(
     target_system = normalize_plan_system(
         target.get("plan_system") or "unknown"
     )
+    account = (
+        db.select_one(
+            "qianchuan_account",
+            where={"account_uid": str(target.get("account_uid") or "")},
+        )
+        if target
+        else None
+    )
     row_system = normalize_plan_system(row.get("plan_system") or "unknown")
+    from services.qianchuan_session import current_session_owner
+
+    current_owner = str(current_session_owner() or "").strip().casefold()
+    account_owner = str((account or {}).get("owner_username") or "").strip().casefold()
+    row_account_uid = str(row.get("account_uid") or "").strip()
     if (
         not target
         or not bool(target.get("enabled"))
+        or str(target.get("capacity_state") or "") != "active"
+        or not account
+        or not bool(account.get("enabled"))
         or str(target.get("last_status") or "").strip().lower() != "ok"
         or str(target.get("aadvid") or "") != aavid
         or str(target.get("ad_id") or "") != ad_id
         or str(target.get("promotion_scene") or "") != promotion_scene
+        or (current_owner and account_owner != current_owner)
     ):
         return None, None, target_system, "监控计划已停用、状态异常或目标身份变化"
     if (
@@ -112,6 +130,10 @@ def _revalidate_stop_candidate(
         or str(row.get("ad_id") or "") != ad_id
         or str(row.get("promotion_scene") or "") != promotion_scene
         or (row_system != "unknown" and row_system != target_system)
+        or (
+            row_account_uid
+            and row_account_uid != str(target.get("account_uid") or "")
+        )
     ):
         return None, None, target_system, "调控任务已删除或归属发生变化"
     if target_system == "unknown":
@@ -285,8 +307,18 @@ def _insert_regulation_run(
     if not _sn or _sn == "?":
         _sn = None
     _tn = str(task_name or "").strip()
+    try:
+        target = db.select_one(
+            "promotion_target",
+            fields="account_uid",
+            where={"target_uid": str(target_uid or "legacy_unscoped")},
+        ) or {}
+        account_uid = str(target.get("account_uid") or "")
+    except Exception:
+        account_uid = ""
     data: Dict[str, Any] = {
         "aavid": aavid,
+        "account_uid": account_uid,
         "ad_id": ad_id,
         "target_uid": str(target_uid or "legacy_unscoped"),
         "promotion_scene": str(promotion_scene or "live"),
@@ -320,6 +352,7 @@ def _insert_regulation_run(
             {
                 "event_uid": f"regulation_run:{run_id}",
                 "aavid": aavid,
+                "account_uid": account_uid,
                 "ad_id": ad_id,
                 "target_uid": str(target_uid or "legacy_unscoped"),
                 "promotion_scene": str(promotion_scene or "live"),
@@ -426,7 +459,14 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
     sem = asyncio.Semaphore(max_p)
     browser_rule = bool(cfg.get("browser_headless", True))
-    enabled_targets = db.select("promotion_target", where={"enabled": 1})
+    enabled_targets = (
+        schedulable_promotion_targets(db=db)
+        if hasattr(db, "config")
+        else db.select(
+            "promotion_target",
+            where="enabled=1 AND capacity_state='active'",
+        )
+    )
 
     async def process_strategy(st: Dict[str, Any]) -> None:
         async with sem:
@@ -725,7 +765,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         t0 = time.time()
                         try:
                             async with exclusive_browser_operation(
-                                f"停投:{target_uid}:{assist_task_id}"
+                                f"停投:{target_uid}:{assist_task_id}",
+                                priority=20,
                             ):
                                 (
                                     latest_target,
@@ -760,6 +801,18 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     target_uid,
                                     assist_task_id,
                                 ):
+                                    continue
+                                from services.qianchuan_session import (
+                                    automation_session_ready,
+                                )
+
+                                session_gate = automation_session_ready()
+                                if not session_gate.get("ready"):
+                                    logger.warning(
+                                        "%s 千川主登录会话不可用，全部账户自动停投已暂停：%s",
+                                        _tag,
+                                        session_gate.get("message") or "请重新登录",
+                                    )
                                     continue
                                 target = latest_target or {}
                                 row = latest_row or {}

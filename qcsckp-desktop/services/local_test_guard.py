@@ -189,7 +189,11 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
         ),
     )
 
-    cookie_ready = os.path.isfile(os.path.join(DATA_DIR, "qcookie.json"))
+    from services.qianchuan_session import has_qianchuan_session
+
+    cookie_ready = has_qianchuan_session() or os.path.isfile(
+        os.path.join(DATA_DIR, "qcookie.json")
+    )
     add_check(
         "qianchuan_login",
         "千川登录状态",

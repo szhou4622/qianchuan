@@ -410,6 +410,13 @@ def configure_macos_lifecycle(window, tray_app):
 # ===== 创建 js_api =====
 class JSApi:
     def __init__(self):
+        # 必须早于 Api() 的 SQLite 建表迁移，保证可以完整恢复rc23数据。
+        try:
+            from services.rc23_rollback import ensure_rc23_upgrade_snapshot
+
+            ensure_rc23_upgrade_snapshot()
+        except Exception as exc:
+            print(f"警告：rc23升级快照创建失败：{exc}")
         self.api = Api()
 
     def getTableData(self, period="1h", sortBy="costDiff", sortOrder="desc", page=1, pageSize=50):
@@ -550,6 +557,18 @@ class JSApi:
     #
     # pywebview 只会向前端暴露 JSApi 上显式声明的方法。核心 Api 即使已经
     # 实现相应接口，如果这里漏掉转发，页面也会一直等待而拿不到账户或计划。
+    def getQianchuanAccountOverview(self):
+        return self.api.getQianchuanAccountOverview()
+
+    def saveQianchuanAccountSettings(self, accountUid=None, settings=None):
+        return self.api.saveQianchuanAccountSettings(accountUid, settings)
+
+    def setWindowsAutostart(self, enabled=False):
+        return self.api.setWindowsAutostart(enabled)
+
+    def restoreRc23QianchuanCookie(self):
+        return self.api.restoreRc23QianchuanCookie()
+
     def listPromotionTargets(self, enabled=None):
         return self.api.listPromotionTargets(enabled)
 

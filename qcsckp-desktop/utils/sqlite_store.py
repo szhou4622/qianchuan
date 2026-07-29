@@ -77,6 +77,7 @@ class SQLiteStore:
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aadvid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'ad_id': 'TEXT NOT NULL',
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'plan_name': 'TEXT',
@@ -105,11 +106,42 @@ class SQLiteStore:
                 ('uk_pmc_ad_detail_basic_aadvid_adid', 'aadvid, ad_id'),
             ],
         },
+        # 一个工具账号下只保存一份千川登录会话；该会话可访问多个 aavid。
+        # 账户目录负责启停、日报选择和飞书接收路由。
+        'qianchuan_account': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'account_uid': 'TEXT NOT NULL',
+                'owner_username': "TEXT NOT NULL DEFAULT 'local_default'",
+                'aavid': 'TEXT NOT NULL',
+                'account_name': 'TEXT',
+                'enabled': 'INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))',
+                'report_enabled': 'INTEGER NOT NULL DEFAULT 0 CHECK (report_enabled IN (0, 1))',
+                'route_mode': "TEXT NOT NULL DEFAULT 'default' CHECK (route_mode IN ('default', 'custom'))",
+                'route_send_personal': 'INTEGER NOT NULL DEFAULT 1 CHECK (route_send_personal IN (0, 1))',
+                'route_group_ids_json': "TEXT NOT NULL DEFAULT '[]'",
+                'last_seen_at': 'TEXT',
+                'last_status': "TEXT NOT NULL DEFAULT 'pending'",
+                'last_error': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_qianchuan_account_owner_enabled', 'owner_username, enabled'),
+                ('idx_qianchuan_account_aavid', 'aavid'),
+                ('idx_qianchuan_account_report', 'owner_username, report_enabled'),
+            ],
+            'unique_indexes': [
+                ('uk_qianchuan_account_uid', 'account_uid'),
+                ('uk_qianchuan_account_owner_aavid', 'owner_username, aavid'),
+            ],
+        },
         # 账户内的直播/商品全域监控目标。target_uid 稳定派生自 aavid + ad_id。
         'promotion_target': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'target_uid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'aadvid': 'TEXT NOT NULL',
                 'ad_id': 'TEXT NOT NULL',
                 'plan_name': 'TEXT',
@@ -123,12 +155,18 @@ class SQLiteStore:
                 'last_sync_at': 'TEXT',
                 'last_status': "TEXT NOT NULL DEFAULT 'pending'",
                 'last_error': 'TEXT',
+                'capacity_state': "TEXT NOT NULL DEFAULT 'active' CHECK (capacity_state IN ('active', 'capacity_waiting', 'disabled'))",
+                'last_duration_ms': 'INTEGER',
+                'next_due_at': 'TEXT',
+                'last_lag_seconds': 'INTEGER NOT NULL DEFAULT 0',
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
             'indexes': [
                 ('idx_promotion_target_account', 'aadvid'),
+                ('idx_promotion_target_account_uid', 'account_uid'),
                 ('idx_promotion_target_enabled', 'enabled'),
+                ('idx_promotion_target_capacity', 'enabled, capacity_state'),
                 ('idx_promotion_target_scene', 'promotion_scene'),
                 ('idx_promotion_target_system', 'plan_system'),
             ],
@@ -186,6 +224,7 @@ class SQLiteStore:
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aavid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'ad_id': 'TEXT NOT NULL',
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
@@ -281,6 +320,7 @@ class SQLiteStore:
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aavid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'ad_id': 'TEXT NOT NULL',
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
@@ -320,6 +360,7 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'event_uid': 'TEXT NOT NULL',
                 'aavid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'ad_id': 'TEXT',
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'promotion_scene': 'TEXT',
@@ -358,6 +399,7 @@ class SQLiteStore:
             },
             'indexes': [
                 ('idx_account_operation_aavid_time', 'aavid, occurred_at'),
+                ('idx_account_operation_account_uid_time', 'account_uid, occurred_at'),
                 ('idx_account_operation_target_time', 'target_uid, occurred_at'),
                 ('idx_account_operation_action_time', 'action_type, occurred_at'),
                 ('idx_account_operation_source_time', 'source, occurred_at'),
@@ -399,6 +441,7 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'task_uid': 'TEXT NOT NULL',
                 'account_username': 'TEXT NOT NULL',
+                'qianchuan_account_uid': "TEXT NOT NULL DEFAULT ''",
                 'active_dedupe_key': 'TEXT',
                 'status': 'TEXT NOT NULL',
                 'action_nonce': 'TEXT NOT NULL',
@@ -432,6 +475,7 @@ class SQLiteStore:
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'aavid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'coverage_from': 'TEXT',
                 'coverage_to': 'TEXT',
                 'last_sync_at': 'TEXT',
@@ -443,8 +487,11 @@ class SQLiteStore:
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
+            'obsolete_indexes': [
+                'uk_platform_log_sync_aavid',
+            ],
             'unique_indexes': [
-                ('uk_platform_log_sync_aavid', 'aavid'),
+                ('uk_platform_log_sync_account_aavid', 'account_uid, aavid'),
             ],
         },
         # 前一日账户操作日报的发送记录；按工具账号、千川账户、日期和飞书接收位置幂等。
@@ -455,6 +502,7 @@ class SQLiteStore:
                 'report_uid': 'TEXT NOT NULL',
                 'account_username': 'TEXT NOT NULL',
                 'aavid': 'TEXT NOT NULL',
+                'qianchuan_account_uid': "TEXT NOT NULL DEFAULT ''",
                 'report_date': 'TEXT NOT NULL',
                 'delivery_mode': "TEXT NOT NULL DEFAULT 'scheduled'",
                 'receive_type': 'TEXT NOT NULL',
@@ -482,6 +530,7 @@ class SQLiteStore:
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'assist_task_id': 'TEXT NOT NULL',
                 'aadvid': 'TEXT NOT NULL',
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
                 'ad_id': 'TEXT NOT NULL',
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",

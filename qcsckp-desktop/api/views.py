@@ -22,6 +22,18 @@ class Api:
         from .promotion_targets import migrate_legacy_target_scope
 
         migrate_legacy_target_scope(db=self.db)
+        from services.qianchuan_accounts import (
+            migrate_existing_qianchuan_accounts,
+        )
+        from services.qianchuan_session import migrate_legacy_qcookie
+
+        migrate_existing_qianchuan_accounts(db=self.db)
+        try:
+            migrate_legacy_qcookie()
+        except Exception as exc:
+            from utils.log import logger
+
+            logger.warning("[千川会话] 旧Cookie加密迁移暂未完成: %s", exc)
         self.dashboard = DashboardApi()
         self.service = get_service_controller()
         self.account_auth = AccountAuthApi()
@@ -62,6 +74,71 @@ class Api:
         )
 
     # ========== 直播 / 商品全域监控计划 ==========
+
+    def getQianchuanAccountOverview(self):
+        from services.local_feishu_bridge import get_local_feishu_status
+        from services.promotion_browser_lock import browser_queue_snapshot
+        from services.qianchuan_accounts import (
+            capacity_snapshot,
+            list_qianchuan_accounts,
+            migrate_existing_qianchuan_accounts,
+        )
+        from services.qianchuan_session import session_status
+        from services.windows_autostart import get_windows_autostart_status
+
+        try:
+            migrate_existing_qianchuan_accounts(db=self.db)
+            feishu = get_local_feishu_status()
+            return {
+                "success": True,
+                "accounts": list_qianchuan_accounts(db=self.db),
+                "targets": self.listPromotionTargets().get("data") or [],
+                "capacity": capacity_snapshot(db=self.db),
+                "session": session_status(),
+                "browser_queue": browser_queue_snapshot(),
+                "feishu": {
+                    "connected": bool(feishu.get("connected")),
+                    "authorized_open_id": str(
+                        (feishu.get("profile") or {}).get("authorized_open_id")
+                        or ""
+                    ),
+                    "groups": (feishu.get("profile") or {}).get("groups") or [],
+                },
+                "autostart": get_windows_autostart_status(),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def saveQianchuanAccountSettings(self, account_uid=None, settings=None):
+        from services.qianchuan_accounts import save_qianchuan_account_settings
+
+        try:
+            return {
+                "success": True,
+                "data": save_qianchuan_account_settings(
+                    account_uid,
+                    settings if isinstance(settings, dict) else {},
+                    db=self.db,
+                ),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def setWindowsAutostart(self, enabled=False):
+        from services.windows_autostart import set_windows_autostart
+
+        try:
+            return set_windows_autostart(bool(enabled))
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def restoreRc23QianchuanCookie(self):
+        from services.qianchuan_session import restore_rc23_cookie
+
+        try:
+            return restore_rc23_cookie()
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
     def listPromotionTargets(self, enabled=None):
         from .promotion_targets import list_promotion_targets
@@ -602,6 +679,21 @@ class Api:
             from services.local_feishu_bridge import activate_local_feishu_account
 
             activate_local_feishu_account(username)
+            try:
+                from services.qianchuan_accounts import (
+                    migrate_existing_qianchuan_accounts,
+                )
+                from services.qianchuan_session import migrate_legacy_qcookie
+
+                migrate_legacy_qcookie()
+                migrate_existing_qianchuan_accounts(
+                    owner_username=username,
+                    db=self.db,
+                )
+            except Exception as exc:
+                from utils.log import logger
+
+                logger.warning("[多账户迁移] 工具账号登录后的迁移暂未完成: %s", exc)
         return result
 
     def clearDeviceSession(self):

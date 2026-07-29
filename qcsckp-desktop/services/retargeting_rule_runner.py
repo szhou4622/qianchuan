@@ -44,6 +44,7 @@ from services.product_rule_engine import evaluate_product_strategy
 from services.plan_system import normalize_plan_system
 from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
+from services.qianchuan_accounts import schedulable_promotion_targets
 from services.retargeting_service import (
     QianChuanRetargetingService,
     retarget_capability_matches,
@@ -698,8 +699,18 @@ def _insert_run(
     _sn = str(strategy_name or "").strip()[:128]
     if not _sn or _sn == "?":
         _sn = None
+    try:
+        target = db.select_one(
+            "promotion_target",
+            fields="account_uid",
+            where={"target_uid": _rate_target_uid(target_uid)},
+        ) or {}
+        account_uid = str(target.get("account_uid") or "")
+    except Exception:
+        account_uid = ""
     data: Dict[str, Any] = {
         "aavid": aavid,
+        "account_uid": account_uid,
         "ad_id": ad_id,
         "target_uid": _rate_target_uid(target_uid),
         "promotion_scene": str(promotion_scene or "live"),
@@ -740,6 +751,7 @@ def _insert_run(
             {
                 "event_uid": f"retarget_run:{run_id}",
                 "aavid": aavid,
+                "account_uid": account_uid,
                 "ad_id": ad_id,
                 "target_uid": _rate_target_uid(target_uid),
                 "promotion_scene": str(promotion_scene or "live"),
@@ -832,10 +844,14 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
     sem = asyncio.Semaphore(MAX_STRATEGY_PARALLEL)
     browser_rule = bool(cfg.get("browser_headless", True))
-    enabled_targets = db.select(
-        "promotion_target",
-        where={"enabled": 1},
-        order_by="updated_at DESC, id DESC",
+    enabled_targets = (
+        schedulable_promotion_targets(db=db)
+        if hasattr(db, "config")
+        else db.select(
+            "promotion_target",
+            where="enabled=1 AND capacity_state='active'",
+            order_by="updated_at DESC, id DESC",
+        )
     )
 
     async def process_strategy(st: Dict[str, Any]) -> None:
@@ -1422,7 +1438,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         t0 = time.time()
                         try:
                             async with exclusive_browser_operation(
-                                f"追投:{target_uid}:{material_id}"
+                                f"追投:{target_uid}:{material_id}",
+                                priority=10,
                             ):
                                 result = await svc.run(
                                     aavid=aavid_int,

@@ -149,7 +149,8 @@ class OperationDailyReportTests(unittest.TestCase):
                 "send_time": "09:00",
                 "aavids": ["10001"],
                 "send_empty": True,
-            }
+            },
+            database=self.db_path,
         )
         self.assertTrue(result["success"])
 
@@ -191,8 +192,8 @@ class OperationDailyReportTests(unittest.TestCase):
         )
         self.assertTrue(first["success"])
         self.assertTrue(second["success"])
-        self.assertEqual(1, len(self.sent))
-        self.assertEqual(1, second["skipped_count"])
+        self.assertEqual(2, len(self.sent))
+        self.assertEqual(2, second["skipped_count"])
         row = self.store.select_one(
             "operation_daily_report_delivery",
             where={"delivery_mode": "scheduled"},
@@ -213,7 +214,7 @@ class OperationDailyReportTests(unittest.TestCase):
         )
         self.assertTrue(first["success"])
         self.assertTrue(second["success"])
-        self.assertEqual(2, len(self.sent))
+        self.assertEqual(4, len(self.sent))
 
     def test_scheduler_waits_until_configured_time(self):
         self._save_enabled()
@@ -240,10 +241,15 @@ class OperationDailyReportTests(unittest.TestCase):
                 now=datetime(2026, 7, 28, 10, 5),
                 database=self.db_path,
             )
-        self.assertEqual(2, len(self.sent))
+        self.assertEqual(4, len(self.sent))
         targets = [item["targets"][0] for item in self.sent]
         self.assertEqual(
-            [("open_id", "ou_owner"), ("chat_id", "oc_group")],
+            [
+                ("open_id", "ou_owner"),
+                ("chat_id", "oc_group"),
+                ("open_id", "ou_owner"),
+                ("chat_id", "oc_group"),
+            ],
             targets,
         )
 

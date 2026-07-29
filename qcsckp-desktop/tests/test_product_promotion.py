@@ -14,6 +14,7 @@ from api.promotion_targets import (
     detect_promotion_scene,
     extract_plan_name,
     extract_target_ids,
+    list_promotion_targets,
     list_target_products,
     make_target_uid,
     normalize_plan_system,
@@ -1340,25 +1341,23 @@ class ProductPromotionTests(unittest.TestCase):
                 "?aavid=1782685702496260&adId=1855536108315875&token=secret"
             ),
         )
-    def test_maximum_ten_enabled_targets_is_enforced_for_create_and_reenable(self):
-        for i in range(10):
+    def test_enabled_targets_use_dynamic_capacity_instead_of_fixed_ten_limit(self):
+        for i in range(13):
             self._target(i)
-        with self.assertRaisesRegex(ValueError, "最多同时启用 10"):
-            self._target(10)
-
-        set_promotion_target_enabled(make_target_uid("10001", "20000"), False, db=self.db)
-        target_11 = self._target(10)
-        self.assertTrue(target_11["enabled"])
-        with self.assertRaisesRegex(ValueError, "最多同时启用 10"):
-            upsert_promotion_target(
-                {
-                    "aavid": "10001",
-                    "ad_id": "20000",
-                    "promotion_scene": "product",
-                    "enabled": True,
-                },
-                db=self.db,
-            )
+        rows = list_promotion_targets(enabled=True, db=self.db)
+        self.assertEqual(13, len(rows))
+        self.assertEqual(
+            12,
+            sum(1 for item in rows if item.get("capacity_state") == "active"),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                1
+                for item in rows
+                if item.get("capacity_state") == "capacity_waiting"
+            ),
+        )
 
     def test_discovery_refresh_preserves_verified_capability_and_scope(self):
         original = upsert_promotion_target(

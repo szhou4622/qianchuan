@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "enabled": False,
     "send_time": "09:00",
     "aavids": [],
-    "send_empty": True,
+    "send_empty": False,
 }
 
 SOURCE_LABELS = {
@@ -134,7 +134,7 @@ def _profile_config(account_username: str) -> Dict[str, Any]:
     except ValueError:
         config["send_time"] = DEFAULT_CONFIG["send_time"]
     config["enabled"] = bool(config.get("enabled"))
-    config["send_empty"] = bool(config.get("send_empty", True))
+    config["send_empty"] = bool(config.get("send_empty", False))
     config["aavids"] = _normalize_aavids(config.get("aavids"))
     return config
 
@@ -150,7 +150,7 @@ def _save_profile_config(account_username: str, config: Dict[str, Any]) -> Dict[
         "enabled": bool(config.get("enabled")),
         "send_time": _normalize_send_time(config.get("send_time") or "09:00"),
         "aavids": selected_aavids,
-        "send_empty": bool(config.get("send_empty", True)),
+        "send_empty": bool(config.get("send_empty", False)),
         "updated_at": _now_text(),
     }
     with CONFIG_LOCK:
@@ -168,6 +168,24 @@ def _store(database: Optional[str] = None) -> SQLiteStore:
 
 def list_operation_account_options(database: Optional[str] = None) -> List[Dict[str, str]]:
     store = _store(database)
+    from services.qianchuan_accounts import (
+        list_qianchuan_accounts,
+        migrate_existing_qianchuan_accounts,
+    )
+
+    owner = current_local_feishu_account() or None
+    migrate_existing_qianchuan_accounts(owner_username=owner, db=store)
+    accounts = list_qianchuan_accounts(owner_username=owner, db=store)
+    if accounts:
+        return [
+            {
+                "account_uid": str(item.get("account_uid") or ""),
+                "aavid": str(item.get("aavid") or ""),
+                "account_name": str(item.get("account_name") or ""),
+                "report_enabled": bool(item.get("report_enabled")),
+            }
+            for item in accounts
+        ]
     rows = store.execute(
         "SELECT aavid FROM account_operation_event WHERE aavid<>'' "
         "UNION SELECT aadvid AS aavid FROM pmc_ad_detail_basic WHERE aadvid<>'' "
@@ -198,20 +216,53 @@ def get_operation_daily_report_config(database: Optional[str] = None) -> Dict[st
             "config": dict(DEFAULT_CONFIG),
             "accounts": [],
         }
+    config = _profile_config(account)
+    options = list_operation_account_options(database)
+    selected = [
+        str(item.get("aavid") or "")
+        for item in options
+        if bool(item.get("report_enabled"))
+    ]
+    if options:
+        config["aavids"] = selected
     return {
         "success": True,
         "account_username": account,
-        "config": _profile_config(account),
-        "accounts": list_operation_account_options(database),
+        "config": config,
+        "accounts": options,
     }
 
 
-def save_operation_daily_report_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def save_operation_daily_report_config(
+    config: Dict[str, Any],
+    database: Optional[str] = None,
+) -> Dict[str, Any]:
     account = current_local_feishu_account()
     if not account:
         return {"success": False, "message": "请先登录工具账号"}
     try:
         saved = _save_profile_config(account, config if isinstance(config, dict) else {})
+        from services.qianchuan_accounts import (
+            list_qianchuan_accounts,
+            migrate_existing_qianchuan_accounts,
+            save_qianchuan_account_settings,
+        )
+
+        selected = set(saved.get("aavids") or [])
+        store = _store(database)
+        migrate_existing_qianchuan_accounts(
+            owner_username=account,
+            db=store,
+        )
+        for item in list_qianchuan_accounts(owner_username=account, db=store):
+            save_qianchuan_account_settings(
+                item["account_uid"],
+                {
+                    "report_enabled": str(item.get("aavid") or "") in selected,
+                },
+                owner_username=account,
+                db=store,
+            )
     except (RuntimeError, ValueError) as exc:
         return {"success": False, "message": str(exc)}
     logger.info(
@@ -243,13 +294,16 @@ def _group_counts(
     start: str,
     end: str,
     field: str,
+    account_uid: str = "",
 ) -> Dict[str, int]:
     if field not in {"action_type", "source", "status"}:
         raise ValueError("不支持的统计字段")
+    scope = "account_uid=?" if account_uid else "aavid=?"
+    scope_value = account_uid or aavid
     rows = store.execute(
         f"SELECT {field} AS name,COUNT(*) AS n FROM account_operation_event "
-        "WHERE aavid=? AND occurred_at>=? AND occurred_at<=? GROUP BY " + field,
-        (aavid, start, end),
+        f"WHERE {scope} AND occurred_at>=? AND occurred_at<=? GROUP BY " + field,
+        (scope_value, start, end),
         fetch=True,
     ) or []
     return {str(row.get("name") or ""): int(row.get("n") or 0) for row in rows}
@@ -268,10 +322,28 @@ def build_operation_daily_report(
     start = day.strftime("%Y-%m-%d 00:00:00")
     end = day.strftime("%Y-%m-%d 23:59:59")
     store = _store(database)
+    from services.qianchuan_accounts import migrate_existing_qianchuan_accounts
+
+    owner = current_local_feishu_account() or None
+    migrate_existing_qianchuan_accounts(owner_username=owner, db=store)
+    directory = store.select_one(
+        "qianchuan_account",
+        where={
+            "owner_username": _account_key(owner) if owner else "local_default",
+            "aavid": aid,
+        },
+    ) or {}
+    account_uid = str(directory.get("account_uid") or "")
+    event_scope = (
+        "account_uid=?"
+        if account_uid
+        else "aavid=?"
+    )
+    event_scope_param = account_uid or aid
     total_rows = store.execute(
         "SELECT COUNT(*) AS n,SUM(CASE WHEN possible_duplicate=1 THEN 1 ELSE 0 END) AS duplicate_n "
-        "FROM account_operation_event WHERE aavid=? AND occurred_at>=? AND occurred_at<=?",
-        (aid, start, end),
+        f"FROM account_operation_event WHERE {event_scope} AND occurred_at>=? AND occurred_at<=?",
+        (event_scope_param, start, end),
         fetch=True,
     ) or [{"n": 0, "duplicate_n": 0}]
     total = int(total_rows[0].get("n") or 0)
@@ -279,9 +351,9 @@ def build_operation_daily_report(
         "SELECT action_type,source,status,operator_name,operator_id,summary,"
         "plan_id,plan_name,material_id,material_name,product_id,product_name,"
         "regulate_task_id,possible_duplicate,occurred_at "
-        "FROM account_operation_event WHERE aavid=? AND occurred_at>=? AND occurred_at<=? "
+        f"FROM account_operation_event WHERE {event_scope} AND occurred_at>=? AND occurred_at<=? "
         "ORDER BY occurred_at DESC,id DESC LIMIT ?",
-        (aid, start, end, DETAIL_LIMIT),
+        (event_scope_param, start, end, DETAIL_LIMIT),
         fetch=True,
     ) or []
     account_rows = store.execute(
@@ -293,8 +365,8 @@ def build_operation_daily_report(
     ) or []
     sync_rows = store.execute(
         "SELECT coverage_from,coverage_to,last_sync_at,last_status,last_error "
-        "FROM platform_log_sync_state WHERE aavid=? LIMIT 1",
-        (aid,),
+        "FROM platform_log_sync_state WHERE account_uid=? AND aavid=? LIMIT 1",
+        (account_uid, aid),
         fetch=True,
     ) or []
     sync = sync_rows[0] if sync_rows else {
@@ -313,17 +385,26 @@ def build_operation_daily_report(
         "report_uid": "daily:" + uuid.uuid4().hex,
         "report_date": day.isoformat(),
         "aavid": aid,
-        "account_name": (
+        "qianchuan_account_uid": str(directory.get("account_uid") or ""),
+        "account_name": str(directory.get("account_name") or "")
+        or (
             str(account_rows[0].get("user_info_name") or "")
             if account_rows
-            else f"千川账户 {aid}"
-        ),
+            else ""
+        )
+        or f"千川账户 {aid}",
         "event_count": total,
         "shown_count": len(details),
         "duplicate_count": int(total_rows[0].get("duplicate_n") or 0),
-        "action_counts": _group_counts(store, aid, start, end, "action_type"),
-        "source_counts": _group_counts(store, aid, start, end, "source"),
-        "status_counts": _group_counts(store, aid, start, end, "status"),
+        "action_counts": _group_counts(
+            store, aid, start, end, "action_type", account_uid
+        ),
+        "source_counts": _group_counts(
+            store, aid, start, end, "source", account_uid
+        ),
+        "status_counts": _group_counts(
+            store, aid, start, end, "status", account_uid
+        ),
         "details": details,
         "platform_sync": sync,
         "platform_coverage_complete": coverage_complete,
@@ -445,6 +526,84 @@ def build_operation_daily_report_card(report: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_operation_daily_summary_card(
+    reports: List[Dict[str, Any]],
+    report_date: str,
+) -> Dict[str, Any]:
+    total_events = sum(int(item.get("event_count") or 0) for item in reports)
+    total_retarget = sum(
+        int((item.get("action_counts") or {}).get("retarget") or 0)
+        for item in reports
+    )
+    total_stop = sum(
+        int((item.get("action_counts") or {}).get("stop") or 0)
+        for item in reports
+    )
+    total_failed = sum(
+        int((item.get("status_counts") or {}).get("failed") or 0)
+        for item in reports
+    )
+    incomplete = [
+        item for item in reports if not bool(item.get("platform_coverage_complete"))
+    ]
+    lines: List[str] = []
+    for item in reports:
+        counts = item.get("action_counts") or {}
+        status_counts = item.get("status_counts") or {}
+        coverage = "完整" if item.get("platform_coverage_complete") else "不完整"
+        lines.append(
+            f"**{item.get('account_name') or item.get('aavid')}**"
+            f" · ID {item.get('aavid')}"
+            f"\n操作 {int(item.get('event_count') or 0)}"
+            f" · 追投 {int(counts.get('retarget') or 0)}"
+            f" · 停投 {int(counts.get('stop') or 0)}"
+            f" · 失败 {int(status_counts.get('failed') or 0)}"
+            f" · 日志{coverage}"
+        )
+    if not lines:
+        lines = ["尚未选择需要日报的千川账户。"]
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": False},
+        "header": {
+            "template": "orange" if incomplete else "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": f"千川多账户操作日报总览 · {report_date}",
+            },
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**账户数：** {len(reports)}"
+                    f"\n**操作总数：** {total_events}"
+                    f" · **追投：** {total_retarget}"
+                    f" · **停投：** {total_stop}"
+                    f" · **失败：** {total_failed}"
+                    f"\n**后台日志不完整账户：** {len(incomplete)}"
+                ),
+            },
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": "\n\n".join(lines),
+            },
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": (
+                            "总览包含全部已勾选账户；详细卡片仅发送给有操作记录、"
+                            "日志异常或已明确开启空日报的账户。"
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+
 def _delivery_key(
     account_username: str,
     aavid: str,
@@ -476,6 +635,9 @@ def _record_delivery(
         "report_uid": str(report.get("report_uid") or "daily:" + uuid.uuid4().hex),
         "account_username": _account_key(account_username),
         "aavid": str(report.get("aavid") or ""),
+        "qianchuan_account_uid": str(
+            report.get("qianchuan_account_uid") or ""
+        ),
         "report_date": str(report.get("report_date") or ""),
         "delivery_mode": mode,
         "receive_type": receive_type,
@@ -508,31 +670,52 @@ def send_operation_daily_report(
     feishu = get_local_feishu_status()
     if not feishu.get("connected"):
         return {"success": False, "message": "飞书长连接尚未连接"}
-    targets = list_local_feishu_bound_targets()
-    if not targets:
+    admin_targets = list_local_feishu_bound_targets()
+    if not admin_targets:
         return {"success": False, "message": "尚未绑定个人或接收群"}
     config = _profile_config(account)
     options = list_operation_account_options(database)
-    aavids = config.get("aavids") or [item["aavid"] for item in options]
+    selected_from_directory = [
+        str(item.get("aavid") or "")
+        for item in options
+        if bool(item.get("report_enabled"))
+    ]
+    aavids = (
+        selected_from_directory
+        if options
+        else (config.get("aavids") or [])
+    )
     if not aavids:
-        return {"success": False, "message": "尚未发现可发送的千川账户"}
+        return {"success": False, "message": "尚未勾选需要日报的千川账户"}
     day = _report_date(report_date)
     store = _store(database)
+    from services.qianchuan_accounts import resolve_account_feishu_targets
+
     sent_count = 0
     skipped_count = 0
     errors: List[str] = []
     reports: List[Dict[str, Any]] = []
     for aavid in aavids:
         report = build_operation_daily_report(aavid, day, database=database)
-        if (
-            mode == "scheduled"
-            and not bool(config.get("send_empty", True))
-            and int(report.get("event_count") or 0) == 0
-        ):
-            skipped_count += len(targets)
+        reports.append(report)
+        sync = report.get("platform_sync") or {}
+        needs_detail = bool(int(report.get("event_count") or 0)) or not bool(
+            report.get("platform_coverage_complete")
+        ) or bool(sync.get("last_error")) or bool(config.get("send_empty", False))
+        if not needs_detail:
+            skipped_count += 1
+            continue
+        detail_targets = resolve_account_feishu_targets(
+            aavid,
+            owner_username=account,
+            db=store,
+            default_targets=admin_targets,
+        )
+        if not detail_targets:
+            errors.append(f"{aavid}: 未配置可用的飞书接收位置")
             continue
         card = build_operation_daily_report_card(report)
-        for receive_type, receive_id in targets:
+        for receive_type, receive_id in detail_targets:
             key = (
                 _delivery_key(
                     account,
@@ -583,16 +766,69 @@ def send_operation_daily_report(
                     error=str(exc),
                 )
                 errors.append(f"{aavid}/{receive_type}: {exc}")
-        reports.append(
-            {
-                "aavid": str(aavid),
-                "event_count": int(report.get("event_count") or 0),
-                "coverage_complete": bool(report.get("platform_coverage_complete")),
-            }
+
+    summary_report = {
+        "report_uid": "daily-summary:" + uuid.uuid4().hex,
+        "report_date": day.isoformat(),
+        "aavid": "__summary__",
+        "qianchuan_account_uid": "",
+        "event_count": sum(int(item.get("event_count") or 0) for item in reports),
+    }
+    summary_card = build_operation_daily_summary_card(reports, day.isoformat())
+    for receive_type, receive_id in admin_targets:
+        key = (
+            _delivery_key(
+                account,
+                "__summary__",
+                day.isoformat(),
+                receive_type,
+                receive_id,
+            )
+            if mode == "scheduled"
+            else None
         )
+        if key:
+            existing = store.select_one(
+                "operation_daily_report_delivery",
+                where={"delivery_key": key},
+            )
+            if existing and existing.get("status") == "success":
+                skipped_count += 1
+                continue
+        try:
+            sent = send_local_feishu_bound_card(
+                summary_card,
+                targets=[(receive_type, receive_id)],
+            )
+            message_id = str(sent[0].get("message_id") or "") if sent else ""
+            _record_delivery(
+                store,
+                delivery_key=key,
+                report=summary_report,
+                account_username=account,
+                mode=mode,
+                receive_type=receive_type,
+                receive_id=receive_id,
+                status="success",
+                message_id=message_id,
+            )
+            sent_count += 1
+        except Exception as exc:
+            _record_delivery(
+                store,
+                delivery_key=key,
+                report=summary_report,
+                account_username=account,
+                mode=mode,
+                receive_type=receive_type,
+                receive_id=receive_id,
+                status="failed",
+                error=str(exc),
+            )
+            errors.append(f"总览/{receive_type}: {exc}")
     success = sent_count > 0 or (skipped_count > 0 and not errors)
     if sent_count:
-        message = f"已发送 {sent_count} 张昨日操作日报卡片"
+        message = f"已发送 {sent_count} 张多账户昨日操作日报卡片"
     elif skipped_count and not errors:
         message = "昨日操作日报已发送过，无需重复发送"
     else:
@@ -606,7 +842,15 @@ def send_operation_daily_report(
         "sent_count": sent_count,
         "skipped_count": skipped_count,
         "errors": errors,
-        "reports": reports,
+        "reports": [
+            {
+                "aavid": str(item.get("aavid") or ""),
+                "account_name": str(item.get("account_name") or ""),
+                "event_count": int(item.get("event_count") or 0),
+                "coverage_complete": bool(item.get("platform_coverage_complete")),
+            }
+            for item in reports
+        ],
     }
 
 

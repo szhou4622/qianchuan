@@ -16,7 +16,9 @@ from services.plan_system import (
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
-MAX_ENABLED_TARGETS = 10
+# 启用数量不再使用固定条数截断，改由账户容量模型把超量计划
+# 标记为 capacity_waiting。
+MAX_ENABLED_TARGETS = 0
 LEGACY_TARGET_UID = "legacy_unscoped"
 ALLOWED_SCENES = frozenset({"live", "product"})
 ALLOWED_FILTER_MODES = frozenset({"all", "selected"})
@@ -299,15 +301,6 @@ def upsert_promotion_target(
     ):
         # 一次缺少体系标志的只读刷新不能抹掉此前已确认的传统全域/乘方分类。
         plan_system = normalize_plan_system(existing.get("plan_system"))
-    if enabled and (not existing or not bool(existing.get("enabled"))):
-        count_row = store.execute(
-            "SELECT COUNT(1) AS n FROM promotion_target WHERE enabled=1",
-            fetch=True,
-        ) or []
-        count = int((count_row[0] if count_row else {}).get("n") or 0)
-        if count >= MAX_ENABLED_TARGETS:
-            raise ValueError(f"最多同时启用 {MAX_ENABLED_TARGETS} 条监控计划")
-
     has_filter_update = (
         "product_filter_mode" in data
         or "product_ids" in data
@@ -362,8 +355,17 @@ def upsert_promotion_target(
         if "last_error" in data
         else (existing.get("last_error") if existing else "")
     )
+    from services.qianchuan_accounts import ensure_qianchuan_account
+
+    account = ensure_qianchuan_account(
+        aavid,
+        account_name=data.get("account_name") or "",
+        seen=True,
+        db=store,
+    )
     row = {
         "target_uid": target_uid,
+        "account_uid": account["account_uid"],
         "aadvid": aavid,
         "ad_id": ad_id,
         "plan_name": str(
@@ -391,6 +393,14 @@ def upsert_promotion_target(
         where={"aadvid": aavid, "ad_id": ad_id},
     )
     assert saved is not None
+    from services.qianchuan_accounts import refresh_monitor_capacity
+
+    refresh_monitor_capacity(db=store)
+    saved = store.select_one(
+        "promotion_target",
+        where={"aadvid": aavid, "ad_id": ad_id},
+    )
+    assert saved is not None
     return _target_row(saved)
 
 
@@ -408,18 +418,23 @@ def set_promotion_target_enabled(
     )
     if not target:
         raise ValueError("监控目标不存在")
-    if enabled and not bool(target.get("enabled")):
-        rows = store.execute(
-            "SELECT COUNT(1) AS n FROM promotion_target WHERE enabled=1",
-            fetch=True,
-        ) or []
-        if int((rows[0] if rows else {}).get("n") or 0) >= MAX_ENABLED_TARGETS:
-            raise ValueError(f"最多同时启用 {MAX_ENABLED_TARGETS} 条监控计划")
+    if enabled:
+        from services.qianchuan_accounts import get_qianchuan_account
+
+        account = get_qianchuan_account(target.get("account_uid"), db=store)
+        if account and not account.get("enabled"):
+            raise ValueError("请先启用该千川账户")
     store.update(
         "promotion_target",
-        {"enabled": 1 if enabled else 0},
+        {
+            "enabled": 1 if enabled else 0,
+            "capacity_state": "active" if enabled else "disabled",
+        },
         where={"target_uid": target["target_uid"]},
     )
+    from services.qianchuan_accounts import refresh_monitor_capacity
+
+    refresh_monitor_capacity(db=store)
     result = get_promotion_target(target["target_uid"], db=store)
     assert result is not None
     return result
@@ -668,11 +683,6 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
         order_by="updated_at DESC, id DESC",
     )
     migrated = 0
-    enabled_rows = store.execute(
-        "SELECT COUNT(1) AS n FROM promotion_target WHERE enabled=1",
-        fetch=True,
-    ) or []
-    enabled_count = int((enabled_rows[0] if enabled_rows else {}).get("n") or 0)
     by_account: Dict[str, List[Dict[str, Any]]] = {}
     for detail in details:
         aavid = str(detail.get("aadvid") or "").strip()
@@ -687,11 +697,9 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
         existing_target = store.select_one(
             "promotion_target", where={"aadvid": aavid, "ad_id": ad_id}
         )
-        enable_target = (
-            bool(existing_target.get("enabled"))
-            if existing_target
-            else enabled_count < MAX_ENABLED_TARGETS
-        )
+        # 历史明细只用于补齐可查看范围；没有明确启用记录的旧计划
+        # 不能自动进入追投/停投监控。
+        enable_target = bool(existing_target and existing_target.get("enabled"))
         upsert_promotion_target(
             {
                 "target_uid": uid,
@@ -704,8 +712,6 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
             },
             db=store,
         )
-        if enable_target and not existing_target:
-            enabled_count += 1
         store.update(
             "pmc_ad_detail_basic",
             {

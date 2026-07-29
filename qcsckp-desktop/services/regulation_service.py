@@ -67,9 +67,10 @@ def _resolve_path(p: Optional[str]) -> Optional[str]:
     return os.path.join(DATA_DIR, s)
 
 
-def _default_storage_state_path() -> Optional[str]:
-    cand = os.path.join(DATA_DIR, "qcookie.json")
-    return cand if os.path.isfile(cand) else None
+def _default_storage_state_path() -> Any:
+    from services.qianchuan_session import load_qianchuan_storage_state
+
+    return load_qianchuan_storage_state()
 
 
 def _is_batch_update_response(resp: Response) -> bool:
@@ -123,7 +124,7 @@ def _parse_batch_operation_json(body: Any, expect_object_id: str) -> Tuple[Optio
 @dataclass
 class RegulationSessionOptions:
     headless: bool = True
-    storage_state: Optional[str] = None
+    storage_state: Any = None
     base_url: str = DEFAULT_BASE_URL
     browser_executable_path: Optional[str] = None
     goto_timeout_ms: int = 60_000
@@ -164,7 +165,11 @@ class QianChuanRegulationStopService:
     def __init__(self, options: Optional[RegulationSessionOptions] = None):
         self._opt = options or RegulationSessionOptions()
         ss = self._opt.storage_state
-        self._storage_state = _default_storage_state_path() if ss is None else _resolve_path(ss)
+        self._storage_state = (
+            _default_storage_state_path()
+            if ss is None
+            else (ss if isinstance(ss, dict) else _resolve_path(ss))
+        )
         self._playwright = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -1328,7 +1333,7 @@ class QianChuanRegulationStopService:
         cls,
         full_config: Dict[str, Any],
         *,
-        storage_state_override: Optional[str] = None,
+        storage_state_override: Any = None,
         base_url: Optional[str] = None,
     ) -> "QianChuanRegulationStopService":
         headless = bool(full_config.get("browser_headless", True))

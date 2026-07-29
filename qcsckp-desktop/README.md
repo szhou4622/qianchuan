@@ -68,8 +68,19 @@ uv run python gui_app.py
 
 1. 启动服务后，会打开**有头**浏览器窗口，请在千川完成登录。
 2. 进入**投放详情页**，使地址符合配置中的前缀（默认 `https://qianchuan.jinritemai.com/uni-prom/deta...`），并包含 `aavid` 与 `adId`。
-3. 程序识别目标后会**保存 Cookie** 到 `data/qcookie.json`（路径可在服务配置中调整），随后默认使用**无头 Chrome**轮询抓取。
+3. 程序识别目标后会按当前工具账号保存一份千川主登录会话，并使用 **Windows DPAPI 加密**；随后默认使用**无头 Chrome**依次轮询用户明确启用的账户与计划。
 4. 数据写入 `data/qianchuan.db`（默认路径见 `config.DB_FILE`），日志在 `logs/` 下滚动。
+
+### 多千川账户
+
+同一个千川登录用户授权的多个 `aavid` 共用一份登录会话。进入“千川账户管理”可以：
+
+- 查看已识别账户、账户ID、监控计划、日志同步和容量状态；
+- 分账户开启或暂停自动化，只启用明确勾选的计划；
+- 分账户选择是否纳入昨日操作日报，以及个人/群接收位置；
+- 查看5分钟目标采集容量；预计不能在10分钟内完成的计划会进入“等待监控容量”。
+
+写操作使用同一浏览器优先级队列：飞书确认追投、自动停投、计划采集、操作日志同步、历史补录。登录失效或出现验证码时会暂停全部账户写操作。
 
 ---
 
@@ -94,6 +105,20 @@ API_BASE_URL = "https://qcscjk.shanghaijiyue.com"
 5. 页面显示“已连接”后发送测试卡片。
 
 App Secret 按工具登录账号隔离，使用 Windows DPAPI 加密保存在本机。普通用户流程不需要 Verification Token、Encrypt Key、回调 URL、服务器、域名或 Cloudflare。工具关闭期间无法接收按钮；重启并恢复连接后，需要在卡片有效期内重新点击。
+
+### rc23 回滚
+
+新版第一次启动会在数据库迁移前自动创建一次 rc23 数据快照，位置为：
+
+`%LOCALAPPDATA%\qcsckp-test-runtime\desktop-data\rollback\测试1版-rc23-auto-*`
+
+需要回滚时，先从系统托盘完全退出工具，再切回 `测试1版-rc23` 代码并执行：
+
+```bash
+uv run python tools/restore_rc23_snapshot.py
+```
+
+脚本会恢复数据库、rc23明文Cookie兼容文件以及当时的主要本地配置。也可以把指定快照目录作为命令的第一个参数。
 
 ### SQLite 自动裁剪（可选）
 

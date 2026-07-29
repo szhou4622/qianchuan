@@ -32,7 +32,7 @@
     <div class="head">
       <div>
         <h1>监控计划</h1>
-        <div class="sub">最多同时监控10条推直播或推商品计划。点击添加后，在新打开的独立Chrome中登录千川并进入计划详情；识别成功后Chrome会自动关闭，计划会显示在下方。</div>
+        <div class="sub">可登记多个千川账户下的推直播或推商品计划。系统按最近采集耗时动态分配容量，目标5分钟一轮；预计无法在10分钟内完成的计划会明确显示“等待监控容量”，不会虚假标记为正常。</div>
       </div>
       <button class="primary" id="discover">打开千川添加计划</button>
     </div>
@@ -47,6 +47,7 @@
     async function waitApi(){for(let i=0;i<100;i++){const a=api();if(a)return a;await new Promise(r=>setTimeout(r,100));}return null}
     function message(text,bad=false){$('notice').textContent=text||'';$('notice').classList.toggle('show',!!text);$('notice').style.borderColor=bad?'#be123c88':'#1d4ed866';}
     function statusText(x){return ({ok:'同步正常',pending:'等待首次同步',paused:'计划已暂停',not_delivering:'计划未在投放',error:'同步异常',capability_mismatch:'页面能力未识别'})[x]||x||'等待首次同步'}
+    function capacityText(x){return ({active:'正常监控',capacity_waiting:'等待监控容量',disabled:'未参与监控'})[x]||'容量待计算'}
     function sceneText(x){return x==='product'?'推商品':x==='live'?'推直播':'未知场景'}
     function systemText(x){return x==='global'?'全域':x==='chengfang'?'千川乘方':'体系待确认'}
     function recentCapabilityTime(value){
@@ -88,7 +89,7 @@
           <div class="row"><div><div class="name">${esc(x.plan_name||'未命名计划')}</div>
           <div class="meta">账户 ${esc(x.aadvid)} · 计划 ${esc(x.ad_id)}<br>${esc(x.target_uid)}</div></div>
           <span class="pill ${x.promotion_scene==='product'?'product':''}">${sceneText(x.promotion_scene)} · ${systemText(x.plan_system)}</span></div>
-          <div class="status ${bad?'bad':x.last_status==='ok'?'ok':''}">${esc(statusText(x.last_status))} · 最后同步 ${esc(x.last_sync_at||'—')}${x.last_error?`<br>${esc(x.last_error)}`:''}</div>
+          <div class="status ${bad||x.capacity_state==='capacity_waiting'?'bad':x.last_status==='ok'?'ok':''}">${esc(capacityText(x.capacity_state))} · ${esc(statusText(x.last_status))} · 最后同步 ${esc(x.last_sync_at||'—')}${Number(x.last_lag_seconds||0)>600?'<br>监控延迟：已超过10分钟':''}${x.last_error?`<br>${esc(x.last_error)}`:''}</div>
           <div class="form">
             <label>计划名称<input data-field="plan_name" value="${esc(x.plan_name||'')}"></label>
             <label>启用状态<select data-field="enabled"><option value="1" ${x.enabled?'selected':''}>启用监控</option><option value="0" ${x.enabled?'':'selected'}>暂停监控</option></select></label>

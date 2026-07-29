@@ -1,0 +1,696 @@
+# -*- coding: utf-8 -*-
+"""单一千川登录身份下的多账户目录、路由和监控容量管理。"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from config import DATA_DIR, DB_FILE
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+
+DEFAULT_OWNER = "local_default"
+CAPACITY_WINDOW_SECONDS = 9 * 60
+CAPACITY_STALE_SECONDS = 10 * 60
+DEFAULT_TARGET_DURATION_MS = 45_000
+MIN_TARGET_DURATION_MS = 5_000
+MAX_TARGET_DURATION_MS = 5 * 60_000
+DAILY_CONFIG_FILE = os.path.join(DATA_DIR, "operation_daily_report.json")
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _owner_key(value: Any = None) -> str:
+    text = str(value or "").strip().casefold()
+    if text:
+        return text
+    try:
+        from services.qianchuan_session import current_session_owner
+
+        text = str(current_session_owner() or "").strip().casefold()
+    except Exception:
+        text = ""
+    return text or DEFAULT_OWNER
+
+
+def make_account_uid(aavid: Any, owner_username: Any = None) -> str:
+    aid = str(aavid or "").strip()
+    if not aid.isdigit():
+        raise ValueError("千川账户ID必须为数字")
+    owner = _owner_key(owner_username)
+    digest = hashlib.sha256(f"{owner}:{aid}".encode("utf-8")).hexdigest()[:24]
+    return f"account_{digest}"
+
+
+def _json_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = [item.strip() for item in value.split(",")]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: List[str] = []
+    for one in value:
+        item = str(one or "").strip()
+        if item and item not in result:
+            result.append(item)
+    return result
+
+
+def _daily_selected_aavids(owner_username: str) -> set[str]:
+    try:
+        with open(DAILY_CONFIG_FILE, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        profile = ((raw or {}).get("profiles") or {}).get(_owner_key(owner_username)) or {}
+        return {
+            str(item).strip()
+            for item in profile.get("aavids") or []
+            if str(item or "").strip()
+        }
+    except Exception:
+        return set()
+
+
+def _sync_daily_selected_aavids(
+    owner_username: Any,
+    *,
+    db: SQLiteStore,
+) -> None:
+    """让旧日报配置与账户目录保持一致，兼容仍读取 aavids 的 rc23 页面。"""
+    if os.path.abspath(str(db.config.get("database") or "")) != os.path.abspath(DB_FILE):
+        return
+    owner = _owner_key(owner_username)
+    rows = db.select(
+        "qianchuan_account",
+        fields="aavid",
+        where={"owner_username": owner, "report_enabled": 1},
+        order_by="aavid ASC",
+    )
+    try:
+        with open(DAILY_CONFIG_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        payload = {"version": 1, "profiles": {}}
+    if not isinstance(payload, dict):
+        payload = {"version": 1, "profiles": {}}
+    profiles = payload.setdefault("profiles", {})
+    profile = profiles.get(owner)
+    profile = dict(profile) if isinstance(profile, dict) else {}
+    profile["aavids"] = [
+        str(item.get("aavid") or "")
+        for item in rows
+        if str(item.get("aavid") or "")
+    ]
+    profile["updated_at"] = _now_text()
+    profiles[owner] = profile
+    os.makedirs(os.path.dirname(DAILY_CONFIG_FILE), exist_ok=True)
+    temp = DAILY_CONFIG_FILE + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(temp, DAILY_CONFIG_FILE)
+
+
+def ensure_qianchuan_account(
+    aavid: Any,
+    *,
+    account_name: Any = "",
+    owner_username: Any = None,
+    enabled: Optional[bool] = None,
+    report_enabled: Optional[bool] = None,
+    seen: bool = False,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    aid = str(aavid or "").strip()
+    uid = make_account_uid(aid, owner)
+    existing = store.select_one(
+        "qianchuan_account",
+        where={"owner_username": owner, "aavid": aid},
+    )
+    values: Dict[str, Any] = {
+        "account_uid": uid,
+        "owner_username": owner,
+        "aavid": aid,
+        "account_name": str(
+            account_name
+            or (existing or {}).get("account_name")
+            or f"千川账户 {aid}"
+        ).strip()[:256],
+        "enabled": (
+            1
+            if (enabled if enabled is not None else bool((existing or {}).get("enabled", 1)))
+            else 0
+        ),
+        "report_enabled": (
+            1
+            if (
+                report_enabled
+                if report_enabled is not None
+                else bool((existing or {}).get("report_enabled", 0))
+            )
+            else 0
+        ),
+        "route_mode": str((existing or {}).get("route_mode") or "default"),
+        "route_send_personal": int(
+            bool((existing or {}).get("route_send_personal", 1))
+        ),
+        "route_group_ids_json": str(
+            (existing or {}).get("route_group_ids_json") or "[]"
+        ),
+        "last_status": str((existing or {}).get("last_status") or "pending"),
+        "last_error": str((existing or {}).get("last_error") or ""),
+    }
+    if seen:
+        values["last_seen_at"] = _now_text()
+        values["last_status"] = "available"
+        values["last_error"] = ""
+    store.insert_or_update(
+        "qianchuan_account",
+        values,
+        unique_fields=["owner_username", "aavid"],
+    )
+    saved = store.select_one("qianchuan_account", where={"account_uid": uid})
+    assert saved is not None
+    return _account_row(saved, store)
+
+
+def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
+    out = dict(row)
+    out["enabled"] = bool(out.get("enabled"))
+    out["report_enabled"] = bool(out.get("report_enabled"))
+    out["route_send_personal"] = bool(out.get("route_send_personal"))
+    out["route_group_ids"] = _json_list(out.pop("route_group_ids_json", "[]"))
+    aid = str(out.get("aavid") or "")
+    counts = store.execute(
+        "SELECT COUNT(*) AS total,"
+        "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS enabled_count,"
+        "SUM(CASE WHEN enabled=1 AND capacity_state='active' THEN 1 ELSE 0 END) AS active_count,"
+        "SUM(CASE WHEN enabled=1 AND capacity_state='capacity_waiting' THEN 1 ELSE 0 END) AS waiting_count "
+        "FROM promotion_target WHERE account_uid=?",
+        (str(out.get("account_uid") or ""),),
+        fetch=True,
+    ) or [{}]
+    out.update(
+        {
+            "plan_count": int(counts[0].get("total") or 0),
+            "enabled_plan_count": int(counts[0].get("enabled_count") or 0),
+            "active_plan_count": int(counts[0].get("active_count") or 0),
+            "waiting_plan_count": int(counts[0].get("waiting_count") or 0),
+        }
+    )
+    sync = store.select_one(
+        "platform_log_sync_state",
+        where={
+            "account_uid": str(out.get("account_uid") or ""),
+            "aavid": aid,
+        },
+    ) or {}
+    out["log_sync"] = {
+        "last_sync_at": str(sync.get("last_sync_at") or ""),
+        "last_status": str(sync.get("last_status") or "not_configured"),
+        "last_error": str(sync.get("last_error") or ""),
+        "coverage_from": str(sync.get("coverage_from") or ""),
+        "coverage_to": str(sync.get("coverage_to") or ""),
+    }
+    return out
+
+
+def list_qianchuan_accounts(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> List[Dict[str, Any]]:
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    rows = store.select(
+        "qianchuan_account",
+        where={"owner_username": owner},
+        order_by="enabled DESC, account_name ASC, aavid ASC",
+    )
+    return [_account_row(row, store) for row in rows]
+
+
+def get_qianchuan_account(
+    value: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Optional[Dict[str, Any]]:
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("account_"):
+        row = store.select_one(
+            "qianchuan_account",
+            where={"account_uid": text, "owner_username": owner},
+        )
+    else:
+        row = store.select_one(
+            "qianchuan_account",
+            where={"aavid": text, "owner_username": owner},
+        )
+    return _account_row(row, store) if row else None
+
+
+def save_qianchuan_account_settings(
+    value: Any,
+    settings: Dict[str, Any],
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    store = db or SQLiteStore()
+    account = get_qianchuan_account(
+        value,
+        owner_username=owner_username,
+        db=store,
+    )
+    if not account:
+        raise ValueError("千川账户不存在")
+    route_mode = str(settings.get("route_mode", account.get("route_mode") or "default")).strip()
+    if route_mode not in {"default", "custom"}:
+        raise ValueError("飞书路由模式无效")
+    groups = _json_list(
+        settings.get("route_group_ids", account.get("route_group_ids") or [])
+    )
+    route_send_personal = bool(
+        settings.get(
+            "route_send_personal",
+            account.get("route_send_personal"),
+        )
+    )
+    if route_mode == "custom" and not route_send_personal and not groups:
+        raise ValueError("账户单独路由至少选择个人或一个已绑定群")
+    values = {
+        "enabled": 1 if bool(settings.get("enabled", account.get("enabled"))) else 0,
+        "report_enabled": (
+            1 if bool(settings.get("report_enabled", account.get("report_enabled"))) else 0
+        ),
+        "route_mode": route_mode,
+        "route_send_personal": (
+            1
+            if route_send_personal
+            else 0
+        ),
+        "route_group_ids_json": json.dumps(groups, ensure_ascii=False),
+    }
+    store.update(
+        "qianchuan_account",
+        values,
+        where={"account_uid": account["account_uid"]},
+    )
+    if not values["enabled"]:
+        store.update(
+            "promotion_target",
+            {"capacity_state": "disabled"},
+            where={"account_uid": account["account_uid"]},
+        )
+    refresh_monitor_capacity(db=store)
+    _sync_daily_selected_aavids(
+        account.get("owner_username") or owner_username,
+        db=store,
+    )
+    saved = get_qianchuan_account(
+        account["account_uid"],
+        owner_username=owner_username,
+        db=store,
+    )
+    assert saved is not None
+    return saved
+
+
+def bind_target_account_scope(
+    target_uid: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """为迁移前的计划补齐账户归属；已有归属绝不改绑。"""
+    store = db or SQLiteStore()
+    uid = str(target_uid or "").strip()
+    target = store.select_one("promotion_target", where={"target_uid": uid})
+    if not target:
+        return None, None
+    account_uid = str(target.get("account_uid") or "").strip()
+    account = (
+        store.select_one("qianchuan_account", where={"account_uid": account_uid})
+        if account_uid
+        else None
+    )
+    if not account:
+        account_view = ensure_qianchuan_account(
+            target.get("aadvid"),
+            owner_username=owner_username,
+            db=store,
+        )
+        account_uid = str(account_view["account_uid"])
+        store.update(
+            "promotion_target",
+            {"account_uid": account_uid},
+            where={"target_uid": uid},
+        )
+        account = store.select_one(
+            "qianchuan_account",
+            where={"account_uid": account_uid},
+        )
+    refresh_monitor_capacity(owner_username=owner_username, db=store)
+    return (
+        store.select_one("promotion_target", where={"target_uid": uid}),
+        account,
+    )
+
+
+def _estimate_duration_ms(row: Dict[str, Any]) -> int:
+    try:
+        value = int(row.get("last_duration_ms") or DEFAULT_TARGET_DURATION_MS)
+    except (TypeError, ValueError):
+        value = DEFAULT_TARGET_DURATION_MS
+    return max(MIN_TARGET_DURATION_MS, min(MAX_TARGET_DURATION_MS, value))
+
+
+def refresh_monitor_capacity(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """按最近耗时准入计划；超出九分钟预算的目标进入等待容量。"""
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    rows = store.execute(
+        "SELECT t.target_uid,t.enabled,t.capacity_state,t.last_duration_ms,"
+        "a.enabled AS account_enabled "
+        "FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE a.owner_username=? "
+        "ORDER BY CASE WHEN t.capacity_state='active' THEN 0 ELSE 1 END,"
+        "t.created_at ASC,t.id ASC",
+        (owner,),
+        fetch=True,
+    ) or []
+    budget_ms = CAPACITY_WINDOW_SECONDS * 1000
+    used_ms = 0
+    active = 0
+    waiting = 0
+    disabled = 0
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        for row in rows:
+            desired = bool(row.get("enabled")) and bool(row.get("account_enabled"))
+            if not desired:
+                state = "disabled"
+                disabled += 1
+            else:
+                estimate = _estimate_duration_ms(row)
+                if used_ms + estimate <= budget_ms or active == 0:
+                    state = "active"
+                    used_ms += estimate
+                    active += 1
+                else:
+                    state = "capacity_waiting"
+                    waiting += 1
+            store.update(
+                "promotion_target",
+                {"capacity_state": state},
+                where={"target_uid": row["target_uid"]},
+                connection=conn,
+            )
+    return {
+        "active_count": active,
+        "waiting_count": waiting,
+        "disabled_count": disabled,
+        "estimated_cycle_seconds": int(round(used_ms / 1000)),
+        "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
+        "stale_after_seconds": CAPACITY_STALE_SECONDS,
+        "healthy": waiting == 0,
+    }
+
+
+def record_target_duration(
+    target_uid: Any,
+    duration_ms: Any,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> None:
+    store = db or SQLiteStore()
+    target = store.select_one(
+        "promotion_target",
+        fields="last_duration_ms",
+        where={"target_uid": str(target_uid or "").strip()},
+    )
+    if not target:
+        return
+    try:
+        measured = max(
+            MIN_TARGET_DURATION_MS,
+            min(MAX_TARGET_DURATION_MS, int(duration_ms)),
+        )
+    except (TypeError, ValueError):
+        return
+    old = int(target.get("last_duration_ms") or measured)
+    smoothed = int(round(old * 0.7 + measured * 0.3))
+    store.update(
+        "promotion_target",
+        {
+            "last_duration_ms": smoothed,
+            "next_due_at": datetime.fromtimestamp(
+                datetime.now().timestamp() + 5 * 60
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "last_lag_seconds": 0,
+        },
+        where={"target_uid": str(target_uid or "").strip()},
+    )
+    refresh_monitor_capacity(db=store)
+
+
+def capacity_snapshot(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    store = db or SQLiteStore()
+    summary = refresh_monitor_capacity(owner_username=owner_username, db=store)
+    rows = store.execute(
+        "SELECT t.target_uid,t.last_sync_at,t.capacity_state FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE t.enabled=1 AND a.owner_username=?",
+        (_owner_key(owner_username),),
+        fetch=True,
+    ) or []
+    now = datetime.now()
+    delayed: List[str] = []
+    max_lag = 0
+    for row in rows:
+        if str(row.get("capacity_state") or "") != "active":
+            continue
+        text = str(row.get("last_sync_at") or "").strip()
+        try:
+            lag = int((now - datetime.strptime(text, "%Y-%m-%d %H:%M:%S")).total_seconds())
+        except Exception:
+            lag = CAPACITY_STALE_SECONDS + 1
+        lag = max(0, lag)
+        max_lag = max(max_lag, lag)
+        store.update(
+            "promotion_target",
+            {"last_lag_seconds": lag},
+            where={"target_uid": row["target_uid"]},
+        )
+        if lag > CAPACITY_STALE_SECONDS:
+            delayed.append(str(row["target_uid"]))
+    summary.update(
+        {
+            "delayed_count": len(delayed),
+            "delayed_target_uids": delayed,
+            "max_lag_seconds": max_lag,
+            "healthy": bool(summary.get("healthy")) and not delayed,
+        }
+    )
+    return summary
+
+
+def schedulable_promotion_targets(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> List[Dict[str, Any]]:
+    from api.promotion_targets import _target_row
+
+    store = db or SQLiteStore()
+    owner = _owner_key(owner_username)
+    refresh_monitor_capacity(owner_username=owner, db=store)
+    rows = store.execute(
+        "SELECT t.* FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE t.enabled=1 AND t.capacity_state='active' AND a.enabled=1 "
+        "AND a.owner_username=? "
+        "ORDER BY COALESCE(t.last_sync_at,'') ASC,t.created_at ASC,t.id ASC",
+        (owner,),
+        fetch=True,
+    ) or []
+    return [_target_row(row) for row in rows]
+
+
+def resolve_account_feishu_targets(
+    aavid: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+    default_targets: Optional[List[Tuple[str, str]]] = None,
+) -> List[Tuple[str, str]]:
+    from services.local_feishu_bridge import (
+        get_local_feishu_status,
+        list_local_feishu_bound_targets,
+    )
+
+    account = get_qianchuan_account(
+        aavid,
+        owner_username=owner_username,
+        db=db,
+    )
+    defaults = (
+        list(default_targets)
+        if default_targets is not None
+        else list_local_feishu_bound_targets()
+    )
+    if not account or account.get("route_mode") != "custom":
+        return defaults
+    status = get_local_feishu_status()
+    profile = status.get("profile") or {}
+    result: List[Tuple[str, str]] = []
+    authorized = str(profile.get("authorized_open_id") or "").strip()
+    if account.get("route_send_personal") and authorized:
+        result.append(("open_id", authorized))
+    bound_groups = {
+        str(item.get("chat_id") or "").strip()
+        for item in profile.get("groups") or []
+        if isinstance(item, dict)
+    }
+    for chat_id in account.get("route_group_ids") or []:
+        if chat_id in bound_groups:
+            result.append(("chat_id", chat_id))
+    return result
+
+
+def migrate_existing_qianchuan_accounts(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> int:
+    """从现有计划、素材账户和操作流水创建账户目录并回填关联。"""
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    # 尚未登录工具账号时不抢占旧数据；登录成功后由明确账号完成一次性归属迁移。
+    if owner == DEFAULT_OWNER:
+        return 0
+    selected = _daily_selected_aavids(owner)
+    rows = store.execute(
+        "SELECT aadvid AS aavid,user_info_name AS account_name,updated_at FROM pmc_ad_detail_basic "
+        "WHERE COALESCE(aadvid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
+        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        "UNION ALL SELECT aadvid AS aavid,'' AS account_name,updated_at FROM promotion_target "
+        "WHERE COALESCE(aadvid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
+        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        "UNION ALL SELECT aavid,'' AS account_name,occurred_at AS updated_at FROM account_operation_event "
+        "WHERE COALESCE(aavid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
+        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        "ORDER BY updated_at DESC",
+        (owner, owner, owner),
+        fetch=True,
+    ) or []
+    by_aavid: Dict[str, str] = {}
+    for row in rows:
+        aid = str(row.get("aavid") or "").strip()
+        if not aid or not aid.isdigit():
+            continue
+        name = str(row.get("account_name") or "").strip()
+        if aid not in by_aavid or (name and by_aavid[aid].startswith("千川账户 ")):
+            by_aavid[aid] = name or f"千川账户 {aid}"
+    for aid, name in by_aavid.items():
+        existing = store.select_one(
+            "qianchuan_account",
+            where={"owner_username": owner, "aavid": aid},
+        )
+        ensure_qianchuan_account(
+            aid,
+            account_name=name,
+            owner_username=owner,
+            # 旧日报配置只用于首次建目录；后续读取页面不能覆盖用户刚保存的选择。
+            report_enabled=(aid in selected) if not existing else None,
+            db=store,
+        )
+    for aid in by_aavid:
+        uid = make_account_uid(aid, owner)
+        for table, column in (
+            ("promotion_target", "aadvid"),
+            ("pmc_ad_detail_basic", "aadvid"),
+            ("pmc_retargeting_run", "aavid"),
+            ("pmc_regulation_run", "aavid"),
+            ("pmc_roi2_assist_task", "aadvid"),
+            ("account_operation_event", "aavid"),
+            ("platform_log_sync_state", "aavid"),
+        ):
+            store.update(
+                table,
+                {"account_uid": uid},
+                where=f"{column}=? AND COALESCE(account_uid,'')=''",
+                params=(aid,),
+            )
+        store.update(
+            "operation_daily_report_delivery",
+            {"qianchuan_account_uid": uid},
+            where="aavid=? AND COALESCE(qianchuan_account_uid,'')=''",
+            params=(aid,),
+        )
+    refresh_monitor_capacity(owner_username=owner, db=store)
+    return len(by_aavid)
+
+
+def upsert_authorized_accounts(
+    accounts: Iterable[Dict[str, Any]],
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> List[Dict[str, Any]]:
+    store = db or SQLiteStore()
+    saved: List[Dict[str, Any]] = []
+    for item in accounts or []:
+        if not isinstance(item, dict):
+            continue
+        aid = str(
+            item.get("aavid")
+            or item.get("advertiser_id")
+            or item.get("advertiserId")
+            or ""
+        ).strip()
+        if not aid.isdigit():
+            continue
+        saved.append(
+            ensure_qianchuan_account(
+                aid,
+                account_name=(
+                    item.get("account_name")
+                    or item.get("advertiser_name")
+                    or item.get("advertiserName")
+                    or item.get("name")
+                    or ""
+                ),
+                owner_username=owner_username,
+                seen=True,
+                db=store,
+            )
+        )
+    return saved

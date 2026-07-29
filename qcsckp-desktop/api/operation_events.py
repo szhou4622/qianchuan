@@ -184,9 +184,16 @@ def upsert_operation_event(data: Dict[str, Any], db: Optional[SQLiteStore] = Non
             )
         except ValueError:
             plan_system = "unknown"
+    aavid = str(data.get("aavid") or data.get("aadvid") or "").strip()
+    account_uid = str(data.get("account_uid") or "").strip()
+    if aavid and not account_uid:
+        from services.qianchuan_accounts import ensure_qianchuan_account
+
+        account_uid = ensure_qianchuan_account(aavid, db=store)["account_uid"]
     row = {
         "event_uid": uid,
-        "aavid": str(data.get("aavid") or data.get("aadvid") or "").strip(),
+        "aavid": aavid,
+        "account_uid": account_uid,
         "ad_id": str(data.get("ad_id") or "").strip(),
         "target_uid": target_uid,
         "promotion_scene": str(data.get("promotion_scene") or "").strip(),
@@ -339,6 +346,9 @@ def query_operation_events_page(
     aid = str(aavid or "").strip()
     if not aid:
         return 0, []
+    from services.qianchuan_accounts import get_qianchuan_account
+
+    account = get_qianchuan_account(aid)
     try:
         p = max(1, int(page))
     except Exception:
@@ -349,6 +359,9 @@ def query_operation_events_page(
         ps = 50
     where = ["aavid = ?"]
     params: List[Any] = [aid]
+    if account:
+        where.append("account_uid = ?")
+        params.append(str(account.get("account_uid") or ""))
     target = str(target_uid or "").strip()
     if target:
         where.append("target_uid = ?")
@@ -415,24 +428,38 @@ def get_operation_event(event_id: Any, aavid: Any = None) -> Optional[Dict[str, 
     aid = str(aavid or "").strip()
     if aid:
         where["aavid"] = aid
+        from services.qianchuan_accounts import get_qianchuan_account
+
+        account = get_qianchuan_account(aid)
+        if account:
+            where["account_uid"] = str(account.get("account_uid") or "")
     return SQLiteStore().select_one(TABLE, where=where)
 
 
 def list_operation_accounts() -> List[str]:
     init_sqlite_schema()
     migrate_legacy_operation_runs()
-    rows = SQLiteStore().execute(
-        "SELECT aavid FROM account_operation_event WHERE aavid <> '' "
-        "UNION SELECT aadvid AS aavid FROM pmc_ad_detail_basic WHERE aadvid <> '' ORDER BY aavid",
-        fetch=True,
-    ) or []
-    return [str(x["aavid"]) for x in rows]
+    from services.qianchuan_accounts import list_qianchuan_accounts
+
+    return [
+        str(item.get("aavid") or "")
+        for item in list_qianchuan_accounts()
+        if str(item.get("aavid") or "")
+    ]
 
 
 def operation_sync_state(aavid: Any) -> Dict[str, Any]:
     init_sqlite_schema()
     aid = str(aavid or "").strip()
-    row = SQLiteStore().select_one("platform_log_sync_state", where={"aavid": aid}) if aid else None
+    row = None
+    if aid:
+        from services.qianchuan_accounts import get_qianchuan_account
+
+        account = get_qianchuan_account(aid)
+        where = {"aavid": aid}
+        if account:
+            where["account_uid"] = str(account.get("account_uid") or "")
+        row = SQLiteStore().select_one("platform_log_sync_state", where=where)
     return row or {
         "aavid": aid,
         "coverage_from": "",
@@ -444,7 +471,8 @@ def operation_sync_state(aavid: Any) -> Dict[str, Any]:
 
 
 def update_platform_sync_state(aavid: Any, **values: Any) -> None:
-    init_sqlite_schema()
+    store = SQLiteStore()
+    init_sqlite_schema(database=store.config["database"])
     aid = str(aavid or "").strip()
     if not aid:
         return
@@ -452,11 +480,20 @@ def update_platform_sync_state(aavid: Any, **values: Any) -> None:
         "coverage_from", "coverage_to", "last_sync_at", "last_status", "last_error",
         "discovered_page_url", "discovered_api_url", "discovered_request_json",
     }
-    data = {"aavid": aid}
+    from services.qianchuan_accounts import ensure_qianchuan_account
+
+    data = {
+        "aavid": aid,
+        "account_uid": ensure_qianchuan_account(aid, db=store)["account_uid"],
+    }
     for key, value in values.items():
         if key in allowed:
             data[key] = _json(value) if key == "discovered_request_json" else str(value or "")
-    SQLiteStore().insert_or_update("platform_log_sync_state", data, unique_fields=["aavid"])
+    store.insert_or_update(
+        "platform_log_sync_state",
+        data,
+        unique_fields=["account_uid", "aavid"],
+    )
 
 
 def export_operation_events_csv(**filters: Any) -> str:
