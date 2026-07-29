@@ -256,6 +256,49 @@ def _normalize_materials(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return result
 
 
+def _candidate_materials(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """返回卡片最初命中的完整候选池，兼容功能上线前创建的任务。"""
+    raw_candidates = payload.get("candidate_materials")
+    if isinstance(raw_candidates, list) and raw_candidates:
+        return _normalize_materials({"materials": raw_candidates})
+    return _normalize_materials(payload)
+
+
+def _selected_material_ids(
+    payload: Dict[str, Any],
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """按候选池顺序返回有效选择；旧任务默认全选。"""
+    candidate_rows = candidates if candidates is not None else _candidate_materials(payload)
+    candidate_ids = [
+        str(material.get("material_id") or "")
+        for material in candidate_rows
+        if str(material.get("material_id") or "")
+    ]
+    raw_selected = payload.get("selected_material_ids")
+    if not isinstance(raw_selected, list):
+        return candidate_ids
+    selected_set = {
+        str(material_id or "").strip()
+        for material_id in raw_selected
+        if str(material_id or "").strip()
+    }
+    return [material_id for material_id in candidate_ids if material_id in selected_set]
+
+
+def _selected_materials(
+    payload: Dict[str, Any],
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    candidate_rows = candidates if candidates is not None else _candidate_materials(payload)
+    selected_ids = set(_selected_material_ids(payload, candidate_rows))
+    return [
+        dict(material)
+        for material in candidate_rows
+        if str(material.get("material_id") or "") in selected_ids
+    ]
+
+
 class FeishuApiError(RuntimeError):
     pass
 
@@ -586,11 +629,17 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         "unknown": "待确认",
     }.get(str(task.get("plan_system") or "unknown"), "待确认")
     level_text = "商品级" if str(task.get("trigger_level") or "material") == "product" else "素材级"
-    materials = _normalize_materials(task)
+    candidates = _candidate_materials(task)
+    selected_ids = _selected_material_ids(task, candidates)
+    selected_set = set(selected_ids)
     material_lines: List[str] = []
-    for index, material in enumerate(materials):
+    for index, material in enumerate(candidates):
         name = str(material.get("material_name") or "未命名素材")[:160]
-        line = f"{index + 1}. {name}\n素材ID：{material['material_id']}"
+        selected_mark = "【已选】" if material["material_id"] in selected_set else "【未选】"
+        line = (
+            f"{selected_mark} {index + 1}. {name}"
+            f"\n素材ID：{material['material_id']}"
+        )
         product_name = str(material.get("product_name") or "")
         product_id = str(material.get("product_id") or "")
         if product_name or product_id:
@@ -619,7 +668,10 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
     summary_lines.extend(
         [
             "",
-            f"本卡追投素材（{len(material_lines)}条）：",
+            (
+                f"候选素材（{len(material_lines)}条，"
+                f"当前已选{len(selected_ids)}条）："
+            ),
             "\n".join(material_lines),
             "",
             f"策略：{task.get('strategy_name') or trigger.get('strategy_title') or '追投策略命中'}",
@@ -686,6 +738,55 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         )
     if status == "pending":
         base = {"task_uid": str(task.get("task_uid") or ""), "nonce": str(task.get("action_nonce") or "")}
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    "**选择素材：** 默认全选。可点击下方编号切换，"
+                    "也可一键全选或清空；至少选择1条后才能确认追投。"
+                ),
+            }
+        )
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "全选"},
+                        "type": "primary",
+                        "value": {**base, "action": "select_all"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "清空选择"},
+                        "value": {**base, "action": "clear_selection"},
+                    },
+                ],
+            }
+        )
+        for start in range(0, len(candidates), 5):
+            actions: List[Dict[str, Any]] = []
+            for offset, material in enumerate(candidates[start : start + 5]):
+                index = start + offset + 1
+                material_id = str(material.get("material_id") or "")
+                selected = material_id in selected_set
+                actions.append(
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": f"{'取消' if selected else '选择'} {index}",
+                        },
+                        "type": "primary" if selected else "default",
+                        "value": {
+                            **base,
+                            "action": "toggle_material",
+                            "material_id": material_id,
+                        },
+                    }
+                )
+            elements.append({"tag": "action", "actions": actions})
         elements.append(
             {
                 "tag": "action",
@@ -1126,6 +1227,7 @@ class LocalFeishuBridge:
             nonce=str(value.get("nonce") or ""),
             action=str(value.get("action") or ""),
             operator_open_id=open_id,
+            material_id=str(value.get("material_id") or ""),
         )
         if result.get("update"):
             threading.Thread(
@@ -1558,6 +1660,10 @@ def create_local_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
     ):
         return {"success": False, "message": "账户、计划、素材或策略快照不完整"}
     payload["materials"] = materials
+    payload["candidate_materials"] = materials
+    payload["selected_material_ids"] = [
+        str(material["material_id"]) for material in materials
+    ]
     payload["material_id"] = materials[0]["material_id"]
     payload["material_name"] = materials[0]["material_name"]
     payload.setdefault("promotion_scene", "live")
@@ -1659,6 +1765,7 @@ def handle_local_card_action(
     nonce: str,
     action: str,
     operator_open_id: str,
+    material_id: str = "",
 ) -> Dict[str, Any]:
     account = _account_key(account_username)
     profile = _profile_for(account)
@@ -1689,13 +1796,77 @@ def handle_local_card_action(
         }
     if action == "view":
         return {"success": True, "message": "已展开详情", "update": True, "expanded": True}
+    selection_actions = {"select_all", "clear_selection", "toggle_material"}
+    if action in selection_actions:
+        conn = _db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status,payload_json FROM local_retarget_task "
+                "WHERE task_uid=? AND account_username=?",
+                (task_uid, account),
+            ).fetchone()
+            if not current:
+                conn.rollback()
+                return {"success": False, "message": "任务不存在"}
+            if str(current["status"]) != "pending":
+                conn.rollback()
+                return {
+                    "success": False,
+                    "message": "该卡片已经处理，不能再调整素材",
+                    "update": True,
+                }
+            payload = _loads(current["payload_json"], {})
+            if not isinstance(payload, dict):
+                conn.rollback()
+                return {"success": False, "message": "任务素材快照损坏"}
+            candidates = _candidate_materials(payload)
+            candidate_ids = [
+                str(material.get("material_id") or "") for material in candidates
+            ]
+            selected_ids = _selected_material_ids(payload, candidates)
+            if action == "select_all":
+                selected_ids = candidate_ids
+                message = f"已全选{len(selected_ids)}条素材"
+            elif action == "clear_selection":
+                selected_ids = []
+                message = "已清空选择，请至少选择1条素材"
+            else:
+                toggle_id = str(material_id or "").strip()
+                if not toggle_id or toggle_id not in candidate_ids:
+                    conn.rollback()
+                    return {"success": False, "message": "素材不在本次候选池中"}
+                selected_set = set(selected_ids)
+                if toggle_id in selected_set:
+                    selected_set.remove(toggle_id)
+                else:
+                    selected_set.add(toggle_id)
+                selected_ids = [
+                    candidate_id
+                    for candidate_id in candidate_ids
+                    if candidate_id in selected_set
+                ]
+                message = f"当前已选择{len(selected_ids)}条素材"
+            payload["candidate_materials"] = candidates
+            payload["selected_material_ids"] = selected_ids
+            now_text = _dt(_now())
+            conn.execute(
+                "UPDATE local_retarget_task SET payload_json=?,updated_at=? "
+                "WHERE task_uid=? AND account_username=? AND status='pending'",
+                (_json(payload), now_text, task_uid, account),
+            )
+            conn.commit()
+            return {"success": True, "message": message, "update": True}
+        finally:
+            conn.close()
     if action not in {"approve", "reject"}:
         return {"success": False, "message": "未知的卡片操作"}
     conn = _db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute(
-            "SELECT status FROM local_retarget_task WHERE task_uid=? AND account_username=?",
+            "SELECT status,payload_json FROM local_retarget_task "
+            "WHERE task_uid=? AND account_username=?",
             (task_uid, account),
         ).fetchone()
         if not current:
@@ -1711,12 +1882,44 @@ def handle_local_card_action(
             }
         now_text = _dt(_now())
         if action == "approve":
+            payload = _loads(current["payload_json"], {})
+            if not isinstance(payload, dict):
+                conn.rollback()
+                return {"success": False, "message": "任务素材快照损坏"}
+            candidates = _candidate_materials(payload)
+            selected_materials = _selected_materials(payload, candidates)
+            if not selected_materials:
+                conn.rollback()
+                return {
+                    "success": False,
+                    "message": "请至少选择1条素材后再确认追投",
+                    "update": True,
+                }
+            selected_ids = [
+                str(material["material_id"]) for material in selected_materials
+            ]
+            payload["candidate_materials"] = candidates
+            payload["selected_material_ids"] = selected_ids
+            payload["materials"] = selected_materials
+            payload["material_id"] = selected_materials[0]["material_id"]
+            payload["material_name"] = selected_materials[0]["material_name"]
+            payload["selection_snapshot"] = {
+                "candidate_count": len(candidates),
+                "selected_count": len(selected_materials),
+                "selected_material_ids": selected_ids,
+                "selected_by": operator_open_id,
+                "selected_at": now_text,
+            }
             conn.execute(
                 "UPDATE local_retarget_task SET status='approved_queued',approved_by=?,"
-                "approved_at=?,updated_at=? WHERE task_uid=? AND status='pending'",
-                (operator_open_id, now_text, now_text, task_uid),
+                "approved_at=?,payload_json=?,updated_at=? "
+                "WHERE task_uid=? AND status='pending'",
+                (operator_open_id, now_text, _json(payload), now_text, task_uid),
             )
-            message = "已确认，工具将重新复核后执行追投"
+            message = (
+                f"已确认{len(selected_materials)}条素材，"
+                "工具将重新复核后执行追投"
+            )
         else:
             conn.execute(
                 "UPDATE local_retarget_task SET status='rejected',approved_by=?,"

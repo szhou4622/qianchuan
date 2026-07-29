@@ -206,6 +206,151 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertIn("\n计划ID：20002\n", summary)
         self.assertIn("\n素材ID：70000\n", summary)
         self.assertNotIn("\n   素材ID", summary)
+        self.assertIn("当前已选3条", summary)
+        self.assertIn("【已选】 1. 测试视频1", summary)
+        action_values = [
+            action.get("value") or {}
+            for element in card["elements"]
+            if element.get("tag") == "action"
+            for action in element.get("actions") or []
+        ]
+        self.assertTrue(
+            any(value.get("action") == "select_all" for value in action_values)
+        )
+        self.assertTrue(
+            any(
+                value.get("action") == "toggle_material"
+                and value.get("material_id") == "70002"
+                for value in action_values
+            )
+        )
+
+    def test_owner_can_select_one_partial_or_all_before_approval(self):
+        created = bridge.create_local_retarget_task(task_payload(4))
+        self.assertTrue(created["success"])
+        task_uid = created["data"]["task_uid"]
+        nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+
+        cleared = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(cleared["success"])
+        empty_approval = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertFalse(empty_approval["success"])
+        self.assertIn("至少选择1条", empty_approval["message"])
+
+        selected_one = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="toggle_material",
+            operator_open_id="ou_owner",
+            material_id="70002",
+        )
+        self.assertTrue(selected_one["success"])
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        self.assertIn("1条素材", approved["message"])
+        pulled = bridge.pull_local_retarget_task()["data"]
+        self.assertEqual(["70002"], [item["material_id"] for item in pulled["materials"]])
+        self.assertEqual(4, pulled["selection_snapshot"]["candidate_count"])
+        self.assertEqual(1, pulled["selection_snapshot"]["selected_count"])
+
+        partial_payload = {**task_payload(4), "strategy_id": "strategy-partial"}
+        partial = bridge.create_local_retarget_task(partial_payload)
+        partial_uid = partial["data"]["task_uid"]
+        partial_nonce = bridge._task_row(partial_uid, "tool-user-a")["action_nonce"]
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=partial_uid,
+            nonce=partial_nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        for material_id in ("70000", "70003"):
+            result = bridge.handle_local_card_action(
+                "tool-user-a",
+                task_uid=partial_uid,
+                nonce=partial_nonce,
+                action="toggle_material",
+                operator_open_id="ou_owner",
+                material_id=material_id,
+            )
+            self.assertTrue(result["success"])
+        partial_task = bridge._task_payload(
+            bridge._task_row(partial_uid, "tool-user-a")
+        )
+        self.assertEqual(["70000", "70003"], partial_task["selected_material_ids"])
+
+        all_payload = {**task_payload(4), "strategy_id": "strategy-all"}
+        all_task = bridge.create_local_retarget_task(all_payload)
+        all_uid = all_task["data"]["task_uid"]
+        all_nonce = bridge._task_row(all_uid, "tool-user-a")["action_nonce"]
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=all_uid,
+            nonce=all_nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        selected_all = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=all_uid,
+            nonce=all_nonce,
+            action="select_all",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(selected_all["success"])
+        all_task_payload = bridge._task_payload(
+            bridge._task_row(all_uid, "tool-user-a")
+        )
+        self.assertEqual(4, len(all_task_payload["selected_material_ids"]))
+
+    def test_material_selection_rejects_forged_or_late_changes(self):
+        created = bridge.create_local_retarget_task(task_payload(3))
+        task_uid = created["data"]["task_uid"]
+        nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+        forged = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="toggle_material",
+            operator_open_id="ou_owner",
+            material_id="forged-material",
+        )
+        self.assertFalse(forged["success"])
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        late = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        self.assertFalse(late["success"])
 
 
 class LocalFeishuBindingTests(unittest.TestCase):

@@ -618,6 +618,9 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
     payload["material_count"] = len(materials)
     trigger_snapshot = task.get("trigger_snapshot") or {}
     query_snapshot = dict(task.get("query_snapshot") or {})
+    selection_snapshot = task.get("selection_snapshot")
+    if isinstance(selection_snapshot, dict):
+        query_snapshot["feishu_material_selection"] = selection_snapshot
     query_snapshot["revalidated_at"] = ended_at
     query_snapshot["revalidated_material_rows"] = rows
     _insert_run(
