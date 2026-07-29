@@ -32,7 +32,7 @@ from utils.sqlite_store import init_sqlite_schema
 PROFILE_FILE = os.path.join(DATA_DIR, "feishu_local_profiles.json")
 TERMINAL_STATUSES = {"succeeded", "failed", "rejected", "expired", "cancelled"}
 ACTIVE_STATUSES = {"pending", "approved_queued", "claimed", "executing"}
-MAX_RETARGET_GROUPS = 10
+MAX_RETARGET_GROUPS = 20
 VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 PROFILE_LOCK = threading.RLock()
 TASK_LOCK = threading.RLock()
@@ -852,8 +852,9 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
             {
                 "tag": "markdown",
                 "content": (
-                    "**多组追投：** 选择素材后点“保存为新追投组”；"
-                    "保存后会自动清空，可继续选择下一组。各组允许素材重叠，"
+                    "**追投方式：** “合并为1条追投”会把当前所选素材放进同一条计划；"
+                    "“选中素材分别追投”会为每条所选素材各建一个单素材组。"
+                    "保存后会自动清空，可继续选择下一组；各组允许素材重叠，"
                     f"最多{MAX_RETARGET_GROUPS}组、每组最多20条。"
                 ),
             }
@@ -904,9 +905,17 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 "actions": [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": "保存为新追投组"},
+                        "text": {"tag": "plain_text", "content": "合并为1条追投"},
                         "type": "primary",
                         "value": {**base, "action": "save_group"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": f"选中素材分别追投（{len(selected_ids)}条）",
+                        },
+                        "value": {**base, "action": "save_individual_groups"},
                     },
                 ],
             }
@@ -2033,6 +2042,7 @@ def handle_local_card_action(
         "clear_selection",
         "toggle_material",
         "save_group",
+        "save_individual_groups",
         "remove_group",
     }
     if action in edit_actions:
@@ -2086,49 +2096,91 @@ def handle_local_card_action(
                     if candidate_id in selected_set
                 ]
                 message = f"当前已选择{len(selected_ids)}条素材"
-            elif action == "save_group":
+            elif action in {"save_group", "save_individual_groups"}:
                 if not selected_ids:
                     conn.rollback()
                     return {
                         "success": False,
-                        "message": "请至少选择1条素材后再保存追投组",
+                        "message": "请至少选择1条素材后再选择追投方式",
                         "update": True,
                     }
-                if len(groups) >= MAX_RETARGET_GROUPS:
-                    conn.rollback()
-                    return {
-                        "success": False,
-                        "message": f"一张卡片最多保存{MAX_RETARGET_GROUPS}条追投组",
-                        "update": True,
-                    }
-                signature = _group_signature(selected_ids)
-                if signature in {
+                existing_signatures = {
                     _group_signature(group["material_ids"]) for group in groups
-                }:
-                    conn.rollback()
-                    return {
-                        "success": False,
-                        "message": "这一组素材已经保存过，请调整选择后再保存",
-                        "update": True,
+                }
+                if action == "save_individual_groups":
+                    new_ids = [
+                        material_id
+                        for material_id in selected_ids
+                        if _group_signature([material_id]) not in existing_signatures
+                    ]
+                    if not new_ids:
+                        conn.rollback()
+                        return {
+                            "success": False,
+                            "message": "所选素材的单条追投组都已经保存过",
+                            "update": True,
+                        }
+                    if len(groups) + len(new_ids) > MAX_RETARGET_GROUPS:
+                        conn.rollback()
+                        return {
+                            "success": False,
+                            "message": (
+                                f"所选素材需要新增{len(new_ids)}条单素材追投，"
+                                f"但本卡只剩{MAX_RETARGET_GROUPS - len(groups)}个追投组名额"
+                            ),
+                            "update": True,
+                        }
+                    candidate_by_id = {
+                        str(material.get("material_id") or ""): dict(material)
+                        for material in candidates
                     }
-                selected_set = set(selected_ids)
-                group_materials = [
-                    dict(material)
-                    for material in candidates
-                    if str(material.get("material_id") or "") in selected_set
-                ]
-                groups.append(
-                    {
-                        "group_uid": uuid.uuid4().hex,
-                        "material_ids": list(selected_ids),
-                        "materials": group_materials,
-                    }
-                )
-                selected_ids = []
-                message = (
-                    f"已保存第{len(groups)}组（{len(group_materials)}条素材），"
-                    "可继续选择下一组"
-                )
+                    for material_id in new_ids:
+                        groups.append(
+                            {
+                                "group_uid": uuid.uuid4().hex,
+                                "material_ids": [material_id],
+                                "materials": [candidate_by_id[material_id]],
+                            }
+                        )
+                    selected_ids = []
+                    message = (
+                        f"已将{len(new_ids)}条素材分别保存为"
+                        f"{len(new_ids)}个单素材追投组"
+                    )
+                else:
+                    if len(groups) >= MAX_RETARGET_GROUPS:
+                        conn.rollback()
+                        return {
+                            "success": False,
+                            "message": f"一张卡片最多保存{MAX_RETARGET_GROUPS}条追投组",
+                            "update": True,
+                        }
+                    signature = _group_signature(selected_ids)
+                    if signature in existing_signatures:
+                        conn.rollback()
+                        return {
+                            "success": False,
+                            "message": "这一组素材已经保存过，请调整选择后再保存",
+                            "update": True,
+                        }
+                    selected_set = set(selected_ids)
+                    group_materials = [
+                        dict(material)
+                        for material in candidates
+                        if str(material.get("material_id") or "") in selected_set
+                    ]
+                    groups.append(
+                        {
+                            "group_uid": uuid.uuid4().hex,
+                            "material_ids": list(selected_ids),
+                            "materials": group_materials,
+                        }
+                    )
+                    selected_ids = []
+                    message = (
+                        f"已合并保存第{len(groups)}组（{len(group_materials)}条素材），"
+                        "该组将创建1条追投计划"
+                    )
             else:
                 remove_uid = str(group_uid or "").strip()
                 next_groups = [

@@ -227,6 +227,14 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertTrue(
             any(value.get("action") == "save_group" for value in action_values)
         )
+        self.assertTrue(
+            any(
+                value.get("action") == "save_individual_groups"
+                for value in action_values
+            )
+        )
+        self.assertIn("合并为1条追投", raw)
+        self.assertIn("选中素材分别追投（3条）", raw)
 
     def test_owner_can_select_one_partial_or_all_before_approval(self):
         created = bridge.create_local_retarget_task(task_payload(4))
@@ -532,6 +540,94 @@ class LocalFeishuTaskTests(unittest.TestCase):
         pulled = bridge.pull_local_retarget_task()["data"]
         self.assertEqual(
             [1, 3],
+            [len(group["material_ids"]) for group in pulled["retarget_groups"]],
+        )
+
+    def test_selected_materials_can_be_split_into_individual_retarget_groups(self):
+        for scene in ("product", "live"):
+            with self.subTest(scene=scene):
+                created = bridge.create_local_retarget_task(
+                    {
+                        **task_payload(4),
+                        "strategy_id": f"strategy-individual-{scene}",
+                        "promotion_scene": scene,
+                    }
+                )
+                task_uid = created["data"]["task_uid"]
+                nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+                split = bridge.handle_local_card_action(
+                    "tool-user-a",
+                    task_uid=task_uid,
+                    nonce=nonce,
+                    action="save_individual_groups",
+                    operator_open_id="ou_owner",
+                )
+                self.assertTrue(split["success"])
+                self.assertIn("4个单素材追投组", split["message"])
+                approved = bridge.handle_local_card_action(
+                    "tool-user-a",
+                    task_uid=task_uid,
+                    nonce=nonce,
+                    action="approve",
+                    operator_open_id="ou_owner",
+                )
+                self.assertTrue(approved["success"])
+                pulled = bridge.pull_local_retarget_task()["data"]
+                self.assertEqual(scene, pulled["promotion_scene"])
+                self.assertEqual(
+                    [1, 1, 1, 1],
+                    [
+                        len(group["material_ids"])
+                        for group in pulled["retarget_groups"]
+                    ],
+                )
+
+    def test_individual_and_merged_groups_can_be_combined_on_one_card(self):
+        created = bridge.create_local_retarget_task(
+            {**task_payload(4), "strategy_id": "strategy-individual-and-merged"}
+        )
+        task_uid = created["data"]["task_uid"]
+        nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        for material_id in ("70000", "70001"):
+            bridge.handle_local_card_action(
+                "tool-user-a",
+                task_uid=task_uid,
+                nonce=nonce,
+                action="toggle_material",
+                operator_open_id="ou_owner",
+                material_id=material_id,
+            )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="save_individual_groups",
+            operator_open_id="ou_owner",
+        )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="select_all",
+            operator_open_id="ou_owner",
+        )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        pulled = bridge.pull_local_retarget_task()["data"]
+        self.assertEqual(
+            [1, 1, 4],
             [len(group["material_ids"]) for group in pulled["retarget_groups"]],
         )
 
