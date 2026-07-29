@@ -931,7 +931,10 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             scoped_rows = [
                 row
                 for row in target_rows
-                if row_is_in_test_scope(row)
+                if (
+                    action_mode == "card_confirm"
+                    or row_is_in_test_scope(row)
+                )
                 and str(row.get("id") or "").strip() not in ("", "-2")
             ]
             hit_rows: List[Dict[str, Any]] = []

@@ -520,6 +520,44 @@ def assert_test_scope(aavid: str, material_id: str) -> None:
         raise RuntimeError("当前素材不在本地真实追投白名单")
 
 
+def assert_test_task_scope(
+    aavid: str,
+    material_ids: List[str],
+    candidate_material_ids: List[str],
+) -> None:
+    """测试模式按账户和卡片候选快照校验用户最终选择的素材。"""
+    if not TEST_MODE:
+        return
+    if not TEST_AAVID:
+        raise RuntimeError("本地测试模式未配置账户白名单")
+    if str(aavid).strip() != TEST_AAVID:
+        raise RuntimeError("当前账户不在本地真实追投白名单")
+
+    selected = {
+        str(material_id or "").strip()
+        for material_id in material_ids
+        if str(material_id or "").strip()
+    }
+    candidates = {
+        str(material_id or "").strip()
+        for material_id in candidate_material_ids
+        if str(material_id or "").strip()
+    }
+    if not selected:
+        raise RuntimeError("本地真实追投缺少素材")
+    if candidates:
+        unexpected = sorted(selected - candidates)
+        if unexpected:
+            raise RuntimeError(
+                "所选素材不属于本次飞书提醒候选：" + "、".join(unexpected)
+            )
+        return
+
+    # 兼容升级前没有 candidate_materials 快照的单素材任务。
+    for material_id in selected:
+        assert_test_scope(aavid, material_id)
+
+
 def row_is_in_test_scope(row: Dict[str, Any]) -> bool:
     if not TEST_MODE:
         return True
@@ -539,6 +577,7 @@ def consume_live_retarget_batch_once(
     task_uid: str,
     aavid: str,
     material_ids: List[str],
+    candidate_material_ids: List[str] | None = None,
 ) -> None:
     """
     在真正调用千川前为整批素材原子消费一次性授权。
@@ -550,8 +589,11 @@ def consume_live_retarget_batch_once(
     ids = [str(item or "").strip() for item in material_ids if str(item or "").strip()]
     if not ids:
         raise RuntimeError("本地真实追投缺少素材")
-    for material_id in ids:
-        assert_test_scope(aavid, material_id)
+    assert_test_task_scope(
+        aavid,
+        ids,
+        list(candidate_material_ids or []),
+    )
     if not ALLOW_LIVE_RETARGET:
         raise RuntimeError("本地真实追投开关未开启，本次只允许模拟验收")
     os.makedirs(DATA_DIR, exist_ok=True)

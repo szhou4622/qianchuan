@@ -19,7 +19,7 @@ from api.rule_retargeting_config import evaluate_trigger, load_rule_retargeting_
 from config import DATA_DIR
 from services.cloud_retarget_client import pull_retarget_task, report_retarget_task
 from services.local_test_guard import (
-    assert_test_scope,
+    assert_test_task_scope,
     consume_live_retarget_batch_once,
 )
 from services.retargeting_rule_runner import (
@@ -243,6 +243,20 @@ def _task_retarget_groups(task: Dict[str, Any]) -> List[Dict[str, Any]]:
     return groups
 
 
+def _task_candidate_material_ids(task: Dict[str, Any]) -> List[str]:
+    raw_candidates = task.get("candidate_materials")
+    candidates = _task_materials(
+        {
+            "materials": (
+                raw_candidates
+                if isinstance(raw_candidates, list) and raw_candidates
+                else task.get("materials")
+            )
+        }
+    )
+    return [item["material_id"] for item in candidates]
+
+
 def _validate_group_rate_capacity(
     task: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -319,6 +333,7 @@ async def _execute_grouped_task(
             str(task.get("task_uid") or ""),
             str(task.get("aavid") or ""),
             unique_material_ids,
+            _task_candidate_material_ids(task),
         )
     except Exception as exc:
         return {
@@ -418,8 +433,11 @@ def _validate_task(
         raise RuntimeError("追投任务没有有效素材")
     if len(materials) > 20:
         raise RuntimeError("单个追投计划最多支持20条素材")
-    for material in materials:
-        assert_test_scope(aavid, material["material_id"])
+    assert_test_task_scope(
+        aavid,
+        [material["material_id"] for material in materials],
+        _task_candidate_material_ids(task),
+    )
     target: Dict[str, Any] = {}
     if target_uid:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
@@ -668,7 +686,12 @@ async def _execute_task(
     strategy_name = str(strategy.get("title") or task.get("strategy_name") or "飞书确认追投")
     try:
         if not _skip_live_guard:
-            consume_live_retarget_batch_once(task_uid, aavid, material_ids)
+            consume_live_retarget_batch_once(
+                task_uid,
+                aavid,
+                material_ids,
+                _task_candidate_material_ids(task),
+            )
     except Exception as exc:
         failure = {
             "success": False,

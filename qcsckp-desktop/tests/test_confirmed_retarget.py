@@ -191,7 +191,7 @@ class RetargetConfigTests(unittest.TestCase):
             return_value=FakeDashboard(),
         ), patch(
             "services.retargeting_rule_runner.row_is_in_test_scope",
-            return_value=True,
+            side_effect=lambda row: str(row.get("id") or "") == "m1",
         ), patch(
             "services.retargeting_rule_runner.evaluate_trigger",
             return_value=True,
@@ -547,7 +547,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "services.retarget_task_worker.rate_limit_should_skip",
             return_value=rate_limited,
         ), patch(
-            "services.retarget_task_worker.assert_test_scope",
+            "services.retarget_task_worker.assert_test_task_scope",
         ):
             return retarget_task_worker._validate_task(self.task, object())
 
@@ -610,7 +610,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "services.retarget_task_worker.rate_limit_should_skip",
             return_value=False,
         ) as rate_limit, patch(
-            "services.retarget_task_worker.assert_test_scope",
+            "services.retarget_task_worker.assert_test_task_scope",
         ):
             _cfg, _strategy, rows = retarget_task_worker._validate_task(
                 task,
@@ -706,7 +706,12 @@ class RetargetWorkerValidationTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual("追投成功（2条素材）", result["message"])
-        consume.assert_called_once_with("task-batch", "10001", ["m1", "m2"])
+        consume.assert_called_once_with(
+            "task-batch",
+            "10001",
+            ["m1", "m2"],
+            ["m1", "m2"],
+        )
         self.assertEqual(1, len(service.calls))
         self.assertEqual(["m1", "m2"], service.calls[0]["material_ids"])
         self.assertEqual(1, insert_run.call_count)
@@ -814,6 +819,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         consume.assert_called_once_with(
             "task-three-groups",
             "10001",
+            [f"m{i}" for i in range(1, 11)],
             [f"m{i}" for i in range(1, 11)],
         )
         self.assertEqual(
@@ -970,6 +976,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "task-live-mixed-groups",
             "10001",
             ["m1", "m2", "m3"],
+            ["m1", "m2", "m3"],
         )
 
     def validate_target_plan_system(self, plan_system):
@@ -1006,7 +1013,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
                 "trigger_query_period": "1h",
                 "strategies": [strategy],
             },
-        ), patch("services.retarget_task_worker.assert_test_scope"):
+        ), patch("services.retarget_task_worker.assert_test_task_scope"):
             return retarget_task_worker._validate_task(task, FakeStore())
 
     def test_unknown_plan_system_blocks_execution(self):
@@ -1148,6 +1155,31 @@ class LocalTestGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "账户"):
                 local_test_guard.assert_test_scope("1002", "2001")
 
+    def test_card_scope_allows_any_selected_material_from_candidate_snapshot(self):
+        with patch.multiple(
+            local_test_guard,
+            TEST_MODE=True,
+            TEST_AAVID="1001",
+            TEST_MATERIAL_ID="2001",
+        ):
+            local_test_guard.assert_test_task_scope(
+                "1001",
+                ["2002", "2003"],
+                ["2001", "2002", "2003"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "不属于本次飞书提醒候选"):
+                local_test_guard.assert_test_task_scope(
+                    "1001",
+                    ["9999"],
+                    ["2001", "2002", "2003"],
+                )
+            with self.assertRaisesRegex(RuntimeError, "账户"):
+                local_test_guard.assert_test_task_scope(
+                    "1002",
+                    ["2002"],
+                    ["2001", "2002", "2003"],
+                )
+
     def test_live_permission_can_only_be_consumed_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             consumed = os.path.join(tmp, "live_retarget_consumed.json")
@@ -1164,6 +1196,28 @@ class LocalTestGuardTests(unittest.TestCase):
                 self.assertTrue(os.path.isfile(consumed))
                 with self.assertRaisesRegex(RuntimeError, "已被消费"):
                     local_test_guard.consume_live_retarget_once("task-1", "1001", "2001")
+
+    def test_live_permission_accepts_multiple_selected_card_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            consumed = os.path.join(tmp, "live_retarget_consumed.json")
+            with patch.multiple(
+                local_test_guard,
+                TEST_MODE=True,
+                TEST_AAVID="1001",
+                TEST_MATERIAL_ID="2001",
+                ALLOW_LIVE_RETARGET=True,
+                DATA_DIR=tmp,
+                CONSUMED_FILE=consumed,
+            ):
+                local_test_guard.consume_live_retarget_batch_once(
+                    "task-batch",
+                    "1001",
+                    ["2002", "2003"],
+                    ["2001", "2002", "2003"],
+                )
+                with open(consumed, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.assertEqual(["2002", "2003"], payload["material_ids"])
 
     def test_live_permission_defaults_to_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
