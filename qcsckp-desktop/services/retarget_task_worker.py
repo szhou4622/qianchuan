@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,8 +26,10 @@ from services.retargeting_rule_runner import (
     _insert_run,
     _interval_from_root_cfg,
     _interval_window_and_max,
+    rate_limit_remaining_capacity,
     rate_limit_record_success,
     rate_limit_should_skip,
+    rate_limit_strategy_remaining_capacity,
     rate_limit_strategy_record_success,
     rate_limit_strategy_should_skip,
     resolve_ad_id_for_aavid,
@@ -217,6 +220,178 @@ def _task_materials(task: Dict[str, Any]) -> List[Dict[str, Any]]:
         if len(materials) >= 20:
             break
     return materials
+
+
+def _task_retarget_groups(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_groups = task.get("retarget_groups")
+    if not isinstance(raw_groups, list):
+        return []
+    groups: List[Dict[str, Any]] = []
+    for index, raw_group in enumerate(raw_groups[:10]):
+        if not isinstance(raw_group, dict):
+            continue
+        materials = _task_materials({"materials": raw_group.get("materials") or []})
+        if not materials:
+            continue
+        groups.append(
+            {
+                "group_uid": str(raw_group.get("group_uid") or f"group-{index + 1}")[:64],
+                "materials": materials,
+                "material_ids": [item["material_id"] for item in materials],
+            }
+        )
+    return groups
+
+
+def _validate_group_rate_capacity(
+    task: Dict[str, Any],
+    cfg: Dict[str, Any],
+    strategy: Dict[str, Any],
+    groups: List[Dict[str, Any]],
+    db: SQLiteStore,
+) -> None:
+    occurrences = Counter(
+        material_id
+        for group in groups
+        for material_id in group.get("material_ids") or []
+    )
+    target_uid = str(task.get("target_uid") or "legacy_unscoped")
+    retargeting = task.get("retargeting") if isinstance(task.get("retargeting"), dict) else {}
+    for material_id, requested_count in occurrences.items():
+        if bool(cfg.get("per_strategy_rate_limit")):
+            window_seconds, max_count = _interval_window_and_max(retargeting)
+            remaining = rate_limit_strategy_remaining_capacity(
+                db,
+                material_id,
+                str(strategy.get("id") or ""),
+                window_seconds,
+                max_count,
+                target_uid,
+            )
+        else:
+            window_seconds, max_count = _interval_from_root_cfg(cfg)
+            remaining = rate_limit_remaining_capacity(
+                db,
+                material_id,
+                window_seconds,
+                max_count,
+                target_uid,
+            )
+        if remaining is not None and requested_count > remaining:
+            raise RuntimeError(
+                f"素材 {material_id} 在本批次被安排{requested_count}次，"
+                f"但当前限频只剩{remaining}次"
+            )
+
+
+async def _execute_grouped_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+    groups: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if str(task.get("promotion_scene") or "live") != "product":
+        return {
+            "success": False,
+            "message": "多组追投第一版仅支持商品全域计划",
+            "detail": "",
+            "step": "unsupported_scene",
+        }
+    validations: List[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]] = []
+    group_tasks: List[Dict[str, Any]] = []
+    try:
+        for index, group in enumerate(groups):
+            materials = [dict(item) for item in group["materials"]]
+            group_task = {
+                **task,
+                "task_uid": f"{task.get('task_uid')}:group:{index + 1}",
+                "materials": materials,
+                "material_id": materials[0]["material_id"],
+                "material_name": materials[0].get("material_name") or "",
+                "retarget_groups": [],
+                "group_index": index + 1,
+                "parent_task_uid": str(task.get("task_uid") or ""),
+            }
+            group_tasks.append(group_task)
+            validations.append(await asyncio.to_thread(_validate_task, group_task, db))
+        cfg, strategy, _rows = validations[0]
+        _validate_group_rate_capacity(task, cfg, strategy, groups, db)
+        unique_material_ids = list(
+            dict.fromkeys(
+                material_id
+                for group in groups
+                for material_id in group["material_ids"]
+            )
+        )
+        consume_live_retarget_batch_once(
+            str(task.get("task_uid") or ""),
+            str(task.get("aavid") or ""),
+            unique_material_ids,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": str(exc),
+            "detail": traceback.format_exc(),
+            "step": "group_revalidate",
+        }
+
+    group_results: List[Dict[str, Any]] = []
+    regulate_task_ids: List[str] = []
+    for index, (group_task, validation) in enumerate(
+        zip(group_tasks, validations),
+        start=1,
+    ):
+        result = await _execute_task(
+            group_task,
+            db,
+            _prevalidated=validation,
+            _skip_live_guard=True,
+            _allow_groups=False,
+        )
+        ids = [
+            str(value)
+            for value in result.get("regulate_task_ids") or []
+            if str(value or "")
+        ]
+        if not ids and result.get("regulate_task_id"):
+            ids = [str(result["regulate_task_id"])]
+        regulate_task_ids.extend(ids)
+        group_results.append(
+            {
+                "group_index": index,
+                "group_uid": groups[index - 1]["group_uid"],
+                "material_ids": groups[index - 1]["material_ids"],
+                "success": bool(result.get("success")),
+                "message": str(result.get("message") or ""),
+                "regulate_task_ids": ids,
+                "result": result,
+            }
+        )
+    succeeded_count = sum(1 for result in group_results if result["success"])
+    all_succeeded = succeeded_count == len(group_results)
+    return {
+        "success": all_succeeded,
+        "message": (
+            f"{len(group_results)}条追投全部创建成功"
+            if all_succeeded
+            else f"多组追投完成：成功{succeeded_count}条，失败{len(group_results) - succeeded_count}条"
+        ),
+        "detail": "" if all_succeeded else _json(group_results),
+        "step": "done" if all_succeeded else "partial_failure",
+        "regulate_task_id": regulate_task_ids[0] if regulate_task_ids else "",
+        "regulate_task_ids": regulate_task_ids,
+        "group_results": group_results,
+        "group_count": len(group_results),
+        "successful_group_count": succeeded_count,
+        "material_count": sum(len(group["material_ids"]) for group in groups),
+        "unique_material_count": len(
+            {
+                material_id
+                for group in groups
+                for material_id in group["material_ids"]
+            }
+        ),
+    }
 
 
 def _validate_task(
@@ -422,7 +597,19 @@ def _validate_task(
     return cfg, strategy, [rows_by_id[item["material_id"]] for item in materials]
 
 
-async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]:
+async def _execute_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+    *,
+    _prevalidated: Optional[
+        Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]
+    ] = None,
+    _skip_live_guard: bool = False,
+    _allow_groups: bool = True,
+) -> Dict[str, Any]:
+    groups = _task_retarget_groups(task)
+    if _allow_groups and len(groups) > 1:
+        return await _execute_grouped_task(task, db, groups)
     task_uid = str(task.get("task_uid") or "")
     aavid = str(task.get("aavid") or "")
     ad_id = str(task.get("ad_id") or "")
@@ -442,7 +629,10 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
     strategy: Dict[str, Any] = {}
     rows: List[Dict[str, Any]] = []
     try:
-        cfg, strategy, rows = await asyncio.to_thread(_validate_task, task, db)
+        if _prevalidated is None:
+            cfg, strategy, rows = await asyncio.to_thread(_validate_task, task, db)
+        else:
+            cfg, strategy, rows = _prevalidated
     except Exception as exc:
         failure = {"success": False, "message": str(exc), "detail": traceback.format_exc(), "step": "revalidate"}
         ended_at = _now()
@@ -484,7 +674,8 @@ async def _execute_task(task: Dict[str, Any], db: SQLiteStore) -> Dict[str, Any]
     retargeting = task.get("retargeting") or {}
     strategy_name = str(strategy.get("title") or task.get("strategy_name") or "飞书确认追投")
     try:
-        consume_live_retarget_batch_once(task_uid, aavid, material_ids)
+        if not _skip_live_guard:
+            consume_live_retarget_batch_once(task_uid, aavid, material_ids)
     except Exception as exc:
         failure = {
             "success": False,

@@ -224,6 +224,9 @@ class LocalFeishuTaskTests(unittest.TestCase):
                 for value in action_values
             )
         )
+        self.assertTrue(
+            any(value.get("action") == "save_group" for value in action_values)
+        )
 
     def test_owner_can_select_one_partial_or_all_before_approval(self):
         created = bridge.create_local_retarget_task(task_payload(4))
@@ -266,7 +269,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
             operator_open_id="ou_owner",
         )
         self.assertTrue(approved["success"])
-        self.assertIn("1条素材", approved["message"])
+        self.assertIn("1条追投组", approved["message"])
         pulled = bridge.pull_local_retarget_task()["data"]
         self.assertEqual(["70002"], [item["material_id"] for item in pulled["materials"]])
         self.assertEqual(4, pulled["selection_snapshot"]["candidate_count"])
@@ -367,7 +370,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
         preview_card = bridge.build_task_card(bridge._task_payload(row))
         preview_raw = json.dumps(preview_card, ensure_ascii=False)
         self.assertIn("安全测试：本卡只验证素材选择，不会触发千川操作", preview_raw)
-        self.assertIn("确认选择（不追投）", preview_raw)
+        self.assertIn("确认1组（不追投）", preview_raw)
         self.assertNotIn("确认追投", preview_raw)
 
         bridge.handle_local_card_action(
@@ -405,7 +408,82 @@ class LocalFeishuTaskTests(unittest.TestCase):
         )
         self.assertIn("素材自选安全测试 · 测试完成", finished_card)
         self.assertIn("测试结果", finished_card)
-        self.assertNotIn("确认选择（不追投）", finished_card)
+        self.assertNotIn("确认1组（不追投）", finished_card)
+
+    def test_one_candidate_batch_can_create_three_overlapping_retarget_groups(self):
+        created = bridge.create_local_retarget_task(
+            {**task_payload(10), "strategy_id": "strategy-three-groups"}
+        )
+        task_uid = created["data"]["task_uid"]
+        nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        for material_id in ("70000", "70001", "70002"):
+            bridge.handle_local_card_action(
+                "tool-user-a",
+                task_uid=task_uid,
+                nonce=nonce,
+                action="toggle_material",
+                operator_open_id="ou_owner",
+                material_id=material_id,
+            )
+        first_group = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="save_group",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(first_group["success"])
+
+        for material_id in ("70000", "70003", "70004", "70005", "70006"):
+            bridge.handle_local_card_action(
+                "tool-user-a",
+                task_uid=task_uid,
+                nonce=nonce,
+                action="toggle_material",
+                operator_open_id="ou_owner",
+                material_id=material_id,
+            )
+        second_group = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="save_group",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(second_group["success"])
+
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="select_all",
+            operator_open_id="ou_owner",
+        )
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        pulled = bridge.pull_local_retarget_task()["data"]
+        groups = pulled["retarget_groups"]
+        self.assertEqual([3, 5, 10], [len(group["material_ids"]) for group in groups])
+        self.assertIn("70000", groups[0]["material_ids"])
+        self.assertIn("70000", groups[1]["material_ids"])
+        self.assertIn("70000", groups[2]["material_ids"])
+        self.assertEqual(10, len(pulled["materials"]))
+        self.assertEqual(3, pulled["selection_snapshot"]["group_count"])
+        self.assertEqual(18, pulled["selection_snapshot"]["group_material_count"])
 
 
 class LocalFeishuBindingTests(unittest.TestCase):

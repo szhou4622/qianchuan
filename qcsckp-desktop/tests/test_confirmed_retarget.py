@@ -715,6 +715,162 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             [call.args[1] for call in record_limit.call_args_list],
         )
 
+    def test_three_overlapping_groups_submit_three_product_retargets(self):
+        material_map = {
+            f"m{index}": {"material_id": f"m{index}", "material_name": f"素材{index}"}
+            for index in range(1, 11)
+        }
+        groups = [
+            {"group_uid": "g1", "materials": [material_map[f"m{i}"] for i in (1, 2, 3)]},
+            {"group_uid": "g2", "materials": [material_map[f"m{i}"] for i in (1, 4, 5, 6, 7)]},
+            {"group_uid": "g3", "materials": list(material_map.values())},
+        ]
+        task = {
+            **self.task,
+            "task_uid": "task-three-groups",
+            "target_uid": "target-product",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "materials": list(material_map.values()),
+            "retarget_groups": groups,
+            "trigger_snapshot": {},
+            "query_snapshot": {},
+        }
+        cfg = {
+            "enabled": True,
+            "browser_headless": True,
+            "per_strategy_rate_limit": False,
+        }
+
+        class FakeResult:
+            def __init__(self, regulate_task_id):
+                self.success = True
+                self.regulate_task_id = regulate_task_id
+
+            def asdict(self):
+                return {
+                    "success": True,
+                    "message": "追投成功",
+                    "detail": "",
+                    "step": "done",
+                    "headless": True,
+                }
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResult(f"regulate-{len(self.calls)}")
+
+            async def close(self):
+                return None
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {"sanitized_page_url": "https://example.test/product"}
+                return None
+
+        service = FakeService()
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}]),
+        ) as validate, patch(
+            "services.retarget_task_worker.rate_limit_remaining_capacity",
+            return_value=10,
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ) as consume, patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retarget_task_worker._insert_run",
+        ) as insert_run, patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 10),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_record_success",
+        ):
+            result = asyncio.run(
+                retarget_task_worker._execute_task(task, FakeStore())
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(3, result["group_count"])
+        self.assertEqual(18, result["material_count"])
+        self.assertEqual(10, result["unique_material_count"])
+        self.assertEqual(
+            [
+                ["m1", "m2", "m3"],
+                ["m1", "m4", "m5", "m6", "m7"],
+                [f"m{i}" for i in range(1, 11)],
+            ],
+            [call["material_ids"] for call in service.calls],
+        )
+        self.assertEqual(3, validate.call_count)
+        self.assertEqual(3, insert_run.call_count)
+        consume.assert_called_once_with(
+            "task-three-groups",
+            "10001",
+            [f"m{i}" for i in range(1, 11)],
+        )
+        self.assertEqual(
+            ["regulate-1", "regulate-2", "regulate-3"],
+            result["regulate_task_ids"],
+        )
+
+    def test_overlapping_groups_respect_remaining_rate_limit_capacity(self):
+        task = {
+            **self.task,
+            "task_uid": "task-rate-capacity",
+            "target_uid": "target-product",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "materials": [
+                {"material_id": "m1", "material_name": "素材1"},
+                {"material_id": "m2", "material_name": "素材2"},
+            ],
+            "retarget_groups": [
+                {
+                    "group_uid": "g1",
+                    "materials": [{"material_id": "m1", "material_name": "素材1"}],
+                },
+                {
+                    "group_uid": "g2",
+                    "materials": [
+                        {"material_id": "m1", "material_name": "素材1"},
+                        {"material_id": "m2", "material_name": "素材2"},
+                    ],
+                },
+            ],
+        }
+        cfg = {
+            "enabled": True,
+            "browser_headless": True,
+            "per_strategy_rate_limit": False,
+        }
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}]),
+        ), patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 1),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_remaining_capacity",
+            return_value=1,
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ) as consume:
+            result = asyncio.run(
+                retarget_task_worker._execute_task(task, object())
+            )
+        self.assertFalse(result["success"])
+        self.assertEqual("group_revalidate", result["step"])
+        self.assertIn("本批次被安排2次", result["message"])
+        consume.assert_not_called()
+
     def validate_target_plan_system(self, plan_system):
         strategy = copy.deepcopy(self.strategy)
         strategy["target_uid"] = "target-1"

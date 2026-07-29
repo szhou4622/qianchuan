@@ -260,6 +260,41 @@ def rate_limit_should_skip(
     return False
 
 
+def rate_limit_remaining_capacity(
+    db: SQLiteStore,
+    material_id: str,
+    window_seconds: int,
+    max_count: int,
+    target_uid: Optional[str] = None,
+) -> Optional[int]:
+    """返回当前窗口剩余次数；None 表示不限频。"""
+    if window_seconds <= 0 or max_count <= 0:
+        return None
+    mid = str(material_id).strip()
+    if not mid:
+        return 0
+    rows = db.select(
+        table=RATE_LIMIT_TABLE,
+        where="target_uid = ? AND material_id = ?",
+        params=(_rate_target_uid(target_uid), mid),
+        limit=1,
+    )
+    if not rows:
+        return max_count
+    row = rows[0]
+    start_dt = _parse_beijing_dt(str(row.get("limit_started_at") or ""))
+    now_dt = _parse_beijing_dt(_beijing_now_str())
+    if start_dt is None or now_dt is None:
+        return max_count
+    if start_dt + timedelta(seconds=window_seconds) <= now_dt:
+        return max_count
+    try:
+        use_count = int(row.get("use_count") or 0)
+    except (TypeError, ValueError):
+        use_count = 0
+    return max(0, max_count - use_count)
+
+
 def rate_limit_record_success(
     db: SQLiteStore,
     material_id: str,
@@ -388,6 +423,43 @@ def rate_limit_strategy_should_skip(
     if window_end > now_dt:
         return use_count >= max_count
     return False
+
+
+def rate_limit_strategy_remaining_capacity(
+    db: SQLiteStore,
+    material_id: str,
+    strategy_id: str,
+    window_seconds: int,
+    max_count: int,
+    target_uid: Optional[str] = None,
+) -> Optional[int]:
+    """返回指定策略当前窗口剩余次数；None 表示不限频。"""
+    if window_seconds <= 0 or max_count <= 0:
+        return None
+    mid = str(material_id).strip()
+    sid = str(strategy_id).strip()
+    if not mid or not sid:
+        return 0
+    rows = db.select(
+        table=RATE_LIMIT_STRATEGY_TABLE,
+        where="target_uid = ? AND material_id = ? AND strategy_id = ?",
+        params=(_rate_target_uid(target_uid), mid, sid),
+        limit=1,
+    )
+    if not rows:
+        return max_count
+    row = rows[0]
+    start_dt = _parse_beijing_dt(str(row.get("limit_started_at") or ""))
+    now_dt = _parse_beijing_dt(_beijing_now_str())
+    if start_dt is None or now_dt is None:
+        return max_count
+    if start_dt + timedelta(seconds=window_seconds) <= now_dt:
+        return max_count
+    try:
+        use_count = int(row.get("use_count") or 0)
+    except (TypeError, ValueError):
+        use_count = 0
+    return max(0, max_count - use_count)
 
 
 def rate_limit_strategy_record_success(

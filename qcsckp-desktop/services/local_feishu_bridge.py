@@ -32,6 +32,7 @@ from utils.sqlite_store import init_sqlite_schema
 PROFILE_FILE = os.path.join(DATA_DIR, "feishu_local_profiles.json")
 TERMINAL_STATUSES = {"succeeded", "failed", "rejected", "expired", "cancelled"}
 ACTIVE_STATUSES = {"pending", "approved_queued", "claimed", "executing"}
+MAX_RETARGET_GROUPS = 10
 VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 PROFILE_LOCK = threading.RLock()
 TASK_LOCK = threading.RLock()
@@ -297,6 +298,56 @@ def _selected_materials(
         for material in candidate_rows
         if str(material.get("material_id") or "") in selected_ids
     ]
+
+
+def _retarget_groups(
+    payload: Dict[str, Any],
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """返回已保存的追投组；组之间允许素材重叠，组内按候选池顺序去重。"""
+    candidate_rows = candidates if candidates is not None else _candidate_materials(payload)
+    candidate_by_id = {
+        str(material.get("material_id") or ""): dict(material)
+        for material in candidate_rows
+        if str(material.get("material_id") or "")
+    }
+    candidate_ids = list(candidate_by_id)
+    raw_groups = payload.get("retarget_groups")
+    if not isinstance(raw_groups, list):
+        return []
+    groups: List[Dict[str, Any]] = []
+    for index, raw_group in enumerate(raw_groups[:MAX_RETARGET_GROUPS]):
+        if not isinstance(raw_group, dict):
+            continue
+        raw_ids = raw_group.get("material_ids")
+        if not isinstance(raw_ids, list):
+            raw_ids = [
+                item.get("material_id")
+                for item in (raw_group.get("materials") or [])
+                if isinstance(item, dict)
+            ]
+        requested = {
+            str(material_id or "").strip()
+            for material_id in raw_ids
+            if str(material_id or "").strip()
+        }
+        material_ids = [
+            material_id for material_id in candidate_ids if material_id in requested
+        ][:20]
+        if not material_ids:
+            continue
+        groups.append(
+            {
+                "group_uid": str(raw_group.get("group_uid") or f"group-{index + 1}")[:64],
+                "material_ids": material_ids,
+                "materials": [candidate_by_id[material_id] for material_id in material_ids],
+            }
+        )
+    return groups
+
+
+def _group_signature(material_ids: List[str]) -> Tuple[str, ...]:
+    return tuple(str(material_id or "") for material_id in material_ids if material_id)
 
 
 class FeishuApiError(RuntimeError):
@@ -640,6 +691,11 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
     candidates = _candidate_materials(task)
     selected_ids = _selected_material_ids(task, candidates)
     selected_set = set(selected_ids)
+    groups = _retarget_groups(task, candidates)
+    candidate_indexes = {
+        str(material.get("material_id") or ""): index + 1
+        for index, material in enumerate(candidates)
+    }
     material_lines: List[str] = []
     for index, material in enumerate(candidates):
         name = str(material.get("material_name") or "未命名素材")[:160]
@@ -683,6 +739,23 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 f"当前已选{len(selected_ids)}条）："
             ),
             "\n".join(material_lines),
+            "",
+            f"已保存追投组（{len(groups)}条）：",
+            (
+                "\n".join(
+                    (
+                        f"第{index + 1}组（{len(group['material_ids'])}条素材）："
+                        + "、".join(
+                            str(candidate_indexes[material_id])
+                            for material_id in group["material_ids"]
+                            if material_id in candidate_indexes
+                        )
+                    )
+                    for index, group in enumerate(groups)
+                )
+                if groups
+                else "尚未保存；当前选择可直接确认成1条追投"
+            ),
             "",
             f"策略：{task.get('strategy_name') or trigger.get('strategy_title') or '追投策略命中'}",
         ]
@@ -731,6 +804,30 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 + "\n".join(f"{i + 1}. `{value}`" for i, value in enumerate(task_ids)),
             }
         )
+    group_results = result.get("group_results")
+    if isinstance(group_results, list) and group_results:
+        result_lines: List[str] = []
+        for item in group_results[:MAX_RETARGET_GROUPS]:
+            if not isinstance(item, dict):
+                continue
+            group_index = int(item.get("group_index") or len(result_lines) + 1)
+            group_ids = "、".join(
+                str(value)
+                for value in item.get("regulate_task_ids") or []
+                if str(value or "")
+            )
+            result_lines.append(
+                f"第{group_index}组：{'成功' if item.get('success') else '失败'}"
+                f"｜{item.get('message') or ''}"
+                + (f"｜任务ID {group_ids}" if group_ids else "")
+            )
+        if result_lines:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "**分组执行结果：**\n" + "\n".join(result_lines),
+                }
+            )
     if expanded:
         elements.extend(
             [
@@ -755,9 +852,9 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
             {
                 "tag": "markdown",
                 "content": (
-                    "**选择素材：** 默认全选。可点击下方编号切换，"
-                    "也可一键全选或清空；至少选择1条后才能"
-                    f"{'确认选择' if preview_only else '确认追投'}。"
+                    "**多组追投：** 选择素材后点“保存为新追投组”；"
+                    "保存后会自动清空，可继续选择下一组。各组允许素材重叠，"
+                    f"最多{MAX_RETARGET_GROUPS}组、每组最多20条。"
                 ),
             }
         )
@@ -807,9 +904,54 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 "actions": [
                     {
                         "tag": "button",
+                        "text": {"tag": "plain_text", "content": "保存为新追投组"},
+                        "type": "primary",
+                        "value": {**base, "action": "save_group"},
+                    },
+                ],
+            }
+        )
+        for start in range(0, len(groups), 5):
+            elements.append(
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {
+                                "tag": "plain_text",
+                                "content": f"删除第{start + offset + 1}组",
+                            },
+                            "value": {
+                                **base,
+                                "action": "remove_group",
+                                "group_uid": group["group_uid"],
+                            },
+                        }
+                        for offset, group in enumerate(groups[start : start + 5])
+                    ],
+                }
+            )
+        existing_signatures = {
+            _group_signature(group["material_ids"]) for group in groups
+        }
+        current_is_new_group = bool(selected_ids) and (
+            _group_signature(selected_ids) not in existing_signatures
+        )
+        approval_group_count = len(groups) + int(current_is_new_group)
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
                         "text": {
                             "tag": "plain_text",
-                            "content": "确认选择（不追投）" if preview_only else "确认追投",
+                            "content": (
+                                f"确认{approval_group_count}组（不追投）"
+                                if preview_only
+                                else f"确认创建{approval_group_count}条追投"
+                            ),
                         },
                         "type": "primary",
                         "value": {**base, "action": "approve"},
@@ -1252,6 +1394,7 @@ class LocalFeishuBridge:
             action=str(value.get("action") or ""),
             operator_open_id=open_id,
             material_id=str(value.get("material_id") or ""),
+            group_uid=str(value.get("group_uid") or ""),
         )
         if result.get("update"):
             threading.Thread(
@@ -1691,6 +1834,7 @@ def _create_local_retarget_task_for(
         return {"success": False, "message": "账户、计划、素材或策略快照不完整"}
     payload["materials"] = materials
     payload["candidate_materials"] = materials
+    payload["retarget_groups"] = []
     payload["selected_material_ids"] = [
         str(material["material_id"]) for material in materials
     ]
@@ -1822,7 +1966,7 @@ def send_local_material_selection_preview(account_username: str) -> Dict[str, An
             b"feishu-material-selection-preview-v1"
         ).hexdigest(),
         "rule_snapshot": {"preview_only": True},
-        "trigger_snapshot": {"reason": "验证全选、单选、部分选择和确认交互"},
+        "trigger_snapshot": {"reason": "验证同一候选池保存多个可重叠追投组"},
         "retargeting": {
             "method": "volume",
             "volume": {"total_budget_yuan": 100, "duration_hours": 24},
@@ -1834,7 +1978,7 @@ def send_local_material_selection_preview(account_username: str) -> Dict[str, An
                 "product_id": "preview-product",
                 "product_name": "安全测试商品",
             }
-            for index in range(1, 7)
+            for index in range(1, 11)
         ],
     }
     return _create_local_retarget_task_for(
@@ -1853,6 +1997,7 @@ def handle_local_card_action(
     action: str,
     operator_open_id: str,
     material_id: str = "",
+    group_uid: str = "",
 ) -> Dict[str, Any]:
     account = _account_key(account_username)
     profile = _profile_for(account)
@@ -1883,8 +2028,14 @@ def handle_local_card_action(
         }
     if action == "view":
         return {"success": True, "message": "已展开详情", "update": True, "expanded": True}
-    selection_actions = {"select_all", "clear_selection", "toggle_material"}
-    if action in selection_actions:
+    edit_actions = {
+        "select_all",
+        "clear_selection",
+        "toggle_material",
+        "save_group",
+        "remove_group",
+    }
+    if action in edit_actions:
         conn = _db()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1912,13 +2063,14 @@ def handle_local_card_action(
                 str(material.get("material_id") or "") for material in candidates
             ]
             selected_ids = _selected_material_ids(payload, candidates)
+            groups = _retarget_groups(payload, candidates)
             if action == "select_all":
                 selected_ids = candidate_ids
                 message = f"已全选{len(selected_ids)}条素材"
             elif action == "clear_selection":
                 selected_ids = []
                 message = "已清空选择，请至少选择1条素材"
-            else:
+            elif action == "toggle_material":
                 toggle_id = str(material_id or "").strip()
                 if not toggle_id or toggle_id not in candidate_ids:
                     conn.rollback()
@@ -1934,8 +2086,62 @@ def handle_local_card_action(
                     if candidate_id in selected_set
                 ]
                 message = f"当前已选择{len(selected_ids)}条素材"
+            elif action == "save_group":
+                if not selected_ids:
+                    conn.rollback()
+                    return {
+                        "success": False,
+                        "message": "请至少选择1条素材后再保存追投组",
+                        "update": True,
+                    }
+                if len(groups) >= MAX_RETARGET_GROUPS:
+                    conn.rollback()
+                    return {
+                        "success": False,
+                        "message": f"一张卡片最多保存{MAX_RETARGET_GROUPS}条追投组",
+                        "update": True,
+                    }
+                signature = _group_signature(selected_ids)
+                if signature in {
+                    _group_signature(group["material_ids"]) for group in groups
+                }:
+                    conn.rollback()
+                    return {
+                        "success": False,
+                        "message": "这一组素材已经保存过，请调整选择后再保存",
+                        "update": True,
+                    }
+                selected_set = set(selected_ids)
+                group_materials = [
+                    dict(material)
+                    for material in candidates
+                    if str(material.get("material_id") or "") in selected_set
+                ]
+                groups.append(
+                    {
+                        "group_uid": uuid.uuid4().hex,
+                        "material_ids": list(selected_ids),
+                        "materials": group_materials,
+                    }
+                )
+                selected_ids = []
+                message = (
+                    f"已保存第{len(groups)}组（{len(group_materials)}条素材），"
+                    "可继续选择下一组"
+                )
+            else:
+                remove_uid = str(group_uid or "").strip()
+                next_groups = [
+                    group for group in groups if group["group_uid"] != remove_uid
+                ]
+                if not remove_uid or len(next_groups) == len(groups):
+                    conn.rollback()
+                    return {"success": False, "message": "要删除的追投组不存在"}
+                groups = next_groups
+                message = f"已删除追投组，当前剩余{len(groups)}组"
             payload["candidate_materials"] = candidates
             payload["selected_material_ids"] = selected_ids
+            payload["retarget_groups"] = groups
             now_text = _dt(_now())
             conn.execute(
                 "UPDATE local_retarget_task SET payload_json=?,updated_at=? "
@@ -1975,31 +2181,78 @@ def handle_local_card_action(
                 return {"success": False, "message": "任务素材快照损坏"}
             candidates = _candidate_materials(payload)
             selected_materials = _selected_materials(payload, candidates)
-            if not selected_materials:
+            groups = _retarget_groups(payload, candidates)
+            if selected_materials:
+                selected_ids = [
+                    str(material["material_id"]) for material in selected_materials
+                ]
+                signature = _group_signature(selected_ids)
+                if signature not in {
+                    _group_signature(group["material_ids"]) for group in groups
+                }:
+                    if len(groups) >= MAX_RETARGET_GROUPS:
+                        conn.rollback()
+                        return {
+                            "success": False,
+                            "message": f"一张卡片最多确认{MAX_RETARGET_GROUPS}条追投组",
+                            "update": True,
+                        }
+                    groups.append(
+                        {
+                            "group_uid": uuid.uuid4().hex,
+                            "material_ids": selected_ids,
+                            "materials": [
+                                dict(material) for material in selected_materials
+                            ],
+                        }
+                    )
+            if not groups:
                 conn.rollback()
                 return {
                     "success": False,
-                    "message": "请至少选择1条素材后再确认追投",
+                    "message": "请至少选择1条素材或先保存一个追投组",
                     "update": True,
                 }
-            selected_ids = [
-                str(material["material_id"]) for material in selected_materials
+            grouped_ids = {
+                material_id
+                for group in groups
+                for material_id in group["material_ids"]
+            }
+            grouped_materials = [
+                dict(material)
+                for material in candidates
+                if str(material.get("material_id") or "") in grouped_ids
             ]
             payload["candidate_materials"] = candidates
-            payload["selected_material_ids"] = selected_ids
-            payload["materials"] = selected_materials
-            payload["material_id"] = selected_materials[0]["material_id"]
-            payload["material_name"] = selected_materials[0]["material_name"]
+            payload["selected_material_ids"] = []
+            payload["retarget_groups"] = groups
+            payload["materials"] = grouped_materials
+            payload["material_id"] = grouped_materials[0]["material_id"]
+            payload["material_name"] = grouped_materials[0]["material_name"]
             payload["selection_snapshot"] = {
                 "candidate_count": len(candidates),
-                "selected_count": len(selected_materials),
-                "selected_material_ids": selected_ids,
+                "selected_count": len(grouped_materials),
+                "selected_material_ids": [
+                    material["material_id"] for material in grouped_materials
+                ],
+                "group_count": len(groups),
+                "group_material_count": sum(
+                    len(group["material_ids"]) for group in groups
+                ),
+                "groups": [
+                    {
+                        "group_uid": group["group_uid"],
+                        "material_ids": group["material_ids"],
+                    }
+                    for group in groups
+                ],
                 "selected_by": operator_open_id,
                 "selected_at": now_text,
             }
             if payload.get("preview_only") is True:
                 message = (
-                    f"素材选择测试成功：已选择{len(selected_materials)}条；"
+                    f"多组素材测试成功：已确认{len(groups)}组，"
+                    f"共{sum(len(group['material_ids']) for group in groups)}次素材投放；"
                     "本卡未进入千川追投队列"
                 )
                 conn.execute(
@@ -2025,8 +2278,8 @@ def handle_local_card_action(
                     (operator_open_id, now_text, _json(payload), now_text, task_uid),
                 )
                 message = (
-                    f"已确认{len(selected_materials)}条素材，"
-                    "工具将重新复核后执行追投"
+                    f"已确认{len(groups)}条追投组，"
+                    "工具将逐组复核并创建多条追投"
                 )
         else:
             conn.execute(
