@@ -608,6 +608,7 @@ def _trigger_summary(trigger: Dict[str, Any], *, expanded: bool = False) -> str:
 
 def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str, Any]:
     status = str(task.get("status") or "pending")
+    preview_only = task.get("preview_only") is True
     status_text = {
         "pending": "等待确认",
         "approved_queued": "已批准，等待工具执行",
@@ -619,9 +620,16 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         "expired": "已过期",
         "cancelled": "已取消",
     }.get(status, status)
+    if preview_only:
+        if status == "pending":
+            status_text = "等待选择"
+        elif status == "cancelled" and task.get("selection_snapshot"):
+            status_text = "测试完成"
     template = "green" if status == "succeeded" else (
         "red" if status in {"failed", "expired", "rejected"} else "blue"
     )
+    if preview_only and status == "cancelled" and task.get("selection_snapshot"):
+        template = "green"
     scene_text = "推商品" if str(task.get("promotion_scene") or "live") == "product" else "推直播"
     plan_system_text = {
         "global": "全域",
@@ -658,6 +666,8 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         f"计划体系：{plan_system_text}",
         f"触发层级：{level_text}",
     ]
+    if preview_only:
+        summary_lines.insert(0, "安全测试：本卡只验证素材选择，不会触发千川操作")
     if task.get("product_id"):
         summary_lines.extend(
             [
@@ -699,7 +709,10 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         elements.append(
             {
                 "tag": "markdown",
-                "content": f"**执行结果：** {str(task.get('result_message'))[:500]}",
+                "content": (
+                    f"**{'测试结果' if preview_only else '执行结果'}：** "
+                    f"{str(task.get('result_message'))[:500]}"
+                ),
             }
         )
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -743,7 +756,8 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 "tag": "markdown",
                 "content": (
                     "**选择素材：** 默认全选。可点击下方编号切换，"
-                    "也可一键全选或清空；至少选择1条后才能确认追投。"
+                    "也可一键全选或清空；至少选择1条后才能"
+                    f"{'确认选择' if preview_only else '确认追投'}。"
                 ),
             }
         )
@@ -793,13 +807,19 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 "actions": [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": "确认追投"},
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "确认选择（不追投）" if preview_only else "确认追投",
+                        },
                         "type": "primary",
                         "value": {**base, "action": "approve"},
                     },
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": "暂不追投"},
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "结束测试" if preview_only else "暂不追投",
+                        },
                         "type": "danger",
                         "value": {**base, "action": "reject"},
                     },
@@ -821,7 +841,11 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
             "template": template,
             "title": {
                 "tag": "plain_text",
-                "content": f"千川追投提醒 · {scene_text} · {plan_system_text} · {status_text}",
+                "content": (
+                    f"素材自选安全测试 · {status_text}"
+                    if preview_only
+                    else f"千川追投提醒 · {scene_text} · {plan_system_text} · {status_text}"
+                ),
             },
         },
         "elements": elements,
@@ -1626,17 +1650,23 @@ def _expire_local_tasks(account_username: str) -> List[str]:
     return expired
 
 
-def create_local_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
-    account = _MANAGER.account
-    bridge = _MANAGER.bridge()
+def _create_local_retarget_task_for(
+    account_username: str,
+    bridge: LocalFeishuBridge,
+    payload: Dict[str, Any],
+    *,
+    require_connected: bool,
+) -> Dict[str, Any]:
+    account = _account_key(account_username)
     if not account or bridge is None:
         return {"success": False, "message": "请先登录工具账号并配置飞书长连接"}
-    status = bridge.status()
-    if not status.get("connected"):
-        return {
-            "success": False,
-            "message": "飞书长连接尚未就绪，请在“飞书绑定”页面确认状态为已连接",
-        }
+    if require_connected:
+        status = bridge.status()
+        if not status.get("connected"):
+            return {
+                "success": False,
+                "message": "飞书长连接尚未就绪，请在“飞书绑定”页面确认状态为已连接",
+            }
     profile = bridge.profile()
     if not profile.get("authorized_open_id") and not profile.get("groups"):
         return {"success": False, "message": "请先完成飞书个人或群绑定"}
@@ -1756,6 +1786,63 @@ def create_local_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
             "sent_count": len(messages),
         },
     }
+
+
+def create_local_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    account = _MANAGER.account
+    bridge = _MANAGER.bridge()
+    if not account or bridge is None:
+        return {"success": False, "message": "请先登录工具账号并配置飞书长连接"}
+    return _create_local_retarget_task_for(
+        account,
+        bridge,
+        payload,
+        require_connected=True,
+    )
+
+
+def send_local_material_selection_preview(account_username: str) -> Dict[str, Any]:
+    """发送一张有本机任务记录、确认后绝不会进入执行队列的素材自选测试卡。"""
+    account = _account_key(account_username)
+    bridge = LocalFeishuBridge(account)
+    preview_id = uuid.uuid4().hex
+    payload = {
+        "preview_only": True,
+        "aavid": "preview-only",
+        "ad_id": "preview-only",
+        "target_uid": "feishu-material-selection-preview",
+        "account_name": "安全交互测试",
+        "plan_name": "素材自选功能测试（不会追投）",
+        "promotion_scene": "product",
+        "plan_system": "global",
+        "trigger_level": "material",
+        "strategy_id": f"selection-preview-{preview_id}",
+        "strategy_name": "飞书多素材自选交互测试",
+        "strategy_hash": hashlib.sha256(
+            b"feishu-material-selection-preview-v1"
+        ).hexdigest(),
+        "rule_snapshot": {"preview_only": True},
+        "trigger_snapshot": {"reason": "验证全选、单选、部分选择和确认交互"},
+        "retargeting": {
+            "method": "volume",
+            "volume": {"total_budget_yuan": 100, "duration_hours": 24},
+        },
+        "materials": [
+            {
+                "material_id": f"preview-material-{index:02d}",
+                "material_name": f"测试素材 {index}（不会追投）",
+                "product_id": "preview-product",
+                "product_name": "安全测试商品",
+            }
+            for index in range(1, 7)
+        ],
+    }
+    return _create_local_retarget_task_for(
+        account,
+        bridge,
+        payload,
+        require_connected=False,
+    )
 
 
 def handle_local_card_action(
@@ -1910,16 +1997,37 @@ def handle_local_card_action(
                 "selected_by": operator_open_id,
                 "selected_at": now_text,
             }
-            conn.execute(
-                "UPDATE local_retarget_task SET status='approved_queued',approved_by=?,"
-                "approved_at=?,payload_json=?,updated_at=? "
-                "WHERE task_uid=? AND status='pending'",
-                (operator_open_id, now_text, _json(payload), now_text, task_uid),
-            )
-            message = (
-                f"已确认{len(selected_materials)}条素材，"
-                "工具将重新复核后执行追投"
-            )
+            if payload.get("preview_only") is True:
+                message = (
+                    f"素材选择测试成功：已选择{len(selected_materials)}条；"
+                    "本卡未进入千川追投队列"
+                )
+                conn.execute(
+                    "UPDATE local_retarget_task SET status='cancelled',approved_by=?,"
+                    "approved_at=?,payload_json=?,active_dedupe_key=NULL,"
+                    "finished_at=?,result_message=?,updated_at=? "
+                    "WHERE task_uid=? AND status='pending'",
+                    (
+                        operator_open_id,
+                        now_text,
+                        _json(payload),
+                        now_text,
+                        message,
+                        now_text,
+                        task_uid,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "UPDATE local_retarget_task SET status='approved_queued',approved_by=?,"
+                    "approved_at=?,payload_json=?,updated_at=? "
+                    "WHERE task_uid=? AND status='pending'",
+                    (operator_open_id, now_text, _json(payload), now_text, task_uid),
+                )
+                message = (
+                    f"已确认{len(selected_materials)}条素材，"
+                    "工具将重新复核后执行追投"
+                )
         else:
             conn.execute(
                 "UPDATE local_retarget_task SET status='rejected',approved_by=?,"

@@ -352,6 +352,61 @@ class LocalFeishuTaskTests(unittest.TestCase):
         )
         self.assertFalse(late["success"])
 
+    def test_preview_selection_finishes_without_entering_execution_queue(self):
+        preview_payload = {
+            **task_payload(3),
+            "strategy_id": "strategy-preview-only",
+            "preview_only": True,
+        }
+        created = bridge.create_local_retarget_task(preview_payload)
+        self.assertTrue(created["success"])
+        task_uid = created["data"]["task_uid"]
+        row = bridge._task_row(task_uid, "tool-user-a")
+        nonce = row["action_nonce"]
+
+        preview_card = bridge.build_task_card(bridge._task_payload(row))
+        preview_raw = json.dumps(preview_card, ensure_ascii=False)
+        self.assertIn("安全测试：本卡只验证素材选择，不会触发千川操作", preview_raw)
+        self.assertIn("确认选择（不追投）", preview_raw)
+        self.assertNotIn("确认追投", preview_raw)
+
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="toggle_material",
+            operator_open_id="ou_owner",
+            material_id="70001",
+        )
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        self.assertIn("未进入千川追投队列", approved["message"])
+        self.assertIsNone(bridge.pull_local_retarget_task()["data"])
+
+        finished = bridge._task_row(task_uid, "tool-user-a")
+        self.assertEqual("cancelled", finished["status"])
+        self.assertIsNone(finished["active_dedupe_key"])
+        finished_card = json.dumps(
+            bridge.build_task_card(bridge._task_payload(finished)),
+            ensure_ascii=False,
+        )
+        self.assertIn("素材自选安全测试 · 测试完成", finished_card)
+        self.assertIn("测试结果", finished_card)
+        self.assertNotIn("确认选择（不追投）", finished_card)
+
 
 class LocalFeishuBindingTests(unittest.TestCase):
     def setUp(self):
