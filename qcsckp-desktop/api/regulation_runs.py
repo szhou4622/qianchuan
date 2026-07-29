@@ -19,7 +19,9 @@ from config import CURRENT_VERSION
 from services.regulation_rule_runner import _insert_regulation_run
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.plan_system import normalize_plan_system
+from services.promotion_capability import record_target_capability
 from services.regulation_service import (
+    REGULATION_PROBE_VERSION,
     QianChuanRegulationStopService,
     RegulationRunResult,
     RegulationSessionOptions,
@@ -53,10 +55,15 @@ def _lookup_roi2_assist_task_row(db: SQLiteStore, assist_task_id: str) -> Option
     if not aid:
         return None
     rows = db.execute(
-        "SELECT * FROM pmc_roi2_assist_task WHERE assist_task_id = ? LIMIT 1",
+        "SELECT * FROM pmc_roi2_assist_task WHERE assist_task_id = ? "
+        "ORDER BY updated_at DESC, id DESC",
         (aid,),
         fetch=True,
     )
+    if len(rows) > 1:
+        raise ValueError(
+            "该调控任务ID同时属于多个监控计划，请从具体计划的任务列表发起停投"
+        )
     return dict(rows[0]) if rows else None
 
 
@@ -302,6 +309,7 @@ def run_immediate_regulation_stop_prepare(
         promotion_scene = "live"
     plan_system = normalize_plan_system(roi_row.get("plan_system") or "unknown")
     source_url: Optional[str] = None
+    target_row: Dict[str, Any] = {}
     if target_uid and target_uid != "legacy_unscoped":
         target_rows = db.execute(
             "SELECT * FROM promotion_target WHERE target_uid = ? LIMIT 1",
@@ -333,12 +341,6 @@ def run_immediate_regulation_stop_prepare(
             "success": False,
             "message": "计划体系尚未识别，已阻止停投；请重新打开计划详情完成识别",
         }
-    if plan_system == "chengfang":
-        return {
-            "success": False,
-            "message": "该计划属于千川乘方，乘方停投适配器尚未完成受控验证，已阻止提交",
-        }
-
     q_snap = _manual_regulation_query_snapshot_from_roi2_row(aid_in, roi_row)
     trig_snap = _json_dumps(
         {
@@ -433,6 +435,7 @@ def run_immediate_regulation_stop_prepare(
                         strategy_title=strategy_name,
                         target_uid=target_uid,
                         promotion_scene=promotion_scene,
+                        plan_system=plan_system,
                         source_url=source_url,
                     )
                 result_holder[0] = r
@@ -512,6 +515,32 @@ def run_immediate_regulation_stop_prepare(
         browser_headless_rule=browser_rule,
         trigger_source="manual",
     )
+
+    # 只有实际完成 batch 操作且服务端响应校验成功，才把本次可见浏览器
+    # 人工确认作为该目标、场景和体系的停投能力证据。失败、超时以及
+    # “原本已暂停”均不能提升权限。
+    if (
+        r.success
+        and r.step == "done"
+        and target_uid
+        and target_uid != "legacy_unscoped"
+        and target_row
+    ):
+        try:
+            record_target_capability(
+                db,
+                target_uid=target_uid,
+                action="regulation",
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+                probe_version=REGULATION_PROBE_VERSION,
+                verified_at=ended_at,
+            )
+        except Exception:
+            logger.exception(
+                "[手动停投] 写入目标级停投能力证据失败 target=%s",
+                target_uid,
+            )
 
     return {
         "success": bool(r.success),

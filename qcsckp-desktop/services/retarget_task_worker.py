@@ -37,6 +37,7 @@ from services.retargeting_rule_runner import (
 from services.retargeting_service import QianChuanRetargetingService
 from services.product_rule_engine import evaluate_product_strategy
 from services.plan_system import normalize_plan_system
+from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -345,14 +346,10 @@ async def _execute_grouped_task(
 
     group_results: List[Dict[str, Any]] = []
     regulate_task_ids: List[str] = []
-    for index, (group_task, validation) in enumerate(
-        zip(group_tasks, validations),
-        start=1,
-    ):
+    for index, group_task in enumerate(group_tasks, start=1):
         result = await _execute_task(
             group_task,
             db,
-            _prevalidated=validation,
             _skip_live_guard=True,
             _allow_groups=False,
         )
@@ -438,46 +435,40 @@ def _validate_task(
         [material["material_id"] for material in materials],
         _task_candidate_material_ids(task),
     )
-    target: Dict[str, Any] = {}
-    if target_uid:
-        target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
-        if not target or not bool(target.get("enabled")):
-            raise RuntimeError("监控计划已删除或停用")
-        if str(target.get("last_status") or "").strip().lower() != "ok":
-            raise RuntimeError(
-                "监控计划当前不是投放中状态，已阻止追投"
-            )
-        if (
-            str(target.get("aadvid") or "") != aavid
-            or str(target.get("ad_id") or "") != ad_id
-            or str(target.get("promotion_scene") or "") != promotion_scene
-            or normalize_plan_system(target.get("plan_system") or "unknown")
-            != plan_system
-        ):
-            raise RuntimeError("当前账户、广告ID或计划体系与提醒不一致")
-        if plan_system == "unknown":
-            raise RuntimeError("计划体系尚未确认是全域还是千川乘方")
-        if plan_system == "chengfang":
-            raise RuntimeError("千川乘方计划尚未通过本机追投适配验证")
-        if promotion_scene == "product":
-            try:
-                capability = json.loads(target.get("capability_json") or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                capability = {}
-            if not isinstance(capability, dict) or not bool(
-                capability.get("retarget_execute")
-            ):
-                raise RuntimeError(
-                    "商品全域计划的追投表单能力尚未通过本机验证，已安全停止"
-                )
-        strategy_target_uid = str(strategy.get("target_uid") or "")
-        if strategy_target_uid and strategy_target_uid != target_uid:
-            raise RuntimeError("追投策略已改为其他监控计划")
-    else:
-        # 兼容升级前已经发出的卡片；新任务均必须带 target_uid。
-        current_ad_id = str(resolve_ad_id_for_aavid(db, aavid) or "")
-        if not current_ad_id or current_ad_id != ad_id:
-            raise RuntimeError("当前账户或广告ID与提醒不一致")
+    if not target_uid or target_uid == "legacy_unscoped":
+        raise RuntimeError("旧版未归属任务仅供查看，不能执行追投")
+    target: Dict[str, Any] = (
+        db.select_one("promotion_target", where={"target_uid": target_uid})
+        or {}
+    )
+    if not target or not bool(target.get("enabled")):
+        raise RuntimeError("监控计划已删除或停用")
+    if str(target.get("last_status") or "").strip().lower() != "ok":
+        raise RuntimeError("监控计划当前不是投放中状态，已阻止追投")
+    if (
+        str(target.get("aadvid") or "") != aavid
+        or str(target.get("ad_id") or "") != ad_id
+        or str(target.get("promotion_scene") or "") != promotion_scene
+        or normalize_plan_system(target.get("plan_system") or "unknown")
+        != plan_system
+    ):
+        raise RuntimeError("当前账户、广告ID或计划体系与提醒不一致")
+    if plan_system == "unknown":
+        raise RuntimeError("计划体系尚未确认是全域还是千川乘方")
+    capability_ok, capability_error = check_target_capability(
+        target,
+        action="retarget",
+        promotion_scene=promotion_scene,
+        plan_system=plan_system,
+        require_batch=len(materials) > 1,
+    )
+    if not capability_ok:
+        raise RuntimeError(
+            f"当前计划的追投能力证据无效：{capability_error}，已安全停止"
+        )
+    strategy_target_uid = str(strategy.get("target_uid") or "")
+    if strategy_target_uid and strategy_target_uid != target_uid:
+        raise RuntimeError("追投策略已改为其他监控计划")
     if not os.path.isfile(os.path.join(DATA_DIR, "qcookie.json")):
         raise RuntimeError("千川登录状态不存在，请在服务控制中重新登录")
 
@@ -752,6 +743,7 @@ async def _execute_task(
                     strategy_title=strategy_name,
                     target_uid=target_uid,
                     promotion_scene=promotion_scene,
+                    plan_system=plan_system,
                     source_url=target.get("sanitized_page_url") or None,
                     reuse_session=False,
                     close_session=False,

@@ -621,8 +621,17 @@ class JSApi:
     def regulationDeleteTask(self):
         return self.api.regulationDeleteTask()
 
-    def runImmediateRetargetPrepare(self, material_id=None, retargeting=None):
-        return self.api.runImmediateRetargetPrepare(material_id, retargeting)
+    def runImmediateRetargetPrepare(
+        self,
+        material_id=None,
+        retargeting=None,
+        target_uid=None,
+    ):
+        return self.api.runImmediateRetargetPrepare(
+            material_id,
+            retargeting,
+            target_uid,
+        )
 
     def runImmediateRegulationStopPrepare(self, assist_task_id=None, stop_action=None):
         return self.api.runImmediateRegulationStopPrepare(assist_task_id, stop_action)

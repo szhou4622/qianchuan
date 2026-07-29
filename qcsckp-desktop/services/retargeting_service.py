@@ -36,6 +36,14 @@ from services.product_scene_adapter import (
     find_visible_exact_text,
     goto_and_confirm_product_target,
 )
+from services.plan_system import (
+    confirm_live_page_plan_system,
+    normalize_plan_system,
+)
+from services.promotion_capability import (
+    RETARGET_FORM_PROBE_VERSION,
+    check_target_capability,
+)
 from utils.common import require_executable_path
 from utils.log import logger
 
@@ -66,6 +74,26 @@ DEFAULT_TASK_NAME_SUFFIX = "素材看盘自动追投"
 
 # 提交追投后由前端调用的创建调控任务接口（成功判定以响应为准，见 dev_files/zuitou.md）
 ASSIST_TASK_API_SUBSTRING = "/ad/api/pmc/v1/uni-promotion/ad/create-uni-prom-assist-task"
+
+# 只有完整验证过当前版本商品追投表单结构的证据，才允许规则调度发卡。
+# 选择器或必填结构发生变化时升级版本，可让旧证据自动失效并要求重新验证。
+RETARGET_PROBE_VERSION = RETARGET_FORM_PROBE_VERSION
+
+
+def retarget_capability_matches(
+    capability: Any,
+    *,
+    promotion_scene: str,
+    plan_system: str,
+) -> bool:
+    """判断追投能力证据是否与当前计划场景、体系和探测器版本一致。"""
+    ok, _ = check_target_capability(
+        capability,
+        action="retarget",
+        promotion_scene=promotion_scene,
+        plan_system=plan_system,
+    )
+    return ok
 
 
 def _resolve_task_name_suffix(r: Dict[str, Any]) -> str:
@@ -970,6 +998,89 @@ class QianChuanRetargetingService:
             return e3
         return None
 
+    async def _probe_product_volume_form_structure(
+        self,
+        page: Page,
+    ) -> Optional[str]:
+        """只读确认商品放量追投所需完整表单结构；不填写、不点击提交。"""
+        return await self._probe_form_inputs_and_submit(
+            page,
+            ("调控预算", "调控时长", "任务名称"),
+            scene_label="商品",
+        )
+
+    async def _probe_form_inputs_and_submit(
+        self,
+        page: Page,
+        labels: Tuple[str, ...],
+        *,
+        scene_label: str,
+    ) -> Optional[str]:
+        """只读检查指定输入框与提交按钮的可见可用结构。"""
+        for label in labels:
+            selector = (
+                f'div[class*="oc-row"]:has(span:has-text("{label}")) '
+                f'>> div[class*="oc-input-group-wrap"] '
+                f'>> input[class*="ovui-input"]'
+            )
+            element = await page.query_selector(selector)
+            if not element:
+                return f"{scene_label}追投表单未找到输入框：{label}"
+            try:
+                if not await element.is_visible():
+                    return f"{scene_label}追投表单输入框不可见：{label}"
+                if await element.is_disabled():
+                    return f"{scene_label}追投表单输入框不可用：{label}"
+            except Exception:
+                return f"{scene_label}追投表单输入框状态无法确认：{label}"
+
+        submit = await self._find_visible_button(page, "提交")
+        if submit is None:
+            return f"{scene_label}追投表单未找到提交按钮"
+        return None
+
+    async def _probe_live_retarget_form_structure(
+        self,
+        page: Page,
+    ) -> Optional[str]:
+        """只读切换直播追投表单各模式并验证字段；绝不填写或提交。"""
+        error = await self._click_radio_option(page, "追投方式", "放量追投")
+        if error:
+            return error
+        error = await self._probe_form_inputs_and_submit(
+            page,
+            ("调控总预算", "调控时长", "任务名称"),
+            scene_label="直播放量",
+        )
+        if error:
+            return error
+
+        error = await self._click_radio_option(page, "追投方式", "控成本追投")
+        if error:
+            return error
+        error = await self._click_radio_option(page, "优化目标", "净成交ROI")
+        if error:
+            return error
+        error = await self._probe_form_inputs_and_submit(
+            page,
+            ("调控日预算", "净成交ROI目标", "任务名称"),
+            scene_label="直播控成本",
+        )
+        if error:
+            return error
+
+        error = await self._click_radio_option(page, "优化目标", "直播间成交")
+        if error:
+            return error
+        error = await self._probe_form_inputs_and_submit(
+            page,
+            ("调控日预算", "我的出价", "任务名称"),
+            scene_label="直播控成本",
+        )
+        if error:
+            return error
+        return None
+
     async def _run_cost_control(self, page: Page, r: Dict[str, Any]) -> Optional[str]:
         cc = r.get("cost_control") or {}
         og = str(cc.get("optimization_goal") or "net_roi").strip().lower()
@@ -1018,6 +1129,7 @@ class QianChuanRetargetingService:
         strategy_title: Optional[str] = None,
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
+        plan_system: str = "unknown",
         source_url: Optional[str] = None,
         reuse_session: bool = False,
         close_session: bool = True,
@@ -1047,6 +1159,17 @@ class QianChuanRetargetingService:
                 success=False,
                 message=str(e),
                 step="validate_scene",
+                retargeting=rdict,
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=material_id,
+            )
+        system = normalize_plan_system(plan_system or "unknown")
+        if system == "unknown":
+            return self._make_result(
+                success=False,
+                message="计划体系未确认，已安全停止追投",
+                step="validate_plan_system",
                 retargeting=rdict,
                 aavid=aavid,
                 ad_id=ad_id,
@@ -1116,6 +1239,7 @@ class QianChuanRetargetingService:
                             fetch_url,
                             expected_aavid=aavid,
                             expected_ad_id=ad_id,
+                            expected_plan_system=system,
                             timeout_ms=self._opt.goto_timeout_ms,
                         )
                         if target_error:
@@ -1152,6 +1276,22 @@ class QianChuanRetargetingService:
                         )
 
                     if scene != "product":
+                        system_error = await confirm_live_page_plan_system(
+                            page,
+                            expected_plan_system=system,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                        )
+                        if system_error:
+                            return self._make_result(
+                                success=False,
+                                message=system_error,
+                                step="plan_system_mismatch",
+                                retargeting=rdict,
+                                aavid=aavid,
+                                ad_id=ad_id,
+                                material_id=material_id,
+                            )
                         err = await self._switch_to_video_tab(scene)
                         if err:
                             return self._make_result(
@@ -1264,6 +1404,7 @@ class QianChuanRetargetingService:
         strategy_title: Optional[str] = None,
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
+        plan_system: str = "unknown",
         source_url: Optional[str] = None,
     ) -> RetargetingRunResult:
         """
@@ -1281,6 +1422,17 @@ class QianChuanRetargetingService:
                 success=False,
                 message=str(e),
                 step="validate_scene",
+                retargeting=rdict,
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=material_id,
+            )
+        system = normalize_plan_system(plan_system or "unknown")
+        if system == "unknown":
+            return self._make_result(
+                success=False,
+                message="计划体系未确认，已安全停止追投",
+                step="validate_plan_system",
                 retargeting=rdict,
                 aavid=aavid,
                 ad_id=ad_id,
@@ -1345,6 +1497,7 @@ class QianChuanRetargetingService:
                         fetch_url,
                         expected_aavid=aavid,
                         expected_ad_id=ad_id,
+                        expected_plan_system=system,
                         timeout_ms=self._opt.goto_timeout_ms,
                     )
                     if target_error:
@@ -1381,6 +1534,22 @@ class QianChuanRetargetingService:
                     )
 
                 if scene != "product":
+                    system_error = await confirm_live_page_plan_system(
+                        page,
+                        expected_plan_system=system,
+                        aavid=aavid,
+                        ad_id=ad_id,
+                    )
+                    if system_error:
+                        return self._make_result(
+                            success=False,
+                            message=system_error,
+                            step="plan_system_mismatch",
+                            retargeting=rdict,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=material_id,
+                        )
                     err = await self._switch_to_video_tab(scene)
                     if err:
                         return self._make_result(
@@ -1478,12 +1647,42 @@ class QianChuanRetargetingService:
         aavid: int,
         ad_id: int,
         material_id: str,
+        material_ids: Optional[List[str]] = None,
         target_uid: Optional[str] = None,
+        promotion_scene: str = "product",
+        plan_system: str = "unknown",
         source_url: Optional[str] = None,
     ) -> RetargetingRunResult:
-        """只读验证商品计划的素材追投入口和素材选择器，绝不点击提交。"""
-        self._log_tag = "[商品追投能力验证]"
-        mid = str(material_id or "").strip()
+        """只读验证指定直播/商品计划的完整追投表单，绝不填写或提交。"""
+        try:
+            scene = normalize_scene(promotion_scene or "product")
+        except ValueError as exc:
+            return self._make_result(
+                success=False,
+                message=str(exc),
+                step="validate_scene",
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=str(material_id or "").strip(),
+            )
+        system = normalize_plan_system(plan_system or "unknown")
+        if system == "unknown":
+            return self._make_result(
+                success=False,
+                message="计划体系未确认，无法验证追投能力",
+                step="validate_plan_system",
+                aavid=aavid,
+                ad_id=ad_id,
+                material_id=str(material_id or "").strip(),
+            )
+        scene_label = "商品" if scene == "product" else "直播"
+        self._log_tag = f"[{scene_label}追投能力验证]"
+        probe_material_ids: List[str] = []
+        for raw_id in material_ids or [material_id]:
+            value = str(raw_id or "").strip()
+            if value and value not in probe_material_ids:
+                probe_material_ids.append(value)
+        mid = probe_material_ids[0] if probe_material_ids else ""
         if not mid:
             return self._make_result(
                 success=False,
@@ -1498,13 +1697,13 @@ class QianChuanRetargetingService:
                 base_url=self._opt.base_url,
                 aavid=int(aavid),
                 ad_id=int(ad_id),
-                promotion_scene="product",
+                promotion_scene=scene,
                 source_url=source_url,
             )
         except Exception as exc:
             return self._make_result(
                 success=False,
-                message="构建商品计划地址失败",
+                message=f"构建{scene_label}计划地址失败",
                 detail=str(exc),
                 step="build_url",
                 aavid=aavid,
@@ -1527,26 +1726,88 @@ class QianChuanRetargetingService:
             pop_handlers: List[Any] = []
             try:
                 pop_handlers = await self._attach_popup_switcher()
-                target_error = await goto_and_confirm_product_target(
-                    page,
-                    fetch_url,
-                    expected_aavid=aavid,
-                    expected_ad_id=ad_id,
-                    timeout_ms=self._opt.goto_timeout_ms,
-                )
-                if target_error:
-                    return self._make_result(
-                        success=False,
-                        message=target_error,
-                        step="target_mismatch",
+                if scene == "product":
+                    target_error = await goto_and_confirm_product_target(
+                        page,
+                        fetch_url,
+                        expected_aavid=aavid,
+                        expected_ad_id=ad_id,
+                        expected_plan_system=system,
+                        timeout_ms=self._opt.goto_timeout_ms,
+                    )
+                    if target_error:
+                        return self._make_result(
+                            success=False,
+                            message=target_error,
+                            step="target_mismatch",
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=mid,
+                        )
+                else:
+                    await page.goto(
+                        fetch_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._opt.goto_timeout_ms,
+                    )
+                    page_aavid, page_ad_id = extract_target_ids(page.url)
+                    if (
+                        str(page_aavid or "") != str(aavid)
+                        or str(page_ad_id or "") != str(ad_id)
+                    ):
+                        return self._make_result(
+                            success=False,
+                            message="打开后的账户或计划与能力验证目标不一致",
+                            step="target_mismatch",
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=mid,
+                        )
+                    system_error = await confirm_live_page_plan_system(
+                        page,
+                        expected_plan_system=system,
                         aavid=aavid,
                         ad_id=ad_id,
-                        material_id=mid,
                     )
+                    if system_error:
+                        return self._make_result(
+                            success=False,
+                            message=system_error,
+                            step="plan_system_mismatch",
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=mid,
+                        )
                 await asyncio.sleep(random.uniform(1.0, 1.8))
-                error = await self._open_product_retarget_dialog(page, ad_id)
-                if not error:
-                    error = await self._select_product_material(page, mid)
+                if scene == "product":
+                    error = await self._open_product_retarget_dialog(page, ad_id)
+                    if not error:
+                        error = await self._select_product_materials(
+                            page,
+                            probe_material_ids,
+                        )
+                    if not error:
+                        error = await self._probe_product_volume_form_structure(
+                            page
+                        )
+                else:
+                    error = await self._switch_to_video_tab(scene)
+                    if not error:
+                        error = await self._search_material_and_open_dialog(
+                            page,
+                            mid,
+                        )
+                    if not error and len(probe_material_ids) > 1:
+                        error = await self._select_product_materials(
+                            page,
+                            probe_material_ids[1:],
+                            scene_label="直播",
+                            expected_total=len(probe_material_ids),
+                        )
+                    if not error:
+                        error = await self._probe_live_retarget_form_structure(
+                            page
+                        )
                 if error:
                     return self._make_result(
                         success=False,
@@ -1558,7 +1819,10 @@ class QianChuanRetargetingService:
                     )
                 return self._make_result(
                     success=True,
-                    message="商品追投表单能力验证通过（未点击提交）",
+                    message=(
+                        f"{scene_label}{'放量' if scene == 'product' else '放量及控成本'}"
+                        "追投完整表单能力验证通过（未填写、未点击提交）"
+                    ),
                     step="capability_probe",
                     aavid=aavid,
                     ad_id=ad_id,
@@ -1570,7 +1834,7 @@ class QianChuanRetargetingService:
             logger.exception("%s 验证异常", self._log_tag)
             return self._make_result(
                 success=False,
-                message="商品追投表单能力验证异常",
+                message=f"{scene_label}追投表单能力验证异常",
                 detail=traceback.format_exc()[:8000],
                 step="exception",
                 aavid=aavid,

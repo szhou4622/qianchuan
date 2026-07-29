@@ -168,6 +168,7 @@ class QianChuanFetcher:
         self._assist_current_count: int = 0
         self._is_assist_collecting: bool = False
         self._assist_fetch_db: Optional[Any] = None
+        self._assist_response_seen: bool = False
     async def _init_browser(self):
         """初始化浏览器"""
         self.playwright = await async_playwright().start()
@@ -204,8 +205,117 @@ class QianChuanFetcher:
         )
         self.page = await self.context.new_page()
 
+    @staticmethod
+    def _decode_request_payload(request_payload: Any) -> Optional[dict]:
+        """把 Playwright 的 POST 正文转换为字典；无法确认时返回 None。"""
+        payload = request_payload
+        if isinstance(payload, (bytes, bytearray)):
+            try:
+                payload = payload.decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return None
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _extract_request_plan_ids(
+        cls,
+        url: str,
+        request_payload: Any = None,
+    ) -> set:
+        """
+        从 URL 或 POST Filters 中提取明确的计划 ID。
+
+        同一账户可能并行加载多条计划；只有请求明确限定为当前 ad_id 时，
+        响应才允许进入当前目标。无计划证据的旧请求安全忽略。
+        """
+        plan_ids = set()
+
+        def add(value: Any) -> None:
+            if isinstance(value, dict) and "value" in value:
+                add(value.get("value"))
+                return
+            if isinstance(value, (list, tuple, set)):
+                for child in value:
+                    add(child)
+                return
+            if value is None or isinstance(value, bool):
+                return
+            text = str(value).strip()
+            if text:
+                plan_ids.add(text)
+
+        parsed = urlparse(url)
+        for key, values in parse_qs(parsed.query).items():
+            if str(key or "").strip().lower() in {
+                "adid",
+                "ad_id",
+                "planid",
+                "plan_id",
+            }:
+                add(values)
+
+        payload = cls._decode_request_payload(request_payload)
+        if not payload:
+            return plan_ids
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                # 千川报表请求通常把计划范围放在
+                # Filters.Conditions[{Field:"ad_id", Values:[...]}]。
+                field = str(
+                    value.get("Field")
+                    or value.get("field")
+                    or ""
+                ).strip().lower()
+                if field in {"adid", "ad_id", "planid", "plan_id"}:
+                    add(
+                        value.get("Values")
+                        if "Values" in value
+                        else value.get("values")
+                    )
+                    if "Value" in value:
+                        add(value.get("Value"))
+                    if "value" in value:
+                        add(value.get("value"))
+                for key, child in value.items():
+                    normalized_key = str(key or "").strip().lower()
+                    if normalized_key in {
+                        "adid",
+                        "ad_id",
+                        "planid",
+                        "plan_id",
+                    }:
+                        add(child)
+                    walk(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    walk(child)
+
+        walk(payload)
+        return plan_ids
+
+    def _request_matches_current_plan(
+        self,
+        url: str,
+        request_payload: Any = None,
+    ) -> bool:
+        current_adid = str(self._current_adid or "").strip()
+        if not current_adid:
+            return False
+        request_plan_ids = self._extract_request_plan_ids(
+            url,
+            request_payload,
+        )
+        # 多计划请求同样不能归入单个监控目标；必须且只能命中当前计划。
+        return request_plan_ids == {current_adid}
+
     def _is_target_api(self, url: str, request_payload: Any = None) -> bool:
-        """检查 URL 是否为目标 API 并包含有效的参数"""
+        """检查素材 API 是否同时匹配当前账户、计划和请求来源。"""
         if not any(url.startswith(prefix) for prefix in API_PREFIXES):
             return False
 
@@ -226,26 +336,20 @@ class QianChuanFetcher:
         req_from = query_params.get("reqFrom", [])
         req_from_value = req_from[0] if req_from else None
         if not req_from_value and request_payload is not None:
-            payload = request_payload
-            if isinstance(payload, (bytes, bytearray)):
-                try:
-                    payload = payload.decode("utf-8", errors="replace")
-                except Exception:
-                    payload = None
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = None
-            if isinstance(payload, dict):
+            payload = self._decode_request_payload(request_payload)
+            if payload:
                 req_from_value = payload.get("reqFrom")
         if req_from_value != "uni-prom-creative-tab-list":
             return False
 
-        return True
+        return self._request_matches_current_plan(url, request_payload)
 
-    def _is_target_assist_api(self, url: str) -> bool:
-        """调控任务列表 ad/list-required：需 aavid 与当前页一致。"""
+    def _is_target_assist_api(
+        self,
+        url: str,
+        request_payload: Any = None,
+    ) -> bool:
+        """调控任务列表：须同时匹配当前账户与当前计划。"""
         if not url.startswith(AD_ASSIST_LIST_REQUIRED_PREFIX):
             return False
         parsed = urlparse(url)
@@ -255,7 +359,7 @@ class QianChuanFetcher:
             return False
         if self._current_aadvid and aavid_list[0] != self._current_aadvid:
             return False
-        return True
+        return self._request_matches_current_plan(url, request_payload)
 
     def _is_ad_detail_gate_url(self, url: str) -> bool:
         """是否为当前计划详情请求；商品全域使用 ad-detail-plus。"""
@@ -1044,37 +1148,56 @@ class QianChuanFetcher:
         self._assist_total_count = 0
         self._assist_current_count = 0
         self._is_assist_collecting = False
+        self._assist_response_seen = False
 
     async def _on_response_assist(self, response: Response):
         url = response.url
-        if not self._is_target_assist_api(url):
+        request_payload = None
+        try:
+            request_payload = response.request.post_data
+        except Exception:
+            pass
+        if not self._is_target_assist_api(url, request_payload):
             return
         try:
             data = await response.json()
         except Exception as e:
             logger.warning(f"[调控任务] 解析响应失败: {url}, {e}")
             return
-        await self._handle_assist_response(data, url)
+        if await self._handle_assist_response(data, url):
+            self._assist_response_seen = True
 
-    async def _handle_assist_response(self, data: dict, url: str):
+    async def _handle_assist_response(self, data: dict, url: str) -> bool:
         """处理 ad/list-required 响应：更新进度并 upsert 本地 pmc_roi2_assist_task。"""
+        if not isinstance(data, dict):
+            logger.warning("[调控任务] API 响应不是对象，忽略本次响应")
+            return False
         if data.get("status_code") != 0:
             logger.warning(f"[调控任务] API 业务异常: {data.get('message')}")
-            return
+            return False
 
-        d = data.get("data") or {}
-        ad_infos = d.get("adInfos") or []
+        d = data.get("data")
+        if not isinstance(d, dict):
+            logger.warning("[调控任务] API 响应缺少有效 data 对象，忽略本次响应")
+            return False
+        if "adInfos" not in d:
+            logger.warning("[调控任务] API 响应缺少 adInfos，忽略本次响应")
+            return False
+        ad_infos = d.get("adInfos")
         if not isinstance(ad_infos, list):
-            ad_infos = []
+            logger.warning("[调控任务] API 响应 adInfos 不是列表，忽略本次响应")
+            return False
 
         # 总条数 data.pagination.totalNum
         total_count = 0
+        total_count_known = False
         pagination = d.get("pagination")
         if isinstance(pagination, dict):
             tn = pagination.get("totalNum")
             if tn is not None and str(tn).strip() != "":
                 try:
                     total_count = int(tn)
+                    total_count_known = True
                 except (TypeError, ValueError):
                     total_count = 0
         if total_count <= 0:
@@ -1082,10 +1205,28 @@ class QianChuanFetcher:
             if total_raw is None:
                 total_raw = d.get("total")
             try:
-                total_count = int(total_raw) if total_raw is not None else 0
+                if total_raw is not None:
+                    total_count = int(total_raw)
+                    total_count_known = True
             except (TypeError, ValueError):
                 total_count = 0
+        if not ad_infos and (not total_count_known or total_count != 0):
+            logger.warning(
+                "[调控任务] 空任务响应缺少明确的 total=0，忽略本次响应"
+            )
+            return False
+        if ad_infos and not total_count_known:
+            logger.warning(
+                "[调控任务] 非空任务响应缺少明确总数，禁止判定为全量同步"
+            )
+            return False
+        if total_count < len(ad_infos):
+            logger.warning(
+                "[调控任务] 响应总数小于本页任务数，忽略本次响应"
+            )
+            return False
 
+        page_task_ids: List[str] = []
         for ad in ad_infos:
             if not isinstance(ad, dict):
                 continue
@@ -1094,11 +1235,17 @@ class QianChuanFetcher:
                 continue
             ts = str(tid).strip()
             if ts:
-                self._assist_task_ids[ts] = True
+                page_task_ids.append(ts)
+
+        if ad_infos and not page_task_ids:
+            logger.warning("[调控任务] 非空响应没有有效任务ID，忽略本次响应")
+            return False
+        if ad_infos and not await self._persist_assist_api_response_to_db(data):
+            return False
+        for task_id in page_task_ids:
+            self._assist_task_ids[task_id] = True
 
         if not self._is_assist_collecting:
-            if total_count <= 0 and ad_infos:
-                total_count = len(ad_infos)
             self._assist_total_count = total_count
             self._is_assist_collecting = True
             logger.info(
@@ -1112,15 +1259,15 @@ class QianChuanFetcher:
             )
 
         self._assist_current_count = len(self._assist_task_ids)
-        await self._persist_assist_api_response_to_db(data)
+        return True
 
-    async def _persist_assist_api_response_to_db(self, raw_top: dict) -> None:
+    async def _persist_assist_api_response_to_db(self, raw_top: dict) -> bool:
         """单条 list-required 完整 JSON → clean → upsert（无云端备份）。"""
         db = self._assist_fetch_db
         aadvid = self._current_aadvid
         ad_id = self._current_adid
         if not db or not aadvid or not ad_id:
-            return
+            return False
         if self._current_promotion_scene == "product":
             try:
                 snapshot = extract_product_scene_snapshot(raw_top)
@@ -1141,15 +1288,17 @@ class QianChuanFetcher:
                     )
             except Exception as e:
                 logger.warning("[调控任务] 商品与素材关系写入失败: %s", e)
+                return False
         try:
             rows = clean_pmc_roi2_assist_task_data(
                 raw_top, str(aadvid).strip(), str(ad_id).strip()
             )
         except Exception as e:
             logger.warning(f"[调控任务] 清洗失败: {e}")
-            return
+            return False
         if not rows:
-            return
+            logger.warning("[调控任务] 非空响应未清洗出任何任务行")
+            return False
 
         def _run() -> None:
             for row in rows:
@@ -1157,6 +1306,44 @@ class QianChuanFetcher:
                 row["target_uid"] = self._current_target_uid
                 row["promotion_scene"] = self._current_promotion_scene
                 row["plan_system"] = self._current_plan_system
+                if self._current_promotion_scene == "product":
+                    material_ids: List[str] = []
+                    try:
+                        materials = json.loads(
+                            row.get("assist_materials_json") or "[]"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        materials = []
+                    for material in materials if isinstance(materials, list) else []:
+                        if not isinstance(material, dict):
+                            continue
+                        material_id = str(
+                            material.get("material_id")
+                            or material.get("materialId")
+                            or ""
+                        ).strip()
+                        if material_id and material_id not in material_ids:
+                            material_ids.append(material_id)
+                    product_ids: List[str] = []
+                    if material_ids:
+                        placeholders = ",".join("?" for _ in material_ids)
+                        relation_rows = db.execute(
+                            "SELECT DISTINCT product_id "
+                            "FROM promotion_material_product "
+                            f"WHERE target_uid=? AND material_id IN ({placeholders})",
+                            (self._current_target_uid, *material_ids),
+                            fetch=True,
+                        )
+                        product_ids = [
+                            str(item.get("product_id") or "").strip()
+                            for item in relation_rows or []
+                            if str(item.get("product_id") or "").strip()
+                        ]
+                    row["product_ids_json"] = json.dumps(
+                        product_ids,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                 db.insert_or_update(
                     table="pmc_roi2_assist_task",
                     data=row,
@@ -1166,6 +1353,46 @@ class QianChuanFetcher:
 
         await asyncio.to_thread(_run)
         logger.info(f"[数据库·调控任务] 本页已写入/更新 {len(rows)} 条")
+        return True
+
+    async def _prune_stale_assist_rows_after_full_sync(self, db: Any) -> bool:
+        """全量同步完成后移除该计划已不存在的旧调控任务，避免旧指标触发停投。"""
+        target_uid = str(self._current_target_uid or "").strip()
+        if (
+            not db
+            or not target_uid
+            or target_uid == LEGACY_TARGET_UID
+        ):
+            return False
+        assist_ids = sorted(
+            str(task_id).strip()
+            for task_id in self._assist_task_ids
+            if str(task_id).strip()
+        )
+
+        def _run() -> None:
+            if assist_ids:
+                placeholders = ",".join("?" for _ in assist_ids)
+                db.execute(
+                    "DELETE FROM pmc_roi2_assist_task "
+                    f"WHERE target_uid=? AND assist_task_id NOT IN ({placeholders})",
+                    (target_uid, *assist_ids),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM pmc_roi2_assist_task WHERE target_uid=?",
+                    (target_uid,),
+                )
+
+        try:
+            await asyncio.to_thread(_run)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[调控任务] 清理已下线旧任务失败，禁止将本轮标记为完整同步: %s",
+                exc,
+            )
+            return False
 
     async def _handle_material_response(self, data: dict, url: str):
         """处理素材列表 API 响应（按 materialId 去重）"""
@@ -1707,17 +1934,17 @@ class QianChuanFetcher:
                 f"[调控任务] 等待超时或提前结束：{self._assist_current_count}/"
                 f"{self._assist_total_count or '?'}"
             )
-            return True
+            return False
         return False
 
-    async def _fetch_roi2_assist_tasks(self, db, timeout: int) -> None:
+    async def _fetch_roi2_assist_tasks(self, db, timeout: int) -> bool:
         """
         同轮次第二段：素材完成后切换「调控 > 素材追投」，拦截 ad/list-required，入库 pmc_roi2_assist_task。
         不做飞书/云端备份。
         """
-        if not self._current_aadvid:
-            logger.warning("[调控任务] 无 aavid，跳过")
-            return
+        if not self._current_aadvid or not self._current_adid:
+            logger.warning("[调控任务] 无 aavid 或 ad_id，跳过")
+            return False
         self._reset_assist_fetch_state()
         self._assist_fetch_db = db
         try:
@@ -1735,25 +1962,36 @@ class QianChuanFetcher:
                 w = 0.0
                 while w < first_page_timeout:
                     await self._raise_if_global_auth_expired()
-                    if self._assist_task_ids:
+                    if self._assist_response_seen:
                         break
                     await asyncio.sleep(step)
                     w += step
 
-                if not self._assist_task_ids:
+                if not self._assist_response_seen:
                     logger.warning("[调控任务] 未拦截到首屏 ad/list-required，跳过翻页")
-                    return
+                    return False
+                if self._assist_total_count <= 0:
+                    if not await self._prune_stale_assist_rows_after_full_sync(db):
+                        return False
+                    logger.info("[调控任务] 当前计划没有调控任务，完整同步成功")
+                    return True
 
                 logger.info(
                     f"[调控任务] 开始翻页拉全量（预计 {self._assist_total_count or '?'} 条）..."
                 )
-                await self._wait_for_full_assist_data(timeout)
+                complete = bool(await self._wait_for_full_assist_data(timeout))
+                if not complete:
+                    return False
+                return bool(
+                    await self._prune_stale_assist_rows_after_full_sync(db)
+                )
             finally:
                 self._detach_assist_listeners()
         except GlobalAuthExpiredError:
             raise
         except Exception as e:
             logger.warning(f"[调控任务] 抓取异常（已忽略，本轮仍继续）: {e}")
+            return False
         finally:
             self._assist_fetch_db = None
 
@@ -1797,6 +2035,7 @@ class QianChuanFetcher:
         self._material_current_count = 0
         self._is_collecting = False
         self._last_saved_count = 0
+        self._reset_assist_fetch_state()
         self._pending_ad_detail_basic_cloud_row = None
         self._delivery_gate_detail = {
             "ok": False,
@@ -1876,6 +2115,15 @@ class QianChuanFetcher:
         if self._current_promotion_scene == "product":
             await self._fetch_product_material_pages(db, timeout)
             await self._finalize_pending_ad_detail_basic_cloud()
+            scrape_cfg = load_scrape_service_config()
+            assist_sync_enabled = bool(scrape_cfg.get("fetch_assist_tasks"))
+            assist_sync_ok = False
+            if assist_sync_enabled:
+                assist_sync_ok = await self._fetch_roi2_assist_tasks(db, timeout)
+            else:
+                logger.info(
+                    "[调控任务] 未启用（采集服务配置中关闭），跳过"
+                )
             return {
                 "aadvid": self._current_aadvid,
                 "ad_id": self._current_adid,
@@ -1890,8 +2138,10 @@ class QianChuanFetcher:
                     "start_time": self._material_start_time,
                     "end_time": self._material_end_time,
                 },
-                "assist_task_count": 0,
-                "assist_task_total_count": 0,
+                "assist_task_count": len(self._assist_task_ids),
+                "assist_task_total_count": self._assist_total_count,
+                "assist_sync_enabled": assist_sync_enabled,
+                "assist_sync_ok": assist_sync_ok,
                 "delivery_gate": dict(self._delivery_gate_detail),
             }
 
@@ -1936,8 +2186,10 @@ class QianChuanFetcher:
 
             # 同轮次第二段：调控任务（需在采集服务配置中开启）
             scrape_cfg = load_scrape_service_config()
-            if scrape_cfg.get("fetch_assist_tasks"):
-                await self._fetch_roi2_assist_tasks(db, timeout)
+            assist_sync_enabled = bool(scrape_cfg.get("fetch_assist_tasks"))
+            assist_sync_ok = False
+            if assist_sync_enabled:
+                assist_sync_ok = await self._fetch_roi2_assist_tasks(db, timeout)
             else:
                 logger.info("[调控任务] 未启用（采集服务配置中关闭），跳过")
 
@@ -1958,6 +2210,8 @@ class QianChuanFetcher:
                 },
                 "assist_task_count": len(self._assist_task_ids),
                 "assist_task_total_count": self._assist_total_count,
+                "assist_sync_enabled": assist_sync_enabled,
+                "assist_sync_ok": assist_sync_ok,
                 "delivery_gate": dict(self._delivery_gate_detail),
             }
         finally:

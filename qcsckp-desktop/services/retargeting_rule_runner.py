@@ -42,9 +42,11 @@ from services.cloud_retarget_client import create_retarget_task
 from services.local_test_guard import row_is_in_test_scope
 from services.product_rule_engine import evaluate_product_strategy
 from services.plan_system import normalize_plan_system
+from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.retargeting_service import (
     QianChuanRetargetingService,
+    retarget_capability_matches,
     retarget_log_tag,
     retargeting_block_from_full_config,
 )
@@ -67,6 +69,18 @@ _material_retouch_locks_guard = asyncio.Lock()
 def auto_execute_allowed_in_current_environment() -> bool:
     """正式环境保留自动追投；本地测试环境只允许走飞书确认任务。"""
     return not TEST_MODE
+
+
+def retarget_method_is_supported_for_scene(
+    promotion_scene: str,
+    retargeting: Dict[str, Any],
+) -> bool:
+    """商品表单当前仅支持放量；直播保留放量和控成本两种方式。"""
+    scene = str(promotion_scene or "live").strip().lower()
+    method = str((retargeting or {}).get("method") or "volume").strip().lower()
+    if scene == "product":
+        return method == "volume"
+    return method in ("volume", "cost_control")
 
 
 async def _lock_for_material_retouch(
@@ -890,24 +904,48 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     st.get("id"),
                 )
                 return
-            if plan_system == "chengfang":
+            capability_ok, capability_reason = check_target_capability(
+                target,
+                action="retarget",
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
+            if not capability_ok:
                 logger.warning(
-                    "%s 策略 %s 对应千川乘方计划；乘方适配器尚未通过真实页面验证，"
+                    "%s 策略 %s 对应计划缺少与场景/体系匹配的追投能力证据：%s；"
                     "本轮不发送卡片、不执行追投",
                     _log_sched,
                     st.get("id"),
+                    capability_reason,
                 )
                 return
             if promotion_scene == "product":
+                method = str(
+                    retargeting.get("method") or "volume"
+                ).strip().lower()
+                if not retarget_method_is_supported_for_scene(
+                    promotion_scene,
+                    retargeting,
+                ):
+                    logger.warning(
+                        "%s 策略 %s 对应推商品计划，但追投方式为 %s；"
+                        "推商品当前仅支持放量追投，本轮不发送卡片、不执行追投",
+                        _log_sched,
+                        st.get("id"),
+                        method or "unknown",
+                    )
+                    return
                 try:
                     capability = json.loads(target.get("capability_json") or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     capability = {}
-                if not isinstance(capability, dict) or not bool(
-                    capability.get("retarget_execute")
+                if not retarget_capability_matches(
+                    capability,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
                 ):
                     logger.warning(
-                        "%s 策略 %s 对应商品计划的追投表单能力尚未通过本机验证，"
+                        "%s 策略 %s 对应商品计划的追投能力证据缺失、过期或与场景/体系不一致，"
                         "本轮不发送追投卡片",
                         _log_sched,
                         st.get("id"),
@@ -1394,6 +1432,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     strategy_title=st_label,
                                     target_uid=target_uid,
                                     promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
                                     source_url=target.get("sanitized_page_url") or None,
                                     reuse_session=False,
                                     close_session=False,

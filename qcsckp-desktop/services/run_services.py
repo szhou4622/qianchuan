@@ -35,6 +35,7 @@ from api.promotion_targets import (
     extract_plan_name,
     list_promotion_targets,
     make_target_uid,
+    patch_target_sync_state,
     replace_material_product_links,
     update_target_sync_state,
     upsert_products,
@@ -59,6 +60,27 @@ from utils.common import browser_runtime_info
 POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
 LAST_TARGET_FILE = os.path.join(DATA_DIR, "last_crawl_target.json")
 PROMOTION_PROBE_FILE = os.path.join(DATA_DIR, "promotion_readonly_probe.json")
+
+
+_WRITE_CAPABILITY_SCOPE_KEYS = (
+    "retarget_scene",
+    "retarget_plan_system",
+    "retarget_probe_version",
+    "retarget_verified_at",
+    "retarget_target_uid",
+    "retarget_aavid",
+    "retarget_ad_id",
+    "retarget_batch_execute",
+    "retarget_batch_probe_version",
+    "retarget_batch_verified_at",
+    "regulation_scene",
+    "regulation_plan_system",
+    "regulation_probe_version",
+    "regulation_verified_at",
+    "regulation_target_uid",
+    "regulation_aavid",
+    "regulation_ad_id",
+)
 
 
 def _persist_product_snapshot(
@@ -1333,10 +1355,15 @@ class ServiceController:
                             source_url=current_target.get("sanitized_page_url") or None,
                         )
                     except Exception as e:
-                        update_target_sync_state(
+                        patch_target_sync_state(
                             current_uid,
                             status="error",
                             error=f"构建抓取地址失败：{e}",
+                            capability_updates={
+                                "assist_sync_in_progress": False,
+                                "assist_sync_ok": False,
+                                "assist_synced_at": "",
+                            },
                             db=db,
                         )
                         self._log(
@@ -1365,6 +1392,17 @@ class ServiceController:
                         f"system={current_plan_system}"
                     )
                     try:
+                        patch_target_sync_state(
+                            current_uid,
+                            status=None,
+                            error="调控任务正在同步，本轮自动停投暂不可用",
+                            capability_updates={
+                                "assist_sync_in_progress": True,
+                                "assist_sync_ok": False,
+                                "assist_synced_at": "",
+                            },
+                            db=db,
+                        )
                         async with exclusive_browser_operation(
                             f"采集:{current_uid}",
                             timeout_seconds=max(60, int(cfg.round_timeout)),
@@ -1385,6 +1423,15 @@ class ServiceController:
                                 plan_name=current_target.get("plan_name") or "",
                             )
                         material_count = int(result.get("material_total_count") or 0)
+                        assist_sync_enabled = bool(
+                            result.get("assist_sync_enabled")
+                        )
+                        assist_sync_ok = bool(result.get("assist_sync_ok"))
+                        assist_synced_at = (
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            if assist_sync_enabled and assist_sync_ok
+                            else ""
+                        )
                         delivery_gate = result.get("delivery_gate") or {}
                         delivery_reason = str(
                             delivery_gate.get("reason") or ""
@@ -1400,27 +1447,26 @@ class ServiceController:
                             target_status = (
                                 "paused" if "暂停" in delivery_name else "not_delivering"
                             )
-                            existing_capability = current_target.get("capability")
-                            if not isinstance(existing_capability, dict):
-                                existing_capability = {}
-                            update_target_sync_state(
+                            patch_target_sync_state(
                                 current_uid,
                                 status=target_status,
                                 error=(
                                     f"计划当前状态：{delivery_name or '非投放中'}；"
                                     "已禁止追投，未执行任何写操作"
                                 ),
-                                capability={
-                                    "material_read": bool(
-                                        existing_capability.get("material_read")
-                                    ),
+                                capability_updates={
                                     "product_relation": (
                                         current_scene == "live"
                                         or product_link_count > 0
                                     ),
                                     "retarget_execute": False,
                                     "regulation_execute": False,
+                                    "assist_sync_enabled": assist_sync_enabled,
+                                    "assist_sync_in_progress": False,
+                                    "assist_sync_ok": False,
+                                    "assist_synced_at": "",
                                 },
+                                capability_remove_keys=_WRITE_CAPABILITY_SCOPE_KEYS,
                                 db=db,
                             )
                             self._log(
@@ -1428,45 +1474,53 @@ class ServiceController:
                                 f"计划当前为{delivery_name or '非投放中'}，已安全跳过"
                             )
                         elif current_scene == "product" and material_count <= 0:
-                            update_target_sync_state(
+                            patch_target_sync_state(
                                 current_uid,
                                 status="capability_mismatch",
                                 error="商品全域页面未识别到素材接口，本轮未执行任何写操作",
-                                capability={
+                                capability_updates={
                                     "material_read": False,
                                     "product_relation": product_link_count > 0,
                                     "retarget_execute": False,
                                     "regulation_execute": False,
+                                    "assist_sync_enabled": assist_sync_enabled,
+                                    "assist_sync_in_progress": False,
+                                    "assist_sync_ok": False,
+                                    "assist_synced_at": "",
                                 },
+                                capability_remove_keys=_WRITE_CAPABILITY_SCOPE_KEYS,
                                 db=db,
                             )
                             self._log(
                                 f"[抓取 {target_index}/{len(targets)}] 商品页面能力未识别，已安全跳过"
                             )
                         else:
-                            existing_capability = current_target.get("capability")
-                            if not isinstance(existing_capability, dict):
-                                existing_capability = {}
-                            update_target_sync_state(
+                            patch_target_sync_state(
                                 current_uid,
                                 status="ok",
                                 synced=True,
-                                capability={
+                                error=(
+                                    "素材同步正常，但调控任务本轮未完整同步；"
+                                    "自动停投已暂停"
+                                    if assist_sync_enabled
+                                    and not assist_sync_ok
+                                    else ""
+                                ),
+                                capability_updates={
                                     "material_read": True,
                                     "product_relation": (
-                                        current_scene == "live" or product_link_count > 0
+                                        current_scene == "live"
+                                        or product_link_count > 0
                                     ),
-                                    # 商品追投表单经独立只读探测确认后保留能力标记；
-                                    # 常规素材轮询不能替代该探测，也不能擅自打开能力。
-                                    "retarget_execute": bool(
-                                        existing_capability.get("retarget_execute")
+                                    "assist_sync_enabled": assist_sync_enabled,
+                                    "assist_sync_in_progress": False,
+                                    "assist_sync_ok": (
+                                        assist_sync_enabled and assist_sync_ok
                                     ),
-                                    # 商品任务列表/结束入口须在真实受控任务创建后
-                                    # 另行探测；未确认前自动停投保持关闭。
-                                    "regulation_execute": bool(
-                                        existing_capability.get("regulation_execute")
-                                    ),
+                                    "assist_synced_at": assist_synced_at,
                                 },
+                                # 常规只读采集只能更新读取能力，不能提升、降级或抹掉
+                                # 已由受控追投/停投验证写入的场景、体系、版本和时间证据。
                                 db=db,
                             )
                             self._log(
@@ -1486,16 +1540,32 @@ class ServiceController:
                     except GlobalAuthExpiredError:
                         raise
                     except Exception as e:
-                        update_target_sync_state(
+                        patch_target_sync_state(
                             current_uid,
                             status="error",
                             error=str(e),
+                            capability_updates={
+                                "assist_sync_in_progress": False,
+                                "assist_sync_ok": False,
+                                "assist_synced_at": "",
+                            },
                             db=db,
                         )
                         self._log(
                             f"[抓取 {target_index}/{len(targets)}] 异常：{e}"
                         )
                     finally:
+                        try:
+                            patch_target_sync_state(
+                                current_uid,
+                                status=None,
+                                capability_updates={
+                                    "assist_sync_in_progress": False,
+                                },
+                                db=db,
+                            )
+                        except Exception:
+                            pass
                         try:
                             fetcher._material_total_count = 0
                             fetcher._material_current_count = 0

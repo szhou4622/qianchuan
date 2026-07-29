@@ -16,7 +16,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from api.dashboard import DashboardApi
 from api.rule_regulation_config import (
@@ -31,6 +31,10 @@ from services.regulation_service import (
 )
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.plan_system import normalize_plan_system
+from services.promotion_capability import (
+    check_target_capability,
+    parse_target_capability,
+)
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -39,6 +43,102 @@ MAX_STRATEGY_PARALLEL = 3
 _DASHBOARD_PAGE_SIZE = 500_000
 # 停投调度拉取调控任务时：仅处理「入库更新时间」近 N 分钟内有变动的行，减少对已停滞数据的重复跳过；0=沿用大屏默认（近 1 天）
 _DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
+
+
+def _target_assist_sync_ready(
+    target: Dict[str, Any],
+    *,
+    max_age_minutes: int = _DEFAULT_ASSIST_UPDATED_WITHIN_MIN,
+) -> Tuple[bool, str]:
+    capability = parse_target_capability(target)
+    if bool(capability.get("assist_sync_in_progress")):
+        return False, "调控任务正在同步中"
+    if not bool(capability.get("assist_sync_enabled")):
+        return False, "调控任务采集未启用"
+    if not bool(capability.get("assist_sync_ok")):
+        return False, "最近一轮调控任务未完整同步"
+    raw = str(capability.get("assist_synced_at") or "").strip()
+    try:
+        synced_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return False, "调控任务同步时间无效"
+    age = datetime.now() - synced_at
+    if age < timedelta(minutes=-5) or age > timedelta(
+        minutes=max(1, int(max_age_minutes))
+    ):
+        return False, "调控任务同步结果已过期"
+    return True, ""
+
+
+def _revalidate_stop_candidate(
+    db: SQLiteStore,
+    *,
+    target_uid: str,
+    assist_task_id: str,
+    aavid: str,
+    ad_id: str,
+    promotion_scene: str,
+    trigger: Dict[str, Any],
+    max_age_minutes: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str]:
+    """在取得浏览器独占锁后重读目标和指标，关闭检查后等待锁的竞态窗口。"""
+    target = db.select_one(
+        "promotion_target",
+        where={"target_uid": target_uid},
+    ) or {}
+    row = db.select_one(
+        "pmc_roi2_assist_task",
+        where={
+            "target_uid": target_uid,
+            "assist_task_id": assist_task_id,
+        },
+    ) or {}
+    target_system = normalize_plan_system(
+        target.get("plan_system") or "unknown"
+    )
+    row_system = normalize_plan_system(row.get("plan_system") or "unknown")
+    if (
+        not target
+        or not bool(target.get("enabled"))
+        or str(target.get("last_status") or "").strip().lower() != "ok"
+        or str(target.get("aadvid") or "") != aavid
+        or str(target.get("ad_id") or "") != ad_id
+        or str(target.get("promotion_scene") or "") != promotion_scene
+    ):
+        return None, None, target_system, "监控计划已停用、状态异常或目标身份变化"
+    if (
+        not row
+        or str(row.get("aadvid") or "") != aavid
+        or str(row.get("ad_id") or "") != ad_id
+        or str(row.get("promotion_scene") or "") != promotion_scene
+        or (row_system != "unknown" and row_system != target_system)
+    ):
+        return None, None, target_system, "调控任务已删除或归属发生变化"
+    if target_system == "unknown":
+        return None, None, target_system, "计划体系尚未确认"
+    assist_ready, assist_error = _target_assist_sync_ready(
+        target,
+        max_age_minutes=max_age_minutes,
+    )
+    if not assist_ready:
+        return None, None, target_system, assist_error
+    capability_ok, capability_error = check_target_capability(
+        target,
+        action="regulation",
+        promotion_scene=promotion_scene,
+        plan_system=target_system,
+    )
+    if not capability_ok:
+        return None, None, target_system, capability_error
+    delivery_type = row.get("ad_delivery_type")
+    if str(delivery_type if delivery_type is not None else "0").strip() not in {
+        "",
+        "0",
+    }:
+        return None, None, target_system, "调控任务已不在执行中"
+    if not evaluate_trigger_roi2_assist(trigger, row):
+        return None, None, target_system, "最新调控指标已不满足停投策略"
+    return target, row, target_system, ""
 
 
 def _assist_updated_within_minutes_from_env() -> Optional[int]:
@@ -379,16 +479,30 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     aavid_raw = row.get("aadvid")
                     aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
                     target_uid = str(row.get("target_uid") or "legacy_unscoped").strip()
+                    if not target_uid or target_uid == "legacy_unscoped":
+                        logger.warning(
+                            "%s 旧版未归属调控任务仅供查看，不参与自动停投 "
+                            "assist_task_id=%s",
+                            _tag,
+                            assist_task_id,
+                        )
+                        continue
                     promotion_scene = str(row.get("promotion_scene") or "live").strip()
                     ad_id = str(row.get("ad_id") or "").strip()
                     target = db.select_one(
                         "promotion_target",
                         where={"target_uid": target_uid},
                     ) or {}
-                    plan_system = normalize_plan_system(
-                        target.get("plan_system")
-                        or row.get("plan_system")
-                        or "unknown"
+                    target_plan_system = normalize_plan_system(
+                        target.get("plan_system") or "unknown"
+                    )
+                    row_plan_system = normalize_plan_system(
+                        row.get("plan_system") or "unknown"
+                    )
+                    plan_system = (
+                        target_plan_system
+                        if target_plan_system != "unknown"
+                        else row_plan_system
                     )
                     product_id, product_name = _product_fields_from_assist_row(
                         db, row, target_uid
@@ -464,6 +578,10 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 and str(target.get("ad_id") or "") == ad_id
                                 and str(target.get("promotion_scene") or "live")
                                 == promotion_scene
+                                and (
+                                    row_plan_system == "unknown"
+                                    or row_plan_system == target_plan_system
+                                )
                             )
                             if not target_matches:
                                 now = _beijing_now_str()
@@ -494,29 +612,6 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     browser_headless_rule=browser_rule,
                                 )
                                 continue
-                            if promotion_scene == "product":
-                                try:
-                                    capability = json.loads(
-                                        target.get("capability_json") or "{}"
-                                    )
-                                except (
-                                    TypeError,
-                                    ValueError,
-                                    json.JSONDecodeError,
-                                ):
-                                    capability = {}
-                                if not isinstance(capability, dict) or not bool(
-                                    capability.get("regulation_execute")
-                                ):
-                                    logger.warning(
-                                        "%s 商品计划的任务列表和结束入口尚未通过"
-                                        "受控任务验证，本轮不执行自动停投 "
-                                        "target=%s assist_task_id=%s",
-                                        _tag,
-                                        target_uid,
-                                        assist_task_id,
-                                    )
-                                    continue
                             if plan_system == "unknown":
                                 logger.warning(
                                     "%s 计划体系尚未识别，本轮不执行自动停投 "
@@ -526,17 +621,43 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     assist_task_id,
                                 )
                                 continue
-                            if plan_system == "chengfang":
+                            assist_ready, assist_error = (
+                                _target_assist_sync_ready(
+                                    target,
+                                    max_age_minutes=(
+                                        assist_uw_min
+                                        or _DEFAULT_ASSIST_UPDATED_WITHIN_MIN
+                                    ),
+                                )
+                            )
+                            if not assist_ready:
                                 logger.warning(
-                                    "%s 千川乘方停投适配器尚未通过受控验证，本轮不执行 "
+                                    "%s 当前计划的调控任务同步状态不可用，本轮不执行：%s "
                                     "target=%s assist_task_id=%s",
                                     _tag,
+                                    assist_error,
                                     target_uid,
                                     assist_task_id,
                                 )
                                 continue
-                        if not ad_id and aavid and target_uid == "legacy_unscoped":
-                            ad_id = resolve_ad_id_for_aavid(db, aavid)
+                            capability_ok, capability_error = (
+                                check_target_capability(
+                                    target,
+                                    action="regulation",
+                                    promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
+                                )
+                            )
+                            if not capability_ok:
+                                logger.warning(
+                                    "%s 当前计划的停投能力证据无效，本轮不执行：%s "
+                                    "target=%s assist_task_id=%s",
+                                    _tag,
+                                    capability_error,
+                                    target_uid,
+                                    assist_task_id,
+                                )
+                                continue
                         if not ad_id:
                             now = _beijing_now_str()
                             _insert_regulation_run(
@@ -606,6 +727,65 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             async with exclusive_browser_operation(
                                 f"停投:{target_uid}:{assist_task_id}"
                             ):
+                                (
+                                    latest_target,
+                                    latest_row,
+                                    latest_plan_system,
+                                    revalidate_error,
+                                ) = _revalidate_stop_candidate(
+                                    db,
+                                    target_uid=target_uid,
+                                    assist_task_id=assist_task_id,
+                                    aavid=aavid,
+                                    ad_id=ad_id,
+                                    promotion_scene=promotion_scene,
+                                    trigger=trigger,
+                                    max_age_minutes=(
+                                        assist_uw_min
+                                        or _DEFAULT_ASSIST_UPDATED_WITHIN_MIN
+                                    ),
+                                )
+                                if revalidate_error:
+                                    logger.warning(
+                                        "%s 取得浏览器锁后复核失败，已取消停投：%s "
+                                        "target=%s assist_task_id=%s",
+                                        _tag,
+                                        revalidate_error,
+                                        target_uid,
+                                        assist_task_id,
+                                    )
+                                    continue
+                                if has_completed_stop(
+                                    db,
+                                    target_uid,
+                                    assist_task_id,
+                                ):
+                                    continue
+                                target = latest_target or {}
+                                row = latest_row or {}
+                                plan_system = latest_plan_system
+                                task_name = _task_name_from_assist_row(row)
+                                product_id, product_name = (
+                                    _product_fields_from_assist_row(
+                                        db,
+                                        row,
+                                        target_uid,
+                                    )
+                                )
+                                eval_snap = (
+                                    build_trigger_evaluation_snapshot_roi2_assist(
+                                        trigger,
+                                        row,
+                                    )
+                                )
+                                trigger_snap = _json_dumps(
+                                    {
+                                        "strategy_id": st.get("id"),
+                                        "strategy_title": st.get("title"),
+                                        "trigger_config": trigger,
+                                        "evaluation": eval_snap,
+                                    }
+                                )
                                 result = await svc.run(
                                     aavid=aavid_int,
                                     ad_id=ad_id_int,
@@ -614,6 +794,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     strategy_title=st_label,
                                     target_uid=target_uid,
                                     promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
                                     source_url=target.get("sanitized_page_url") or None,
                                     reuse_session=False,
                                     close_session=False,

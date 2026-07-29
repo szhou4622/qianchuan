@@ -172,18 +172,22 @@ class Api:
         target_uid=None,
         material_id=None,
     ):
-        """只读打开商品追投表单并选择一条素材；不填写预算、不点击提交。"""
+        """只读验证直播/商品计划完整追投表单；不填写任何字段、不点击提交。"""
         import asyncio
-        import json
+        import datetime
 
         from .promotion_targets import (
             get_promotion_target,
-            update_target_sync_state,
+            patch_target_sync_state,
         )
         from .rule_retargeting_config import load_rule_retargeting_config
         from services.plan_system import normalize_plan_system
         from services.promotion_browser_lock import exclusive_browser_operation
-        from services.retargeting_service import QianChuanRetargetingService
+        from services.promotion_capability import record_target_capability
+        from services.retargeting_service import (
+            QianChuanRetargetingService,
+            RETARGET_PROBE_VERSION,
+        )
 
         uid = str(target_uid or "").strip()
         target = get_promotion_target(uid, db=self.db)
@@ -191,12 +195,18 @@ class Api:
             return {"success": False, "message": "监控计划不存在"}
         if not target.get("enabled"):
             return {"success": False, "message": "请先启用监控计划"}
-        if str(target.get("promotion_scene") or "") != "product":
-            return {"success": False, "message": "当前只需验证推商品计划的追投表单"}
-        if normalize_plan_system(target.get("plan_system") or "unknown") != "global":
+        promotion_scene = str(
+            target.get("promotion_scene") or ""
+        ).strip().lower()
+        if promotion_scene not in ("live", "product"):
+            return {"success": False, "message": "推广场景尚未确认"}
+        plan_system = normalize_plan_system(
+            target.get("plan_system") or "unknown"
+        )
+        if plan_system == "unknown":
             return {
                 "success": False,
-                "message": "请先把计划体系明确设置为“全域”；千川乘方不能使用该验证入口",
+                "message": "请先把计划体系明确设置为“全域”或“千川乘方”",
             }
         if str(target.get("last_status") or "").strip().lower() != "ok":
             return {
@@ -204,21 +214,31 @@ class Api:
                 "message": "计划当前不是正常投放状态，不能验证追投入口",
             }
         requested_material_id = str(material_id or "").strip()
-        material_where = {"target_uid": uid}
         if requested_material_id:
-            material_where["material_id"] = requested_material_id
-        material = self.db.select_one(
-            "pmc_promotion_material",
-            fields="material_id",
-            where=material_where,
-            order_by=(
-                "prepay_pay_settle_1h DESC, stat_cost DESC, "
-                "updated_at DESC, id DESC"
-            ),
-        )
-        probe_material_id = str(
-            (material or {}).get("material_id") or ""
-        ).strip()
+            material_rows = self.db.execute(
+                "SELECT material_id FROM pmc_promotion_material "
+                "WHERE target_uid=? AND material_id=? "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (uid, requested_material_id),
+                fetch=True,
+            )
+        else:
+            material_rows = self.db.execute(
+                "SELECT material_id FROM pmc_promotion_material "
+                "WHERE target_uid=? AND material_id IS NOT NULL "
+                "AND TRIM(material_id)<>'' "
+                "GROUP BY material_id "
+                "ORDER BY MAX(prepay_pay_settle_1h) DESC, "
+                "MAX(stat_cost) DESC, MAX(updated_at) DESC LIMIT 2",
+                (uid,),
+                fetch=True,
+            )
+        probe_material_ids = [
+            str(row.get("material_id") or "").strip()
+            for row in material_rows or []
+            if str(row.get("material_id") or "").strip()
+        ]
+        probe_material_id = probe_material_ids[0] if probe_material_ids else ""
         if not probe_material_id:
             return {
                 "success": False,
@@ -243,34 +263,108 @@ class Api:
                     aavid=aavid,
                     ad_id=ad_id,
                     material_id=probe_material_id,
+                    material_ids=probe_material_ids,
                     target_uid=uid,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
                     source_url=target.get("sanitized_page_url") or None,
                 )
 
         try:
             result = asyncio.run(run_probe())
         except Exception as exc:
-            return {"success": False, "message": f"能力验证异常：{exc}"}
+            patch_target_sync_state(
+                uid,
+                status=None,
+                error=f"追投能力验证异常：{exc}",
+                capability_updates={
+                    "retarget_execute": False,
+                    "retarget_batch_execute": False,
+                },
+                capability_remove_keys=(
+                    "retarget_scene",
+                    "retarget_plan_system",
+                    "retarget_probe_version",
+                    "retarget_verified_at",
+                    "retarget_target_uid",
+                    "retarget_aavid",
+                    "retarget_ad_id",
+                    "retarget_batch_probe_version",
+                    "retarget_batch_verified_at",
+                ),
+                db=self.db,
+            )
+            return {
+                "success": False,
+                "message": f"能力验证异常：{exc}",
+                "target": get_promotion_target(uid, db=self.db),
+            }
+
         if not result.success:
+            patch_target_sync_state(
+                uid,
+                status=None,
+                error=f"追投能力验证失败：{result.message}",
+                capability_updates={
+                    "retarget_execute": False,
+                    "retarget_batch_execute": False,
+                },
+                capability_remove_keys=(
+                    "retarget_scene",
+                    "retarget_plan_system",
+                    "retarget_probe_version",
+                    "retarget_verified_at",
+                    "retarget_target_uid",
+                    "retarget_aavid",
+                    "retarget_ad_id",
+                    "retarget_batch_probe_version",
+                    "retarget_batch_verified_at",
+                ),
+                db=self.db,
+            )
             return {
                 "success": False,
                 "message": result.message,
                 "data": result.asdict(),
+                "target": get_promotion_target(uid, db=self.db),
             }
 
-        capability = target.get("capability")
-        if not isinstance(capability, dict):
-            try:
-                capability = json.loads(target.get("capability_json") or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                capability = {}
-        capability = dict(capability or {})
-        capability["retarget_execute"] = True
-        update_target_sync_state(
+        verified_at = (
+            datetime.datetime.now()
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+        record_target_capability(
+            self.db,
+            target_uid=uid,
+            action="retarget",
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+            probe_version=RETARGET_PROBE_VERSION,
+            verified_at=verified_at,
+        )
+        batch_updates = {
+            "retarget_batch_execute": len(probe_material_ids) >= 2,
+        }
+        batch_remove_keys = ()
+        if len(probe_material_ids) >= 2:
+            batch_updates.update(
+                {
+                    "retarget_batch_probe_version": RETARGET_PROBE_VERSION,
+                    "retarget_batch_verified_at": verified_at,
+                }
+            )
+        else:
+            batch_remove_keys = (
+                "retarget_batch_probe_version",
+                "retarget_batch_verified_at",
+            )
+        patch_target_sync_state(
             uid,
-            status="ok",
+            status=None,
             error="",
-            capability=capability,
+            capability_updates=batch_updates,
+            capability_remove_keys=batch_remove_keys,
             db=self.db,
         )
         return {
@@ -655,12 +749,30 @@ class Api:
             merge_and_save,
             preview_merge,
             validate_rule_retargeting_config,
+            validate_strategy_target_compatibility,
         )
+        from .promotion_targets import get_promotion_target
 
         if config is not None and not isinstance(config, dict):
             return {"success": False, "message": "配置须为对象"}
         merged = preview_merge(config)
         ok, msg = validate_rule_retargeting_config(merged)
+        if not ok:
+            return {"success": False, "message": msg}
+        target_map = {}
+        for strategy in merged.get("strategies") or []:
+            if not isinstance(strategy, dict):
+                continue
+            target_uid = str(strategy.get("target_uid") or "").strip()
+            if target_uid and target_uid not in target_map:
+                target_map[target_uid] = get_promotion_target(
+                    target_uid,
+                    db=self.db,
+                )
+        ok, msg = validate_strategy_target_compatibility(
+            merged,
+            target_map,
+        )
         if not ok:
             return {"success": False, "message": msg}
         saved = merge_and_save(config)

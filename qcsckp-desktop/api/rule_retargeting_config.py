@@ -922,6 +922,42 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
+def validate_strategy_target_compatibility(
+    data: Dict[str, Any],
+    targets_by_uid: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """校验依赖监控目标场景的追投方式，避免保存必然失败的配置。"""
+    if not isinstance(data, dict) or not bool(data.get("enabled", False)):
+        return True, ""
+    strategies = data.get("strategies")
+    if not isinstance(strategies, list):
+        return True, ""
+    for index, strategy in enumerate(strategies):
+        if not isinstance(strategy, dict):
+            continue
+        target_uid = str(strategy.get("target_uid") or "").strip()
+        target = targets_by_uid.get(target_uid)
+        if not isinstance(target, dict):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的监控计划不存在，请重新选择"
+        if not bool(target.get("enabled")):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的监控计划已停用，请先启用计划"
+        scene = str(target.get("promotion_scene") or "live").strip().lower()
+        retargeting = strategy.get("retargeting")
+        if not isinstance(retargeting, dict):
+            continue
+        method = str(retargeting.get("method") or "volume").strip().lower()
+        if scene == "product" and method == "cost_control":
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return (
+                False,
+                f"“{title}”选择的是推商品计划；推商品当前仅支持放量追投，"
+                "不能保存控成本追投。推直播仍可使用控成本追投。",
+            )
+    return True, ""
+
+
 # ---------- 大屏行字典与触发条件求值（与 DashboardApi.get_table_data 返回的 data 项字段名一致，camelCase）----------
 
 def metric_value_from_dashboard_row(metric: str, row: Dict[str, Any]) -> Optional[float]:

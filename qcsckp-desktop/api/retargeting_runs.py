@@ -25,6 +25,10 @@ from services.retargeting_rule_runner import (
     rate_limit_record_success,
 )
 from services.promotion_browser_lock import exclusive_browser_operation
+from services.promotion_capability import (
+    MANUAL_RETARGET_PROBE_VERSION,
+    record_target_capability,
+)
 from services.plan_system import normalize_plan_system
 from services.retargeting_service import (
     QianChuanRetargetingService,
@@ -34,6 +38,31 @@ from services.retargeting_service import (
 )
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore
+
+
+
+def _record_manual_retarget_capability_if_verified(
+    db: SQLiteStore,
+    result: RetargetingRunResult,
+    *,
+    target_uid: str,
+    promotion_scene: str,
+    plan_system: str,
+    verified_at: str,
+) -> bool:
+    """仅在真实提交成功时写能力证据；返回是否发生写入。"""
+    if not result.success or result.step != "done":
+        return False
+    record_target_capability(
+        db,
+        target_uid=target_uid,
+        action="retarget",
+        promotion_scene=promotion_scene,
+        plan_system=plan_system,
+        probe_version=MANUAL_RETARGET_PROBE_VERSION,
+        verified_at=verified_at,
+    )
+    return True
 
 
 def _store() -> SQLiteStore:
@@ -246,6 +275,11 @@ def run_immediate_retarget_prepare(
 
     db = _store()
     requested_target_uid = str(target_uid or "").strip()
+    if not requested_target_uid:
+        return {
+            "success": False,
+            "message": "即刻追投必须指定监控计划，请先在规则中选择计划",
+        }
     mat_row = _lookup_latest_material_full(db, mid, requested_target_uid or None)
     if not mat_row:
         return {
@@ -278,11 +312,10 @@ def run_immediate_retarget_prepare(
             "success": False,
             "message": "计划体系尚未识别，已阻止追投；请重新打开计划详情完成识别",
         }
-    if plan_system == "chengfang":
-        return {
-            "success": False,
-            "message": "该计划属于千川乘方，乘方追投适配器尚未完成受控验证，已阻止提交",
-        }
+    # “即刻追投”使用可见浏览器，由用户核对表单并亲自点击提交，且仍会
+    # 复核账户、计划、场景和素材。它是建立 scoped 能力证据的受控验证
+    # 入口，因此不要求目标预先已有能力证据；规则发卡和后台执行仍严格
+    # 经过 services.promotion_capability 的目标级 gate。
     source_url = str(target.get("sanitized_page_url") or "").strip() or None
     target_ad_id = str(target.get("ad_id") or "").strip()
     if (
@@ -389,6 +422,7 @@ def run_immediate_retarget_prepare(
                         retargeting=rt,
                         target_uid=resolved_target_uid,
                         promotion_scene=promotion_scene,
+                        plan_system=plan_system,
                         source_url=source_url,
                     )
                 result_holder[0] = r
@@ -459,6 +493,23 @@ def run_immediate_retarget_prepare(
         browser_headless_rule=bool(cfg.get("browser_headless", True)),
         trigger_source="manual",
     )
+
+    # 只有千川创建调控任务接口返回成功才提升目标能力。填表失败、用户未
+    # 提交、接口失败或超时均不会写入证据。
+    try:
+        _record_manual_retarget_capability_if_verified(
+            db,
+            r,
+            target_uid=resolved_target_uid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+            verified_at=ended_at,
+        )
+    except Exception:
+        logger.exception(
+            "[即刻追投] 写入目标级追投能力证据失败 target=%s",
+            resolved_target_uid,
+        )
 
     if r.success:
         per_str = bool(cfg.get("per_strategy_rate_limit"))

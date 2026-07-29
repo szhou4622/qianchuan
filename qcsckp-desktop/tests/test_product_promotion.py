@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import json
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from api.promotion_targets import (
@@ -14,13 +17,17 @@ from api.promotion_targets import (
     list_target_products,
     make_target_uid,
     normalize_plan_system,
+    patch_target_sync_state,
     replace_material_product_links,
     sanitize_target_url,
     set_promotion_target_enabled,
+    update_target_sync_state,
     upsert_products,
     upsert_promotion_target,
 )
+from api.views import Api
 from api.rule_regulation_config import validate_rule_regulation_config
+from api.rule_retargeting_config import validate_strategy_target_compatibility
 from services.fetcher import QianChuanFetcher, build_qianchuan_url_by_params
 from services.product_rule_engine import (
     aggregate_product_rows,
@@ -42,10 +49,22 @@ from services.product_scene_adapter import (
 from services.retargeting_rule_runner import (
     rate_limit_record_success,
     rate_limit_should_skip,
+    retarget_method_is_supported_for_scene,
 )
-from services.retargeting_service import QianChuanRetargetingService
-from services.regulation_rule_runner import has_completed_stop
+from services.retargeting_service import (
+    QianChuanRetargetingService,
+    RETARGET_PROBE_VERSION,
+    RetargetingRunResult,
+    retarget_capability_matches,
+)
+from services.regulation_rule_runner import (
+    _target_assist_sync_ready,
+    has_completed_stop,
+)
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+
+TEST_CAPABILITY_VERIFIED_AT = datetime.now().isoformat(timespec="seconds")
 
 
 def trigger(metric, op, value):
@@ -255,11 +274,52 @@ class ProductPromotionTests(unittest.TestCase):
                     },
                 },
                 promotion_scene="product",
+                plan_system="global",
             )
         )
         self.assertFalse(result.success)
         self.assertEqual("validate", result.step)
         self.assertIn("最多支持20条素材", result.message)
+
+    def test_retarget_execution_rejects_unknown_plan_system_before_browser(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+        service._ensure_browser = AsyncMock()
+        payload = {
+            "method": "volume",
+            "volume": {
+                "total_budget_yuan": 100,
+                "duration_hours": 1,
+            },
+        }
+        result = asyncio.run(
+            service.run(
+                aavid=10001,
+                ad_id=30001,
+                material_id="m1",
+                retargeting=payload,
+                promotion_scene="product",
+                plan_system="unknown",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertEqual("validate_plan_system", result.step)
+        service._ensure_browser.assert_not_awaited()
+
+        result = asyncio.run(
+            service.run_prepare_for_manual_submit(
+                aavid=10001,
+                ad_id=30001,
+                material_id="m1",
+                retargeting=payload,
+                promotion_scene="product",
+                plan_system="unknown",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertEqual("validate_plan_system", result.step)
+        service._ensure_browser.assert_not_awaited()
 
     def test_live_batch_reaches_browser_adapter_instead_of_legacy_rejection(self):
         service = QianChuanRetargetingService.from_rule_file_dict(
@@ -284,6 +344,7 @@ class ProductPromotionTests(unittest.TestCase):
                     },
                 },
                 promotion_scene="live",
+                plan_system="global",
             )
         )
         self.assertFalse(result.success)
@@ -302,7 +363,10 @@ class ProductPromotionTests(unittest.TestCase):
         service._attach_popup_switcher = AsyncMock(return_value=[])
         service._detach_popup_switcher = lambda _handlers: None
         service._open_product_retarget_dialog = AsyncMock(return_value=None)
-        service._select_product_material = AsyncMock(return_value=None)
+        service._select_product_materials = AsyncMock(return_value=None)
+        service._probe_product_volume_form_structure = AsyncMock(
+            return_value=None
+        )
         service._click_submit_and_wait_assist = AsyncMock()
         service.close = AsyncMock()
 
@@ -320,6 +384,7 @@ class ProductPromotionTests(unittest.TestCase):
                         "https://qianchuan.jinritemai.com/uni-prom"
                         "?aavid=10001&adId=20001"
                     ),
+                    plan_system="global",
                 )
             )
 
@@ -327,12 +392,331 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertEqual("capability_probe", result.step)
         self.assertIn("未点击提交", result.message)
         service._open_product_retarget_dialog.assert_awaited_once()
-        service._select_product_material.assert_awaited_once_with(
+        service._select_product_materials.assert_awaited_once_with(
             service.page,
-            "m1",
+            ["m1"],
+        )
+        service._probe_product_volume_form_structure.assert_awaited_once_with(
+            service.page,
         )
         service._click_submit_and_wait_assist.assert_not_awaited()
         service.close.assert_awaited_once()
+
+    def test_product_capability_probe_rejects_incomplete_form_without_submit(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+
+        async def ensure_browser():
+            service.page = object()
+
+        service._ensure_browser = ensure_browser
+        service._attach_popup_switcher = AsyncMock(return_value=[])
+        service._detach_popup_switcher = lambda _handlers: None
+        service._open_product_retarget_dialog = AsyncMock(return_value=None)
+        service._select_product_materials = AsyncMock(return_value=None)
+        service._probe_product_volume_form_structure = AsyncMock(
+            return_value="商品追投表单未找到输入框：调控时长"
+        )
+        service._click_submit_and_wait_assist = AsyncMock()
+        service.close = AsyncMock()
+
+        with patch(
+            "services.retargeting_service.goto_and_confirm_product_target",
+            new=AsyncMock(return_value=None),
+        ):
+            result = asyncio.run(
+                service.probe_product_retarget_capability(
+                    aavid=10001,
+                    ad_id=20001,
+                    material_id="m1",
+                    target_uid="target-1",
+                    plan_system="global",
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("调控时长", result.message)
+        service._click_submit_and_wait_assist.assert_not_awaited()
+
+    def test_live_chengfang_capability_probe_is_scoped_and_never_submits(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+
+        class Page:
+            url = ""
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+        async def ensure_browser():
+            service.page = Page()
+
+        service._ensure_browser = ensure_browser
+        service._attach_popup_switcher = AsyncMock(return_value=[])
+        service._detach_popup_switcher = lambda _handlers: None
+        service._switch_to_video_tab = AsyncMock(return_value=None)
+        service._search_material_and_open_dialog = AsyncMock(return_value=None)
+        service._probe_live_retarget_form_structure = AsyncMock(
+            return_value=None
+        )
+        service._click_submit_and_wait_assist = AsyncMock()
+        service.close = AsyncMock()
+
+        with patch(
+            "services.retargeting_service.asyncio.sleep",
+            new=AsyncMock(),
+        ), patch(
+            "services.retargeting_service.confirm_live_page_plan_system",
+            new=AsyncMock(return_value=""),
+        ):
+            result = asyncio.run(
+                service.probe_product_retarget_capability(
+                    aavid=10001,
+                    ad_id=20001,
+                    material_id="m1",
+                    target_uid="target-live-chengfang",
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertIn("直播放量及控成本", result.message)
+        service._switch_to_video_tab.assert_awaited_once_with("live")
+        service._search_material_and_open_dialog.assert_awaited_once_with(
+            service.page,
+            "m1",
+        )
+        service._probe_live_retarget_form_structure.assert_awaited_once_with(
+            service.page,
+        )
+        service._click_submit_and_wait_assist.assert_not_awaited()
+        service.close.assert_awaited_once()
+
+    def test_live_capability_structure_checks_all_supported_fields(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+
+        class Element:
+            async def is_visible(self):
+                return True
+
+            async def is_disabled(self):
+                return False
+
+        class Page:
+            def __init__(self):
+                self.selectors = []
+
+            async def query_selector(self, selector):
+                self.selectors.append(selector)
+                return Element()
+
+        page = Page()
+        service._click_radio_option = AsyncMock(return_value=None)
+        service._find_visible_button = AsyncMock(return_value=object())
+        service._click_submit_and_wait_assist = AsyncMock()
+        error = asyncio.run(
+            service._probe_live_retarget_form_structure(page)
+        )
+        self.assertIsNone(error)
+        selector_text = "\n".join(page.selectors)
+        for label in (
+            "调控总预算",
+            "调控时长",
+            "调控日预算",
+            "净成交ROI目标",
+            "我的出价",
+            "任务名称",
+        ):
+            self.assertIn(label, selector_text)
+        self.assertEqual(4, service._click_radio_option.await_count)
+        service._find_visible_button.assert_awaited()
+        service._click_submit_and_wait_assist.assert_not_awaited()
+
+    def test_probe_api_records_live_chengfang_scoped_evidence(self):
+        target = {
+            "target_uid": "target-live-chengfang",
+            "aadvid": "10001",
+            "ad_id": "20001",
+            "plan_name": "乘方直播",
+            "promotion_scene": "live",
+            "plan_system": "chengfang",
+            "enabled": 1,
+            "last_status": "ok",
+            "capability_json": "{}",
+            "sanitized_page_url": (
+                "https://qianchuan.jinritemai.com/uni-prom/detail"
+                "?aavid=10001&adId=20001"
+            ),
+        }
+
+        class FakeDb:
+            @contextmanager
+            def transaction(self):
+                yield object()
+
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return dict(target)
+                if table == "pmc_promotion_material":
+                    return {"material_id": "m1"}
+                return None
+
+            def update(self, table, values, **_kwargs):
+                if table == "promotion_target":
+                    target.update(values)
+                return 1
+
+            def execute(self, sql, *_args, **_kwargs):
+                if str(sql).strip().upper().startswith("BEGIN"):
+                    return []
+                return [
+                    {"material_id": "m1"},
+                    {"material_id": "m2"},
+                ]
+
+        captured = {}
+
+        class FakeService:
+            async def probe_product_retarget_capability(self, **kwargs):
+                captured.update(kwargs)
+                return RetargetingRunResult(
+                    success=True,
+                    message="验证通过",
+                    step="capability_probe",
+                )
+
+        api = Api.__new__(Api)
+        api.db = FakeDb()
+        with (
+            patch(
+                "services.retargeting_service."
+                "QianChuanRetargetingService.from_rule_file_dict",
+                return_value=FakeService(),
+            ),
+            patch(
+                "api.rule_retargeting_config.load_rule_retargeting_config",
+                return_value={"browser_headless": True},
+            ),
+        ):
+            result = api.probePromotionTargetRetargetCapability(
+                "target-live-chengfang"
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("live", captured["promotion_scene"])
+        self.assertEqual("chengfang", captured["plan_system"])
+        capability = json.loads(target["capability_json"])
+        self.assertTrue(capability["retarget_execute"])
+        self.assertEqual("live", capability["retarget_scene"])
+        self.assertEqual("chengfang", capability["retarget_plan_system"])
+        self.assertEqual(
+            RETARGET_PROBE_VERSION,
+            capability["retarget_probe_version"],
+        )
+        self.assertTrue(capability["retarget_verified_at"])
+        self.assertEqual("target-live-chengfang", capability["retarget_target_uid"])
+        self.assertEqual("10001", capability["retarget_aavid"])
+        self.assertEqual("20001", capability["retarget_ad_id"])
+        self.assertTrue(capability["retarget_batch_execute"])
+
+    def test_product_capability_evidence_is_scoped_and_versioned(self):
+        evidence = {
+            "retarget_execute": True,
+            "retarget_scene": "product",
+            "retarget_plan_system": "global",
+            "retarget_probe_version": RETARGET_PROBE_VERSION,
+            "retarget_verified_at": TEST_CAPABILITY_VERIFIED_AT,
+            "retarget_target_uid": "target-product",
+            "retarget_aavid": "10001",
+            "retarget_ad_id": "20001",
+        }
+        self.assertTrue(
+            retarget_capability_matches(
+                evidence,
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertFalse(
+            retarget_capability_matches(
+                evidence,
+                promotion_scene="live",
+                plan_system="global",
+            )
+        )
+        self.assertFalse(
+            retarget_capability_matches(
+                {**evidence, "retarget_probe_version": "old-version"},
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertFalse(
+            retarget_capability_matches(
+                {"retarget_execute": True},
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertFalse(
+            retarget_capability_matches(
+                {"retarget_execute": True},
+                promotion_scene="product",
+                plan_system="chengfang",
+            )
+        )
+
+    def test_product_cost_control_config_is_rejected_but_live_is_allowed(self):
+        config = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "title": "商品策略",
+                    "target_uid": "product-target",
+                    "retargeting": {"method": "cost_control"},
+                }
+            ],
+        }
+        ok, message = validate_strategy_target_compatibility(
+            config,
+            {
+                "product-target": {
+                    "promotion_scene": "product",
+                    "enabled": True,
+                }
+            },
+        )
+        self.assertFalse(ok)
+        self.assertIn("推商品当前仅支持放量追投", message)
+
+        ok, message = validate_strategy_target_compatibility(
+            config,
+            {
+                "product-target": {
+                    "promotion_scene": "live",
+                    "enabled": True,
+                }
+            },
+        )
+        self.assertTrue(ok)
+        self.assertEqual("", message)
+        self.assertFalse(
+            retarget_method_is_supported_for_scene(
+                "product",
+                {"method": "cost_control"},
+            )
+        )
+        self.assertTrue(
+            retarget_method_is_supported_for_scene(
+                "live",
+                {"method": "cost_control"},
+            )
+        )
 
     def test_product_material_selection_passes_wait_argument_by_keyword(self):
         service = QianChuanRetargetingService.from_rule_file_dict(
@@ -448,28 +832,243 @@ class ProductPromotionTests(unittest.TestCase):
     def test_product_material_request_accepts_req_from_in_post_body(self):
         fetcher = QianChuanFetcher()
         fetcher._current_aadvid = "10001"
+        fetcher._current_adid = "20001"
         url = (
             "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
             "uni-promotion/material/list-required?aavid=10001"
         )
+        matching_body = {
+            "reqFrom": "uni-prom-creative-tab-list",
+            "Filters": {
+                "Conditions": [
+                    {"Field": "ad_id", "Values": ["20001"]},
+                ]
+            },
+        }
         self.assertTrue(
             fetcher._is_target_api(
                 url,
-                {"reqFrom": "uni-prom-creative-tab-list"},
+                matching_body,
             )
         )
         self.assertTrue(
             fetcher._is_target_api(
-                url + "&reqFrom=uni-prom-creative-tab-list",
+                url + "&reqFrom=uni-prom-creative-tab-list&adId=20001",
             )
         )
-        self.assertFalse(fetcher._is_target_api(url, {"reqFrom": "other"}))
+        self.assertFalse(
+            fetcher._is_target_api(
+                url,
+                {
+                    **matching_body,
+                    "reqFrom": "other",
+                },
+            )
+        )
         self.assertFalse(
             fetcher._is_target_api(
                 url.replace("aavid=10001", "aavid=10002"),
+                matching_body,
+            )
+        )
+
+    def test_material_and_assist_requests_reject_other_plan_in_same_account(self):
+        fetcher = QianChuanFetcher()
+        fetcher._current_aadvid = "10001"
+        fetcher._current_adid = "20001"
+        material_url = (
+            "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
+            "uni-promotion/material/list-required?aavid=10001"
+        )
+        assist_url = (
+            "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
+            "uni-promotion/ad/list-required?aavid=10001"
+        )
+
+        def body(ad_id):
+            return {
+                "reqFrom": "uni-prom-creative-tab-list",
+                "Filters": {
+                    "Conditions": [
+                        {"Field": "ad_id", "Values": [ad_id]},
+                    ]
+                },
+            }
+
+        self.assertTrue(fetcher._is_target_api(material_url, body("20001")))
+        self.assertFalse(fetcher._is_target_api(material_url, body("20002")))
+        self.assertFalse(
+            fetcher._is_target_api(
+                material_url,
                 {"reqFrom": "uni-prom-creative-tab-list"},
             )
         )
+        self.assertTrue(
+            fetcher._is_target_assist_api(assist_url, body("20001"))
+        )
+        self.assertFalse(
+            fetcher._is_target_assist_api(assist_url, body("20002"))
+        )
+        self.assertFalse(fetcher._is_target_assist_api(assist_url))
+
+    def test_response_handlers_ignore_same_account_other_plan(self):
+        fetcher = QianChuanFetcher()
+        fetcher._current_aadvid = "10001"
+        fetcher._current_adid = "20001"
+        other_plan_body = {
+            "reqFrom": "uni-prom-creative-tab-list",
+            "Filters": {
+                "Conditions": [
+                    {"Field": "ad_id", "Values": ["20002"]},
+                ]
+            },
+        }
+
+        class Request:
+            post_data = json.dumps(other_plan_body)
+
+        class Response:
+            def __init__(self, url):
+                self.url = url
+                self.request = Request()
+                self.json = AsyncMock(return_value={"status_code": 0})
+
+        fetcher._handle_material_response = AsyncMock()
+        material_response = Response(
+            "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
+            "uni-promotion/material/list-required?aavid=10001"
+        )
+        asyncio.run(fetcher._on_response(material_response))
+        fetcher._handle_material_response.assert_not_awaited()
+        material_response.json.assert_not_awaited()
+
+        fetcher._handle_assist_response = AsyncMock()
+        assist_response = Response(
+            "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
+            "uni-promotion/ad/list-required?aavid=10001"
+        )
+        asyncio.run(fetcher._on_response_assist(assist_response))
+        fetcher._handle_assist_response.assert_not_awaited()
+        assist_response.json.assert_not_awaited()
+
+    def test_assist_sync_marks_seen_only_after_valid_business_response(self):
+        fetcher = QianChuanFetcher()
+        fetcher._current_aadvid = "10001"
+        fetcher._current_adid = "20001"
+        fetcher._persist_assist_api_response_to_db = AsyncMock()
+        body = {
+            "reqFrom": "uni-prom-creative-tab-list",
+            "Filters": {
+                "Conditions": [
+                    {"Field": "ad_id", "Values": ["20001"]},
+                ]
+            },
+        }
+
+        class Request:
+            post_data = json.dumps(body)
+
+        class Response:
+            url = (
+                "https://qianchuan.jinritemai.com/ad/api/pmc/v1/"
+                "uni-promotion/ad/list-required?aavid=10001"
+            )
+            request = Request()
+
+            def __init__(self, result):
+                self.json = AsyncMock(return_value=result)
+
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response({"status_code": 500, "message": "failed"})
+            )
+        )
+        self.assertFalse(fetcher._assist_response_seen)
+
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response({"status_code": 0, "data": {"adInfos": {}}})
+            )
+        )
+        self.assertFalse(fetcher._assist_response_seen)
+
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response({"status_code": 0, "data": {}})
+            )
+        )
+        self.assertFalse(fetcher._assist_response_seen)
+
+        fetcher._persist_assist_api_response_to_db.return_value = False
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response(
+                    {
+                        "status_code": 0,
+                        "data": {
+                            "adInfos": [{"id": "assist-1"}],
+                            "pagination": {"totalNum": 1},
+                        },
+                    }
+                )
+            )
+        )
+        self.assertFalse(fetcher._assist_response_seen)
+
+        fetcher._persist_assist_api_response_to_db.return_value = True
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response(
+                    {
+                        "status_code": 0,
+                        "data": {"adInfos": [{"id": "assist-1"}]},
+                    }
+                )
+            )
+        )
+        self.assertFalse(fetcher._assist_response_seen)
+
+        asyncio.run(
+            fetcher._on_response_assist(
+                Response(
+                    {
+                        "status_code": 0,
+                        "data": {
+                            "adInfos": [],
+                            "pagination": {"totalNum": 0},
+                        },
+                    }
+                )
+            )
+        )
+        self.assertTrue(fetcher._assist_response_seen)
+
+    def test_full_assist_sync_prunes_tasks_removed_from_current_target(self):
+        target_uid = make_target_uid("10001", "20001")
+        for assist_id in ("keep", "stale"):
+            self.db.insert(
+                "pmc_roi2_assist_task",
+                {
+                    "target_uid": target_uid,
+                    "assist_task_id": assist_id,
+                    "aadvid": "10001",
+                    "ad_id": "20001",
+                },
+            )
+        fetcher = QianChuanFetcher()
+        fetcher._current_target_uid = target_uid
+        fetcher._assist_task_ids = {"keep": True}
+        self.assertTrue(
+            asyncio.run(
+                fetcher._prune_stale_assist_rows_after_full_sync(self.db)
+            )
+        )
+        rows = self.db.select(
+            "pmc_roi2_assist_task",
+            fields="assist_task_id",
+            where={"target_uid": target_uid},
+        )
+        self.assertEqual(["keep"], [row["assist_task_id"] for row in rows])
 
     def test_product_material_request_body_is_scoped_to_target_plan(self):
         fetcher = QianChuanFetcher()
@@ -544,6 +1143,71 @@ class ProductPromotionTests(unittest.TestCase):
             "unknown",
             detect_plan_system(page_text="商品全域推广"),
         )
+        self.assertEqual(
+            "unknown",
+            detect_plan_system(page_text="推直播"),
+        )
+        for page_text in ("直播全域", "直播间 · 全域计划"):
+            with self.subTest(page_text=page_text):
+                self.assertEqual(
+                    "global",
+                    detect_plan_system(page_text=page_text),
+                )
+        self.assertEqual(
+            "chengfang",
+            detect_plan_system(page_text="推直播 · 直播全域 · 千川乘方计划"),
+        )
+        self.assertEqual(
+            "chengfang",
+            detect_plan_system(
+                payload={
+                    "data": {
+                        "planSystem": "global",
+                        "isChengfang": True,
+                    }
+                }
+            ),
+        )
+
+    def test_product_fetch_collects_assist_tasks_when_enabled(self):
+        fetcher = QianChuanFetcher()
+        fetcher.page = AsyncMock()
+        fetcher._check_product_delivery_gate = AsyncMock(return_value=True)
+        fetcher._fetch_product_material_pages = AsyncMock()
+        fetcher._finalize_pending_ad_detail_basic_cloud = AsyncMock()
+
+        async def collect_assist(_db, _timeout):
+            fetcher._assist_task_ids = {"assist-1": True, "assist-2": True}
+            fetcher._assist_total_count = 2
+
+        fetcher._fetch_roi2_assist_tasks = AsyncMock(side_effect=collect_assist)
+        fetcher._raise_if_global_auth_expired = AsyncMock()
+        url = (
+            "https://qianchuan.jinritemai.com/uni-prom/detail"
+            "?aavid=10001&adId=20001"
+        )
+
+        with (
+            patch(
+                "services.fetcher.load_scrape_service_config",
+                return_value={"fetch_assist_tasks": True},
+            ),
+            patch("services.fetcher.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = asyncio.run(
+                fetcher.fetch(
+                    url,
+                    db=self.db,
+                    timeout=30,
+                    target_uid=make_target_uid("10001", "20001"),
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            )
+
+        fetcher._fetch_roi2_assist_tasks.assert_awaited_once_with(self.db, 30)
+        self.assertEqual(2, result["assist_task_count"])
+        self.assertEqual(2, result["assist_task_total_count"])
 
     def test_discovery_requires_confirmed_detail_context(self):
         generic = (
@@ -711,12 +1375,17 @@ class ProductPromotionTests(unittest.TestCase):
                     "https://qianchuan.jinritemai.com/uni-prom/detail"
                     "?aavid=10001&adId=20001"
                 ),
-                "capability": {
-                    "material_read": True,
-                    "product_relation": True,
-                    "retarget_execute": True,
-                    "regulation_execute": False,
-                },
+            },
+            db=self.db,
+        )
+        update_target_sync_state(
+            original["target_uid"],
+            status="ok",
+            capability={
+                "material_read": True,
+                "product_relation": True,
+                "retarget_execute": True,
+                "regulation_execute": False,
             },
             db=self.db,
         )
@@ -738,6 +1407,115 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertTrue(refreshed["capability"]["retarget_execute"])
         self.assertTrue(refreshed["capability"]["product_relation"])
         self.assertEqual("global", refreshed["plan_system"])
+
+    def test_client_upsert_cannot_forge_write_capability(self):
+        target = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "商品计划",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "enabled": True,
+                "capability": {
+                    "retarget_execute": True,
+                    "regulation_execute": True,
+                },
+            },
+            db=self.db,
+        )
+        self.assertFalse(target["capability"].get("retarget_execute", False))
+        self.assertFalse(target["capability"].get("regulation_execute", False))
+
+    def test_atomic_sync_patch_preserves_controlled_capability_evidence(self):
+        target = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "enabled": True,
+            },
+            db=self.db,
+        )
+        controlled = {
+            "retarget_execute": True,
+            "retarget_target_uid": target["target_uid"],
+            "retarget_aavid": "10001",
+            "retarget_ad_id": "20001",
+        }
+        update_target_sync_state(
+            target["target_uid"],
+            status="ok",
+            capability=controlled,
+            db=self.db,
+        )
+        merged = patch_target_sync_state(
+            target["target_uid"],
+            status="ok",
+            synced=True,
+            capability_updates={
+                "material_read": True,
+                "assist_sync_ok": True,
+            },
+            db=self.db,
+        )
+        self.assertTrue(merged["retarget_execute"])
+        self.assertEqual(target["target_uid"], merged["retarget_target_uid"])
+        self.assertTrue(merged["material_read"])
+        self.assertTrue(merged["assist_sync_ok"])
+
+    def test_auto_stop_requires_current_complete_assist_sync(self):
+        now = datetime.now()
+        ready, _ = _target_assist_sync_ready(
+            {
+                "capability": {
+                    "assist_sync_enabled": True,
+                    "assist_sync_ok": True,
+                    "assist_synced_at": now.isoformat(timespec="seconds"),
+                }
+            }
+        )
+        self.assertTrue(ready)
+
+        incomplete, reason = _target_assist_sync_ready(
+            {
+                "capability": {
+                    "assist_sync_enabled": True,
+                    "assist_sync_ok": False,
+                    "assist_synced_at": now.isoformat(timespec="seconds"),
+                }
+            }
+        )
+        self.assertFalse(incomplete)
+        self.assertIn("未完整同步", reason)
+
+        stale, reason = _target_assist_sync_ready(
+            {
+                "capability": {
+                    "assist_sync_enabled": True,
+                    "assist_sync_ok": True,
+                    "assist_synced_at": (
+                        now - timedelta(hours=2)
+                    ).isoformat(timespec="seconds"),
+                }
+            }
+        )
+        self.assertFalse(stale)
+        self.assertIn("过期", reason)
+
+        in_progress, reason = _target_assist_sync_ready(
+            {
+                "capability": {
+                    "assist_sync_enabled": True,
+                    "assist_sync_in_progress": True,
+                    "assist_sync_ok": True,
+                    "assist_synced_at": now.isoformat(timespec="seconds"),
+                }
+            }
+        )
+        self.assertFalse(in_progress)
+        self.assertIn("正在同步", reason)
 
     def test_partial_target_refresh_preserves_sync_status_and_error(self):
         original = upsert_promotion_target(

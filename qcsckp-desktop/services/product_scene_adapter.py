@@ -10,7 +10,7 @@ import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 
-from services.plan_system import detect_plan_system
+from services.plan_system import detect_plan_system, normalize_plan_system
 
 
 PRODUCT_PLAN_API_PATHS = frozenset(
@@ -420,6 +420,7 @@ async def goto_and_confirm_product_target(
     *,
     expected_aavid: Any,
     expected_ad_id: Any,
+    expected_plan_system: Any = None,
     timeout_ms: int = 60_000,
 ) -> Optional[str]:
     """打开商品自选列表并同时确认可见计划行和精确计划接口；成功返回 None。"""
@@ -533,6 +534,19 @@ async def goto_and_confirm_product_target(
             f"商品全域账户不匹配：期望 {expected_account}，实际 "
             f"{actual_account}"
         )
+    if expected_plan_system not in (None, ""):
+        expected_system = normalize_plan_system(expected_plan_system)
+        actual_system = detect_plan_system(
+            payload=payload,
+            page_text=row_text,
+        )
+        if actual_system == "unknown":
+            return "商品计划体系无法从千川详情响应中确认，已安全停止"
+        if actual_system != expected_system:
+            return (
+                f"商品计划体系不匹配：配置为 {expected_system}，"
+                f"页面实际为 {actual_system}"
+            )
     return validate_exact_product_plan_payload(
         payload,
         expected_ad_id=expected_plan,

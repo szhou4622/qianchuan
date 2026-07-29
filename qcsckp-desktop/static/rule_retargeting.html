@@ -1241,6 +1241,9 @@
                         <button type="button" data-method="volume" class="method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">放量追投</button>
                         <button type="button" data-method="cost_control" class="method-btn seg-btn px-4 py-2 rounded-lg text-sm">控成本追投</button>
                     </div>
+                    <p id="retargetMethodSceneHint" class="hidden text-[11px] text-amber-400/90 leading-relaxed">
+                        推商品计划当前仅支持放量追投；控成本追投仅可用于推直播计划。
+                    </p>
 
                     <!-- 放量 -->
                     <div id="panelVolume" class="space-y-4 pt-1">
@@ -1858,6 +1861,35 @@
                     : '请先在“监控计划”页面添加计划。';
             }
             renderStrategyProductOptions();
+            syncRetargetMethodAvailability();
+        }
+
+        function syncRetargetMethodAvailability() {
+            const targetUid = document.getElementById('strategyTargetUid')?.value || '';
+            const target = promotionTargetsState.find(x => x.target_uid === targetUid);
+            const productOnlyVolume = target?.promotion_scene === 'product';
+            const costButton = document.querySelector('.method-btn[data-method="cost_control"]');
+            const volumeButton = document.querySelector('.method-btn[data-method="volume"]');
+            const hint = document.getElementById('retargetMethodSceneHint');
+            if (costButton) {
+                costButton.disabled = productOnlyVolume;
+                costButton.classList.toggle('opacity-45', productOnlyVolume);
+                costButton.classList.toggle('cursor-not-allowed', productOnlyVolume);
+                costButton.setAttribute(
+                    'title',
+                    productOnlyVolume ? '推商品当前仅支持放量追投' : ''
+                );
+            }
+            if (hint) hint.classList.toggle('hidden', !productOnlyVolume);
+            if (
+                productOnlyVolume &&
+                costButton?.classList.contains('seg-btn-active')
+            ) {
+                costButton.classList.remove('seg-btn-active');
+                volumeButton?.classList.add('seg-btn-active');
+                syncMethodPanels();
+                clearRetargetingFieldErrorsOnly();
+            }
         }
 
         function renderStrategyProductOptions() {
@@ -2271,6 +2303,7 @@
             document.querySelectorAll('.method-btn').forEach((b) => {
                 b.classList.toggle('seg-btn-active', b.getAttribute('data-method') === method);
             });
+            syncRetargetMethodAvailability();
             const vol = r.volume || {};
             document.getElementById('volBudget').value =
                 vol.total_budget_yuan != null && vol.total_budget_yuan !== '' ? vol.total_budget_yuan : '';
@@ -2442,6 +2475,19 @@
                         ok: false,
                         vt: { ok: true },
                         vr: { ok: false, firstMsg: msg, firstScrollEl: targetEl },
+                        failedStrategyIndex: i,
+                    };
+                }
+                const selectedMethod =
+                    document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+                if (selectedTarget.promotion_scene === 'product' && selectedMethod === 'cost_control') {
+                    renderStrategyTabs();
+                    const methodEl = document.querySelector('.method-btn[data-method="cost_control"]');
+                    const msg = '推商品计划当前仅支持放量追投；控成本追投仅可用于推直播计划';
+                    return {
+                        ok: false,
+                        vt: { ok: true },
+                        vr: { ok: false, firstMsg: msg, firstScrollEl: methodEl },
                         failedStrategyIndex: i,
                     };
                 }
@@ -3263,6 +3309,10 @@
 
         document.querySelectorAll('.method-btn').forEach((b) => {
             b.addEventListener('click', () => {
+                if (b.disabled) {
+                    notifyErr('推商品计划当前仅支持放量追投；控成本追投仅可用于推直播计划');
+                    return;
+                }
                 document.querySelectorAll('.method-btn').forEach((x) => x.classList.remove('seg-btn-active'));
                 b.classList.add('seg-btn-active');
                 syncMethodPanels();
@@ -3352,8 +3402,20 @@
         }
         function syncImmediateModalFromMain() {
             const method = document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
+            const targetUid = document.getElementById('strategyTargetUid')?.value || '';
+            const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
+            const productOnlyVolume = selectedTarget?.promotion_scene === 'product';
             document.querySelectorAll('.imm-method-btn').forEach((b) => {
-                b.classList.toggle('seg-btn-active', b.getAttribute('data-method') === method);
+                const isCost = b.getAttribute('data-method') === 'cost_control';
+                b.disabled = productOnlyVolume && isCost;
+                b.classList.toggle('opacity-45', b.disabled);
+                b.classList.toggle('cursor-not-allowed', b.disabled);
+                b.classList.toggle(
+                    'seg-btn-active',
+                    b.getAttribute('data-method') === (
+                        productOnlyVolume ? 'volume' : method
+                    )
+                );
             });
             const goal = document.querySelector('.goal-btn.seg-btn-active')?.getAttribute('data-goal') || 'net_roi';
             document.querySelectorAll('.imm-goal-btn').forEach((b) => {
@@ -3535,6 +3597,10 @@
         document.querySelectorAll('.imm-method-btn').forEach((b) => {
             b.addEventListener('click', () => {
                 clearImmediateModalMessage();
+                if (b.disabled) {
+                    setImmediateModalMessage('error', '推商品当前仅支持放量追投');
+                    return;
+                }
                 if (typeof window.clearImmediateFieldErrors === 'function') window.clearImmediateFieldErrors();
                 document.querySelectorAll('.imm-method-btn').forEach((x) => x.classList.remove('seg-btn-active'));
                 b.classList.add('seg-btn-active');
@@ -3603,7 +3669,8 @@
             try {
                 const res = await api.runImmediateRetargetPrepare(
                     document.getElementById('immMaterialId').value.trim(),
-                    collectImmediateRetargeting()
+                    collectImmediateRetargeting(),
+                    document.getElementById('strategyTargetUid')?.value || ''
                 );
                 if (res && res.success) {
                     const okMsg = res.message || '已打开浏览器，请在页面内手动提交';

@@ -49,6 +49,28 @@
     function statusText(x){return ({ok:'同步正常',pending:'等待首次同步',paused:'计划已暂停',not_delivering:'计划未在投放',error:'同步异常',capability_mismatch:'页面能力未识别'})[x]||x||'等待首次同步'}
     function sceneText(x){return x==='product'?'推商品':x==='live'?'推直播':'未知场景'}
     function systemText(x){return x==='global'?'全域':x==='chengfang'?'千川乘方':'体系待确认'}
+    function recentCapabilityTime(value){
+      const raw=String(value||'').trim(); if(!raw)return false;
+      const parsed=new Date(raw.includes('T')?raw:raw.replace(' ','T'));
+      if(Number.isNaN(parsed.getTime()))return false;
+      const age=Date.now()-parsed.getTime();
+      return age>=-5*60*1000&&age<=30*24*60*60*1000;
+    }
+    function retargetCapabilityVerified(x){
+      const c=x?.capability||{}; if(!c.retarget_execute)return false;
+      const scoped=!!(c.retarget_scene||c.retarget_plan_system||c.retarget_probe_version||c.retarget_verified_at);
+      if(!scoped)return x.promotion_scene==='live'&&x.plan_system==='global';
+      const supportedVersions=new Set(['retarget-form-v3','manual-retarget-submit-v1']);
+      return c.retarget_scene===x.promotion_scene&&c.retarget_plan_system===x.plan_system&&c.retarget_target_uid===x.target_uid&&String(c.retarget_aavid||'')===String(x.aadvid||'')&&String(c.retarget_ad_id||'')===String(x.ad_id||'')&&supportedVersions.has(c.retarget_probe_version)&&recentCapabilityTime(c.retarget_verified_at);
+    }
+    function retargetBatchCapabilityVerified(x){
+      const c=x?.capability||{};
+      return retargetCapabilityVerified(x)&&c.retarget_batch_execute===true&&c.retarget_batch_probe_version==='retarget-form-v3'&&recentCapabilityTime(c.retarget_batch_verified_at);
+    }
+    function capabilityButtonText(x){
+      if(!retargetCapabilityVerified(x))return '验证追投能力';
+      return retargetBatchCapabilityVerified(x)?'单素材＋多素材已验证':'单素材已验证 · 多素材待验证';
+    }
     async function load(){
       const a=await waitApi(); const r=await a.listPromotionTargets();
       const rows=r?.data||[]; $('empty').style.display=rows.length?'none':'block';
@@ -74,7 +96,7 @@
             ${x.promotion_scene==='product'?`<label>商品范围<select data-field="product_filter_mode"><option value="all" ${x.product_filter_mode==='all'?'selected':''}>全部商品</option><option value="selected" ${x.product_filter_mode==='selected'?'selected':''}>只关注指定商品</option></select></label>
             <div></div><div class="products">${products.length?products.map(p=>`<label class="product-check"><input type="checkbox" data-product-id="${esc(p.product_id)}" ${selected.has(String(p.product_id))?'checked':''}><span>${esc(p.product_name||'未命名商品')}<br><span class="meta">${esc(p.product_id)}</span></span></label>`).join(''):'<div class="product-empty">首次采集成功后，这里会显示可勾选的商品。</div>'}</div>`:''}
           </div>
-          <div class="actions">${x.promotion_scene==='product'&&x.plan_system==='global'?`<button data-probe>${x.capability?.retarget_execute?'追投能力已验证':'验证追投能力'}</button>`:''}<button data-save>保存设置</button></div>
+          <div class="actions">${x.plan_system!=='unknown'?`<button data-probe>${capabilityButtonText(x)}</button>`:''}<button data-save>保存设置</button></div>
         </section>`;
       }).join('');
       document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>save(btn.closest('.card')));
@@ -93,7 +115,7 @@
     }
     async function probe(card,btn){
       const a=await waitApi(); if(!a?.probePromotionTargetRetargetCapability){message('当前版本不支持能力验证',true);return}
-      btn.disabled=true; message('正在只读验证追投表单，不会点击提交……');
+      btn.disabled=true; message('正在只读验证当前计划的完整追投表单，不会点击提交，也不会填写任何字段……');
       try{
         const r=await a.probePromotionTargetRetargetCapability(card.dataset.uid);
         message(r?.message||(r?.success?'验证通过':'验证失败'),!r?.success);

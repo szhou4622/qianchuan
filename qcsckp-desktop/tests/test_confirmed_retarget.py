@@ -22,6 +22,7 @@ from api.rule_retargeting_config import _normalize_full
 from services.cloud_retarget_client import report_retarget_task
 from services import local_test_guard
 from services import retarget_task_worker
+from services.promotion_capability import RETARGET_FORM_PROBE_VERSION
 from services.run_services import (
     ServiceConfig,
     _choose_startup_target,
@@ -46,6 +47,39 @@ from services.operation_log_monitor import (
 from services.retarget_task_worker import _snapshot_hash, _strategy_hash, _strategy_snapshot
 from services import retargeting_rule_runner
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+
+TEST_CAPABILITY_VERIFIED_AT = datetime.now().isoformat(timespec="seconds")
+
+
+def _retarget_capability_json(
+    *,
+    target_uid,
+    aavid,
+    ad_id,
+    scene,
+    plan_system,
+    batch=False,
+):
+    capability = {
+        "retarget_execute": True,
+        "retarget_scene": scene,
+        "retarget_plan_system": plan_system,
+        "retarget_probe_version": RETARGET_FORM_PROBE_VERSION,
+        "retarget_verified_at": TEST_CAPABILITY_VERIFIED_AT,
+        "retarget_target_uid": target_uid,
+        "retarget_aavid": aavid,
+        "retarget_ad_id": ad_id,
+    }
+    if batch:
+        capability.update(
+            {
+                "retarget_batch_execute": True,
+                "retarget_batch_probe_version": RETARGET_FORM_PROBE_VERSION,
+                "retarget_batch_verified_at": TEST_CAPABILITY_VERIFIED_AT,
+            }
+        )
+    return json.dumps(capability)
 
 
 class RetargetConfigTests(unittest.TestCase):
@@ -139,7 +173,13 @@ class RetargetConfigTests(unittest.TestCase):
             "plan_system": "global",
             "last_status": "ok",
             "enabled": 1,
-            "capability_json": '{"retarget_execute":true}',
+            "capability_json": _retarget_capability_json(
+                target_uid="target-product",
+                aavid="10001",
+                ad_id="30001",
+                scene="product",
+                plan_system="global",
+            ),
         }
         rows = [
             {
@@ -506,6 +546,9 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "rule_snapshot": snapshot,
             "aavid": "10001",
             "ad_id": "30001",
+            "target_uid": "target-live",
+            "promotion_scene": "live",
+            "plan_system": "global",
             "material_id": "20001",
             "retargeting": copy.deepcopy(snapshot["retargeting"]),
         }
@@ -525,6 +568,21 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "per_strategy_rate_limit": False,
             "strategies": [strategy],
         }
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {
+                        "target_uid": "target-live",
+                        "aadvid": "10001",
+                        "ad_id": current_ad_id,
+                        "promotion_scene": "live",
+                        "plan_system": "global",
+                        "enabled": 1,
+                        "last_status": "ok",
+                        "capability_json": '{"retarget_execute":true}',
+                    }
+                return None
+
         with patch(
             "services.retarget_task_worker.load_rule_retargeting_config",
             return_value=cfg,
@@ -535,8 +593,8 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "services.retarget_task_worker.os.path.isfile",
             return_value=True,
         ), patch(
-            "services.retarget_task_worker._latest_material_row",
-            return_value={"aadvid": "10001", "id": "20001"},
+            "services.retarget_task_worker._latest_target_rows",
+            return_value=[{"aadvid": "10001", "id": "20001"}],
         ), patch(
             "services.retarget_task_worker.evaluate_trigger",
             return_value=trigger_passed,
@@ -549,7 +607,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         ), patch(
             "services.retarget_task_worker.assert_test_task_scope",
         ):
-            return retarget_task_worker._validate_task(self.task, object())
+            return retarget_task_worker._validate_task(self.task, FakeStore())
 
     def test_strategy_change_blocks_execution(self):
         changed = copy.deepcopy(self.strategy)
@@ -558,7 +616,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             self.validate(current_strategy=changed)
 
     def test_account_mismatch_blocks_execution(self):
-        with self.assertRaisesRegex(RuntimeError, "账户或广告ID"):
+        with self.assertRaisesRegex(RuntimeError, "账户.*广告ID"):
             self.validate(current_ad_id="99999")
 
     def test_material_no_longer_matches_blocks_execution(self):
@@ -572,7 +630,9 @@ class RetargetWorkerValidationTests(unittest.TestCase):
     def test_product_batch_revalidates_every_material_in_one_task(self):
         task = {
             **self.task,
+            "target_uid": "target-product",
             "promotion_scene": "product",
+            "plan_system": "global",
             "materials": [
                 {"material_id": "20001", "material_name": "素材1"},
                 {"material_id": "20002", "material_name": "素材2"},
@@ -585,8 +645,27 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "strategies": [copy.deepcopy(self.strategy)],
         }
 
-        def latest(_aavid, material_id, _period):
-            return {"aadvid": "10001", "id": material_id}
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {
+                        "target_uid": "target-product",
+                        "aadvid": "10001",
+                        "ad_id": "30001",
+                        "promotion_scene": "product",
+                        "plan_system": "global",
+                        "enabled": 1,
+                        "last_status": "ok",
+                        "capability_json": _retarget_capability_json(
+                            target_uid="target-product",
+                            aavid="10001",
+                            ad_id="30001",
+                            scene="product",
+                            plan_system="global",
+                            batch=True,
+                        ),
+                    }
+                return None
 
         with patch(
             "services.retarget_task_worker.load_rule_retargeting_config",
@@ -598,8 +677,11 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             "services.retarget_task_worker.os.path.isfile",
             return_value=True,
         ), patch(
-            "services.retarget_task_worker._latest_material_row",
-            side_effect=latest,
+            "services.retarget_task_worker._latest_target_rows",
+            return_value=[
+                {"aadvid": "10001", "id": "20001"},
+                {"aadvid": "10001", "id": "20002"},
+            ],
         ), patch(
             "services.retarget_task_worker.evaluate_trigger",
             return_value=True,
@@ -614,7 +696,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         ):
             _cfg, _strategy, rows = retarget_task_worker._validate_task(
                 task,
-                object(),
+                FakeStore(),
             )
 
         self.assertEqual(["20001", "20002"], [row["id"] for row in rows])
@@ -814,7 +896,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             ],
             [call["material_ids"] for call in service.calls],
         )
-        self.assertEqual(3, validate.call_count)
+        self.assertEqual(6, validate.call_count)
         self.assertEqual(3, insert_run.call_count)
         consume.assert_called_once_with(
             "task-three-groups",
@@ -1021,7 +1103,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             self.validate_target_plan_system("unknown")
 
     def test_chengfang_plan_system_blocks_unverified_adapter(self):
-        with self.assertRaisesRegex(RuntimeError, "千川乘方计划尚未通过"):
+        with self.assertRaisesRegex(RuntimeError, "追投能力证据无效"):
             self.validate_target_plan_system("chengfang")
 
 
@@ -1266,7 +1348,13 @@ class LocalTestGuardTests(unittest.TestCase):
                         "plan_name": "测试全域计划",
                         "enabled": 1,
                         "last_status": "ok",
-                        "capability_json": '{"retarget_execute": true}',
+                        "capability_json": _retarget_capability_json(
+                            target_uid="target-test",
+                            aavid="1001",
+                            ad_id="3001",
+                            scene="product",
+                            plan_system="global",
+                        ),
                     }
                 if table == "pmc_ad_detail_basic":
                     return {"user_info_name": "测试账户"}
@@ -1366,7 +1454,13 @@ class LocalTestGuardTests(unittest.TestCase):
                         "plan_name": "测试全域计划",
                         "enabled": 1,
                         "last_status": "pending",
-                        "capability_json": '{"retarget_execute": true}',
+                        "capability_json": _retarget_capability_json(
+                            target_uid="target-test",
+                            aavid="1001",
+                            ad_id="3001",
+                            scene="product",
+                            plan_system="global",
+                        ),
                     }
                 if table == "pmc_ad_detail_basic":
                     return {"user_info_name": "测试账户"}

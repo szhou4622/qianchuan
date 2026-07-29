@@ -21,6 +21,11 @@ from playwright.async_api import Browser, BrowserContext, Page, Response, async_
 from config import DATA_DIR
 from services.fetcher import build_qianchuan_url_by_params
 from services.product_scene_adapter import goto_and_confirm_product_target
+from services.plan_system import (
+    confirm_live_page_plan_system,
+    normalize_plan_system,
+)
+from services.promotion_capability import REGULATION_MANUAL_PROBE_VERSION
 from api.promotion_targets import extract_target_ids, normalize_scene
 from utils.common import require_executable_path
 from utils.log import logger
@@ -29,6 +34,8 @@ DEFAULT_BASE_URL = "https://qianchuan.jinritemai.com/uni-prom/detail"
 
 BATCH_UPDATE_SUBSTRING = "/ad/api/pmc/v1/batch_update_operation"
 BATCH_DELETE_SUBSTRING = "/ad/api/pmc/v1/batch_delete_operation"
+# 手动可见浏览器完成一次 batch 操作并校验响应后写入目标级停投能力证据。
+REGULATION_PROBE_VERSION = REGULATION_MANUAL_PROBE_VERSION
 
 
 def regulation_log_tag(*, strategy_title: Optional[str] = None, scheduler: bool = False) -> str:
@@ -505,6 +512,7 @@ class QianChuanRegulationStopService:
         strategy_title: Optional[str] = None,
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
+        plan_system: str = "unknown",
         source_url: Optional[str] = None,
         reuse_session: bool = False,
         close_session: bool = True,
@@ -517,6 +525,17 @@ class QianChuanRegulationStopService:
                 success=False,
                 message=str(e),
                 step="validate_scene",
+                aavid=aavid,
+                ad_id=ad_id,
+                assist_task_id=assist_task_id,
+                stop_action=stop_action,
+            )
+        system = normalize_plan_system(plan_system or "unknown")
+        if system == "unknown":
+            return self._make_result(
+                success=False,
+                message="计划体系尚未确认，已安全停止",
+                step="validate_plan_system",
                 aavid=aavid,
                 ad_id=ad_id,
                 assist_task_id=assist_task_id,
@@ -590,6 +609,7 @@ class QianChuanRegulationStopService:
                         fetch_url,
                         expected_aavid=aavid,
                         expected_ad_id=ad_id,
+                        expected_plan_system=system,
                         timeout_ms=self._opt.goto_timeout_ms,
                     )
                     if target_error:
@@ -623,6 +643,23 @@ class QianChuanRegulationStopService:
                         assist_task_id=aid,
                         stop_action=act,
                     )
+                if scene != "product":
+                    system_error = await confirm_live_page_plan_system(
+                        page,
+                        expected_plan_system=system,
+                        aavid=aavid,
+                        ad_id=ad_id,
+                    )
+                    if system_error:
+                        return self._make_result(
+                            success=False,
+                            message=system_error,
+                            step="plan_system_mismatch",
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            assist_task_id=aid,
+                            stop_action=act,
+                        )
                 err = await self._switch_to_assist_tab()
                 if err:
                     return self._make_result(
@@ -981,6 +1018,7 @@ class QianChuanRegulationStopService:
         strategy_title: Optional[str] = None,
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
+        plan_system: str = "unknown",
         source_url: Optional[str] = None,
     ) -> RegulationRunResult:
         """
@@ -996,6 +1034,17 @@ class QianChuanRegulationStopService:
                 success=False,
                 message=str(e),
                 step="validate_scene",
+                aavid=aavid,
+                ad_id=ad_id,
+                assist_task_id=assist_task_id,
+                stop_action=stop_action,
+            )
+        system = normalize_plan_system(plan_system or "unknown")
+        if system == "unknown":
+            return self._make_result(
+                success=False,
+                message="计划体系尚未确认，已安全停止",
+                step="validate_plan_system",
                 aavid=aavid,
                 ad_id=ad_id,
                 assist_task_id=assist_task_id,
@@ -1068,6 +1117,7 @@ class QianChuanRegulationStopService:
                     fetch_url,
                     expected_aavid=aavid,
                     expected_ad_id=ad_id,
+                    expected_plan_system=system,
                     timeout_ms=self._opt.goto_timeout_ms,
                 )
                 if target_error:
@@ -1102,6 +1152,23 @@ class QianChuanRegulationStopService:
                     assist_task_id=aid,
                     stop_action=act,
                 )
+            if scene != "product":
+                system_error = await confirm_live_page_plan_system(
+                    page,
+                    expected_plan_system=system,
+                    aavid=aavid,
+                    ad_id=ad_id,
+                )
+                if system_error:
+                    return self._make_result(
+                        success=False,
+                        message=system_error,
+                        step="plan_system_mismatch",
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        assist_task_id=aid,
+                        stop_action=act,
+                    )
             err = await self._switch_to_assist_tab()
             if err:
                 return self._make_result(

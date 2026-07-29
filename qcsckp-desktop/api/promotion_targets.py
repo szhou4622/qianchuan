@@ -339,12 +339,13 @@ def upsert_promotion_target(
     if not page_url_source and existing:
         page_url_source = str(existing.get("sanitized_page_url") or "")
     page_url = sanitize_target_url(page_url_source)
-    capability_provided = "capability" in data or "capability_json" in data
-    capability = data.get("capability")
-    capability_json_source = data.get("capability_json")
-    if not capability_provided and existing:
-        capability_json_source = existing.get("capability_json")
-    if capability is None and isinstance(capability_json_source, str):
+    # 写操作能力只能由只读探测或真实受控操作的内部接口写入。普通页面保存
+    # 会回传完整目标对象，因此绝不能信任客户端提供的 capability 字段。
+    capability: Any = None
+    capability_json_source = (
+        existing.get("capability_json") if existing else None
+    )
+    if isinstance(capability_json_source, str):
         try:
             capability = json.loads(capability_json_source)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -428,7 +429,7 @@ def update_target_sync_state(
     target_uid: Any,
     *,
     status: str,
-    error: str = "",
+    error: Optional[str] = None,
     synced: bool = False,
     capability: Optional[Dict[str, Any]] = None,
     db: Optional[SQLiteStore] = None,
@@ -468,6 +469,80 @@ def update_target_sync_state(
         values,
         where={"target_uid": str(target_uid or "").strip()},
     )
+
+
+def patch_target_sync_state(
+    target_uid: Any,
+    *,
+    status: Optional[str],
+    error: str = "",
+    synced: bool = False,
+    capability_updates: Optional[Dict[str, Any]] = None,
+    capability_remove_keys: Iterable[str] = (),
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """原子合并采集状态，避免覆盖同时写入的受控追投/停投能力证据。"""
+    uid = str(target_uid or "").strip()
+    if not uid:
+        raise ValueError("缺少监控目标")
+    init_sqlite_schema()
+    store = db or SQLiteStore()
+    with store.transaction() as conn:
+        # 先取得写锁，再读取能力快照；其他线程只能在本事务提交后写入。
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        row = store.select_one(
+            "promotion_target",
+            fields="capability_json,last_status,last_error",
+            where={"target_uid": uid},
+            connection=conn,
+        )
+        if not row:
+            raise ValueError("监控目标不存在")
+        raw = row.get("capability_json")
+        try:
+            capability = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            capability = {}
+        if not isinstance(capability, dict):
+            capability = {}
+        capability.update(dict(capability_updates or {}))
+        for key in capability_remove_keys or ():
+            capability.pop(str(key), None)
+
+        values: Dict[str, Any] = {
+            "last_status": str(
+                status
+                if status is not None
+                else row.get("last_status") or "unknown"
+            )[:64],
+            "last_error": str(
+                error
+                if error is not None
+                else row.get("last_error") or ""
+            )[:2000],
+            "capability_json": _json_dumps(capability),
+        }
+        if synced:
+            store.execute(
+                "UPDATE promotion_target SET last_status=?, last_error=?, "
+                "capability_json=?, last_sync_at=datetime('now','+8 hours'), "
+                "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
+                (
+                    values["last_status"],
+                    values["last_error"],
+                    values["capability_json"],
+                    uid,
+                ),
+                connection=conn,
+            )
+        else:
+            store.update(
+                "promotion_target",
+                values,
+                where={"target_uid": uid},
+                connection=conn,
+            )
+    return capability
 
 
 def upsert_products(

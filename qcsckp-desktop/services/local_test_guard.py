@@ -16,6 +16,7 @@ from config import (
     TEST_MODE,
 )
 from services.plan_system import normalize_plan_system
+from services.promotion_capability import check_target_capability
 
 
 CONSUMED_FILE = os.path.join(DATA_DIR, "live_retarget_consumed.json")
@@ -224,6 +225,7 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
     monitor_target_account_matches = False
     monitor_target_status = ""
     retarget_capability_ready = False
+    retarget_capability_detail = "尚未取得可验证的监控计划"
     rate_limit_ready = False
     rate_limit_detail = "尚未取得可检查限频的计划和素材"
     if target_ready:
@@ -264,19 +266,14 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
                     plan_name = str(target_row.get("plan_name") or "").strip()
                 else:
                     ad_id = ""
-                if promotion_scene == "product":
-                    try:
-                        capability = json.loads(
-                            target_row.get("capability_json") or "{}"
-                        )
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        capability = {}
-                    retarget_capability_ready = bool(
-                        isinstance(capability, dict)
-                        and capability.get("retarget_execute")
+                retarget_capability_ready, retarget_capability_detail = (
+                    check_target_capability(
+                        target_row,
+                        action="retarget",
+                        promotion_scene=promotion_scene,
+                        plan_system=plan_system,
                     )
-                else:
-                    retarget_capability_ready = True
+                )
             else:
                 # 仅兼容升级前的单计划配置；新配置会由规则校验要求 target_uid。
                 ad_id = str(resolve_ad_id_for_aavid(db, TEST_AAVID) or "")
@@ -428,12 +425,17 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
     add_check(
         "plan_system",
         "计划体系与执行适配器",
-        plan_system == "global",
+        plan_system == "global"
+        or (plan_system == "chengfang" and retarget_capability_ready),
         (
             "已识别为全域，可使用当前已验证适配器"
             if plan_system == "global"
             else (
-                "已识别为千川乘方；乘方适配器尚未完成受控验证"
+                (
+                    "已识别为千川乘方，且当前目标已取得匹配的受控能力证据"
+                    if retarget_capability_ready
+                    else f"已识别为千川乘方；{retarget_capability_detail}"
+                )
                 if plan_system == "chengfang"
                 else "计划体系尚未识别，请重新打开计划详情"
             )
@@ -446,11 +448,7 @@ def build_live_retarget_preflight() -> Dict[str, Any]:
         (
             "当前计划的追投表单已通过本机只读探测"
             if retarget_capability_ready
-            else (
-                "商品计划的追投表单尚未通过本机探测"
-                if promotion_scene == "product"
-                else "当前计划尚未确认可执行追投"
-            )
+            else retarget_capability_detail
         ),
     )
     add_check(
