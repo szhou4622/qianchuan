@@ -130,6 +130,56 @@ class SingleInstanceChecker:
         # project_root 保留参数以兼容旧调用；单实例只认可执行路径，不再用工作目录推断
         self.command_file = os.path.join(DATA_DIR, "command.json")
         self._command_mtime = None
+        self._lease_handle = None
+
+    def acquire_runtime_lease(self) -> bool:
+        """按数据目录加跨进程锁，源码运行和打包运行都只能启动一个实例。"""
+        if self._lease_handle is not None:
+            return True
+        os.makedirs(DATA_DIR, exist_ok=True)
+        lock_path = os.path.join(DATA_DIR, "qcsckp.instance.lock")
+        handle = open(lock_path, "a+b")
+        try:
+            handle.seek(0)
+            if handle.read(1) != b"1":
+                handle.seek(0)
+                handle.write(b"1")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            handle.close()
+            self._write_show_window_command()
+            return False
+        self._lease_handle = handle
+        return True
+
+    def release_runtime_lease(self) -> None:
+        handle = self._lease_handle
+        self._lease_handle = None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, IOError):
+            pass
+        finally:
+            handle.close()
 
     def check_single_instance(self):
         """
@@ -584,6 +634,9 @@ class JSApi:
     def setPromotionTargetEnabled(self, targetUid=None, enabled=True):
         return self.api.setPromotionTargetEnabled(targetUid, enabled)
 
+    def clearPromotionTargetWriteBlock(self, targetUid=None):
+        return self.api.clearPromotionTargetWriteBlock(targetUid)
+
     def listPromotionTargetProducts(self, targetUid=None):
         return self.api.listPromotionTargetProducts(targetUid)
 
@@ -864,6 +917,10 @@ def _cleanup_data_temp_dir():
 
 
 def main():
+    if not single_instance_checker.acquire_runtime_lease():
+        single_instance_checker._write_show_window_command()
+        print("[!] 当前数据目录已有工具实例运行，已激活现有窗口")
+        return
     try:
         # ===== 单实例检查 =====
         print("[*] 检查单实例运行...")
@@ -1041,6 +1098,7 @@ def main():
             deactivate_local_feishu_account()
         except Exception:
             pass
+        single_instance_checker.release_runtime_lease()
         print("程序已退出")
 
 

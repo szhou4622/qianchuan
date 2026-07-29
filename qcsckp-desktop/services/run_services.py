@@ -35,6 +35,7 @@ from services.qianchuan_accounts import (
     upsert_authorized_accounts,
 )
 from services.qianchuan_session import (
+    current_session_owner,
     load_qianchuan_storage_state,
     mark_qianchuan_session_available,
     mark_qianchuan_session_invalid,
@@ -47,7 +48,6 @@ from api.promotion_targets import (
     detect_promotion_scene,
     extract_plan_name,
     list_promotion_targets,
-    make_target_uid,
     patch_target_sync_state,
     replace_material_product_links,
     update_target_sync_state,
@@ -69,6 +69,14 @@ from utils.common import browser_runtime_info
 注意：PROJECT_ROOT / DATA_DIR / LOGS_DIR 统一从 config.py 引用
 """
 
+
+def _require_session_owner(expected_owner: str) -> None:
+    current = current_session_owner()
+    if not expected_owner or current != expected_owner:
+        raise RuntimeError(
+            "工具账号已经切换或退出，旧千川浏览器会话已安全停止"
+        )
+
 # 轮询抓取阶段：浏览器持续运行超过此时长则关闭并用 Cookie 重建，缓解长时间运行内存增长（秒）
 POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
 # 自动监控按“整轮开始到下一轮开始”最多 5 分钟调度；整轮本身过长时立即进入下一轮，
@@ -76,6 +84,7 @@ POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
 AUTO_MONITOR_INTERVAL_SEC = 5 * 60
 LAST_TARGET_FILE = os.path.join(DATA_DIR, "last_crawl_target.json")
 PROMOTION_PROBE_FILE = os.path.join(DATA_DIR, "promotion_readonly_probe.json")
+_LAST_TARGET_LOCK = threading.Lock()
 
 
 _WRITE_CAPABILITY_SCOPE_KEYS = (
@@ -143,40 +152,92 @@ def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def _load_last_target(path: Optional[str] = None):
+def _last_target_owner(owner_username: Any = None) -> str:
+    owner = str(owner_username or current_session_owner() or "").strip().casefold()
+    return owner or "local_default"
+
+
+def _load_last_target(
+    path: Optional[str] = None,
+    owner_username: Any = None,
+):
     target_path = path or LAST_TARGET_FILE
+    scoped = path is None or owner_username is not None
     try:
-        with open(target_path, "r", encoding="utf-8-sig") as handle:
-            data = json.load(handle)
+        with _LAST_TARGET_LOCK:
+            with open(target_path, "r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
     except Exception:
         return None
     if not isinstance(data, dict):
         return None
+    migrate_legacy_scope = False
+    if scoped:
+        profiles = data.get("profiles")
+        if isinstance(profiles, dict):
+            data = profiles.get(_last_target_owner(owner_username))
+            if not isinstance(data, dict):
+                return None
+        else:
+            migrate_legacy_scope = True
     aavid = str(data.get("aavid") or "").strip()
     ad_id = str(data.get("adId") or data.get("ad_id") or "").strip()
     if not aavid.isdigit() or not ad_id.isdigit():
         return None
+    if migrate_legacy_scope:
+        _save_last_target(
+            aavid,
+            ad_id,
+            target_path,
+            owner_username=owner_username,
+        )
     return {"aavid": aavid, "adId": ad_id}
 
 
-def _save_last_target(aavid, ad_id, path: Optional[str] = None) -> bool:
+def _save_last_target(
+    aavid,
+    ad_id,
+    path: Optional[str] = None,
+    owner_username: Any = None,
+) -> bool:
     aavid_text = str(aavid or "").strip()
     ad_id_text = str(ad_id or "").strip()
     if not aavid_text.isdigit() or not ad_id_text.isdigit():
         return False
     target_path = path or LAST_TARGET_FILE
+    scoped = path is None or owner_username is not None
     parent = os.path.dirname(os.path.abspath(target_path))
     os.makedirs(parent, exist_ok=True)
     temp_path = target_path + ".tmp"
     try:
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"aavid": aavid_text, "adId": ad_id_text},
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-        os.replace(temp_path, target_path)
+        with _LAST_TARGET_LOCK:
+            payload: Dict[str, Any]
+            if scoped:
+                try:
+                    with open(target_path, "r", encoding="utf-8-sig") as handle:
+                        existing_payload = json.load(handle)
+                except Exception:
+                    existing_payload = {}
+                profiles = (
+                    dict(existing_payload.get("profiles") or {})
+                    if isinstance(existing_payload, dict)
+                    else {}
+                )
+                profiles[_last_target_owner(owner_username)] = {
+                    "aavid": aavid_text,
+                    "adId": ad_id_text,
+                }
+                payload = {"version": 2, "profiles": profiles}
+            else:
+                payload = {"aavid": aavid_text, "adId": ad_id_text}
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    payload,
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            os.replace(temp_path, target_path)
         return True
     except Exception:
         try:
@@ -718,6 +779,22 @@ class ServiceController:
         self._log("[服务] 已发起停止")
         return self.status()
 
+    def stop_and_wait(self, timeout_seconds: float = 30.0) -> dict:
+        """账号切换/退出时等待旧浏览器线程退出，禁止两套会话重叠。"""
+        self._stop_event.set()
+        thread = self._thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(0.0, float(timeout_seconds)))
+        status = self.status()
+        if status.get("running"):
+            status["success"] = False
+            status["message"] = "旧千川会话仍在安全退出，请稍后重试"
+        return status
+
     def start_target_discovery(self) -> dict:
         """打开独立有头浏览器，用户进入计划详情后自动登记监控目标。"""
         with self._lock:
@@ -763,13 +840,18 @@ class ServiceController:
     async def _target_discovery_async(self) -> None:
         # 这是用户控制的只读Chrome，可能停留10分钟等待选计划；不长期占用
         # 自动化队列，否则会阻塞已确认追投。实际采集和所有写操作仍走全局锁。
+        session_owner = current_session_owner()
+        if not session_owner:
+            raise RuntimeError("请先登录工具账号，再识别千川账户和计划")
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
         migrate_legacy_qcookie()
         known_target_keys = _known_promotion_target_keys(
-            list_promotion_targets(db=db)
+            list_promotion_targets(owner_username=session_owner, db=db)
         )
-        storage_state = load_qianchuan_storage_state()
+        storage_state = load_qianchuan_storage_state(
+            owner_username=session_owner
+        )
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state)
         await fetcher._init_browser()
         probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
@@ -945,6 +1027,7 @@ class ServiceController:
             if target_scene == "product":
                 plan = product_snapshot.get("plan") or {}
                 plan_name = str(plan.get("plan_name") or plan_name).strip()[:256]
+            _require_session_owner(session_owner)
             target = upsert_promotion_target(
                 {
                     "aavid": aavid,
@@ -956,14 +1039,25 @@ class ServiceController:
                     "enabled": True,
                     "last_status": "pending",
                 },
+                owner_username=session_owner,
                 db=db,
             )
-            upsert_authorized_accounts(probe.authorized_accounts(), db=db)
+            upsert_authorized_accounts(
+                probe.authorized_accounts(),
+                owner_username=session_owner,
+                db=db,
+            )
             if target_scene == "product":
                 _persist_product_snapshot(db, target["target_uid"], product_snapshot)
             if fetcher.context:
-                await save_context_storage_state(fetcher.context)
-                mark_qianchuan_session_available()
+                _require_session_owner(session_owner)
+                await save_context_storage_state(
+                    fetcher.context,
+                    owner_username=session_owner,
+                )
+                mark_qianchuan_session_available(
+                    owner_username=session_owner,
+                )
             with self._lock:
                 self._target_discovery_status = {
                     "running": False,
@@ -984,6 +1078,9 @@ class ServiceController:
             self._log(f"[服务] 异常退出：{e}")
 
     async def _run_async(self):
+        session_owner = current_session_owner()
+        if not session_owner:
+            raise RuntimeError("请先登录工具账号，再启动千川采集服务")
         cfg = ServiceConfig()
         scrape0 = load_scrape_service_config()
         # headless_poll=True：轮询阶段无头；登录阶段恒有头
@@ -1003,7 +1100,9 @@ class ServiceController:
 
         db = SQLiteStore(database=cfg.db_path)
         migrate_legacy_qcookie()
-        storage_state_path = load_qianchuan_storage_state()
+        storage_state_path = load_qianchuan_storage_state(
+            owner_username=session_owner
+        )
         # 首次/登录阶段必须可见窗口，与「无头」选项无关
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state_path)
         await fetcher._init_browser()
@@ -1046,9 +1145,13 @@ class ServiceController:
 
         # 打开一个起始页，让用户手动登录
         startup_url = cfg.open_url
-        known_targets = list_promotion_targets(enabled=True, db=db)
+        known_targets = list_promotion_targets(
+            enabled=True,
+            owner_username=session_owner,
+            db=db,
+        )
         reuse_last_target = _reuse_last_target_enabled()
-        last_target = _load_last_target()
+        last_target = _load_last_target(owner_username=session_owner)
         remembered_target = last_target if reuse_last_target else None
         excluded_target = last_target if not reuse_last_target else None
         startup_target = _choose_startup_target(
@@ -1163,9 +1266,9 @@ class ServiceController:
                         known.get("plan_system") or "unknown"
                     )
                     break
+        _require_session_owner(session_owner)
         target = upsert_promotion_target(
             {
-                "target_uid": make_target_uid(aavid, ad_id),
                 "aavid": aavid,
                 "ad_id": ad_id,
                 "plan_name": plan_name,
@@ -1175,16 +1278,25 @@ class ServiceController:
                 "enabled": True,
                 "last_status": "pending",
             },
+            owner_username=session_owner,
             db=db,
         )
-        upsert_authorized_accounts(probe.authorized_accounts(), db=db)
+        upsert_authorized_accounts(
+            probe.authorized_accounts(),
+            owner_username=session_owner,
+            db=db,
+        )
         if promotion_scene == "product":
             _persist_product_snapshot(
                 db,
                 target["target_uid"],
                 discovered.get("snapshot"),
             )
-        _save_last_target(aavid, ad_id)
+        _save_last_target(
+            aavid,
+            ad_id,
+            owner_username=session_owner,
+        )
         with self._lock:
             self._last_target = {
                 "targetUid": target["target_uid"],
@@ -1210,8 +1322,14 @@ class ServiceController:
         # -------- 阶段切换：识别成功后先保存 cookies，然后关闭当前浏览器，再用 cookies 重启抓取 --------
         try:
             if fetcher.context:
-                await save_context_storage_state(fetcher.context)
-                mark_qianchuan_session_available()
+                _require_session_owner(session_owner)
+                await save_context_storage_state(
+                    fetcher.context,
+                    owner_username=session_owner,
+                )
+                mark_qianchuan_session_available(
+                    owner_username=session_owner,
+                )
                 self._log(f"[Cookie] 已保存")
         except Exception as e:
             self._log(f"[Cookie] 保存失败（仍继续重启）：{e}")
@@ -1250,7 +1368,9 @@ class ServiceController:
         except Exception:
             pass
 
-        storage_state_path = load_qianchuan_storage_state()
+        storage_state_path = load_qianchuan_storage_state(
+            owner_username=session_owner
+        )
         fetcher = QianChuanFetcher(headless=headless_mode, storage_state=storage_state_path)
         await fetcher._init_browser()
         self._active_poll_headless = headless_mode
@@ -1279,6 +1399,7 @@ class ServiceController:
         first_poll = True
         auto_stopped_auth_expired = False
         while not self._stop_event.is_set():
+            _require_session_owner(session_owner)
             while not self._stop_event.is_set():
                 if first_poll:
                     break
@@ -1311,7 +1432,9 @@ class ServiceController:
                     await fetcher.close()
                 except Exception:
                     pass
-                storage_state_path = load_qianchuan_storage_state()
+                storage_state_path = load_qianchuan_storage_state(
+                    owner_username=session_owner
+                )
                 fetcher = QianChuanFetcher(headless=new_headless, storage_state=storage_state_path)
                 await fetcher._init_browser()
                 self._fetcher = fetcher
@@ -1325,14 +1448,20 @@ class ServiceController:
                 )
                 try:
                     if fetcher.context:
-                        await save_context_storage_state(fetcher.context)
+                        _require_session_owner(session_owner)
+                        await save_context_storage_state(
+                            fetcher.context,
+                            owner_username=session_owner,
+                        )
                 except Exception as e:
                     self._log(f"[Cookie] 周期重启前保存失败（仍继续重启）：{e}")
                 try:
                     await fetcher.close()
                 except Exception:
                     pass
-                storage_state_path = load_qianchuan_storage_state()
+                storage_state_path = load_qianchuan_storage_state(
+                    owner_username=session_owner
+                )
                 fetcher = QianChuanFetcher(headless=new_headless, storage_state=storage_state_path)
                 await fetcher._init_browser()
                 self._fetcher = fetcher
@@ -1340,7 +1469,10 @@ class ServiceController:
                 self._log("[服务] 轮询浏览器已按周期重启，继续抓取")
 
             try:
-                targets = schedulable_promotion_targets(db=db)
+                targets = schedulable_promotion_targets(
+                    owner_username=session_owner,
+                    db=db,
+                )
                 if not targets:
                     self._log("[抓取] 没有启用的监控计划，本轮跳过")
                     self._last_fetch_time = time.time()
@@ -1350,6 +1482,7 @@ class ServiceController:
                 fs_panel = load_feishu_bitable_panel_config()
                 fpm = fs_panel.get("push_mode") or "each_crawl"
                 for target_index, current_target in enumerate(targets, start=1):
+                    _require_session_owner(session_owner)
                     if self._stop_event.is_set():
                         break
                     current_aavid = str(current_target.get("aadvid") or "").strip()
@@ -1601,11 +1734,17 @@ class ServiceController:
                 # 整轮结束后保存一次 Cookie。
                 try:
                     if fetcher.context:
-                        await save_context_storage_state(fetcher.context)
+                        _require_session_owner(session_owner)
+                        await save_context_storage_state(
+                            fetcher.context,
+                            owner_username=session_owner,
+                        )
                 except Exception:
                     pass
                 self._last_fetch_time = time.time()
-                mark_qianchuan_session_available()
+                mark_qianchuan_session_available(
+                    owner_username=session_owner,
+                )
                 self._log("[抓取] 本轮全部监控计划处理完成")
                 # 本轮已结束，清空进度计数；否则 status 里一直带着上一轮的 current/total，
                 # 前端会永远走「抓取中」分支，无法显示轮询间隔内的「等待中 / 倒计时」。
@@ -1618,7 +1757,10 @@ class ServiceController:
                     pass
             except GlobalAuthExpiredError:
                 auto_stopped_auth_expired = True
-                mark_qianchuan_session_invalid("千川全域投放授权已失效")
+                mark_qianchuan_session_invalid(
+                    "千川全域投放授权已失效",
+                    owner_username=session_owner,
+                )
                 self._log("[服务] 检测到千川「全域投放授权已失效」弹窗，抓取已自动终止；请在平台重新授权后重启服务。")
                 try:
                     fetcher._material_total_count = 0

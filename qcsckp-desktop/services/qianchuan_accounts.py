@@ -18,7 +18,7 @@ CAPACITY_WINDOW_SECONDS = 9 * 60
 CAPACITY_STALE_SECONDS = 10 * 60
 DEFAULT_TARGET_DURATION_MS = 45_000
 MIN_TARGET_DURATION_MS = 5_000
-MAX_TARGET_DURATION_MS = 5 * 60_000
+MAX_TARGET_DURATION_MS = 30 * 60_000
 DAILY_CONFIG_FILE = os.path.join(DATA_DIR, "operation_daily_report.json")
 
 
@@ -350,6 +350,9 @@ def bind_target_account_scope(
         if account_uid
         else None
     )
+    owner = _owner_key(owner_username)
+    if account and str(account.get("owner_username") or "").casefold() != owner:
+        raise ValueError("监控计划不属于当前工具账号")
     if not account:
         account_view = ensure_qianchuan_account(
             target.get("aadvid"),
@@ -366,7 +369,7 @@ def bind_target_account_scope(
             "qianchuan_account",
             where={"account_uid": account_uid},
         )
-    refresh_monitor_capacity(owner_username=owner_username, db=store)
+    refresh_monitor_capacity(owner_username=owner, db=store)
     return (
         store.select_one("promotion_target", where={"target_uid": uid}),
         account,
@@ -415,7 +418,7 @@ def refresh_monitor_capacity(
                 disabled += 1
             else:
                 estimate = _estimate_duration_ms(row)
-                if used_ms + estimate <= budget_ms or active == 0:
+                if used_ms + estimate <= budget_ms:
                     state = "active"
                     used_ms += estimate
                     active += 1
@@ -461,7 +464,9 @@ def record_target_duration(
     except (TypeError, ValueError):
         return
     old = int(target.get("last_duration_ms") or measured)
-    smoothed = int(round(old * 0.7 + measured * 0.3))
+    # 变慢时立即按真实耗时收紧容量，变快时再平滑恢复，不能把超时计划
+    # 截断成“正常”后继续接纳更多计划。
+    smoothed = max(measured, int(round(old * 0.7 + measured * 0.3)))
     store.update(
         "promotion_target",
         {
@@ -632,29 +637,33 @@ def migrate_existing_qianchuan_accounts(
             report_enabled=(aid in selected) if not existing else None,
             db=store,
         )
-    for aid in by_aavid:
-        uid = make_account_uid(aid, owner)
-        for table, column in (
-            ("promotion_target", "aadvid"),
-            ("pmc_ad_detail_basic", "aadvid"),
-            ("pmc_retargeting_run", "aavid"),
-            ("pmc_regulation_run", "aavid"),
-            ("pmc_roi2_assist_task", "aadvid"),
-            ("account_operation_event", "aavid"),
-            ("platform_log_sync_state", "aavid"),
-        ):
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        for aid in by_aavid:
+            uid = make_account_uid(aid, owner)
+            for table, column in (
+                ("promotion_target", "aadvid"),
+                ("pmc_ad_detail_basic", "aadvid"),
+                ("pmc_retargeting_run", "aavid"),
+                ("pmc_regulation_run", "aavid"),
+                ("pmc_roi2_assist_task", "aadvid"),
+                ("account_operation_event", "aavid"),
+                ("platform_log_sync_state", "aavid"),
+            ):
+                store.update(
+                    table,
+                    {"account_uid": uid},
+                    where=f"{column}=? AND COALESCE(account_uid,'')=''",
+                    params=(aid,),
+                    connection=conn,
+                )
             store.update(
-                table,
-                {"account_uid": uid},
-                where=f"{column}=? AND COALESCE(account_uid,'')=''",
+                "operation_daily_report_delivery",
+                {"qianchuan_account_uid": uid},
+                where="aavid=? AND COALESCE(qianchuan_account_uid,'')=''",
                 params=(aid,),
+                connection=conn,
             )
-        store.update(
-            "operation_daily_report_delivery",
-            {"qianchuan_account_uid": uid},
-            where="aavid=? AND COALESCE(qianchuan_account_uid,'')=''",
-            params=(aid,),
-        )
     refresh_monitor_capacity(owner_username=owner, db=store)
     return len(by_aavid)
 

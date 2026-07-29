@@ -81,6 +81,12 @@
     const groups=data.feishu?.groups||[];
     const targets=data.targets||[];
     const accounts=data.accounts||[];
+    const daily=data.daily_report?.config||{};
+    if(accounts.some(acc=>!!acc.report_enabled)&&!daily.enabled){
+      message('账户已勾选纳入日报，但全局自动日报尚未开启。请到“飞书绑定”页面开启自动日报。',true);
+    }else{
+      message('');
+    }
     $('empty').style.display=accounts.length?'none':'block';
     $('accounts').innerHTML=accounts.map(acc=>{
       const plans=targets.filter(t=>String(t.account_uid||'')===String(acc.account_uid||''));
@@ -107,7 +113,8 @@
             <div class="panel-title">明确启用的自动化计划</div>
             <div class="plans">${plans.length?plans.map(p=>{
               const state=p.capacity_state||'disabled'; const late=Number(p.last_lag_seconds||0)>600;
-              return `<label class="plan"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)}<br>计划ID ${esc(p.ad_id||'')} · ${esc(p.target_uid||'')}</span></span><span><input type="checkbox" data-target="${esc(p.target_uid)}" ${p.enabled?'checked':''}><span class="plan-state ${late?'late':state==='active'?'active':state==='capacity_waiting'?'wait':''}">${late?'监控延迟':capText(state)}</span></span></label>`;
+              const blocked=!!p.automation_write_blocked;
+              return `<label class="plan"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)}<br>计划ID ${esc(p.ad_id||'')} · ${esc(p.target_uid||'')}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span><input type="checkbox" data-target="${esc(p.target_uid)}" ${p.enabled?'checked':''}><span class="plan-state ${blocked||late?'late':state==='active'?'active':state==='capacity_waiting'?'wait':''}">${blocked?'自动写入已封锁':late?'监控延迟':capText(state)}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
             }).join(''):'<div class="group-empty">此账户还没有登记计划。点击右上角进入计划详情即可添加。</div>'}</div>
           </div>
         </div>
@@ -116,6 +123,12 @@
     }).join('');
     document.querySelectorAll('[data-field=route_mode]').forEach(el=>el.onchange=()=>{el.closest('.panel').querySelector('[data-custom-route]').style.display=el.value==='custom'?'':'none'});
     document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>saveAccount(btn.closest('.card')));
+    document.querySelectorAll('[data-unblock]').forEach(btn=>btn.onclick=async event=>{
+      event.preventDefault();event.stopPropagation();
+      if(!window.confirm('仅在已经核对千川追投任务和本地限频流水后解除。确定继续吗？'))return;
+      const a=await waitApi();const r=await a.clearPromotionTargetWriteBlock(btn.dataset.unblock);
+      if(!r?.success){message(r?.message||'解除失败',true);return}await load();message(r?.message||'自动写入安全封锁已解除');
+    });
     $('accounts').onchange=()=>{dirty=true};
   }
 
@@ -134,14 +147,16 @@
     };
     let r=await a.saveQianchuanAccountSettings(uid,settings);
     if(!r?.success){message(r?.message||'账户设置保存失败',true);return}
+    let savedPlans=0;
     for(const checkbox of card.querySelectorAll('[data-target]')){
       const one=await a.getPromotionTarget(checkbox.dataset.target);
-      if(!one?.success){message(one?.message||'读取计划失败',true);return}
+      if(!one?.success){message(`部分保存：账户设置和${savedPlans}条计划已保存；${one?.message||'读取计划失败'}`,true);return}
       const target=one.data;target.enabled=checkbox.checked;
       r=await a.savePromotionTarget(target);
-      if(!r?.success){message(r?.message||'计划设置保存失败',true);return}
+      if(!r?.success){message(`部分保存：账户设置和${savedPlans}条计划已保存；${r?.message||'计划设置保存失败'}`,true);return}
+      savedPlans++;
     }
-    dirty=false;message('账户、日报路由和监控计划已保存');await load();
+    dirty=false;await load();message('账户、日报路由和监控计划已保存');
   }
   async function discover(){
     const a=await waitApi();const r=await a.startPromotionTargetDiscovery();message(r?.message||'请在Chrome中进入计划详情',!r?.success);

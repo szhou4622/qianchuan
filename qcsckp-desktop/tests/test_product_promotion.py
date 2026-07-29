@@ -21,6 +21,7 @@ from api.promotion_targets import (
     patch_target_sync_state,
     replace_material_product_links,
     sanitize_target_url,
+    set_target_automation_write_block,
     set_promotion_target_enabled,
     update_target_sync_state,
     upsert_products,
@@ -48,6 +49,7 @@ from services.product_scene_adapter import (
     validate_exact_product_plan_payload,
 )
 from services.retargeting_rule_runner import (
+    block_target_after_rate_record_failure,
     rate_limit_record_success,
     rate_limit_should_skip,
     retarget_method_is_supported_for_scene,
@@ -59,6 +61,7 @@ from services.retargeting_service import (
     retarget_capability_matches,
 )
 from services.regulation_rule_runner import (
+    _revalidate_stop_candidate,
     _target_assist_sync_ready,
     has_completed_stop,
 )
@@ -1464,6 +1467,42 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertTrue(merged["material_read"])
         self.assertTrue(merged["assist_sync_ok"])
 
+    def test_rate_record_failure_write_block_survives_read_only_collection(self):
+        target = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "enabled": True,
+            },
+            db=self.db,
+        )
+        block_target_after_rate_record_failure(
+            self.db,
+            target["target_uid"],
+            RuntimeError("rate-db-down"),
+        )
+        patch_target_sync_state(
+            target["target_uid"],
+            status="ok",
+            error="",
+            synced=True,
+            db=self.db,
+        )
+        row = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertEqual(1, row["automation_write_blocked"])
+        self.assertIn("限频记录失败", row["write_block_reason"])
+        cleared = set_target_automation_write_block(
+            target["target_uid"],
+            False,
+            db=self.db,
+        )
+        self.assertFalse(cleared["automation_write_blocked"])
+
     def test_auto_stop_requires_current_complete_assist_sync(self):
         now = datetime.now()
         ready, _ = _target_assist_sync_ready(
@@ -1695,6 +1734,60 @@ class ProductPromotionTests(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertIn("监控计划", message)
+
+
+    def test_stop_revalidation_rejects_reauthorized_session_and_strategy_change(self):
+        original = {
+            "id": "stop-1",
+            "title": "止损",
+            "target_uid": "target-1",
+            "regulation_stop_action": "pause",
+            "trigger": trigger("stat_cost_for_roi2_assist", "gt", 10),
+        }
+        common = {
+            "db": self.db,
+            "original_strategy": original,
+            "expected_owner": "owner",
+            "expected_session_epoch": 1,
+            "target_uid": "target-1",
+            "assist_task_id": "assist-1",
+            "aavid": "10001",
+            "ad_id": "20001",
+            "promotion_scene": "product",
+            "trigger": original["trigger"],
+            "max_age_minutes": 30,
+        }
+        with (
+            patch(
+                "services.qianchuan_session.current_session_owner",
+                return_value="owner",
+            ),
+            patch(
+                "services.qianchuan_session.automation_session_ready",
+                return_value={"ready": True, "session_epoch": 2},
+            ),
+        ):
+            _target, _row, _system, error = _revalidate_stop_candidate(**common)
+        self.assertIn("重新授权", error)
+
+        changed = dict(original)
+        changed["regulation_stop_action"] = "delete"
+        with (
+            patch(
+                "services.qianchuan_session.current_session_owner",
+                return_value="owner",
+            ),
+            patch(
+                "services.qianchuan_session.automation_session_ready",
+                return_value={"ready": True, "session_epoch": 1},
+            ),
+            patch(
+                "services.regulation_rule_runner.load_rule_regulation_config",
+                return_value={"enabled": True, "strategies": [changed]},
+            ),
+        ):
+            _target, _row, _system, error = _revalidate_stop_candidate(**common)
+        self.assertIn("参数已经变更", error)
 
 
 if __name__ == "__main__":

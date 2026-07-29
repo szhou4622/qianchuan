@@ -658,6 +658,67 @@ def _record_delivery(
         store.insert("operation_daily_report_delivery", data)
 
 
+def _claim_scheduled_delivery(
+    store: SQLiteStore,
+    *,
+    delivery_key: str,
+    report: Dict[str, Any],
+    account_username: str,
+    receive_type: str,
+    receive_id: str,
+    stale_seconds: int = 600,
+) -> str:
+    """原子领取定时日报发送权，避免两个进程同时通过“未发送”检查。"""
+    now = datetime.now()
+    claim_data = {
+        "delivery_key": delivery_key,
+        "report_uid": str(
+            report.get("report_uid") or "daily:" + uuid.uuid4().hex
+        ),
+        "account_username": _account_key(account_username),
+        "aavid": str(report.get("aavid") or ""),
+        "qianchuan_account_uid": str(
+            report.get("qianchuan_account_uid") or ""
+        ),
+        "report_date": str(report.get("report_date") or ""),
+        "delivery_mode": "scheduled",
+        "receive_type": receive_type,
+        "receive_id": receive_id,
+        "message_id": "",
+        "status": "sending",
+        "event_count": int(report.get("event_count") or 0),
+        "last_error": "",
+        "sent_at": "",
+    }
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        existing = store.select_one(
+            "operation_daily_report_delivery",
+            where={"delivery_key": delivery_key},
+            connection=conn,
+        )
+        if existing and str(existing.get("status") or "") == "success":
+            return "already_success"
+        if existing and str(existing.get("status") or "") == "sending":
+            updated_text = str(existing.get("updated_at") or "")
+            try:
+                updated_at = datetime.strptime(
+                    updated_text,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+            except (TypeError, ValueError):
+                updated_at = datetime.min
+            if (now - updated_at).total_seconds() < max(60, stale_seconds):
+                return "in_progress"
+        store.insert_or_update(
+            "operation_daily_report_delivery",
+            claim_data,
+            unique_fields=["delivery_key"],
+            connection=conn,
+        )
+    return "claimed"
+
+
 def send_operation_daily_report(
     *,
     report_date: Any = None,
@@ -728,11 +789,15 @@ def send_operation_daily_report(
                 else None
             )
             if key:
-                existing = store.select_one(
-                    "operation_daily_report_delivery",
-                    where={"delivery_key": key},
+                claim = _claim_scheduled_delivery(
+                    store,
+                    delivery_key=key,
+                    report=report,
+                    account_username=account,
+                    receive_type=receive_type,
+                    receive_id=receive_id,
                 )
-                if existing and existing.get("status") == "success":
+                if claim != "claimed":
                     skipped_count += 1
                     continue
             try:
@@ -788,11 +853,15 @@ def send_operation_daily_report(
             else None
         )
         if key:
-            existing = store.select_one(
-                "operation_daily_report_delivery",
-                where={"delivery_key": key},
+            claim = _claim_scheduled_delivery(
+                store,
+                delivery_key=key,
+                report=summary_report,
+                account_username=account,
+                receive_type=receive_type,
+                receive_id=receive_id,
             )
-            if existing and existing.get("status") == "success":
+            if claim != "claimed":
                 skipped_count += 1
                 continue
         try:

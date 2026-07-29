@@ -16,6 +16,7 @@ from api.operation_events import (
     normalize_action_type,
     prune_operation_events,
     query_operation_events_page,
+    update_platform_sync_state,
     upsert_operation_event,
 )
 from api.rule_retargeting_config import _normalize_full
@@ -42,7 +43,10 @@ from services.operation_log_monitor import (
     _paginate_body,
     _paginate_url,
     _prepare_replay_body,
+    _replay_has_explicit_30_day_range,
+    _thirty_day_coverage_window,
     _with_30_day_body,
+    _with_30_day_range,
 )
 from services.retarget_task_worker import _snapshot_hash, _strategy_hash, _strategy_snapshot
 from services import retargeting_rule_runner
@@ -134,6 +138,126 @@ class RetargetConfigTests(unittest.TestCase):
             self.assertFalse(retargeting_rule_runner.auto_execute_allowed_in_current_environment())
         with patch.object(retargeting_rule_runner, "TEST_MODE", False):
             self.assertTrue(retargeting_rule_runner.auto_execute_allowed_in_current_environment())
+
+    def test_auto_execute_revalidates_strategy_and_material_under_browser_lock(self):
+        strategy = {
+            "id": "auto-s1",
+            "title": "自动追投",
+            "target_uid": "target-live",
+            "trigger_level": "material",
+            "action_mode": "auto_execute",
+            "trigger": {"groups": []},
+            "retargeting": {
+                "method": "volume",
+                "volume": {"total_budget_yuan": 100, "duration_hours": 1},
+            },
+        }
+        target = {
+            "target_uid": "target-live",
+            "aadvid": "10001",
+            "ad_id": "30001",
+            "promotion_scene": "live",
+            "plan_system": "global",
+            "last_status": "ok",
+            "enabled": 1,
+            "capability_json": _retarget_capability_json(
+                target_uid="target-live",
+                aavid="10001",
+                ad_id="30001",
+                scene="live",
+                plan_system="global",
+            ),
+        }
+
+        class FakeStore:
+            def select(self, _table, **_kwargs):
+                return []
+
+        class FakeDashboard:
+            def get_table_data(self, **_kwargs):
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "targetUid": "target-live",
+                            "aadvid": "10001",
+                            "id": "m1",
+                        }
+                    ],
+                }
+
+        cfg = {
+            "enabled": True,
+            "trigger_query_period": "1h",
+            "per_strategy_rate_limit": False,
+            "interval": {"window_seconds": 3600, "max_count": 1},
+            "strategies": [copy.deepcopy(strategy)],
+        }
+        with patch(
+            "services.retargeting_rule_runner.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.retargeting_rule_runner.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retargeting_rule_runner.schedulable_promotion_targets",
+            return_value=[target],
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeDashboard(),
+        ), patch(
+            "services.retargeting_rule_runner.evaluate_trigger",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.rate_limit_should_skip",
+            return_value=False,
+        ):
+            current_cfg, current_strategy, current_target = (
+                retargeting_rule_runner._revalidate_auto_retarget_under_lock(
+                    FakeStore(),
+                    original_strategy=strategy,
+                    target_uid="target-live",
+                    aavid="10001",
+                    ad_id="30001",
+                    promotion_scene="live",
+                    plan_system="global",
+                    material_id="m1",
+                    product_id="",
+                )
+            )
+        self.assertIs(cfg, current_cfg)
+        self.assertEqual("auto-s1", current_strategy["id"])
+        self.assertEqual("target-live", current_target["target_uid"])
+
+        changed = copy.deepcopy(cfg)
+        changed["strategies"][0]["retargeting"]["volume"][
+            "total_budget_yuan"
+        ] = 200
+        with patch(
+            "services.retargeting_rule_runner.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.retargeting_rule_runner.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=changed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "策略参数已经变更"):
+                retargeting_rule_runner._revalidate_auto_retarget_under_lock(
+                    FakeStore(),
+                    original_strategy=strategy,
+                    target_uid="target-live",
+                    aavid="10001",
+                    ad_id="30001",
+                    promotion_scene="live",
+                    plan_system="global",
+                    material_id="m1",
+                    product_id="",
+                )
 
     def test_strategy_snapshot_hash_detects_parameter_tampering(self):
         strategy = {
@@ -470,6 +594,29 @@ class OperationEventTests(unittest.TestCase):
         self.assertIn("调控任务ID", csv_text)
 
 
+    def test_completed_query_window_expands_and_never_shrinks_coverage(self):
+        update_platform_sync_state(
+            "1001",
+            db=self.db,
+            coverage_from="2026-07-01 00:00:00",
+            coverage_to="2026-07-30 23:59:59",
+            last_status="ok",
+        )
+        update_platform_sync_state(
+            "1001",
+            db=self.db,
+            coverage_from="2026-07-10 00:00:00",
+            coverage_to="2026-07-20 23:59:59",
+            last_status="ok",
+        )
+        row = self.db.select_one(
+            "platform_log_sync_state",
+            where={"aavid": "1001"},
+        )
+        self.assertEqual("2026-07-01 00:00:00", row["coverage_from"])
+        self.assertEqual("2026-07-30 23:59:59", row["coverage_to"])
+
+
 class PlatformLogMonitorTests(unittest.TestCase):
     def test_extracts_log_rows_and_classifies_plan_writes(self):
         rows = [
@@ -511,6 +658,41 @@ class PlatformLogMonitorTests(unittest.TestCase):
         self.assertEqual(4, body["page_no"])
         self.assertEqual(100, body["limit"])
         self.assertFalse(_explicit_has_more({"data": {"has_more": False}}))
+
+    def test_complete_window_requires_explicit_date_fields(self):
+        self.assertTrue(
+            _replay_has_explicit_30_day_range(
+                "https://example.test/log?start_date=old&end_date=old",
+                "",
+            )
+        )
+        self.assertTrue(
+            _replay_has_explicit_30_day_range(
+                "https://example.test/log",
+                '{"filters":{"start_time":1,"end_time":2}}',
+            )
+        )
+        self.assertFalse(
+            _replay_has_explicit_30_day_range(
+                "https://example.test/log?page=1",
+                '{"filters":{"operator":"owner"}}',
+            )
+        )
+        self.assertFalse(
+            _replay_has_explicit_30_day_range(
+                "https://example.test/log?start_date=old",
+                "",
+            )
+        )
+        rewritten = _with_30_day_range(
+            "https://example.test/log?start_time=1700000000000"
+            "&end_time=1700100000000"
+        )
+        self.assertNotIn("1700000000000", rewritten)
+        self.assertNotIn("1700100000000", rewritten)
+        coverage_from, coverage_to = _thirty_day_coverage_window()
+        self.assertTrue(coverage_from.endswith("00:00:00"))
+        self.assertTrue(coverage_to.endswith("23:59:59"))
 
 
 class CloudClientTests(unittest.TestCase):
@@ -1123,6 +1305,46 @@ class LocalTestGuardTests(unittest.TestCase):
                 _load_last_target(target_file),
             )
             self.assertFalse(_save_last_target("not-an-account", "2002", target_file))
+
+    def test_last_crawl_target_is_isolated_by_tool_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_file = os.path.join(tmp, "last_crawl_target.json")
+            self.assertTrue(
+                _save_last_target(
+                    "1001",
+                    "2001",
+                    target_file,
+                    owner_username="tool-a",
+                )
+            )
+            self.assertTrue(
+                _save_last_target(
+                    "1002",
+                    "2002",
+                    target_file,
+                    owner_username="tool-b",
+                )
+            )
+            self.assertEqual(
+                {"aavid": "1001", "adId": "2001"},
+                _load_last_target(
+                    target_file,
+                    owner_username="tool-a",
+                ),
+            )
+            self.assertEqual(
+                {"aavid": "1002", "adId": "2002"},
+                _load_last_target(
+                    target_file,
+                    owner_username="tool-b",
+                ),
+            )
+            self.assertIsNone(
+                _load_last_target(
+                    target_file,
+                    owner_username="tool-c",
+                )
+            )
 
     def test_target_reselection_disables_remembered_target_for_one_launch(self):
         with patch.dict(os.environ, {"QCSCKP_FORCE_TARGET_RESELECT": "1"}):

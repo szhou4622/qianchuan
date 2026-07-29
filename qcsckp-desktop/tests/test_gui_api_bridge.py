@@ -17,6 +17,7 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.savePromotionTarget.return_value = {"success": True}
         self.core.discoverPromotionTarget.return_value = {"success": True}
         self.core.setPromotionTargetEnabled.return_value = {"success": True}
+        self.core.clearPromotionTargetWriteBlock.return_value = {"success": True}
         self.core.listPromotionTargetProducts.return_value = {"success": True, "data": []}
         self.core.probePromotionTargetRetargetCapability.return_value = {
             "success": True
@@ -42,6 +43,10 @@ class JSApiBridgeTests(unittest.TestCase):
         )
         self.assertEqual(
             self.bridge.setPromotionTargetEnabled("target-1", False),
+            {"success": True},
+        )
+        self.assertEqual(
+            self.bridge.clearPromotionTargetWriteBlock("target-1"),
             {"success": True},
         )
         self.assertEqual(
@@ -71,6 +76,9 @@ class JSApiBridgeTests(unittest.TestCase):
         )
         self.core.setPromotionTargetEnabled.assert_called_once_with(
             "target-1", False
+        )
+        self.core.clearPromotionTargetWriteBlock.assert_called_once_with(
+            "target-1"
         )
         self.core.listPromotionTargetProducts.assert_called_once_with("target-1")
         self.core.probePromotionTargetRetargetCapability.assert_called_once_with(

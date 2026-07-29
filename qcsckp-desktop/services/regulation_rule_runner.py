@@ -71,9 +71,42 @@ def _target_assist_sync_ready(
     return True, ""
 
 
+def _stop_strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only the mutable strategy fields that authorize a stop write."""
+    return {
+        "id": str(strategy.get("id") or ""),
+        "title": str(strategy.get("title") or ""),
+        "target_uid": str(strategy.get("target_uid") or ""),
+        "trigger": (
+            strategy.get("trigger")
+            if isinstance(strategy.get("trigger"), dict)
+            else {}
+        ),
+        "regulation_stop_action": str(
+            strategy.get("regulation_stop_action") or "pause"
+        ).strip().lower(),
+    }
+
+
+def _find_stop_strategy(
+    cfg: Dict[str, Any],
+    strategy_id: str,
+) -> Optional[Dict[str, Any]]:
+    for strategy in cfg.get("strategies") or []:
+        if (
+            isinstance(strategy, dict)
+            and str(strategy.get("id") or "") == str(strategy_id or "")
+        ):
+            return strategy
+    return None
+
+
 def _revalidate_stop_candidate(
     db: SQLiteStore,
     *,
+    original_strategy: Dict[str, Any],
+    expected_owner: str,
+    expected_session_epoch: int,
     target_uid: str,
     assist_task_id: str,
     aavid: str,
@@ -83,6 +116,45 @@ def _revalidate_stop_candidate(
     max_age_minutes: int,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str]:
     """在取得浏览器独占锁后重读目标和指标，关闭检查后等待锁的竞态窗口。"""
+    from services.qianchuan_session import (
+        automation_session_ready,
+        current_session_owner,
+    )
+
+    owner = str(current_session_owner() or "").strip().casefold()
+    expected_owner = str(expected_owner or "").strip().casefold()
+    if not owner or owner != expected_owner:
+        return None, None, "unknown", "工具账号已切换或退出"
+    session_gate = automation_session_ready(expected_owner)
+    try:
+        current_epoch = int(session_gate.get("session_epoch") or 0)
+    except (TypeError, ValueError):
+        current_epoch = 0
+    if (
+        not session_gate.get("ready")
+        or current_epoch != int(expected_session_epoch)
+    ):
+        return None, None, "unknown", "千川登录会话已失效或重新授权"
+
+    current_cfg = load_rule_regulation_config()
+    if not current_cfg.get("enabled"):
+        return None, None, "unknown", "规则化停投已关闭"
+    strategy_id = str(original_strategy.get("id") or "")
+    current_strategy = _find_stop_strategy(current_cfg, strategy_id)
+    if not current_strategy:
+        return None, None, "unknown", "停投策略已删除"
+    original_snapshot = _json_dumps(_stop_strategy_snapshot(original_strategy))
+    current_snapshot = _json_dumps(_stop_strategy_snapshot(current_strategy))
+    if current_snapshot != original_snapshot:
+        return None, None, "unknown", "停投策略参数已经变更"
+    whitelist = {
+        str(item).strip()
+        for item in (current_cfg.get("whitelist_assist_ids") or [])
+        if str(item).strip()
+    }
+    if str(assist_task_id or "").strip() in whitelist:
+        return None, None, "unknown", "调控任务已加入停投白名单"
+
     target = db.select_one(
         "promotion_target",
         where={"target_uid": target_uid},
@@ -106,9 +178,6 @@ def _revalidate_stop_candidate(
         else None
     )
     row_system = normalize_plan_system(row.get("plan_system") or "unknown")
-    from services.qianchuan_session import current_session_owner
-
-    current_owner = str(current_session_owner() or "").strip().casefold()
     account_owner = str((account or {}).get("owner_username") or "").strip().casefold()
     row_account_uid = str(row.get("account_uid") or "").strip()
     if (
@@ -117,11 +186,12 @@ def _revalidate_stop_candidate(
         or str(target.get("capacity_state") or "") != "active"
         or not account
         or not bool(account.get("enabled"))
+        or bool(target.get("automation_write_blocked"))
         or str(target.get("last_status") or "").strip().lower() != "ok"
         or str(target.get("aadvid") or "") != aavid
         or str(target.get("ad_id") or "") != ad_id
         or str(target.get("promotion_scene") or "") != promotion_scene
-        or (current_owner and account_owner != current_owner)
+        or account_owner != expected_owner
     ):
         return None, None, target_system, "监控计划已停用、状态异常或目标身份变化"
     if (
@@ -386,6 +456,24 @@ async def run_one_cycle(db: SQLiteStore) -> None:
     if not cfg.get("enabled"):
         logger.info("%s 未启用 enabled，跳过本轮", _log_sched)
         return
+
+    from services.qianchuan_session import (
+        automation_session_ready,
+        current_session_owner,
+    )
+
+    cycle_owner = str(current_session_owner() or "").strip().casefold()
+    session_gate = automation_session_ready(cycle_owner)
+    if not cycle_owner or not session_gate.get("ready"):
+        logger.warning(
+            "%s 千川主登录会话不可用，本轮自动停投已跳过",
+            _log_sched,
+        )
+        return
+    try:
+        cycle_session_epoch = int(session_gate.get("session_epoch") or 0)
+    except (TypeError, ValueError):
+        cycle_session_epoch = 0
 
     period = str(cfg.get("trigger_query_period") or "1h").strip() or "1h"
     strategies = cfg.get("strategies")
@@ -775,6 +863,9 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     revalidate_error,
                                 ) = _revalidate_stop_candidate(
                                     db,
+                                    original_strategy=st,
+                                    expected_owner=cycle_owner,
+                                    expected_session_epoch=cycle_session_epoch,
                                     target_uid=target_uid,
                                     assist_task_id=assist_task_id,
                                     aavid=aavid,

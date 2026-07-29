@@ -24,6 +24,13 @@ def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _session_epoch(profile: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(profile.get("session_epoch") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def current_session_owner() -> str:
     override = str(os.getenv("QCSCKP_SESSION_OWNER") or "").strip().casefold()
     if override:
@@ -110,8 +117,12 @@ def _read_legacy_cookie() -> Optional[Dict[str, Any]]:
     return None
 
 
-def load_qianchuan_storage_state() -> Optional[Dict[str, Any]]:
-    owner = current_session_owner()
+def load_qianchuan_storage_state(
+    owner_username: Any = None,
+) -> Optional[Dict[str, Any]]:
+    owner = str(
+        owner_username or current_session_owner() or ""
+    ).strip().casefold()
     with SESSION_LOCK:
         if owner:
             profile = (_load_file().get("profiles") or {}).get(owner) or {}
@@ -145,6 +156,7 @@ def save_qianchuan_storage_state(
                 "storage_state_protected": protected,
                 "status": "available",
                 "last_error": "",
+                "session_epoch": _session_epoch(profile),
                 "updated_at": _now_text(),
             }
         )
@@ -153,11 +165,18 @@ def save_qianchuan_storage_state(
     return session_status(owner)
 
 
-async def save_context_storage_state(context: Any) -> Dict[str, Any]:
+async def save_context_storage_state(
+    context: Any,
+    *,
+    owner_username: Any = None,
+) -> Dict[str, Any]:
     if context is None:
         raise RuntimeError("浏览器上下文不存在")
     state = await context.storage_state()
-    return save_qianchuan_storage_state(state)
+    return save_qianchuan_storage_state(
+        state,
+        owner_username=owner_username,
+    )
 
 
 def migrate_legacy_qcookie() -> Dict[str, Any]:
@@ -189,8 +208,14 @@ def migrate_legacy_qcookie() -> Dict[str, Any]:
         }
 
 
-def mark_qianchuan_session_invalid(message: Any) -> None:
-    owner = current_session_owner()
+def mark_qianchuan_session_invalid(
+    message: Any,
+    *,
+    owner_username: Any = None,
+) -> None:
+    owner = str(
+        owner_username or current_session_owner() or ""
+    ).strip().casefold()
     if not owner:
         return
     with SESSION_LOCK:
@@ -198,19 +223,34 @@ def mark_qianchuan_session_invalid(message: Any) -> None:
         profiles = data.setdefault("profiles", {})
         current = profiles.get(owner)
         profile = dict(current) if isinstance(current, dict) else {}
+        epoch = _session_epoch(profile) + 1
         profile.update(
             {
                 "status": "login_required",
                 "last_error": str(message or "千川登录状态已失效")[:1000],
+                "session_epoch": epoch,
                 "updated_at": _now_text(),
             }
         )
         profiles[owner] = profile
         _atomic_save(data)
+    # 登录失效前生成或批准的任务不能在重新登录后补执行。
+    try:
+        from services.local_feishu_bridge import cancel_active_local_retarget_tasks
+
+        cancel_active_local_retarget_tasks(
+            owner,
+            str(message or "千川登录状态已失效，请重新命中规则并再次确认"),
+        )
+    except Exception:
+        # 会话总闸已经关闭；卡片状态同步失败也不能重新放行写操作。
+        pass
 
 
-def mark_qianchuan_session_available() -> None:
-    owner = current_session_owner()
+def mark_qianchuan_session_available(*, owner_username: Any = None) -> None:
+    owner = str(
+        owner_username or current_session_owner() or ""
+    ).strip().casefold()
     if not owner:
         return
     with SESSION_LOCK:
@@ -224,6 +264,7 @@ def mark_qianchuan_session_available() -> None:
             {
                 "status": "available",
                 "last_error": "",
+                "session_epoch": _session_epoch(profile),
                 "updated_at": _now_text(),
             }
         )
@@ -277,6 +318,7 @@ def session_status(owner_username: Any = None) -> Dict[str, Any]:
         ),
         "updated_at": str(profile.get("updated_at") or ""),
         "last_error": str(profile.get("last_error") or ""),
+        "session_epoch": _session_epoch(profile),
         "legacy_cookie_present": os.path.isfile(LEGACY_COOKIE_FILE),
         "rollback_cookie_present": os.path.isfile(LEGACY_ROLLBACK_FILE),
     }

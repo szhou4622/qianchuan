@@ -487,7 +487,7 @@ class QianChuanFetcher:
                     self._sqlite_store.insert_or_update(
                         table="pmc_ad_detail_basic",
                         data=row,
-                        unique_fields=["aadvid", "ad_id"],
+                        unique_fields=["account_uid", "aadvid", "ad_id"],
                         update_fields=[
                             "account_uid",
                             "target_uid",
@@ -668,7 +668,7 @@ class QianChuanFetcher:
                 db.insert_or_update(
                     table="pmc_ad_detail_basic",
                     data=row,
-                    unique_fields=["aadvid", "ad_id"],
+                    unique_fields=["account_uid", "aadvid", "ad_id"],
                     update_fields=[
                         "account_uid",
                         "target_uid",

@@ -34,6 +34,36 @@ def make_target_uid(aavid: Any, ad_id: Any) -> str:
     return f"target_{digest}"
 
 
+def make_scoped_target_uid(
+    account_uid: Any,
+    aavid: Any,
+    ad_id: Any,
+) -> str:
+    """同一千川计划被不同工具账号登记时使用的隔离标识。"""
+    scope = str(account_uid or "").strip()
+    aid = str(aavid or "").strip()
+    pid = str(ad_id or "").strip()
+    if not scope or not aid or not pid:
+        raise ValueError("缺少 account_uid、aavid 或 ad_id")
+    digest = hashlib.sha256(
+        f"{scope}:{aid}:{pid}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"target_{digest}"
+
+
+def _owner_key(value: Any = None) -> str:
+    text = str(value or "").strip().casefold()
+    if text:
+        return text
+    try:
+        from services.qianchuan_session import current_session_owner
+
+        text = str(current_session_owner() or "").strip().casefold()
+    except Exception:
+        text = ""
+    return text or "local_default"
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -220,6 +250,9 @@ def sanitize_target_url(url: str) -> str:
 def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
+    out["automation_write_blocked"] = bool(
+        out.get("automation_write_blocked")
+    )
     out["product_ids"] = _json_list(out.pop("product_ids_json", None))
     for key in ("capability_json",):
         raw = out.get(key)
@@ -236,36 +269,58 @@ def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
 def list_promotion_targets(
     *,
     enabled: Optional[bool] = None,
+    owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
 ) -> List[Dict[str, Any]]:
-    init_sqlite_schema()
     store = db or SQLiteStore()
-    where = None if enabled is None else {"enabled": 1 if enabled else 0}
-    rows = store.select(
-        "promotion_target",
-        where=where,
-        order_by="enabled DESC, updated_at DESC, id DESC",
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = _owner_key(owner_username)
+    sql = (
+        "SELECT t.* FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE a.owner_username=?"
     )
+    params: List[Any] = [owner]
+    if enabled is not None:
+        sql += " AND t.enabled=?"
+        params.append(1 if enabled else 0)
+    sql += " ORDER BY t.enabled DESC,t.updated_at DESC,t.id DESC"
+    rows = store.execute(sql, tuple(params), fetch=True) or []
     return [_target_row(row) for row in rows]
 
 
 def get_promotion_target(
     target_uid: Any,
     *,
+    owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
 ) -> Optional[Dict[str, Any]]:
     uid = str(target_uid or "").strip()
     if not uid:
         return None
-    init_sqlite_schema()
     store = db or SQLiteStore()
-    row = store.select_one("promotion_target", where={"target_uid": uid})
+    if not hasattr(store, "config"):
+        row = store.select_one(
+            "promotion_target",
+            where={"target_uid": uid},
+        )
+        return _target_row(row) if row else None
+    init_sqlite_schema(database=store.config.get("database"))
+    rows = store.execute(
+        "SELECT t.* FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE t.target_uid=? AND a.owner_username=? LIMIT 1",
+        (uid, _owner_key(owner_username)),
+        fetch=True,
+    ) or []
+    row = rows[0] if rows else None
     return _target_row(row) if row else None
 
 
 def upsert_promotion_target(
     data: Dict[str, Any],
     *,
+    owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     if not isinstance(data, dict):
@@ -278,16 +333,56 @@ def upsert_promotion_target(
         raise ValueError("aavid 和 ad_id 必须为数字")
     scene = normalize_scene(data.get("promotion_scene"))
     plan_system_provided = "plan_system" in data
-    stable_target_uid = make_target_uid(aavid, ad_id)
-    requested_target_uid = str(data.get("target_uid") or "").strip()
-    if requested_target_uid and requested_target_uid != stable_target_uid:
-        raise ValueError("target_uid 与账户、计划不匹配")
-    target_uid = stable_target_uid
     enabled = 1 if data.get("enabled", True) else 0
+    from services.qianchuan_accounts import ensure_qianchuan_account
+
+    account = ensure_qianchuan_account(
+        aavid,
+        account_name=data.get("account_name") or "",
+        owner_username=owner_username,
+        seen=True,
+        db=store,
+    )
+    account_uid = str(account["account_uid"])
     existing = store.select_one(
         "promotion_target",
-        where={"aadvid": aavid, "ad_id": ad_id},
+        where={
+            "account_uid": account_uid,
+            "aadvid": aavid,
+            "ad_id": ad_id,
+        },
     )
+    existing_any = existing or store.select_one(
+        "promotion_target",
+        where={"aadvid": aavid, "ad_id": ad_id},
+        order_by="id ASC",
+    )
+    if (
+        not existing
+        and existing_any
+        and not str(existing_any.get("account_uid") or "").strip()
+    ):
+        store.update(
+            "promotion_target",
+            {"account_uid": account_uid},
+            where={"id": existing_any["id"]},
+        )
+        existing = store.select_one(
+            "promotion_target",
+            where={"id": existing_any["id"]},
+        )
+    target_uid = (
+        str(existing.get("target_uid") or "")
+        if existing
+        else (
+            make_target_uid(aavid, ad_id)
+            if not existing_any
+            else make_scoped_target_uid(account_uid, aavid, ad_id)
+        )
+    )
+    requested_target_uid = str(data.get("target_uid") or "").strip()
+    if requested_target_uid and requested_target_uid != target_uid:
+        raise ValueError("target_uid 与当前工具账号、账户或计划不匹配")
     plan_system = normalize_plan_system(
         data.get("plan_system")
         if plan_system_provided
@@ -355,17 +450,9 @@ def upsert_promotion_target(
         if "last_error" in data
         else (existing.get("last_error") if existing else "")
     )
-    from services.qianchuan_accounts import ensure_qianchuan_account
-
-    account = ensure_qianchuan_account(
-        aavid,
-        account_name=data.get("account_name") or "",
-        seen=True,
-        db=store,
-    )
     row = {
         "target_uid": target_uid,
-        "account_uid": account["account_uid"],
+        "account_uid": account_uid,
         "aadvid": aavid,
         "ad_id": ad_id,
         "plan_name": str(
@@ -386,11 +473,15 @@ def upsert_promotion_target(
     store.insert_or_update(
         "promotion_target",
         row,
-        unique_fields=["aadvid", "ad_id"],
+        unique_fields=["account_uid", "aadvid", "ad_id"],
     )
     saved = store.select_one(
         "promotion_target",
-        where={"aadvid": aavid, "ad_id": ad_id},
+        where={
+            "account_uid": account_uid,
+            "aadvid": aavid,
+            "ad_id": ad_id,
+        },
     )
     assert saved is not None
     from services.qianchuan_accounts import refresh_monitor_capacity
@@ -398,7 +489,11 @@ def upsert_promotion_target(
     refresh_monitor_capacity(db=store)
     saved = store.select_one(
         "promotion_target",
-        where={"aadvid": aavid, "ad_id": ad_id},
+        where={
+            "account_uid": account_uid,
+            "aadvid": aavid,
+            "ad_id": ad_id,
+        },
     )
     assert saved is not None
     return _target_row(saved)
@@ -412,10 +507,7 @@ def set_promotion_target_enabled(
 ) -> Dict[str, Any]:
     init_sqlite_schema()
     store = db or SQLiteStore()
-    target = store.select_one(
-        "promotion_target",
-        where={"target_uid": str(target_uid or "").strip()},
-    )
+    target = get_promotion_target(target_uid, db=store)
     if not target:
         raise ValueError("监控目标不存在")
     if enabled:
@@ -436,6 +528,41 @@ def set_promotion_target_enabled(
 
     refresh_monitor_capacity(db=store)
     result = get_promotion_target(target["target_uid"], db=store)
+    assert result is not None
+    return result
+
+
+def set_target_automation_write_block(
+    target_uid: Any,
+    blocked: bool,
+    *,
+    reason: Any = "",
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """Persist a safety latch that read-only collection is never allowed to clear."""
+    uid = str(target_uid or "").strip()
+    if not uid:
+        raise ValueError("缺少监控目标")
+    init_sqlite_schema()
+    store = db or SQLiteStore()
+    target = get_promotion_target(uid, db=store)
+    if not target:
+        raise ValueError("监控目标不存在或不属于当前工具账号")
+    if blocked:
+        store.execute(
+            "UPDATE promotion_target SET automation_write_blocked=1,"
+            "write_block_reason=?,write_blocked_at=datetime('now','+8 hours'),"
+            "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
+            (str(reason or "自动写入安全封锁")[:2000], uid),
+        )
+    else:
+        store.execute(
+            "UPDATE promotion_target SET automation_write_blocked=0,"
+            "write_block_reason='',write_blocked_at=NULL,"
+            "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
+            (uid,),
+        )
+    result = get_promotion_target(uid, db=store)
     assert result is not None
     return result
 
@@ -666,9 +793,12 @@ def list_target_products(
 ) -> List[Dict[str, Any]]:
     init_sqlite_schema()
     store = db or SQLiteStore()
+    uid = str(target_uid or "").strip()
+    if not get_promotion_target(uid, db=store):
+        return []
     return store.select(
         "promotion_product",
-        where={"target_uid": str(target_uid or "").strip()},
+        where={"target_uid": uid},
         order_by="product_name ASC, product_id ASC",
     )
 
@@ -679,30 +809,61 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
     store = db or SQLiteStore()
     details = store.select(
         "pmc_ad_detail_basic",
-        fields="aadvid, ad_id, target_uid, plan_name, promotion_scene, plan_system",
+        fields=(
+            "id,account_uid,aadvid,ad_id,target_uid,plan_name,"
+            "promotion_scene,plan_system"
+        ),
         order_by="updated_at DESC, id DESC",
     )
+    owner = _owner_key()
     migrated = 0
-    by_account: Dict[str, List[Dict[str, Any]]] = {}
+    by_account: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for detail in details:
+        detail_account_uid = str(detail.get("account_uid") or "").strip()
+        if detail_account_uid:
+            account_row = store.select_one(
+                "qianchuan_account",
+                fields="owner_username",
+                where={"account_uid": detail_account_uid},
+            )
+            if (
+                account_row
+                and str(account_row.get("owner_username") or "").casefold()
+                != owner
+            ):
+                continue
         aavid = str(detail.get("aadvid") or "").strip()
         ad_id = str(detail.get("ad_id") or "").strip()
         if not aavid or not ad_id:
             continue
-        uid = make_target_uid(aavid, ad_id)
         try:
             scene = normalize_scene(detail.get("promotion_scene") or "live")
         except ValueError:
             scene = "live"
-        existing_target = store.select_one(
-            "promotion_target", where={"aadvid": aavid, "ad_id": ad_id}
-        )
+        if detail_account_uid:
+            existing_target = store.select_one(
+                "promotion_target",
+                where={
+                    "account_uid": detail_account_uid,
+                    "aadvid": aavid,
+                    "ad_id": ad_id,
+                },
+            )
+        else:
+            existing_rows = store.execute(
+                "SELECT t.* FROM promotion_target t "
+                "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+                "WHERE a.owner_username=? AND t.aadvid=? AND t.ad_id=? "
+                "LIMIT 1",
+                (owner, aavid, ad_id),
+                fetch=True,
+            ) or []
+            existing_target = existing_rows[0] if existing_rows else None
         # 历史明细只用于补齐可查看范围；没有明确启用记录的旧计划
         # 不能自动进入追投/停投监控。
         enable_target = bool(existing_target and existing_target.get("enabled"))
-        upsert_promotion_target(
+        saved_target = upsert_promotion_target(
             {
-                "target_uid": uid,
                 "aavid": aavid,
                 "ad_id": ad_id,
                 "plan_name": detail.get("plan_name") or "",
@@ -712,16 +873,19 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
             },
             db=store,
         )
+        uid = str(saved_target["target_uid"])
+        saved_account_uid = str(saved_target.get("account_uid") or "")
         store.update(
             "pmc_ad_detail_basic",
             {
+                "account_uid": saved_account_uid,
                 "target_uid": uid,
                 "promotion_scene": scene,
                 "plan_system": detail.get("plan_system") or "unknown",
             },
-            where={"aadvid": aavid, "ad_id": ad_id},
+            where={"id": detail["id"]},
         )
-        by_account.setdefault(aavid, []).append(
+        by_account.setdefault((saved_account_uid, aavid), []).append(
             {
                 "target_uid": uid,
                 "ad_id": ad_id,
@@ -731,18 +895,18 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
         )
         migrated += 1
 
-    for aavid, targets in by_account.items():
+    for (account_uid, aavid), targets in by_account.items():
         # 旧素材没有 ad_id；仅当账户只有一条计划时才安全迁移。
         unique = {x["target_uid"]: x for x in targets}
         if len(unique) != 1:
             continue
         target = next(iter(unique.values()))
-        for table, account_col, extra in (
-            ("pmc_promotion_material", "aadvid", {"ad_id": target["ad_id"]}),
-            ("pmc_retargeting_run", "aavid", {}),
-            ("pmc_regulation_run", "aavid", {}),
-            ("pmc_roi2_assist_task", "aadvid", {}),
-            ("account_operation_event", "aavid", {}),
+        for table, account_col, has_account_uid, extra in (
+            ("pmc_promotion_material", "aadvid", False, {"ad_id": target["ad_id"]}),
+            ("pmc_retargeting_run", "aavid", True, {}),
+            ("pmc_regulation_run", "aavid", True, {}),
+            ("pmc_roi2_assist_task", "aadvid", True, {}),
+            ("account_operation_event", "aavid", True, {}),
         ):
             values = {
                 "target_uid": target["target_uid"],
@@ -750,13 +914,26 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
                 "plan_system": target.get("plan_system") or "unknown",
                 **extra,
             }
+            if has_account_uid:
+                values["account_uid"] = account_uid
+            account_scope = (
+                " AND (COALESCE(account_uid,'')='' OR account_uid=?)"
+                if has_account_uid
+                else ""
+            )
+            params: Tuple[Any, ...] = (
+                (aavid, LEGACY_TARGET_UID, account_uid)
+                if has_account_uid
+                else (aavid, LEGACY_TARGET_UID)
+            )
             store.update(
                 table,
                 values,
                 where=(
                     f"{account_col} = ? AND "
                     "(target_uid IS NULL OR target_uid = '' OR target_uid = ?)"
+                    + account_scope
                 ),
-                params=(aavid, LEGACY_TARGET_UID),
+                params=params,
             )
     return migrated

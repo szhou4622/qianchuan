@@ -92,6 +92,15 @@ class LocalFeishuTaskTests(unittest.TestCase):
             patch.object(bridge, "DB_FILE", self.db_path),
             patch.object(bridge, "PROFILE_FILE", self.profile_path),
             patch.object(bridge, "_MANAGER", self.manager),
+            patch(
+                "services.qianchuan_session.automation_session_ready",
+                return_value={
+                    "ready": True,
+                    "available": True,
+                    "status": "available",
+                    "session_epoch": 1,
+                },
+            ),
         ]
         for item in self.patches:
             item.start()

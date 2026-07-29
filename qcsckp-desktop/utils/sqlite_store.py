@@ -100,10 +100,14 @@ class SQLiteStore:
             ],
             'obsolete_indexes': [
                 'uk_pmc_ad_detail_basic_aadvid',
+                'uk_pmc_ad_detail_basic_aadvid_adid',
             ],
             # 业务唯一：同一广告主下允许多条计划，以账户 + 计划隔离。
             'unique_indexes': [
-                ('uk_pmc_ad_detail_basic_aadvid_adid', 'aadvid, ad_id'),
+                (
+                    'uk_pmc_ad_detail_basic_account_aadvid_adid',
+                    'account_uid, aadvid, ad_id',
+                ),
             ],
         },
         # 一个工具账号下只保存一份千川登录会话；该会话可访问多个 aavid。
@@ -155,6 +159,9 @@ class SQLiteStore:
                 'last_sync_at': 'TEXT',
                 'last_status': "TEXT NOT NULL DEFAULT 'pending'",
                 'last_error': 'TEXT',
+                'automation_write_blocked': 'INTEGER NOT NULL DEFAULT 0 CHECK (automation_write_blocked IN (0, 1))',
+                'write_block_reason': 'TEXT',
+                'write_blocked_at': 'TEXT',
                 'capacity_state': "TEXT NOT NULL DEFAULT 'active' CHECK (capacity_state IN ('active', 'capacity_waiting', 'disabled'))",
                 'last_duration_ms': 'INTEGER',
                 'next_due_at': 'TEXT',
@@ -170,9 +177,15 @@ class SQLiteStore:
                 ('idx_promotion_target_scene', 'promotion_scene'),
                 ('idx_promotion_target_system', 'plan_system'),
             ],
+            'obsolete_indexes': [
+                'uk_promotion_target_account_plan',
+            ],
             'unique_indexes': [
                 ('uk_promotion_target_uid', 'target_uid'),
-                ('uk_promotion_target_account_plan', 'aadvid, ad_id'),
+                (
+                    'uk_promotion_target_owner_account_plan',
+                    'account_uid, aadvid, ad_id',
+                ),
             ],
         },
         # 商品全域计划中的商品快照。

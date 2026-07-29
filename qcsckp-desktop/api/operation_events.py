@@ -190,6 +190,25 @@ def upsert_operation_event(data: Dict[str, Any], db: Optional[SQLiteStore] = Non
         from services.qianchuan_accounts import ensure_qianchuan_account
 
         account_uid = ensure_qianchuan_account(aavid, db=store)["account_uid"]
+    elif aavid and account_uid:
+        account = store.select_one(
+            "qianchuan_account",
+            fields="account_uid",
+            where={"account_uid": account_uid, "aavid": aavid},
+        )
+        if not account:
+            raise ValueError("操作流水的 account_uid 与 aavid 不匹配")
+    existing_uid = store.select_one(
+        TABLE,
+        fields="account_uid",
+        where={"event_uid": uid},
+    )
+    if (
+        existing_uid
+        and str(existing_uid.get("account_uid") or "")
+        not in {"", account_uid}
+    ):
+        uid = make_event_uid(source, account_uid, uid)
     row = {
         "event_uid": uid,
         "aavid": aavid,
@@ -241,7 +260,9 @@ def migrate_legacy_operation_runs(db: Optional[SQLiteStore] = None) -> int:
     count = 0
     retarget_rows = store.execute(
         "SELECT r.* FROM pmc_retargeting_run r LEFT JOIN account_operation_event e "
-        "ON e.event_uid=('retarget_run:' || r.id) WHERE e.id IS NULL",
+        "ON e.event_uid=('retarget_run:' || r.id) WHERE e.id IS NULL "
+        "OR (COALESCE(r.account_uid,'')<>'' AND "
+        "COALESCE(e.account_uid,'')<>r.account_uid)",
         fetch=True,
     ) or []
     for row in retarget_rows:
@@ -252,6 +273,7 @@ def migrate_legacy_operation_runs(db: Optional[SQLiteStore] = None) -> int:
             {
                 "event_uid": uid,
                 "aavid": row.get("aavid"),
+                "account_uid": row.get("account_uid"),
                 "ad_id": row.get("ad_id"),
                 "target_uid": row.get("target_uid") or "legacy_unscoped",
                 "promotion_scene": row.get("promotion_scene") or "live",
@@ -280,7 +302,9 @@ def migrate_legacy_operation_runs(db: Optional[SQLiteStore] = None) -> int:
         count += 1
     stop_rows = store.execute(
         "SELECT r.* FROM pmc_regulation_run r LEFT JOIN account_operation_event e "
-        "ON e.event_uid=('regulation_run:' || r.id) WHERE e.id IS NULL",
+        "ON e.event_uid=('regulation_run:' || r.id) WHERE e.id IS NULL "
+        "OR (COALESCE(r.account_uid,'')<>'' AND "
+        "COALESCE(e.account_uid,'')<>r.account_uid)",
         fetch=True,
     ) or []
     for row in stop_rows:
@@ -292,6 +316,7 @@ def migrate_legacy_operation_runs(db: Optional[SQLiteStore] = None) -> int:
             {
                 "event_uid": uid,
                 "aavid": row.get("aavid"),
+                "account_uid": row.get("account_uid"),
                 "ad_id": row.get("ad_id"),
                 "target_uid": row.get("target_uid") or "legacy_unscoped",
                 "promotion_scene": row.get("promotion_scene") or "live",
@@ -348,7 +373,9 @@ def query_operation_events_page(
         return 0, []
     from services.qianchuan_accounts import get_qianchuan_account
 
-    account = get_qianchuan_account(aid)
+    account = get_qianchuan_account(aid, db=store)
+    if not account:
+        return 0, []
     try:
         p = max(1, int(page))
     except Exception:
@@ -357,11 +384,8 @@ def query_operation_events_page(
         ps = max(1, min(5000, int(page_size)))
     except Exception:
         ps = 50
-    where = ["aavid = ?"]
-    params: List[Any] = [aid]
-    if account:
-        where.append("account_uid = ?")
-        params.append(str(account.get("account_uid") or ""))
+    where = ["aavid = ?", "account_uid = ?"]
+    params: List[Any] = [aid, str(account.get("account_uid") or "")]
     target = str(target_uid or "").strip()
     if target:
         where.append("target_uid = ?")
@@ -420,20 +444,23 @@ def query_operation_events_page(
 
 def get_operation_event(event_id: Any, aavid: Any = None) -> Optional[Dict[str, Any]]:
     init_sqlite_schema()
+    store = SQLiteStore()
     try:
         rid = int(event_id)
     except Exception:
         return None
     where = {"id": rid}
     aid = str(aavid or "").strip()
-    if aid:
-        where["aavid"] = aid
-        from services.qianchuan_accounts import get_qianchuan_account
+    if not aid:
+        return None
+    where["aavid"] = aid
+    from services.qianchuan_accounts import get_qianchuan_account
 
-        account = get_qianchuan_account(aid)
-        if account:
-            where["account_uid"] = str(account.get("account_uid") or "")
-    return SQLiteStore().select_one(TABLE, where=where)
+    account = get_qianchuan_account(aid, db=store)
+    if not account:
+        return None
+    where["account_uid"] = str(account.get("account_uid") or "")
+    return store.select_one(TABLE, where=where)
 
 
 def list_operation_accounts() -> List[str]:
@@ -450,16 +477,21 @@ def list_operation_accounts() -> List[str]:
 
 def operation_sync_state(aavid: Any) -> Dict[str, Any]:
     init_sqlite_schema()
+    store = SQLiteStore()
     aid = str(aavid or "").strip()
     row = None
     if aid:
         from services.qianchuan_accounts import get_qianchuan_account
 
-        account = get_qianchuan_account(aid)
-        where = {"aavid": aid}
+        account = get_qianchuan_account(aid, db=store)
         if account:
-            where["account_uid"] = str(account.get("account_uid") or "")
-        row = SQLiteStore().select_one("platform_log_sync_state", where=where)
+            row = store.select_one(
+                "platform_log_sync_state",
+                where={
+                    "aavid": aid,
+                    "account_uid": str(account.get("account_uid") or ""),
+                },
+            )
     return row or {
         "aavid": aid,
         "coverage_from": "",
@@ -470,8 +502,14 @@ def operation_sync_state(aavid: Any) -> Dict[str, Any]:
     }
 
 
-def update_platform_sync_state(aavid: Any, **values: Any) -> None:
-    store = SQLiteStore()
+def update_platform_sync_state(
+    aavid: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+    **values: Any,
+) -> None:
+    store = db or SQLiteStore()
     init_sqlite_schema(database=store.config["database"])
     aid = str(aavid or "").strip()
     if not aid:
@@ -484,11 +522,40 @@ def update_platform_sync_state(aavid: Any, **values: Any) -> None:
 
     data = {
         "aavid": aid,
-        "account_uid": ensure_qianchuan_account(aid, db=store)["account_uid"],
+        "account_uid": ensure_qianchuan_account(
+            aid,
+            owner_username=owner_username,
+            db=store,
+        )["account_uid"],
     }
+    existing = store.select_one(
+        "platform_log_sync_state",
+        where={
+            "account_uid": data["account_uid"],
+            "aavid": aid,
+        },
+    ) or {}
     for key, value in values.items():
         if key in allowed:
             data[key] = _json(value) if key == "discovered_request_json" else str(value or "")
+    if data.get("coverage_from"):
+        data["coverage_from"] = min(
+            value
+            for value in (
+                str(existing.get("coverage_from") or ""),
+                str(data["coverage_from"]),
+            )
+            if value
+        )
+    if data.get("coverage_to"):
+        data["coverage_to"] = max(
+            value
+            for value in (
+                str(existing.get("coverage_to") or ""),
+                str(data["coverage_to"]),
+            )
+            if value
+        )
     store.insert_or_update(
         "platform_log_sync_state",
         data,
@@ -567,13 +634,29 @@ def _normalize_occurred_at(value: Any) -> str:
     return text[:19] if text else _now()
 
 
-def ingest_platform_log_rows(aavid: Any, rows: Iterable[Dict[str, Any]]) -> int:
+def ingest_platform_log_rows(
+    aavid: Any,
+    rows: Iterable[Dict[str, Any]],
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> int:
     """接收记录浏览器发现的平台日志行，保留原文并做基础字段兼容。"""
     init_sqlite_schema()
     aid = str(aavid or "").strip()
     if not aid:
         raise ValueError("缺少 aavid")
-    store = SQLiteStore()
+    store = db or SQLiteStore()
+    from services.qianchuan_accounts import ensure_qianchuan_account
+
+    account_uid = str(
+        ensure_qianchuan_account(
+            aid,
+            owner_username=owner_username,
+            db=store,
+        ).get("account_uid")
+        or ""
+    )
     inserted = 0
     seen_times: List[str] = []
     for raw in rows:
@@ -594,18 +677,51 @@ def ingest_platform_log_rows(aavid: Any, rows: Iterable[Dict[str, Any]]) -> int:
         raw_status = str(_first(raw, ("status", "result", "operation_result", "结果"))).strip().lower()
         event_status = "failed" if any(x in raw_status for x in ("fail", "失败", "错误")) else ("success" if raw_status == "" or any(x in raw_status for x in ("success", "成功")) else "unknown")
         action = normalize_action_type(description)
-        uid = (
+        legacy_uid = (
             f"platform_log:{aid}:{platform_id}"
             if platform_id
             else make_event_uid("platform_log", aid, occurred_at, operator_id, description, object_id)
         )
+        legacy_event = store.select_one(
+            TABLE,
+            fields="account_uid",
+            where={"event_uid": legacy_uid},
+        )
+        if (
+            legacy_event
+            and str(legacy_event.get("account_uid") or "")
+            not in {"", account_uid}
+        ):
+            uid = (
+                f"platform_log:{account_uid}:{aid}:{platform_id}"
+                if platform_id
+                else make_event_uid(
+                    "platform_log",
+                    account_uid,
+                    aid,
+                    occurred_at,
+                    operator_id,
+                    description,
+                    object_id,
+                )
+            )
+        else:
+            # 保留既有单账号UID，避免升级后同一日志形成重复记录。
+            uid = legacy_uid
         possible = False
         related = ""
         candidates = store.execute(
             "SELECT event_uid,operator_id,operator_name,platform_event_id,raw_json "
-            "FROM account_operation_event WHERE aavid=? AND source<>? "
+            "FROM account_operation_event WHERE account_uid=? AND aavid=? AND source<>? "
             "AND action_type=? AND object_id=? AND ABS(strftime('%s',occurred_at)-strftime('%s',?)) <= 120 LIMIT 2",
-            (aid, "platform_log", action, str(object_id or ""), occurred_at),
+            (
+                account_uid,
+                aid,
+                "platform_log",
+                action,
+                str(object_id or ""),
+                occurred_at,
+            ),
             fetch=True,
         ) or []
         if object_id not in (None, "") and action != "other" and len(candidates) == 1:
@@ -660,6 +776,7 @@ def ingest_platform_log_rows(aavid: Any, rows: Iterable[Dict[str, Any]]) -> int:
             {
                 "event_uid": uid,
                 "aavid": aid,
+                "account_uid": account_uid,
                 "ad_id": _first(raw, ("ad_id", "advertiser_id")),
                 "target_uid": _first(raw, ("target_uid",), "legacy_unscoped"),
                 "promotion_scene": _first(raw, ("promotion_scene", "scene")),
@@ -695,15 +812,23 @@ def ingest_platform_log_rows(aavid: Any, rows: Iterable[Dict[str, Any]]) -> int:
         inserted += 1
     state = {
         "aavid": aid,
+        "account_uid": account_uid,
         "last_sync_at": _now(),
         "last_status": "ok",
         "last_error": "",
     }
     if seen_times:
-        existing = store.select_one("platform_log_sync_state", where={"aavid": aid}) or {}
+        existing = store.select_one(
+            "platform_log_sync_state",
+            where={"account_uid": account_uid, "aavid": aid},
+        ) or {}
         old_from = str(existing.get("coverage_from") or "")
         old_to = str(existing.get("coverage_to") or "")
         state["coverage_from"] = min([x for x in [old_from, min(seen_times)] if x])
         state["coverage_to"] = max([x for x in [old_to, max(seen_times)] if x])
-    store.insert_or_update("platform_log_sync_state", state, unique_fields=["aavid"])
+    store.insert_or_update(
+        "platform_log_sync_state",
+        state,
+        unique_fields=["account_uid", "aavid"],
+    )
     return inserted

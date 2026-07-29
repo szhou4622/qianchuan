@@ -77,6 +77,9 @@ class Api:
 
     def getQianchuanAccountOverview(self):
         from services.local_feishu_bridge import get_local_feishu_status
+        from services.operation_daily_report import (
+            get_operation_daily_report_config,
+        )
         from services.promotion_browser_lock import browser_queue_snapshot
         from services.qianchuan_accounts import (
             capacity_snapshot,
@@ -105,6 +108,7 @@ class Api:
                     "groups": (feishu.get("profile") or {}).get("groups") or [],
                 },
                 "autostart": get_windows_autostart_status(),
+                "daily_report": get_operation_daily_report_config(),
             }
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -230,6 +234,22 @@ class Api:
                 db=self.db,
             )
             return {"success": True, "data": target}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def clearPromotionTargetWriteBlock(self, target_uid=None):
+        from .promotion_targets import set_target_automation_write_block
+
+        try:
+            return {
+                "success": True,
+                "data": set_target_automation_write_block(
+                    target_uid,
+                    False,
+                    db=self.db,
+                ),
+                "message": "自动写入安全封锁已解除",
+            }
         except Exception as e:
             return {"success": False, "message": str(e)}
 
@@ -528,9 +548,33 @@ class Api:
         p = password if password is not None else ""
         if not u or not p:
             return self._start_denied_response("启动采集须传入账号与密码，并由服务端校验通过")
+        from services.cloud_retarget_client import load_device_session
+
+        old_owner = str(
+            (load_device_session() or {}).get("username") or ""
+        ).strip().casefold()
+        new_owner = u.casefold()
+        if old_owner and old_owner != new_owner:
+            stopped = self.service.stop_and_wait(30)
+            if stopped.get("running"):
+                return self._start_denied_response(
+                    "旧工具账号的千川会话仍在安全退出，请稍后重新启动"
+                )
         chk = self.account_auth.verify_can_start_service(u, p)
         if not chk.get("ok"):
             return self._start_denied_response(chk.get("message") or "账号校验失败")
+        if old_owner and old_owner != new_owner:
+            from services.local_feishu_bridge import (
+                cancel_active_local_retarget_tasks,
+            )
+
+            cancel_active_local_retarget_tasks(
+                old_owner,
+                "工具账号已经切换，旧追投提醒已作废",
+            )
+        from services.local_feishu_bridge import activate_local_feishu_account
+
+        activate_local_feishu_account(u)
         self.service.set_cloud_backup_credentials(u, p)
         # 与界面一致：写入 control_panel.json → crawl 后再启动线程
         from services.control_panel_config import load_scrape_service_config, save_scrape_service_config
@@ -667,6 +711,22 @@ class Api:
         """
         远程校验普通用户账号与密码，并返回有效期、禁用状态（见 dev_files/api文档.md）。
         """
+        from services.cloud_retarget_client import load_device_session
+
+        old_owner = str(
+            (load_device_session() or {}).get("username") or ""
+        ).strip().casefold()
+        new_owner = str(username or "").strip().casefold()
+        if old_owner and old_owner != new_owner:
+            stopped = self.service.stop_and_wait(30)
+            if stopped.get("running"):
+                return {
+                    "success": False,
+                    "message": (
+                        "旧工具账号的千川会话仍在安全退出，"
+                        "请稍后重新登录"
+                    ),
+                }
         result = self.account_auth.verify_login(username, password)
         data = result.get("data") if isinstance(result, dict) else None
         if (
@@ -676,6 +736,21 @@ class Api:
             and int(data.get("is_disabled") or 0) != 1
             and self.account_auth._is_within_validity(data)
         ):
+            if old_owner and old_owner != new_owner:
+                from services.local_feishu_bridge import (
+                    cancel_active_local_retarget_tasks,
+                )
+
+                cancel_active_local_retarget_tasks(
+                    old_owner,
+                    "工具账号已经切换，旧追投提醒已作废",
+                )
+                try:
+                    from services.operation_log_monitor import stop_record_browser
+
+                    stop_record_browser()
+                except Exception:
+                    pass
             from services.local_feishu_bridge import activate_local_feishu_account
 
             activate_local_feishu_account(username)
@@ -698,8 +773,30 @@ class Api:
 
     def clearDeviceSession(self):
         from services.local_feishu_bridge import deactivate_local_feishu_account
-        from services.cloud_retarget_client import clear_device_session
+        from services.cloud_retarget_client import (
+            clear_device_session,
+            load_device_session,
+        )
 
+        old_owner = str(
+            (load_device_session() or {}).get("username") or ""
+        ).strip().casefold()
+        self.service.stop_and_wait(30)
+        try:
+            from services.operation_log_monitor import stop_record_browser
+
+            stop_record_browser()
+        except Exception:
+            pass
+        if old_owner:
+            from services.local_feishu_bridge import (
+                cancel_active_local_retarget_tasks,
+            )
+
+            cancel_active_local_retarget_tasks(
+                old_owner,
+                "工具账号已退出，旧追投提醒已作废",
+            )
         deactivate_local_feishu_account()
         return clear_device_session()
 

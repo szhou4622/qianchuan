@@ -200,6 +200,38 @@ class OperationDailyReportTests(unittest.TestCase):
         )
         self.assertEqual("success", row["status"])
 
+    def test_scheduled_delivery_claim_blocks_concurrent_sender(self):
+        report = daily.build_operation_daily_report(
+            "10001",
+            "2026-07-27",
+            database=self.db_path,
+        )
+        key = daily._delivery_key(
+            "tool-user",
+            "10001",
+            "2026-07-27",
+            "open_id",
+            "ou_owner",
+        )
+        first = daily._claim_scheduled_delivery(
+            self.store,
+            delivery_key=key,
+            report=report,
+            account_username="tool-user",
+            receive_type="open_id",
+            receive_id="ou_owner",
+        )
+        second = daily._claim_scheduled_delivery(
+            self.store,
+            delivery_key=key,
+            report=report,
+            account_username="tool-user",
+            receive_type="open_id",
+            receive_id="ou_owner",
+        )
+        self.assertEqual("claimed", first)
+        self.assertEqual("in_progress", second)
+
     def test_manual_send_can_be_repeated_for_testing(self):
         self._save_enabled()
         first = daily.send_operation_daily_report(

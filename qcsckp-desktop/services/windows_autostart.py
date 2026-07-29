@@ -57,11 +57,24 @@ def get_windows_autostart_status() -> Dict[str, object]:
             enabled = bool(value)
     except FileNotFoundError:
         pass
+    expected = _command()
+    stale = bool(value) and os.path.normcase(value.strip()) != os.path.normcase(
+        expected.strip()
+    )
+    if stale:
+        enabled = False
     return {
         "success": True,
         "supported": True,
         "enabled": enabled,
-        "command": value if enabled else _command(),
+        "stale": stale,
+        "registered_command": value,
+        "command": value if enabled else expected,
+        "message": (
+            "检测到旧版开机自启命令，请重新开启"
+            if stale
+            else ""
+        ),
     }
 
 

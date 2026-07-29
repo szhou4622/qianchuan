@@ -45,6 +45,7 @@ from services.plan_system import normalize_plan_system
 from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.qianchuan_accounts import schedulable_promotion_targets
+from services.qianchuan_session import automation_session_ready, current_session_owner
 from services.retargeting_service import (
     QianChuanRetargetingService,
     retarget_capability_matches,
@@ -107,6 +108,311 @@ def _json_dumps(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except Exception:
         return "{}"
+
+
+def block_target_after_rate_record_failure(
+    db: SQLiteStore,
+    target_uid: str,
+    exc: BaseException,
+) -> None:
+    """千川已写成功但限频落库失败时封锁目标，避免下一轮重复执行。"""
+    try:
+        message = (
+            "追投成功但限频记录失败，已暂停自动写操作：" + str(exc)
+        )[:1000]
+        db.execute(
+            "UPDATE promotion_target SET last_status='error',last_error=?,"
+            "automation_write_blocked=1,write_block_reason=?,"
+            "write_blocked_at=datetime('now','+8 hours'),"
+            "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
+            (
+                message,
+                (
+                    "追投已成功，但限频记录失败；必须核对千川任务和限频流水后人工解除："
+                    + str(exc)
+                )[:2000],
+                str(target_uid or ""),
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "限频记录失败后封锁监控目标也失败 target=%s",
+            target_uid,
+        )
+
+
+def record_retarget_rate_success_safely(
+    db: SQLiteStore,
+    *,
+    material_ids: List[str],
+    target_uid: str,
+    cfg: Dict[str, Any],
+    strategy: Dict[str, Any],
+    retargeting: Dict[str, Any],
+) -> None:
+    """在浏览器写锁内记录成功次数；失败则封锁目标但不伪报千川写失败。"""
+    try:
+        for material_id in material_ids:
+            if bool(cfg.get("per_strategy_rate_limit")):
+                window_seconds, max_count = _interval_window_and_max(retargeting)
+                rate_limit_strategy_record_success(
+                    db,
+                    material_id,
+                    str(strategy.get("id") or "__legacy__"),
+                    window_seconds,
+                    max_count,
+                    target_uid,
+                )
+            root_window, root_max = _interval_from_root_cfg(cfg)
+            rate_limit_record_success(
+                db,
+                material_id,
+                root_window,
+                root_max,
+                target_uid,
+            )
+    except Exception as exc:
+        logger.exception(
+            "追投成功后记录限频失败，已暂停目标 target=%s materials=%s",
+            target_uid,
+            ",".join(material_ids),
+        )
+        block_target_after_rate_record_failure(db, target_uid, exc)
+
+
+def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    """生成稳定的策略快照，供排队前后比较，防止等待浏览器期间策略被修改。"""
+    return {
+        "id": str(strategy.get("id") or ""),
+        "title": str(strategy.get("title") or strategy.get("id") or "?")[:64],
+        "target_uid": str(strategy.get("target_uid") or ""),
+        "trigger_level": str(strategy.get("trigger_level") or "material"),
+        "product_filter": (
+            strategy.get("product_filter")
+            if isinstance(strategy.get("product_filter"), list)
+            else []
+        ),
+        "candidate_trigger": (
+            strategy.get("candidate_trigger")
+            if isinstance(strategy.get("candidate_trigger"), dict)
+            else {}
+        ),
+        "candidate_sort": str(strategy.get("candidate_sort") or "net_roi_desc"),
+        "candidate_limit": int(strategy.get("candidate_limit") or 1),
+        "action_mode": str(strategy.get("action_mode") or "card_confirm"),
+        "trigger": (
+            strategy.get("trigger")
+            if isinstance(strategy.get("trigger"), dict)
+            else {}
+        ),
+        "retargeting": (
+            strategy.get("retargeting")
+            if isinstance(strategy.get("retargeting"), dict)
+            else {}
+        ),
+    }
+
+
+def _strategy_fingerprint(strategy: Dict[str, Any]) -> str:
+    raw = json.dumps(
+        _strategy_snapshot(strategy),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _find_strategy(cfg: Dict[str, Any], strategy_id: str) -> Optional[Dict[str, Any]]:
+    for strategy in cfg.get("strategies") or []:
+        if (
+            isinstance(strategy, dict)
+            and str(strategy.get("id") or "") == strategy_id
+        ):
+            return strategy
+    return None
+
+
+def _revalidate_auto_retarget_under_lock(
+    db: SQLiteStore,
+    *,
+    original_strategy: Dict[str, Any],
+    target_uid: str,
+    aavid: str,
+    ad_id: str,
+    promotion_scene: str,
+    plan_system: str,
+    material_id: str,
+    product_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """在取得全局浏览器写锁后重新验证所有会影响自动追投的可变状态。"""
+    owner = current_session_owner()
+    if not owner:
+        raise RuntimeError("当前工具账号未登录，已阻止自动追投")
+    session_gate = automation_session_ready(owner)
+    if not session_gate.get("ready"):
+        raise RuntimeError(
+            str(session_gate.get("message") or "千川登录状态不存在或已失效")
+        )
+
+    current_cfg = load_rule_retargeting_config()
+    if not current_cfg.get("enabled"):
+        raise RuntimeError("规则化追投已关闭")
+    strategy_id = str(original_strategy.get("id") or "")
+    current_strategy = _find_strategy(current_cfg, strategy_id)
+    if not current_strategy:
+        raise RuntimeError("追投策略已删除")
+    if str(current_strategy.get("action_mode") or "card_confirm") != "auto_execute":
+        raise RuntimeError("追投策略执行方式已经变更")
+    if _strategy_fingerprint(current_strategy) != _strategy_fingerprint(
+        original_strategy
+    ):
+        raise RuntimeError("追投策略参数已经变更")
+
+    target = next(
+        (
+            row
+            for row in schedulable_promotion_targets(
+                owner_username=owner,
+                db=db,
+            )
+            if str(row.get("target_uid") or "") == target_uid
+        ),
+        None,
+    )
+    if not target:
+        raise RuntimeError("监控计划已停用或正在等待监控容量")
+    current_scene = str(target.get("promotion_scene") or "live").strip().lower()
+    current_system = normalize_plan_system(target.get("plan_system") or "unknown")
+    if (
+        str(target.get("aadvid") or "") != str(aavid)
+        or str(target.get("ad_id") or "") != str(ad_id)
+        or current_scene != str(promotion_scene)
+        or current_system != normalize_plan_system(plan_system)
+    ):
+        raise RuntimeError("当前账户、计划、推广场景或计划体系已经变化")
+    if str(target.get("last_status") or "").strip().lower() != "ok":
+        raise RuntimeError("监控计划当前状态异常")
+    if bool(target.get("automation_write_blocked")):
+        raise RuntimeError(
+            "该计划已触发自动写入安全封锁："
+            + str(target.get("write_block_reason") or "请人工核对后解除")
+        )
+    if current_system == "unknown":
+        raise RuntimeError("计划体系尚未确认")
+    capability_ok, capability_reason = check_target_capability(
+        target,
+        action="retarget",
+        promotion_scene=current_scene,
+        plan_system=current_system,
+    )
+    if not capability_ok:
+        raise RuntimeError(f"当前计划追投能力无效：{capability_reason}")
+    retargeting = (
+        current_strategy.get("retargeting")
+        if isinstance(current_strategy.get("retargeting"), dict)
+        else {}
+    )
+    if not retarget_method_is_supported_for_scene(current_scene, retargeting):
+        raise RuntimeError("当前追投方式不适用于该推广场景")
+
+    period = str(current_cfg.get("trigger_query_period") or "1h")
+    response = DashboardApi().get_table_data(
+        period=period,
+        sort_by="costDiff",
+        sort_order="desc",
+        page=1,
+        page_size=_DASHBOARD_PAGE_SIZE,
+        target_uid=target_uid,
+    )
+    if not response.get("success"):
+        raise RuntimeError(response.get("message") or "读取素材最新数据失败")
+    target_rows = [
+        row
+        for row in (response.get("data") or [])
+        if isinstance(row, dict)
+        and str(row.get("targetUid") or target_uid) == target_uid
+    ]
+    material_row = next(
+        (
+            row
+            for row in target_rows
+            if str(row.get("id") or "") == str(material_id)
+            and str(row.get("aadvid") or aavid) == str(aavid)
+        ),
+        None,
+    )
+    if not material_row:
+        raise RuntimeError("素材已不在当前计划的最新数据中")
+
+    trigger_level = str(
+        current_strategy.get("trigger_level") or "material"
+    ).strip().lower()
+    if trigger_level == "product":
+        if current_scene != "product":
+            raise RuntimeError("商品级规则不能用于推直播计划")
+        if not product_id:
+            raise RuntimeError("商品级自动追投缺少商品归属")
+        relation_rows = db.select(
+            "promotion_material_product",
+            fields="material_id, product_id",
+            where={"target_uid": target_uid},
+        )
+        relation_map: Dict[str, List[str]] = {}
+        for relation in relation_rows:
+            relation_map.setdefault(
+                str(relation.get("material_id") or ""),
+                [],
+            ).append(str(relation.get("product_id") or ""))
+        product_rows = db.select(
+            "promotion_product",
+            fields="product_id, product_name",
+            where={"target_uid": target_uid},
+        )
+        product_names = {
+            str(item.get("product_id") or ""): str(item.get("product_name") or "")
+            for item in product_rows
+        }
+        hits = evaluate_product_strategy(
+            target_rows,
+            current_strategy,
+            relation_map=relation_map,
+            product_names=product_names,
+            allowed_product_ids=[product_id],
+        )
+        candidates = {
+            str(candidate.get("id") or "")
+            for hit in hits
+            if str(hit.get("productId") or "") == product_id
+            for candidate in (hit.get("candidates") or [])
+        }
+        if material_id not in candidates:
+            raise RuntimeError("商品汇总或候选素材条件已不再命中")
+    elif not evaluate_trigger(current_strategy.get("trigger") or {}, material_row):
+        raise RuntimeError("素材最新数据已不再命中追投规则")
+
+    if bool(current_cfg.get("per_strategy_rate_limit")):
+        window_seconds, max_count = _interval_window_and_max(retargeting)
+        if rate_limit_strategy_should_skip(
+            db,
+            material_id,
+            str(current_strategy.get("id") or "__legacy__"),
+            window_seconds,
+            max_count,
+            target_uid,
+        ):
+            raise RuntimeError("素材已达到本策略追投次数上限")
+    else:
+        window_seconds, max_count = _interval_from_root_cfg(current_cfg)
+        if rate_limit_should_skip(
+            db,
+            material_id,
+            window_seconds,
+            max_count,
+            target_uid,
+        ):
+            raise RuntimeError("素材已达到全局追投次数上限")
+    return current_cfg, current_strategy, target
 
 
 def _interval_from_root_cfg(cfg: Dict[str, Any]) -> Tuple[int, int]:
@@ -892,6 +1198,16 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     target_uid,
                 )
                 return
+            if bool(target.get("automation_write_blocked")):
+                logger.warning(
+                    "%s 策略 %s 对应计划已被持久写入保护封锁，"
+                    "本轮不发送追投卡片：target=%s reason=%s",
+                    _log_sched,
+                    st.get("id"),
+                    target_uid,
+                    str(target.get("write_block_reason") or "unknown"),
+                )
+                return
             target_status = str(target.get("last_status") or "").strip().lower()
             if target_status != "ok":
                 logger.warning(
@@ -1436,24 +1752,62 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
                         started_at = _beijing_now_str()
                         t0 = time.time()
+                        rate_recorded_under_lock = False
                         try:
                             async with exclusive_browser_operation(
                                 f"追投:{target_uid}:{material_id}",
                                 priority=10,
                             ):
+                                (
+                                    locked_cfg,
+                                    locked_strategy,
+                                    locked_target,
+                                ) = await asyncio.to_thread(
+                                    _revalidate_auto_retarget_under_lock,
+                                    db,
+                                    original_strategy=st,
+                                    target_uid=target_uid,
+                                    aavid=aavid,
+                                    ad_id=ad_id,
+                                    promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
+                                    material_id=material_id,
+                                    product_id=product_id,
+                                )
+                                locked_retargeting = (
+                                    locked_strategy.get("retargeting")
+                                    if isinstance(
+                                        locked_strategy.get("retargeting"),
+                                        dict,
+                                    )
+                                    else {}
+                                )
                                 result = await svc.run(
                                     aavid=aavid_int,
                                     ad_id=ad_id_int,
                                     material_id=material_id,
-                                    retargeting=retargeting,
+                                    retargeting=locked_retargeting,
                                     strategy_title=st_label,
                                     target_uid=target_uid,
                                     promotion_scene=promotion_scene,
                                     plan_system=plan_system,
-                                    source_url=target.get("sanitized_page_url") or None,
+                                    source_url=(
+                                        locked_target.get("sanitized_page_url")
+                                        or None
+                                    ),
                                     reuse_session=False,
                                     close_session=False,
                                 )
+                                if result.success:
+                                    record_retarget_rate_success_safely(
+                                        db,
+                                        material_ids=[material_id],
+                                        target_uid=target_uid,
+                                        cfg=locked_cfg,
+                                        strategy=locked_strategy,
+                                        retargeting=locked_retargeting,
+                                    )
+                                    rate_recorded_under_lock = True
                         except Exception:
                             ended_at = _beijing_now_str()
                             dur = int((time.time() - t0) * 1000)
@@ -1520,7 +1874,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             headless=bool(result.headless),
                             browser_headless_rule=browser_rule,
                         )
-                        if result.success:
+                        if result.success and not rate_recorded_under_lock:
                             if per_strategy_rl:
                                 rate_limit_strategy_record_success(
                                     db,

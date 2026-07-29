@@ -119,19 +119,127 @@ def _with_30_day_range(url: str) -> str:
     try:
         parts = urlsplit(url)
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d")
-        if "dr" in query:
-            query["dr"] = f"{start},{today}"
-        for key in ("start_date", "date_from"):
+        now = datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
+        start_dt = (now - timedelta(days=29)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        start = start_dt.strftime("%Y-%m-%d")
+        today = now.strftime("%Y-%m-%d")
+        for key in ("dr", "date_range", "daterange", "time_range", "timerange"):
             if key in query:
-                query[key] = start
-        for key in ("end_date", "date_to"):
+                query[key] = f"{start},{today}"
+        for key in (
+            "start_date",
+            "date_from",
+            "start_time",
+            "starttime",
+            "begin_time",
+            "begintime",
+        ):
             if key in query:
-                query[key] = today
+                query[key] = _date_value_like(query[key], start_dt)
+        for key in (
+            "end_date",
+            "date_to",
+            "end_time",
+            "endtime",
+            "finish_time",
+            "finishtime",
+        ):
+            if key in query:
+                query[key] = _date_value_like(query[key], now)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
     except Exception:
         return url
+
+
+def _thirty_day_coverage_window() -> Tuple[str, str]:
+    now = datetime.now()
+    start = (now - timedelta(days=29)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    return (
+        start.strftime("%Y-%m-%d %H:%M:%S"),
+        end.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _date_range_key_state(value: Any) -> Tuple[bool, bool, bool]:
+    range_keys = {
+        "dr",
+        "date_range",
+        "daterange",
+        "time_range",
+        "timerange",
+    }
+    start_keys = {
+        "start_date",
+        "date_from",
+        "start_time",
+        "starttime",
+        "begin_time",
+        "begintime",
+    }
+    end_keys = {
+        "end_date",
+        "date_to",
+        "end_time",
+        "endtime",
+        "finish_time",
+        "finishtime",
+    }
+    if isinstance(value, dict):
+        has_range = False
+        has_start = False
+        has_end = False
+        for key, item in value.items():
+            normalized = str(key).lower()
+            has_range = has_range or normalized in range_keys
+            has_start = has_start or normalized in start_keys
+            has_end = has_end or normalized in end_keys
+            nested = _date_range_key_state(item)
+            has_range = has_range or nested[0]
+            has_start = has_start or nested[1]
+            has_end = has_end or nested[2]
+        return has_range, has_start, has_end
+    if isinstance(value, list):
+        states = [_date_range_key_state(item) for item in value]
+        return (
+            any(item[0] for item in states),
+            any(item[1] for item in states),
+            any(item[2] for item in states),
+        )
+    return False, False, False
+
+
+def _replay_has_explicit_30_day_range(
+    api_url: str,
+    post_data: Any,
+) -> bool:
+    try:
+        query = dict(
+            parse_qsl(urlsplit(str(api_url or "")).query, keep_blank_values=True)
+        )
+    except Exception:
+        query = {}
+    raw = str(post_data or "")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        body = dict(parse_qsl(raw, keep_blank_values=True)) if raw else {}
+    url_state = _date_range_key_state(query)
+    body_state = _date_range_key_state(body)
+    has_range = url_state[0] or body_state[0]
+    has_start = url_state[1] or body_state[1]
+    has_end = url_state[2] or body_state[2]
+    return has_range or (has_start and has_end)
 
 
 def _date_value_like(current: Any, value: datetime) -> Any:
@@ -169,7 +277,7 @@ def _with_30_day_body(value: Any) -> Any:
                     _date_value_like(item[1], now.replace(hour=23, minute=59, second=59, microsecond=0)),
                     *item[2:],
                 ]
-            elif normalized == "dr" and isinstance(item, str):
+            elif normalized in range_keys and isinstance(item, str):
                 result[key] = f"{start:%Y-%m-%d},{now:%Y-%m-%d}"
             else:
                 result[key] = _with_30_day_body(item)
@@ -349,7 +457,11 @@ def _response_success(status_code: int, payload: Any) -> bool:
     return True
 
 
-async def _ingest_page_fallback(page: Any, aavid: str) -> int:
+async def _ingest_page_fallback(
+    page: Any,
+    aavid: str,
+    owner_username: str = "",
+) -> int:
     """网络日志接口无法识别时，从明确的操作日志表格页面读取可见行。"""
     try:
         marker = (str(page.url or "") + " " + await page.title()).lower()
@@ -378,9 +490,14 @@ async def _ingest_page_fallback(page: Any, aavid: str) -> int:
         )
         if not isinstance(rows, list) or not rows:
             return 0
-        count = ingest_platform_log_rows(aavid, [row for row in rows if isinstance(row, dict)])
+        count = ingest_platform_log_rows(
+            aavid,
+            [row for row in rows if isinstance(row, dict)],
+            owner_username=owner_username or None,
+        )
         update_platform_sync_state(
             aavid,
+            owner_username=owner_username or None,
             last_status="ok",
             last_error="",
             last_sync_at=_now(),
@@ -391,8 +508,15 @@ async def _ingest_page_fallback(page: Any, aavid: str) -> int:
         return 0
 
 
-async def _handle_response(response: Any, aavid: str, page: Any) -> None:
+async def _handle_response(
+    response: Any,
+    aavid: str,
+    page: Any,
+    owner_username: str = "",
+) -> None:
     try:
+        if owner_username and current_session_owner() != owner_username:
+            return
         request = response.request
         method = str(request.method or "GET").upper()
         url = str(response.url or "")
@@ -403,9 +527,14 @@ async def _handle_response(response: Any, aavid: str, page: Any) -> None:
 
         rows = _extract_platform_rows(payload) if _looks_like_log_url(url) else []
         if rows:
-            inserted = ingest_platform_log_rows(aavid, rows)
+            inserted = ingest_platform_log_rows(
+                aavid,
+                rows,
+                owner_username=owner_username or None,
+            )
             update_platform_sync_state(
                 aavid,
+                owner_username=owner_username or None,
                 last_status="ok",
                 last_error="",
                 last_sync_at=_now(),
@@ -444,6 +573,7 @@ async def _handle_response(response: Any, aavid: str, page: Any) -> None:
         request_id = _find_value(payload, ("request_id", "log_id", "operation_id"))
         event_uid = make_event_uid(
             "browser_observed",
+            owner_username,
             aavid,
             request_id or occurred,
             method,
@@ -451,6 +581,15 @@ async def _handle_response(response: Any, aavid: str, page: Any) -> None:
             action,
             object_id,
             request_payload,
+        )
+        from services.qianchuan_accounts import ensure_qianchuan_account
+
+        account_uid = str(
+            ensure_qianchuan_account(
+                aavid,
+                owner_username=owner_username or None,
+            ).get("account_uid")
+            or ""
         )
         upsert_operation_event(
             {
@@ -476,6 +615,7 @@ async def _handle_response(response: Any, aavid: str, page: Any) -> None:
                 "request": {"method": method, "url": url, "body": request_payload},
                 "response": payload,
                 "occurred_at": occurred,
+                "account_uid": account_uid,
             }
         )
     except Exception:
@@ -486,9 +626,12 @@ async def _run_record_browser_unlocked(
     aavid: str,
     ad_id: str,
     stop_event: threading.Event,
+    owner_username: str,
 ) -> None:
     global _monitor_status
-    storage_state = load_qianchuan_storage_state()
+    if current_session_owner() != owner_username:
+        raise RuntimeError("工具账号已经切换，记录模式已停止")
+    storage_state = load_qianchuan_storage_state(owner_username)
     if storage_state is None:
         _monitor_status = {"running": False, "aavid": aavid, "message": "请先在服务控制中登录千川"}
         return
@@ -498,7 +641,12 @@ async def _run_record_browser_unlocked(
         page = fetcher.page
         if page is None:
             raise RuntimeError("浏览器页面创建失败")
-        page.on("response", lambda resp: asyncio.create_task(_handle_response(resp, aavid, page)))
+        page.on(
+            "response",
+            lambda resp: asyncio.create_task(
+                _handle_response(resp, aavid, page, owner_username)
+            ),
+        )
         url = build_qianchuan_url_by_params(
             base_url="https://qianchuan.jinritemai.com/uni-prom/detail",
             aavid=int(aavid),
@@ -508,8 +656,10 @@ async def _run_record_browser_unlocked(
         _monitor_status = {"running": True, "aavid": aavid, "message": "记录模式运行中；可在该浏览器内操作或打开后台操作日志"}
         next_dom_check = 0.0
         while not stop_event.is_set() and not page.is_closed():
+            if current_session_owner() != owner_username:
+                raise RuntimeError("工具账号已经切换，记录模式已停止")
             if time.time() >= next_dom_check:
-                await _ingest_page_fallback(page, aavid)
+                await _ingest_page_fallback(page, aavid, owner_username)
                 next_dom_check = time.time() + 5
             await asyncio.sleep(1)
     except Exception as exc:
@@ -525,21 +675,32 @@ async def _run_record_browser(
     aavid: str,
     ad_id: str,
     stop_event: threading.Event,
+    owner_username: str,
 ) -> None:
     async with exclusive_browser_operation(
         f"人工操作记录:{aavid}:{ad_id}",
         priority=30,
         timeout_seconds=900,
     ):
-        await _run_record_browser_unlocked(aavid, ad_id, stop_event)
+        if current_session_owner() != owner_username:
+            raise RuntimeError("工具账号已经切换，记录模式已停止")
+        await _run_record_browser_unlocked(
+            aavid,
+            ad_id,
+            stop_event,
+            owner_username,
+        )
 
 
 def start_record_browser(aavid: Any, ad_id: Any) -> Dict[str, Any]:
     global _monitor_thread, _monitor_stop, _monitor_status
     aid = str(aavid or "").strip()
     ad = str(ad_id or "").strip()
+    owner = current_session_owner()
     if not aid or not ad:
         return {"success": False, "message": "缺少千川账户或广告ID"}
+    if not owner:
+        return {"success": False, "message": "请先登录工具账号"}
     with _monitor_lock:
         if _monitor_thread and _monitor_thread.is_alive():
             return {"success": False, "message": "已有记录模式浏览器正在运行", "data": dict(_monitor_status)}
@@ -547,7 +708,9 @@ def start_record_browser(aavid: Any, ad_id: Any) -> Dict[str, Any]:
         _monitor_status = {"running": True, "aavid": aid, "message": "正在打开记录模式浏览器"}
 
         def entry() -> None:
-            asyncio.run(_run_record_browser(aid, ad, _monitor_stop))
+            asyncio.run(
+                _run_record_browser(aid, ad, _monitor_stop, owner)
+            )
 
         _monitor_thread = threading.Thread(target=entry, name="operation-record-browser", daemon=True)
         _monitor_thread.start()
@@ -569,18 +732,27 @@ async def _sync_one_unlocked(
     page_url: str,
     api_url: str = "",
     request_json: Any = "",
+    owner_username: str = "",
 ) -> None:
-    gate = automation_session_ready()
+    if not owner_username or current_session_owner() != owner_username:
+        raise RuntimeError("工具账号已经切换，日志同步已停止")
+    gate = automation_session_ready(owner_username)
     if not gate.get("ready"):
         update_platform_sync_state(
             aavid,
+            owner_username=owner_username,
             last_status="login_required",
             last_error=str(gate.get("message") or "千川登录状态失效或不存在"),
         )
         return
-    storage_state = load_qianchuan_storage_state()
+    storage_state = load_qianchuan_storage_state(owner_username)
     if storage_state is None:
-        update_platform_sync_state(aavid, last_status="login_required", last_error="千川登录状态失效或不存在")
+        update_platform_sync_state(
+            aavid,
+            owner_username=owner_username,
+            last_status="login_required",
+            last_error="千川登录状态失效或不存在",
+        )
         return
     fetcher = QianChuanFetcher(headless=True, storage_state=storage_state)
     try:
@@ -589,7 +761,12 @@ async def _sync_one_unlocked(
         page = fetcher.page
         if page is None:
             raise RuntimeError("同步页面创建失败")
-        page.on("response", lambda resp: asyncio.create_task(_handle_response(resp, aavid, page)))
+        page.on(
+            "response",
+            lambda resp: asyncio.create_task(
+                _handle_response(resp, aavid, page, owner_username)
+            ),
+        )
         await page.goto(_with_30_day_range(page_url), wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(3)
         request_spec = _safe_json(request_json)
@@ -599,6 +776,10 @@ async def _sync_one_unlocked(
         if api_url and isinstance(request_spec, dict) and fetcher.context is not None:
             try:
                 method = str(request_spec.get("method") or "GET").upper()
+                explicit_window = _replay_has_explicit_30_day_range(
+                    api_url,
+                    request_spec.get("post_data"),
+                )
                 base_body, headers = _prepare_replay_body(request_spec.get("post_data"))
                 content_type = str(headers.get("Content-Type") or "")
                 fingerprints = set()
@@ -625,7 +806,13 @@ async def _sync_one_unlocked(
                         break
                     fingerprints.add(fingerprint)
                     replay_rows += len(rows)
-                    ingest_platform_log_rows(aavid, rows)
+                    if current_session_owner() != owner_username:
+                        raise RuntimeError("工具账号已经切换，日志同步已停止")
+                    ingest_platform_log_rows(
+                        aavid,
+                        rows,
+                        owner_username=owner_username,
+                    )
                     has_more = _explicit_has_more(payload)
                     if has_more is False:
                         break
@@ -636,30 +823,57 @@ async def _sync_one_unlocked(
                 else:
                     pagination_complete = False
                     replay_error = "日志接口超过200页，已停止补录并标记为不完整"
-                if replay_rows:
+                if pagination_complete and not explicit_window:
+                    pagination_complete = False
+                    replay_error = (
+                        "日志请求中未发现可安全改写的日期字段，"
+                        "不能确认已完整扫描最近30天"
+                    )
+                coverage_from, coverage_to = _thirty_day_coverage_window()
+                if replay_rows or not replay_error:
                     update_platform_sync_state(
                         aavid,
+                        owner_username=owner_username,
                         last_status="ok" if pagination_complete else "partial",
                         last_error="" if pagination_complete else replay_error,
                         last_sync_at=_now(),
-                    )
-                elif not replay_error:
-                    update_platform_sync_state(
-                        aavid,
-                        last_status="empty",
-                        last_error="最近30天日志接口返回0条记录，尚无可展示的覆盖时间",
-                        last_sync_at=_now(),
+                        **(
+                            {
+                                "coverage_from": coverage_from,
+                                "coverage_to": coverage_to,
+                            }
+                            if pagination_complete
+                            else {}
+                        ),
                     )
             except Exception as exc:
                 replay_error = str(exc)
         await asyncio.sleep(6)
-        await _ingest_page_fallback(page, aavid)
+        await _ingest_page_fallback(page, aavid, owner_username)
         await asyncio.sleep(3)
         if replay_error:
-            state = SQLiteStore().select_one("platform_log_sync_state", where={"aavid": aavid}) or {}
+            from services.qianchuan_accounts import get_qianchuan_account
+
+            account = get_qianchuan_account(
+                aavid,
+                owner_username=owner_username,
+            )
+            state = (
+                SQLiteStore().select_one(
+                    "platform_log_sync_state",
+                    where={
+                        "account_uid": str(
+                            (account or {}).get("account_uid") or ""
+                        ),
+                        "aavid": aavid,
+                    },
+                )
+                or {}
+            )
             if replay_rows:
                 update_platform_sync_state(
                     aavid,
+                    owner_username=owner_username,
                     last_status="partial",
                     last_error="后台日志只完成部分补录：" + replay_error,
                     last_sync_at=_now(),
@@ -667,7 +881,13 @@ async def _sync_one_unlocked(
             elif str(state.get("last_status") or "") != "ok" or str(state.get("last_sync_at") or "") < sync_started:
                 raise RuntimeError("日志接口重放失败，页面也未读取到操作表格：" + replay_error)
     except Exception as exc:
-        update_platform_sync_state(aavid, last_status="error", last_error=str(exc), last_sync_at=_now())
+        update_platform_sync_state(
+            aavid,
+            owner_username=owner_username,
+            last_status="error",
+            last_error=str(exc),
+            last_sync_at=_now(),
+        )
         logger.warning("[账户操作流水] 平台日志同步失败 aavid=%s: %s", aavid, exc)
     finally:
         await fetcher.close()
@@ -678,13 +898,22 @@ async def _sync_one(
     page_url: str,
     api_url: str = "",
     request_json: Any = "",
+    owner_username: str = "",
 ) -> None:
     async with exclusive_browser_operation(
         f"账户操作日志同步:{aavid}",
         priority=40,
         timeout_seconds=900,
     ):
-        await _sync_one_unlocked(aavid, page_url, api_url, request_json)
+        if not owner_username or current_session_owner() != owner_username:
+            raise RuntimeError("工具账号已经切换，日志同步已停止")
+        await _sync_one_unlocked(
+            aavid,
+            page_url,
+            api_url,
+            request_json,
+            owner_username,
+        )
 
 
 async def platform_log_sync_loop() -> None:
@@ -714,6 +943,7 @@ async def platform_log_sync_loop() -> None:
                     str(row["discovered_page_url"]),
                     str(row.get("discovered_api_url") or ""),
                     row.get("discovered_request_json") or "",
+                    owner,
                 )
         except Exception:
             logger.exception("[账户操作流水] 五分钟同步循环异常")

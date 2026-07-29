@@ -2,21 +2,27 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import sqlite3
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
+from api.views import Api
 from api.promotion_targets import upsert_promotion_target
+from api.promotion_targets import list_promotion_targets
+from api.operation_events import upsert_operation_event
 from services import promotion_browser_lock, qianchuan_session, rc23_rollback
 from services.qianchuan_accounts import (
     capacity_snapshot,
     ensure_qianchuan_account,
     list_qianchuan_accounts,
     resolve_account_feishu_targets,
+    record_target_duration,
     save_qianchuan_account_settings,
     schedulable_promotion_targets,
 )
@@ -98,6 +104,43 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertEqual(["retarget"], [row["action_type"] for row in rows_a])
         self.assertEqual(["stop"], [row["action_type"] for row in rows_b])
 
+    def test_captured_owner_is_used_even_if_current_owner_changes_before_write(self):
+        with patch.dict(
+            os.environ,
+            {"QCSCKP_SESSION_OWNER": "tool-b"},
+        ):
+            target = upsert_promotion_target(
+                {
+                    "aavid": "10001",
+                    "ad_id": "20001",
+                    "plan_name": "captured-owner-plan",
+                    "promotion_scene": "product",
+                    "plan_system": "global",
+                    "enabled": True,
+                },
+                owner_username="tool-a",
+                db=self.db,
+            )
+        account = self.db.select_one(
+            "qianchuan_account",
+            where={"account_uid": target["account_uid"]},
+        )
+        self.assertEqual("tool-a", account["owner_username"])
+        self.assertEqual(
+            [],
+            list_promotion_targets(owner_username="tool-b", db=self.db),
+        )
+        self.assertEqual(
+            [target["target_uid"]],
+            [
+                row["target_uid"]
+                for row in list_promotion_targets(
+                    owner_username="tool-a",
+                    db=self.db,
+                )
+            ],
+        )
+
     def test_disabled_account_disables_all_its_automation_targets(self):
         target = self._target("10001", 1)
         save_qianchuan_account_settings(
@@ -133,6 +176,71 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         )
         self.assertNotEqual(current["account_uid"], other["account_uid"])
 
+    def test_same_qianchuan_plan_is_isolated_between_tool_accounts(self):
+        first = self._target("10001", 1)
+        with patch.dict(
+            os.environ,
+            {"QCSCKP_SESSION_OWNER": "other-tool-owner"},
+        ):
+            second = self._target("10001", 1)
+            self.assertEqual(
+                [second["target_uid"]],
+                [item["target_uid"] for item in list_promotion_targets(db=self.db)],
+            )
+        self.assertNotEqual(first["account_uid"], second["account_uid"])
+        self.assertNotEqual(first["target_uid"], second["target_uid"])
+        self.assertEqual(
+            [first["target_uid"]],
+            [item["target_uid"] for item in list_promotion_targets(db=self.db)],
+        )
+
+    def test_same_external_event_id_never_overwrites_another_tool_account(self):
+        first_uid = upsert_operation_event(
+            {
+                "event_uid": "shared-platform-id",
+                "aavid": "10001",
+                "source": "platform_log",
+                "action_type": "budget_update",
+                "status": "success",
+            },
+            self.db,
+        )
+        with patch.dict(
+            os.environ,
+            {"QCSCKP_SESSION_OWNER": "other-tool-owner"},
+        ):
+            second_uid = upsert_operation_event(
+                {
+                    "event_uid": "shared-platform-id",
+                    "aavid": "10001",
+                    "source": "platform_log",
+                    "action_type": "roi_update",
+                    "status": "success",
+                },
+                self.db,
+            )
+        self.assertNotEqual(first_uid, second_uid)
+        rows = self.db.select(
+            "account_operation_event",
+            order_by="id ASC",
+        )
+        self.assertEqual(2, len(rows))
+        self.assertEqual(
+            ["budget_update", "roi_update"],
+            [row["action_type"] for row in rows],
+        )
+
+    def test_single_target_longer_than_capacity_window_waits(self):
+        target = self._target("10001", 1)
+        record_target_duration(
+            target["target_uid"],
+            11 * 60_000,
+            db=self.db,
+        )
+        snapshot = capacity_snapshot(db=self.db)
+        self.assertEqual(0, snapshot["active_count"])
+        self.assertEqual(1, snapshot["waiting_count"])
+
     def test_account_specific_feishu_route_only_uses_selected_bound_targets(self):
         account = ensure_qianchuan_account("10001", db=self.db)
         save_qianchuan_account_settings(
@@ -161,6 +269,15 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             [("open_id", "ou_owner"), ("chat_id", "oc_selected")],
             targets,
         )
+
+    def test_account_page_reads_nested_global_daily_report_config(self):
+        html = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "qianchuan_accounts.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("data.daily_report?.config||{}", html)
+        self.assertNotIn("const daily=data.daily_report||{}", html)
 
 
 class QianchuanSessionTests(unittest.TestCase):
@@ -243,6 +360,58 @@ class QianchuanSessionTests(unittest.TestCase):
         self.assertFalse(gate["ready"])
         self.assertEqual("login_required", gate["status"])
 
+    def test_login_failure_increments_epoch_and_cancels_old_tasks(self):
+        state = {"cookies": [], "origins": []}
+        qianchuan_session.save_qianchuan_storage_state(state)
+        before = qianchuan_session.session_status()["session_epoch"]
+        with patch(
+            "services.local_feishu_bridge.cancel_active_local_retarget_tasks"
+        ) as cancel:
+            qianchuan_session.mark_qianchuan_session_invalid("expired")
+        after = qianchuan_session.session_status()["session_epoch"]
+        self.assertEqual(before + 1, after)
+        cancel.assert_called_once()
+
+
+class ToolAccountSwitchTests(unittest.TestCase):
+    def test_start_service_switch_stops_old_owner_before_remote_verification(self):
+        api = Api.__new__(Api)
+        api.service = Mock()
+        api.service.stop_and_wait.return_value = {"running": True}
+        api.service.status.return_value = {"running": True}
+        api.account_auth = Mock()
+
+        with patch(
+            "services.cloud_retarget_client.load_device_session",
+            return_value={"username": "tool-a"},
+        ):
+            result = api.startService(
+                username="tool-b",
+                password="password",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("安全退出", result["message"])
+        api.service.stop_and_wait.assert_called_once_with(30)
+        api.account_auth.verify_can_start_service.assert_not_called()
+
+    def test_login_switch_must_stop_old_service_before_new_session_registration(self):
+        api = Api.__new__(Api)
+        api.service = Mock()
+        api.service.stop_and_wait.return_value = {"running": True}
+        api.account_auth = Mock()
+
+        with patch(
+            "services.cloud_retarget_client.load_device_session",
+            return_value={"username": "tool-a"},
+        ):
+            result = api.verify_account_login("tool-b", "password")
+
+        self.assertFalse(result["success"])
+        self.assertIn("安全退出", result["message"])
+        api.service.stop_and_wait.assert_called_once_with(30)
+        api.account_auth.verify_login.assert_not_called()
+
 
 class PromotionBrowserPriorityTests(unittest.TestCase):
     def setUp(self):
@@ -283,6 +452,47 @@ class PromotionBrowserPriorityTests(unittest.TestCase):
         low.join(2)
         high.join(2)
         self.assertEqual(["retarget", "log"], order)
+
+    def test_cancelled_async_waiter_never_leaves_orphan_lock(self):
+        async def scenario():
+            self.assertTrue(promotion_browser_lock._acquire(30, 1))
+
+            async def waiter():
+                async with promotion_browser_lock.exclusive_browser_operation(
+                    "cancel-me",
+                    priority=10,
+                    timeout_seconds=2,
+                ):
+                    return True
+
+            task = asyncio.create_task(waiter())
+            deadline = time.time() + 1
+            while (
+                promotion_browser_lock.browser_queue_snapshot()["waiting_count"] < 1
+                and time.time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            promotion_browser_lock._release()
+            deadline = time.time() + 1
+            while (
+                promotion_browser_lock.browser_queue_snapshot()["active"]
+                or promotion_browser_lock.browser_queue_snapshot()["waiting_count"]
+            ) and time.time() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(
+                {
+                    "active": False,
+                    "waiting_count": 0,
+                    "waiting_priorities": [],
+                    "next_priority": None,
+                },
+                promotion_browser_lock.browser_queue_snapshot(),
+            )
+
+        asyncio.run(scenario())
 
 
 class Rc23RollbackSnapshotTests(unittest.TestCase):

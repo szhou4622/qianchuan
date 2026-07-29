@@ -1812,6 +1812,51 @@ def _expire_local_tasks(account_username: str) -> List[str]:
     return expired
 
 
+def cancel_active_local_retarget_tasks(
+    account_username: str,
+    reason: str,
+) -> int:
+    """登录会话失效时原子作废旧提醒，禁止重新登录后补执行。"""
+    account = _account_key(account_username)
+    if not account:
+        return 0
+    now_text = _dt(_now())
+    message = str(
+        reason or "千川登录状态已失效，请重新命中规则并再次确认"
+    )[:1000]
+    conn = _db()
+    task_uids: List[str] = []
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT task_uid FROM local_retarget_task WHERE account_username=? "
+            "AND status IN ('pending','approved_queued','claimed')",
+            (account,),
+        ).fetchall()
+        task_uids = [str(row["task_uid"]) for row in rows]
+        if task_uids:
+            placeholders = ",".join("?" for _ in task_uids)
+            conn.execute(
+                f"UPDATE local_retarget_task SET status='cancelled',"
+                f"active_dedupe_key=NULL,claim_token=NULL,claim_expires_at=NULL,"
+                f"result_message=?,finished_at=?,updated_at=? "
+                f"WHERE task_uid IN ({placeholders})",
+                [message, now_text, now_text, *task_uids],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    bridge = _MANAGER.bridge() if _MANAGER.account == account else None
+    if bridge is not None:
+        for task_uid in task_uids:
+            threading.Thread(
+                target=bridge.update_task_cards,
+                args=(task_uid,),
+                daemon=True,
+            ).start()
+    return len(task_uids)
+
+
 def _create_local_retarget_task_for(
     account_username: str,
     bridge: LocalFeishuBridge,
@@ -1867,8 +1912,18 @@ def _create_local_retarget_task_for(
         ensure_qianchuan_account,
         resolve_account_feishu_targets,
     )
+    from services.qianchuan_session import automation_session_ready
     from utils.sqlite_store import SQLiteStore
 
+    session_gate = automation_session_ready(account)
+    if not session_gate.get("ready"):
+        return {
+            "success": False,
+            "message": str(
+                session_gate.get("message")
+                or "千川登录状态不存在或已失效，请重新登录"
+            ),
+        }
     task_store = SQLiteStore(database=DB_FILE)
     qianchuan_account = ensure_qianchuan_account(
         required["aavid"],
@@ -1897,6 +1952,9 @@ def _create_local_retarget_task_for(
     if not qianchuan_account.get("enabled"):
         return {"success": False, "message": "该千川账户已停用"}
     payload["qianchuan_account_uid"] = qianchuan_account["account_uid"]
+    payload["qianchuan_session_epoch"] = int(
+        session_gate.get("session_epoch") or 1
+    )
     payload["materials"] = materials
     payload["candidate_materials"] = materials
     payload["retarget_groups"] = []
@@ -2424,6 +2482,18 @@ def pull_local_retarget_task() -> Dict[str, Any]:
     bridge = _MANAGER.bridge()
     if not account or bridge is None:
         return {"success": False, "message": "missing_local_account", "silent": True}
+    from services.qianchuan_session import automation_session_ready
+
+    session_gate = automation_session_ready(account)
+    if not session_gate.get("ready"):
+        cancel_active_local_retarget_tasks(
+            account,
+            str(
+                session_gate.get("message")
+                or "千川登录状态已失效，请重新命中规则并再次确认"
+            ),
+        )
+        return {"success": True, "data": None}
     for task_uid in _expire_local_tasks(account):
         threading.Thread(
             target=bridge.update_task_cards,
@@ -2443,6 +2513,32 @@ def pull_local_retarget_task() -> Dict[str, Any]:
         ).fetchone()
         if not row:
             conn.commit()
+            return {"success": True, "data": None}
+        try:
+            row_payload = json.loads(str(row["payload_json"] or "{}"))
+        except Exception:
+            row_payload = {}
+        task_epoch = int(row_payload.get("qianchuan_session_epoch") or 0)
+        current_epoch = int(session_gate.get("session_epoch") or 1)
+        if task_epoch != current_epoch:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='cancelled',"
+                "active_dedupe_key=NULL,claim_token=NULL,claim_expires_at=NULL,"
+                "result_message=?,finished_at=?,updated_at=? "
+                "WHERE task_uid=? AND status='approved_queued'",
+                (
+                    "千川登录会话已经变化，请等待新提醒并重新确认",
+                    now_text,
+                    now_text,
+                    row["task_uid"],
+                ),
+            )
+            conn.commit()
+            threading.Thread(
+                target=bridge.update_task_cards,
+                args=(str(row["task_uid"]),),
+                daemon=True,
+            ).start()
             return {"success": True, "data": None}
         updated = conn.execute(
             "UPDATE local_retarget_task SET status='claimed',claim_token=?,"

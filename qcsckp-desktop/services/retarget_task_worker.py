@@ -32,6 +32,7 @@ from services.retargeting_rule_runner import (
     rate_limit_strategy_remaining_capacity,
     rate_limit_strategy_record_success,
     rate_limit_strategy_should_skip,
+    block_target_after_rate_record_failure,
     resolve_ad_id_for_aavid,
 )
 from services.retargeting_service import QianChuanRetargetingService
@@ -350,6 +351,7 @@ async def _execute_grouped_task(
         result = await _execute_task(
             group_task,
             db,
+            _prevalidated=validations[index - 1],
             _skip_live_guard=True,
             _allow_groups=False,
         )
@@ -480,6 +482,11 @@ def _validate_task(
         raise RuntimeError("追投任务的千川账户归属已被篡改")
     if str(target.get("last_status") or "").strip().lower() != "ok":
         raise RuntimeError("监控计划当前不是投放中状态，已阻止追投")
+    if bool(target.get("automation_write_blocked")):
+        raise RuntimeError(
+            "该计划已触发自动写入安全封锁："
+            + str(target.get("write_block_reason") or "请人工核对后解除")
+        )
     if (
         str(target.get("aadvid") or "") != aavid
         or str(target.get("ad_id") or "") != ad_id
@@ -506,15 +513,31 @@ def _validate_task(
         raise RuntimeError("追投策略已改为其他监控计划")
     from services.qianchuan_session import (
         automation_session_ready,
+        current_session_owner,
         has_qianchuan_session,
     )
 
+    task_owner = str(task.get("account_username") or "").strip().casefold()
+    if not legacy_test_double and (
+        not task_owner or current_session_owner() != task_owner
+    ):
+        raise RuntimeError("当前工具账号已经切换，本次追投任务已作废")
     session_gate = automation_session_ready(task.get("account_username"))
+    if not legacy_test_double and int(
+        task.get("qianchuan_session_epoch") or 0
+    ) != int(
+        session_gate.get("session_epoch") or 1
+    ):
+        raise RuntimeError("千川登录会话已经变化，请等待新提醒并重新确认")
     legacy_cookie_ready = os.path.isfile(os.path.join(DATA_DIR, "qcookie.json"))
-    if str(session_gate.get("status") or "") == "login_required":
+    if (
+        not legacy_test_double
+        and str(session_gate.get("status") or "") == "login_required"
+    ):
         raise RuntimeError("千川登录状态已失效，请重新登录后等待新提醒")
     if (
-        not session_gate.get("ready")
+        not legacy_test_double
+        and not session_gate.get("ready")
         and not legacy_cookie_ready
         and not has_qianchuan_session()
     ):
@@ -774,30 +797,69 @@ async def _execute_task(
         return failure
     svc = QianChuanRetargetingService.from_rule_file_dict(cfg)
     results: List[Any] = []
+    rate_recorded_under_lock = False
     try:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
         async with exclusive_browser_operation(
             f"飞书确认追投:{target_uid}:{','.join(material_ids)}",
             priority=10,
         ):
+            # 排队期间账户、计划、登录、策略、指标和限频都可能变化；
+            # 必须在获得唯一浏览器写锁后重新做完整复核。
+            cfg, strategy, rows = await asyncio.to_thread(
+                _validate_task,
+                task,
+                db,
+            )
             # 推商品和推直播统一按“一个素材组＝一条追投计划”提交；
             # 单素材组仍是原有的单素材追投，多素材组最多20条。
-            results.append(
-                await svc.run(
-                    aavid=int(aavid),
-                    ad_id=int(ad_id),
-                    material_id=material_id,
-                    material_ids=material_ids,
-                    retargeting=retargeting,
-                    strategy_title=strategy_name,
-                    target_uid=target_uid,
-                    promotion_scene=promotion_scene,
-                    plan_system=plan_system,
-                    source_url=target.get("sanitized_page_url") or None,
-                    reuse_session=False,
-                    close_session=False,
-                )
+            locked_result = await svc.run(
+                aavid=int(aavid),
+                ad_id=int(ad_id),
+                material_id=material_id,
+                material_ids=material_ids,
+                retargeting=retargeting,
+                strategy_title=strategy_name,
+                target_uid=target_uid,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+                source_url=target.get("sanitized_page_url") or None,
+                reuse_session=False,
+                close_session=False,
             )
+            results.append(locked_result)
+            if locked_result.success:
+                try:
+                    for current_material_id in material_ids:
+                        if bool(cfg.get("per_strategy_rate_limit")):
+                            ws, mc = _interval_window_and_max(retargeting)
+                            rate_limit_strategy_record_success(
+                                db,
+                                current_material_id,
+                                str(strategy.get("id") or ""),
+                                ws,
+                                mc,
+                                target_uid,
+                            )
+                        root_ws, root_mc = _interval_from_root_cfg(cfg)
+                        rate_limit_record_success(
+                            db,
+                            current_material_id,
+                            root_ws,
+                            root_mc,
+                            target_uid,
+                        )
+                except Exception as rate_exc:
+                    logger.exception(
+                        "追投成功后记录限频失败，已暂停目标 target=%s",
+                        target_uid,
+                    )
+                    block_target_after_rate_record_failure(
+                        db,
+                        target_uid,
+                        rate_exc,
+                    )
+                rate_recorded_under_lock = True
     except Exception as exc:
         results = []
         failure = {"success": False, "message": "追投执行异常", "detail": traceback.format_exc(), "step": "exception"}
@@ -877,7 +939,7 @@ async def _execute_task(
     successful_ids = set(payload.get("successful_material_ids") or [])
     if payload.get("success") and not successful_ids:
         successful_ids = set(material_ids)
-    if successful_ids:
+    if successful_ids and not rate_recorded_under_lock:
         for current_material_id in material_ids:
             if current_material_id not in successful_ids:
                 continue
