@@ -709,21 +709,24 @@ class QianChuanRetargetingService:
         self,
         page: Page,
         material_ids: List[str],
+        *,
+        scene_label: str = "商品",
+        expected_total: Optional[int] = None,
     ) -> Optional[str]:
-        """在商品追投弹层中按精确素材ID批量选择视频，最多20条。"""
+        """在已打开的追投表单中按精确素材ID批量添加视频，最多20条。"""
         ids: List[str] = []
         for raw_id in material_ids:
             mid = str(raw_id or "").strip()
             if mid and mid not in ids:
                 ids.append(mid)
         if not ids:
-            return "商品追投任务缺少素材"
+            return f"{scene_label}追投任务缺少素材"
         if len(ids) > 20:
-            return "商品追投单次最多支持20条素材"
+            return f"{scene_label}追投单次最多支持20条素材"
 
         add_video = page.get_by_text("添加视频", exact=True)
         if not await self._click_last_visible(add_video):
-            return "商品素材追投表单未找到「添加视频」"
+            return f"{scene_label}素材追投表单未找到「添加视频」"
 
         search_input = page.locator(
             'input[placeholder="输入视频名称/ID后回车搜索"]'
@@ -734,7 +737,7 @@ class QianChuanRetargetingService:
                 timeout=min(self._opt.goto_timeout_ms, 15_000),
             )
         except Exception:
-            return "商品素材选择器未找到视频搜索框"
+            return f"{scene_label}素材选择器未找到视频搜索框"
         # 弹层先绘制行骨架，再异步补齐素材可选状态；过早读取会把可用
         # 素材误判为 disabled。
         await page.wait_for_timeout(2_000)
@@ -745,7 +748,7 @@ class QianChuanRetargetingService:
             "][1]"
         )
         if await selector_modal.count() < 1:
-            return "商品素材选择弹层结构无法识别"
+            return f"{scene_label}素材选择弹层结构无法识别"
 
         for selected_count, mid in enumerate(ids, start=1):
             await search_input.last.fill(mid)
@@ -757,7 +760,7 @@ class QianChuanRetargetingService:
                     timeout=min(self._opt.goto_timeout_ms, 20_000),
                 )
             except Exception:
-                return f"商品计划未找到素材 ID：{mid}"
+                return f"{scene_label}计划未找到素材 ID：{mid}"
             await page.wait_for_timeout(1_000)
 
             material_row = None
@@ -781,7 +784,7 @@ class QianChuanRetargetingService:
             if material_row is None:
                 material_row = disabled_row
             if material_row is None or await material_row.count() < 1:
-                return f"无法定位商品素材 {mid} 的选择行"
+                return f"无法定位{scene_label}素材 {mid} 的选择行"
 
             checkbox_input = material_row.locator('input[type="checkbox"]')
             if await checkbox_input.count() > 0:
@@ -803,7 +806,7 @@ class QianChuanRetargetingService:
                                 timeout=min(self._opt.goto_timeout_ms, 8_000),
                             )
                         except Exception:
-                            return f"商品素材 {mid} 当前不可追投（选择框禁用）"
+                            return f"{scene_label}素材 {mid} 当前不可追投（选择框禁用）"
                     if not await checkbox_input.first.is_checked():
                         # 点击组件 label，让千川自身的选择事件更新「已选」计数。
                         if await checkbox_label.count() > 0:
@@ -811,15 +814,15 @@ class QianChuanRetargetingService:
                         else:
                             await checkbox_input.first.evaluate("element => element.click()")
                     if not await checkbox_input.first.is_checked():
-                        return f"商品素材 {mid} 未被选中"
+                        return f"{scene_label}素材 {mid} 未被选中"
                 except Exception:
-                    return f"商品素材 {mid} 的选择框无法勾选"
+                    return f"{scene_label}素材 {mid} 的选择框无法勾选"
             else:
                 checkbox_inner = material_row.locator(
                     'div[class*="ovui-checkbox__inner"]'
                 )
                 if await checkbox_inner.count() < 1:
-                    return f"商品素材 {mid} 没有可用的选择框"
+                    return f"{scene_label}素材 {mid} 没有可用的选择框"
                 await checkbox_inner.first.click(force=True)
 
             try:
@@ -833,11 +836,12 @@ class QianChuanRetargetingService:
                     timeout=min(self._opt.goto_timeout_ms, 15_000),
                 )
             except Exception:
-                return f"商品素材 {mid} 勾选后未进入已选列表"
+                return f"{scene_label}素材 {mid} 勾选后未进入已选列表"
 
         confirm = selector_modal.get_by_role("button", name="确定", exact=True)
         if not await self._click_last_visible(confirm):
-            return "商品素材选择器未找到「确定」按钮"
+            return f"{scene_label}素材选择器未找到「确定」按钮"
+        form_total = int(expected_total or len(ids))
         try:
             await selector_modal.wait_for(
                 state="hidden",
@@ -849,11 +853,11 @@ class QianChuanRetargetingService:
                     const match = text.match(/已添加[：:]\\s*(\\d+)\\s*\\/\\s*20/);
                     return !!match && Number(match[1]) === Number(expected);
                 }""",
-                len(ids),
+                form_total,
                 timeout=min(self._opt.goto_timeout_ms, 15_000),
             )
         except Exception:
-            return f"{len(ids)}条商品素材的选择结果未写入追投表单"
+            return f"{form_total}条{scene_label}素材的选择结果未写入追投表单"
         return None
 
     async def _select_product_material(
@@ -1054,8 +1058,6 @@ class QianChuanRetargetingService:
             vmsg = "追投任务缺少素材"
         if not vmsg and len(batch_material_ids) > 20:
             vmsg = "单次追投最多支持20条素材"
-        if not vmsg and scene != "product" and len(batch_material_ids) > 1:
-            vmsg = "直播追投尚不支持在一个调控任务中批量添加素材"
         if vmsg:
             return self._make_result(
                 success=False,
@@ -1171,6 +1173,13 @@ class QianChuanRetargetingService:
                         err = await self._select_product_materials(page, batch_material_ids)
                 else:
                     err = await self._search_material_and_open_dialog(page, material_id)
+                    if not err and len(batch_material_ids) > 1:
+                        err = await self._select_product_materials(
+                            page,
+                            batch_material_ids[1:],
+                            scene_label="直播",
+                            expected_total=len(batch_material_ids),
+                        )
                 if err:
                     return self._make_result(
                         success=False,

@@ -871,6 +871,107 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         self.assertIn("本批次被安排2次", result["message"])
         consume.assert_not_called()
 
+    def test_live_groups_keep_single_and_multi_material_retarget_modes(self):
+        groups = [
+            {
+                "group_uid": "single",
+                "materials": [{"material_id": "m1", "material_name": "素材1"}],
+            },
+            {
+                "group_uid": "multi",
+                "materials": [
+                    {"material_id": "m2", "material_name": "素材2"},
+                    {"material_id": "m3", "material_name": "素材3"},
+                ],
+            },
+        ]
+        task = {
+            **self.task,
+            "task_uid": "task-live-mixed-groups",
+            "target_uid": "target-live",
+            "promotion_scene": "live",
+            "plan_system": "global",
+            "materials": [
+                {"material_id": "m1", "material_name": "素材1"},
+                {"material_id": "m2", "material_name": "素材2"},
+                {"material_id": "m3", "material_name": "素材3"},
+            ],
+            "retarget_groups": groups,
+            "trigger_snapshot": {},
+            "query_snapshot": {},
+        }
+        cfg = {
+            "enabled": True,
+            "browser_headless": True,
+            "per_strategy_rate_limit": False,
+        }
+
+        class FakeResult:
+            def __init__(self, rid):
+                self.success = True
+                self.regulate_task_id = rid
+
+            def asdict(self):
+                return {
+                    "success": True,
+                    "message": "追投成功",
+                    "detail": "",
+                    "step": "done",
+                    "headless": True,
+                }
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResult(f"live-{len(self.calls)}")
+
+            async def close(self):
+                return None
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {"sanitized_page_url": "https://example.test/live"}
+                return None
+
+        service = FakeService()
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}]),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_remaining_capacity",
+            return_value=10,
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ) as consume, patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retarget_task_worker._insert_run",
+        ), patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 10),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_record_success",
+        ):
+            result = asyncio.run(
+                retarget_task_worker._execute_task(task, FakeStore())
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual([["m1"], ["m2", "m3"]], [
+            call["material_ids"] for call in service.calls
+        ])
+        self.assertTrue(all(call["promotion_scene"] == "live" for call in service.calls))
+        consume.assert_called_once_with(
+            "task-live-mixed-groups",
+            "10001",
+            ["m1", "m2", "m3"],
+        )
+
     def validate_target_plan_system(self, plan_system):
         strategy = copy.deepcopy(self.strategy)
         strategy["target_uid"] = "target-1"

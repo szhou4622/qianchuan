@@ -289,13 +289,6 @@ async def _execute_grouped_task(
     db: SQLiteStore,
     groups: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    if str(task.get("promotion_scene") or "live") != "product":
-        return {
-            "success": False,
-            "message": "多组追投第一版仅支持商品全域计划",
-            "detail": "",
-            "step": "unsupported_scene",
-        }
     validations: List[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]] = []
     group_tasks: List[Dict[str, Any]] = []
     try:
@@ -724,40 +717,23 @@ async def _execute_task(
         async with exclusive_browser_operation(
             f"飞书确认追投:{target_uid}:{','.join(material_ids)}"
         ):
-            if promotion_scene == "product":
-                results.append(
-                    await svc.run(
-                        aavid=int(aavid),
-                        ad_id=int(ad_id),
-                        material_id=material_id,
-                        material_ids=material_ids,
-                        retargeting=retargeting,
-                        strategy_title=strategy_name,
-                        target_uid=target_uid,
-                        promotion_scene=promotion_scene,
-                        source_url=target.get("sanitized_page_url") or None,
-                        reuse_session=False,
-                        close_session=False,
-                    )
+            # 推商品和推直播统一按“一个素材组＝一条追投计划”提交；
+            # 单素材组仍是原有的单素材追投，多素材组最多20条。
+            results.append(
+                await svc.run(
+                    aavid=int(aavid),
+                    ad_id=int(ad_id),
+                    material_id=material_id,
+                    material_ids=material_ids,
+                    retargeting=retargeting,
+                    strategy_title=strategy_name,
+                    target_uid=target_uid,
+                    promotion_scene=promotion_scene,
+                    source_url=target.get("sanitized_page_url") or None,
+                    reuse_session=False,
+                    close_session=False,
                 )
-            else:
-                # 直播详情页一次只能从具体素材行创建调控任务；仍然只发
-                # 一张飞书卡、只确认一次，但在同一浏览器锁内逐条完成。
-                for current_material_id in material_ids:
-                    results.append(
-                        await svc.run(
-                            aavid=int(aavid),
-                            ad_id=int(ad_id),
-                            material_id=current_material_id,
-                            retargeting=retargeting,
-                            strategy_title=strategy_name,
-                            target_uid=target_uid,
-                            promotion_scene=promotion_scene,
-                            source_url=target.get("sanitized_page_url") or None,
-                            reuse_session=False,
-                            close_session=False,
-                        )
-                    )
+            )
     except Exception as exc:
         results = []
         failure = {"success": False, "message": "追投执行异常", "detail": traceback.format_exc(), "step": "exception"}
@@ -776,20 +752,8 @@ async def _execute_task(
             for item in results
             if str(item.regulate_task_id or "")
         ]
-        successful_material_ids = (
-            material_ids
-            if promotion_scene == "product" and bool(results[0].success)
-            else [
-                current_material_id
-                for current_material_id, current_result in zip(material_ids, results)
-                if bool(current_result.success)
-            ]
-        )
-        all_succeeded = (
-            bool(results[0].success)
-            if promotion_scene == "product"
-            else len(successful_material_ids) == len(material_ids)
-        )
+        successful_material_ids = material_ids if bool(results[0].success) else []
+        all_succeeded = bool(results[0].success)
         first_result = results[0]
         payload = first_result.asdict()
         payload["success"] = all_succeeded

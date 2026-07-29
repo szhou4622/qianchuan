@@ -261,6 +261,35 @@ class ProductPromotionTests(unittest.TestCase):
         self.assertEqual("validate", result.step)
         self.assertIn("最多支持20条素材", result.message)
 
+    def test_live_batch_reaches_browser_adapter_instead_of_legacy_rejection(self):
+        service = QianChuanRetargetingService.from_rule_file_dict(
+            {"browser_headless": True}
+        )
+
+        async def no_browser():
+            return None
+
+        service._ensure_browser = no_browser
+        result = asyncio.run(
+            service.run(
+                aavid=10001,
+                ad_id=30001,
+                material_id="m1",
+                material_ids=["m1", "m2"],
+                retargeting={
+                    "method": "volume",
+                    "volume": {
+                        "total_budget_yuan": 100,
+                        "duration_hours": 1,
+                    },
+                },
+                promotion_scene="live",
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertEqual("browser", result.step)
+        self.assertNotIn("尚不支持", result.message)
+
     def test_product_material_request_accepts_req_from_in_post_body(self):
         fetcher = QianChuanFetcher()
         fetcher._current_aadvid = "10001"

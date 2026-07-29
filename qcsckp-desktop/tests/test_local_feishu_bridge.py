@@ -485,6 +485,56 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertEqual(3, pulled["selection_snapshot"]["group_count"])
         self.assertEqual(18, pulled["selection_snapshot"]["group_material_count"])
 
+    def test_single_and_multi_material_groups_can_be_mixed(self):
+        created = bridge.create_local_retarget_task(
+            {**task_payload(4), "strategy_id": "strategy-mixed-groups"}
+        )
+        task_uid = created["data"]["task_uid"]
+        nonce = bridge._task_row(task_uid, "tool-user-a")["action_nonce"]
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="clear_selection",
+            operator_open_id="ou_owner",
+        )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="toggle_material",
+            operator_open_id="ou_owner",
+            material_id="70000",
+        )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="save_group",
+            operator_open_id="ou_owner",
+        )
+        for material_id in ("70001", "70002", "70003"):
+            bridge.handle_local_card_action(
+                "tool-user-a",
+                task_uid=task_uid,
+                nonce=nonce,
+                action="toggle_material",
+                operator_open_id="ou_owner",
+                material_id=material_id,
+            )
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=nonce,
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        pulled = bridge.pull_local_retarget_task()["data"]
+        self.assertEqual(
+            [1, 3],
+            [len(group["material_ids"]) for group in pulled["retarget_groups"]],
+        )
+
 
 class LocalFeishuBindingTests(unittest.TestCase):
     def setUp(self):
