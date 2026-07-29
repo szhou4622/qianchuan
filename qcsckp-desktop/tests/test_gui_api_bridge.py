@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from gui_app import JSApi
@@ -94,6 +95,29 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.getOperationDailyReportConfig.assert_called_once_with()
         self.core.saveOperationDailyReportConfig.assert_called_once_with(config)
         self.core.sendYesterdayOperationDailyReportNow.assert_called_once_with()
+
+    def test_rule_retargeting_reload_refreshes_promotion_targets(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "rule_retargeting.html"
+        ).read_text(encoding="utf-8")
+        start = page.index(
+            "document.getElementById('btnReload').addEventListener"
+        )
+        end = page.index(
+            "document.getElementById('btnRefreshLivePreflight')",
+            start,
+        )
+        reload_handler = page[start:end]
+        self.assertIn(
+            "await loadPromotionTargetOptions(api);",
+            reload_handler,
+        )
+        self.assertLess(
+            reload_handler.index("await loadPromotionTargetOptions(api);"),
+            reload_handler.index("await api.getRuleRetargetingConfig();"),
+        )
 
 
 if __name__ == "__main__":

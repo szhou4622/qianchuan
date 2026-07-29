@@ -3648,6 +3648,7 @@
         document.getElementById('btnReload').addEventListener('click', async () => {
             const api = await waitForApi();
             if (!api) return;
+            await loadPromotionTargetOptions(api);
             const res = await api.getRuleRetargetingConfig();
             applyData(res);
             await refreshLiveRetargetPreflight();
