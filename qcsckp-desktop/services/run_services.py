@@ -27,6 +27,7 @@ from utils.sqlite_store import SQLiteStore
 from services.fetcher import QianChuanFetcher, build_qianchuan_url_by_params, GlobalAuthExpiredError
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.promotion_readonly_probe import PromotionReadOnlyProbe
+from services.product_scene_adapter import scope_product_scene_snapshot
 from services.plan_system import detect_plan_system, normalize_plan_system
 from api.promotion_targets import (
     detect_confirmed_detail_scene,
@@ -67,10 +68,24 @@ def _persist_product_snapshot(
 ) -> None:
     if not isinstance(snapshot, dict):
         return
-    products = snapshot.get("products") or []
+    plan = snapshot.get("plan") or {}
+    scoped = scope_product_scene_snapshot(
+        snapshot,
+        ad_id=plan.get("ad_id") or "",
+    )
+    products = scoped.get("products") or []
+    if scoped.get("ad_rows"):
+        db.execute(
+            "DELETE FROM promotion_material_product WHERE target_uid=?",
+            (target_uid,),
+        )
+        db.execute(
+            "DELETE FROM promotion_product WHERE target_uid=?",
+            (target_uid,),
+        )
     if products:
         upsert_products(target_uid, products, db=db)
-    for material in snapshot.get("materials") or []:
+    for material in scoped.get("materials") or []:
         if not isinstance(material, dict):
             continue
         material_id = str(material.get("material_id") or "").strip()

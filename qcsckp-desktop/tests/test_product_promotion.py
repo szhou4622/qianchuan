@@ -27,11 +27,16 @@ from services.product_rule_engine import (
     evaluate_product_strategy,
     select_product_candidates,
 )
-from services.promotion_readonly_probe import summarize_json, summarize_page
+from services.promotion_readonly_probe import (
+    PromotionReadOnlyProbe,
+    summarize_json,
+    summarize_page,
+)
 from services.product_scene_adapter import (
     extract_product_scene_snapshot,
     extract_safe_query_identifiers,
     merge_product_scene_snapshots,
+    scope_product_scene_snapshot,
     validate_exact_product_plan_payload,
 )
 from services.retargeting_rule_runner import (
@@ -84,6 +89,67 @@ class ProductPromotionTests(unittest.TestCase):
             },
             db=self.db,
         )
+
+    def test_product_probe_uses_latest_observed_plan_not_dict_insertion_order(self):
+        probe = PromotionReadOnlyProbe.__new__(PromotionReadOnlyProbe)
+        probe._apis = {
+            "/ad/api/creation/v1/ad/ad-detail-plus": {
+                "path": "/ad/api/creation/v1/ad/ad-detail-plus",
+                "observed_at": "2026-07-29 10:04:43",
+                "product_snapshot": {
+                    "plan": {
+                        "ad_id": "new-plan",
+                        "plan_name": "新计划",
+                    }
+                },
+            },
+            "/ad/api/creation/v1/shop-prom/get-config": {
+                "path": "/ad/api/creation/v1/shop-prom/get-config",
+                "observed_at": "2026-07-29 10:04:31",
+                "product_snapshot": {
+                    "plan": {
+                        "ad_id": "old-plan",
+                        "plan_name": "旧计划",
+                    }
+                },
+            },
+        }
+
+        snapshot = probe.latest_product_snapshot()
+
+        self.assertEqual("new-plan", snapshot["plan"]["ad_id"])
+        self.assertEqual("新计划", snapshot["plan"]["plan_name"])
+
+    def test_account_snapshot_is_scoped_to_selected_plan(self):
+        snapshot = {
+            "plan": {"ad_id": "20002", "plan_name": "计划2"},
+            "products": [
+                {"product_id": "p1", "product_name": "商品1"},
+                {"product_id": "p2", "product_name": "商品2"},
+            ],
+            "ad_rows": [
+                {"ad_id": "20001", "product_ids": ["p1"]},
+                {"ad_id": "20002", "product_ids": ["p2"]},
+            ],
+            "materials": [
+                {
+                    "ad_id": "20001",
+                    "material_id": "m1",
+                    "product_ids": ["p1"],
+                },
+                {
+                    "ad_id": "20002",
+                    "material_id": "m2",
+                    "product_ids": ["p2", "p1"],
+                },
+            ],
+        }
+
+        scoped = scope_product_scene_snapshot(snapshot, ad_id="20002")
+
+        self.assertEqual(["p2"], [item["product_id"] for item in scoped["products"]])
+        self.assertEqual(["m2"], [item["material_id"] for item in scoped["materials"]])
+        self.assertEqual(["p2"], scoped["materials"][0]["product_ids"])
 
     def test_exact_product_plan_payload_blocks_default_or_paused_plan(self):
         active = {

@@ -298,6 +298,60 @@ def merge_product_scene_snapshots(
     }
 
 
+def scope_product_scene_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    ad_id: Any,
+) -> Dict[str, Any]:
+    """Restrict an account-wide product snapshot to one monitored plan."""
+    target_ad_id = _text(ad_id, 64)
+    result = {
+        "plan": dict(snapshot.get("plan") or {}),
+        "products": list(snapshot.get("products") or []),
+        "ad_rows": list(snapshot.get("ad_rows") or []),
+        "materials": list(snapshot.get("materials") or []),
+    }
+    if not target_ad_id:
+        return result
+
+    target_rows = [
+        dict(item)
+        for item in result["ad_rows"]
+        if isinstance(item, Mapping)
+        and _text(item.get("ad_id"), 64) == target_ad_id
+    ]
+    if not target_rows:
+        return result
+
+    product_ids = {
+        _text(product_id, 64)
+        for item in target_rows
+        for product_id in (item.get("product_ids") or [])
+        if _text(product_id, 64)
+    }
+    result["ad_rows"] = target_rows
+    result["products"] = [
+        dict(item)
+        for item in result["products"]
+        if isinstance(item, Mapping)
+        and _text(item.get("product_id"), 64) in product_ids
+    ]
+    result["materials"] = [
+        {
+            **dict(item),
+            "product_ids": [
+                _text(product_id, 64)
+                for product_id in (item.get("product_ids") or [])
+                if _text(product_id, 64) in product_ids
+            ],
+        }
+        for item in result["materials"]
+        if isinstance(item, Mapping)
+        and _text(item.get("ad_id"), 64) == target_ad_id
+    ]
+    return result
+
+
 def _find_identifier(
     payload: Any,
     names: frozenset[str],

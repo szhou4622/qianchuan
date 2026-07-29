@@ -293,12 +293,18 @@ class PromotionReadOnlyProbe:
         page.on("response", self._on_response)
 
     def latest_product_snapshot(self) -> Dict[str, Any]:
-        snapshots = [
-            item.get("product_snapshot") or {}
+        items = [
+            item
             for item in self._apis.values()
             if item.get("path")
             in (PRODUCT_PLAN_API_PATHS | PRODUCT_AD_LIST_API_PATHS)
         ]
+        # _apis is keyed by API path. Updating an existing path does not move it
+        # to the end of the dict, so insertion order can leave a stale plan
+        # snapshot after the newly opened detail response. Merge by observation
+        # time to ensure the most recently returned plan wins.
+        items.sort(key=lambda item: str(item.get("observed_at") or ""))
+        snapshots = [item.get("product_snapshot") or {} for item in items]
         return merge_product_scene_snapshots(snapshots)
 
     def confirmed_product_target(self) -> Optional[Dict[str, Any]]:
