@@ -81,9 +81,16 @@
                     <div class="text-xs text-slate-400 mt-0.5">上半：配置（分 Tab）| 下半：日志</div>
                 </div>
             </div>
-            <div class="flex items-center gap-2">
-                <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
-                <span id="statusText" class="text-sm text-slate-300">状态：未知</span>
+            <div class="flex items-center gap-3">
+                <button type="button" id="btnBackAccounts"
+                        class="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-600/80 bg-slate-800/80 text-xs font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors">
+                    <i data-lucide="arrow-left" class="w-4 h-4"></i>
+                    返回千川账户管理
+                </button>
+                <div class="flex items-center gap-2">
+                    <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+                    <span id="statusText" class="text-sm text-slate-300">状态：未知</span>
+                </div>
             </div>
         </header>
 
@@ -991,6 +998,10 @@
             }
             const st = await api.stopService();
             setStatusUI(st);
+        });
+
+        document.getElementById('btnBackAccounts').addEventListener('click', () => {
+            window.location.href = 'qianchuan_accounts.html';
         });
 
         // init

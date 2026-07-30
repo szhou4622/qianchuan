@@ -187,6 +187,16 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn("item.account_name", page)
         self.assertIn("`${name}（${id}）`", page)
 
+    def test_diagnostics_page_has_direct_account_management_return(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "control.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('id="btnBackAccounts"', page)
+        self.assertIn("返回千川账户管理", page)
+        self.assertIn("window.location.href = 'qianchuan_accounts.html'", page)
+
 
 if __name__ == "__main__":
     unittest.main()
