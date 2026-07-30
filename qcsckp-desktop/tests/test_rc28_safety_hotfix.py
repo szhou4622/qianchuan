@@ -24,7 +24,11 @@ from services.qianchuan_accounts import (
     save_qianchuan_account_automation_setup,
 )
 from services.retargeting_service import QianChuanRetargetingService
-from services.run_services import CatalogLoginRequired, ServiceController
+from services.run_services import (
+    CatalogLoginRequired,
+    ServiceController,
+    _qianchuan_authenticated_shell_visible,
+)
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -573,6 +577,39 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         mark_available.assert_called_once_with(owner_username=self.owner)
         self.assertTrue(fetcher.closed)
 
+    def test_login_success_can_be_confirmed_by_authenticated_shell(self):
+        class FakeLocator:
+            @property
+            def first(self):
+                return self
+
+            async def is_visible(self, **_kwargs):
+                return True
+
+        class FakePage:
+            url = "https://qianchuan.jinritemai.com/home"
+
+            async def is_closed(self):
+                return False
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        self.assertTrue(
+            asyncio.run(
+                _qianchuan_authenticated_shell_visible(FakePage())
+            )
+        )
+
+    def test_catalog_sync_waits_while_visible_relogin_is_running(self):
+        controller = ServiceController()
+        controller._target_discovery_thread = Mock()
+        controller._target_discovery_thread.is_alive.return_value = True
+        controller._target_discovery_login_only = True
+        result = controller.start_catalog_sync()
+        self.assertFalse(result["success"])
+        self.assertEqual("relogin_in_progress", result["failure_kind"])
+
     def test_target_discovery_failure_contract_is_fail_closed(self):
         controller = ServiceController()
         with patch.object(
@@ -781,7 +818,7 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
 
         cfg = SimpleNamespace(db_path=self.db_path)
         cfg.normalize_paths = lambda: cfg
-        controller = ServiceController.__new__(ServiceController)
+        controller = ServiceController()
         invalid = Mock()
         with (
             patch(
@@ -815,6 +852,40 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         ):
             controller._catalog_sync_entry(self.owner)
         invalid.assert_called_once()
+
+    def test_stale_catalog_login_failure_cannot_override_visible_relogin(self):
+        controller = ServiceController()
+        controller._target_discovery_thread = Mock()
+        controller._target_discovery_thread.is_alive.return_value = True
+        controller._target_discovery_login_only = True
+        invalid = Mock()
+        finalized = Mock()
+        with (
+            patch.object(
+                controller,
+                "_catalog_sync_async",
+                AsyncMock(
+                    side_effect=CatalogLoginRequired(
+                        "旧Cookie已失效"
+                    )
+                ),
+            ),
+            patch(
+                "services.run_services.mark_qianchuan_session_invalid",
+                invalid,
+            ),
+            patch(
+                "services.qianchuan_catalog.finalize_catalog_sync",
+                finalized,
+            ),
+        ):
+            controller._catalog_sync_entry(self.owner)
+        invalid.assert_not_called()
+        finalized.assert_called_once()
+        self.assertIn(
+            "可见Chrome正在重新登录",
+            finalized.call_args.kwargs["error"],
+        )
 
     def test_catalog_account_scan_login_expiry_is_not_downgraded_to_partial(self):
         class FakePage:

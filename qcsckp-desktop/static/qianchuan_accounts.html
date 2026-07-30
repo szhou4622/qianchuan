@@ -251,6 +251,7 @@
         if(s?.success&&s?.relogin_complete){
           await load();
           message('千川登录成功，正在重新同步全部账户和计划。');
+          await new Promise(resolve=>setTimeout(resolve,1200));
           await discover();
         }else{
           await load();

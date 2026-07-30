@@ -527,6 +527,28 @@ def _is_qianchuan_login_url(url: Any) -> bool:
     )
 
 
+async def _qianchuan_authenticated_shell_visible(page: Any) -> bool:
+    """登录成功总闸：必须位于千川域名且出现登录后的账户导航。"""
+    if page is None or _is_qianchuan_login_url(getattr(page, "url", "")):
+        return False
+    try:
+        if await page.is_closed():
+            return False
+    except Exception:
+        pass
+    for selector in (
+        "#navigator-right-account",
+        ".qc-ui-navigator-account",
+    ):
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=1_000):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _choose_startup_target(
     known_targets: List[Dict[str, Any]],
     remembered_target: Optional[Dict[str, Any]],
@@ -1104,6 +1126,18 @@ class ServiceController:
                 self._catalog_sync_thread is not None
                 and self._catalog_sync_thread.is_alive()
             )
+            visible_login_running = (
+                self._target_discovery_thread is not None
+                and self._target_discovery_thread.is_alive()
+                and self._target_discovery_login_only
+            )
+        if visible_login_running:
+            return {
+                "success": False,
+                "running": False,
+                "message": "正在可见Chrome中确认千川登录，完成后将自动同步目录",
+                "failure_kind": "relogin_in_progress",
+            }
         if running:
             return catalog_sync_status()
         owner = current_session_owner()
@@ -1184,6 +1218,25 @@ class ServiceController:
         except CatalogLoginRequired as exc:
             from services.qianchuan_catalog import finalize_catalog_sync
 
+            with self._lock:
+                visible_login_running = (
+                    self._target_discovery_thread is not None
+                    and self._target_discovery_thread.is_alive()
+                    and self._target_discovery_login_only
+                )
+            if visible_login_running:
+                finalize_catalog_sync(
+                    owner_username=owner_username,
+                    error=(
+                        "旧目录同步检测到登录异常，但可见Chrome正在重新登录；"
+                        "已忽略旧会话结果"
+                    ),
+                )
+                logger.info(
+                    "[千川目录] 可见Chrome重新登录进行中，"
+                    "忽略旧目录同步的登录失效结果"
+                )
+                return
             mark_qianchuan_session_invalid(
                 str(exc),
                 owner_username=owner_username,
@@ -1832,17 +1885,43 @@ class ServiceController:
                     await probe.observe_page(fetcher.page)
                     last_probe_at = time.time()
                 if login_only:
-                    accounts = await probe.discover_authorized_accounts(
-                        fetcher.page,
-                        timeout_ms=15_000,
-                    )
-                    if accounts:
-                        _require_session_owner(session_owner)
-                        upsert_authorized_accounts(
-                            accounts,
-                            owner_username=session_owner,
-                            db=db,
+                    try:
+                        page_closed = await fetcher.page.is_closed()
+                    except Exception:
+                        page_closed = False
+                    if page_closed:
+                        raise RuntimeError(
+                            "登录Chrome已关闭，尚未完成千川登录确认"
                         )
+                    authenticated = (
+                        await _qianchuan_authenticated_shell_visible(
+                            fetcher.page
+                        )
+                    )
+                    accounts_loader = getattr(
+                        probe,
+                        "authorized_accounts",
+                        None,
+                    )
+                    accounts = (
+                        accounts_loader()
+                        if callable(accounts_loader)
+                        else []
+                    )
+                    if not authenticated and not accounts:
+                        accounts = await probe.discover_authorized_accounts(
+                            fetcher.page,
+                            timeout_ms=4_000,
+                        )
+                        authenticated = bool(accounts)
+                    if authenticated:
+                        _require_session_owner(session_owner)
+                        if accounts:
+                            upsert_authorized_accounts(
+                                accounts,
+                                owner_username=session_owner,
+                                db=db,
+                            )
                         if fetcher.context:
                             await save_context_storage_state(
                                 fetcher.context,
@@ -1856,12 +1935,17 @@ class ServiceController:
                                 "success": True,
                                 "running": False,
                                 "message": (
-                                    "千川重新登录成功，授权账户已确认；"
-                                    "可以开始刷新全部账户和计划"
+                                    "千川重新登录成功，Cookie已保存；"
+                                    "登录Chrome已自动关闭，正在准备无头同步账户和计划"
                                 ),
                                 "target": None,
                                 "relogin_complete": True,
                             }
+                        logger.info(
+                            "[千川可见登录] 登录成功，Cookie已保存，"
+                            "将关闭可见Chrome accounts=%s",
+                            len(accounts),
+                        )
                         return
                 if urlparse(cur).path == "/uni-prom":
                     product_target = probe.confirmed_product_target()
@@ -2050,6 +2134,8 @@ class ServiceController:
                     "relogin_complete": False,
                 }
         finally:
+            if login_only:
+                logger.info("[千川可见登录] 正在关闭独立Google Chrome")
             await fetcher.close()
 
     # ---------------- thread main ----------------
