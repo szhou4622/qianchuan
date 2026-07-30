@@ -721,7 +721,10 @@ def refresh_monitor_capacity(
                     waiting += 1
             store.update(
                 "promotion_target",
-                {"capacity_state": state},
+                {
+                    "capacity_state": state,
+                    **({"last_lag_seconds": 0} if state == "disabled" else {}),
+                },
                 where={"target_uid": row["target_uid"]},
                 connection=conn,
             )

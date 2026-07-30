@@ -287,6 +287,11 @@ class MultiQianchuanAccountTests(unittest.TestCase):
 
     def test_disabled_account_disables_all_its_automation_targets(self):
         target = self._target("10001", 1)
+        self.db.update(
+            "promotion_target",
+            {"last_lag_seconds": 1200},
+            where={"target_uid": target["target_uid"]},
+        )
         save_qianchuan_account_settings(
             target["account_uid"],
             {"enabled": False},
@@ -297,6 +302,7 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             where={"target_uid": target["target_uid"]},
         )
         self.assertEqual("disabled", saved["capacity_state"])
+        self.assertEqual(0, saved["last_lag_seconds"])
 
     def test_dynamic_capacity_marks_excess_targets_waiting(self):
         for index in range(13):
@@ -441,6 +447,11 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn("overflow-y:auto", html)
         self.assertIn("该账户全部计划（全域/乘方 × 推直播/推商品）", html)
         self.assertIn("请先启用此千川账户，再选择", html)
+        self.assertIn(
+            "const late=selected&&accountEnabled&&state==='active'&&!!p.last_sync_at",
+            html,
+        )
+        self.assertIn("firstRun?'等待首次采集':late?'监控延迟'", html)
 
 
 class QianchuanSessionTests(unittest.TestCase):

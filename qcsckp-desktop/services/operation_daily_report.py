@@ -28,6 +28,12 @@ CONFIG_LOCK = threading.RLock()
 SCHEDULER_LOCK = threading.Lock()
 SCHEDULER_STARTED = False
 DETAIL_LIMIT = 20
+# 日报只展示实际投放操作：工具执行、千川后台日志，以及已经由千川
+# 后台日志ID核验过的浏览器记录。纯“记录浏览器模式”轨迹不属于日报。
+REPORTABLE_EVENT_SQL = (
+    "(source IN ('tool_direct','platform_log') "
+    "OR (source='browser_observed' AND COALESCE(platform_event_id,'')<>''))"
+)
 
 DEFAULT_CONFIG = {
     "enabled": False,
@@ -303,9 +309,15 @@ def _group_counts(
         raise ValueError("不支持的统计字段")
     scope = "account_uid=?" if account_uid else "aavid=?"
     scope_value = account_uid or aavid
+    select_field = (
+        "CASE WHEN source='browser_observed' THEN 'platform_log' ELSE source END"
+        if field == "source"
+        else field
+    )
     rows = store.execute(
-        f"SELECT {field} AS name,COUNT(*) AS n FROM account_operation_event "
-        f"WHERE {scope} AND occurred_at>=? AND occurred_at<=? GROUP BY " + field,
+        f"SELECT {select_field} AS name,COUNT(*) AS n FROM account_operation_event "
+        f"WHERE {scope} AND occurred_at>=? AND occurred_at<=? "
+        f"AND {REPORTABLE_EVENT_SQL} GROUP BY {select_field}",
         (scope_value, start, end),
         fetch=True,
     ) or []
@@ -345,7 +357,8 @@ def build_operation_daily_report(
     event_scope_param = account_uid or aid
     total_rows = store.execute(
         "SELECT COUNT(*) AS n,SUM(CASE WHEN possible_duplicate=1 THEN 1 ELSE 0 END) AS duplicate_n "
-        f"FROM account_operation_event WHERE {event_scope} AND occurred_at>=? AND occurred_at<=?",
+        f"FROM account_operation_event WHERE {event_scope} AND occurred_at>=? AND occurred_at<=? "
+        f"AND {REPORTABLE_EVENT_SQL}",
         (event_scope_param, start, end),
         fetch=True,
     ) or [{"n": 0, "duplicate_n": 0}]
@@ -355,6 +368,7 @@ def build_operation_daily_report(
         "plan_id,plan_name,material_id,material_name,product_id,product_name,"
         "regulate_task_id,possible_duplicate,occurred_at "
         f"FROM account_operation_event WHERE {event_scope} AND occurred_at>=? AND occurred_at<=? "
+        f"AND {REPORTABLE_EVENT_SQL} "
         "ORDER BY occurred_at DESC,id DESC LIMIT ?",
         (event_scope_param, start, end, DETAIL_LIMIT),
         fetch=True,
@@ -514,7 +528,7 @@ def build_operation_daily_report_card(report: Dict[str, Any]) -> Dict[str, Any]:
             {"tag": "hr"},
             {
                 "tag": "markdown",
-                "content": "**操作明细（时间倒序）**\n" + "\n\n".join(detail_lines),
+                "content": "**投放操作日志（时间倒序）**\n" + "\n\n".join(detail_lines),
             },
             {
                 "tag": "note",

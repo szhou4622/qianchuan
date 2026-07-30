@@ -69,6 +69,15 @@ class OperationDailyReportTests(unittest.TestCase):
             "platform_log",
             "2026-07-26 12:00:00",
         )
+        self._event(
+            "event-browser-only",
+            "10001",
+            "other",
+            "success",
+            "browser_observed",
+            "2026-07-27 13:00:00",
+            summary="记录模式捕获到千川操作",
+        )
         self.store.insert_or_update(
             "platform_log_sync_state",
             {
@@ -163,8 +172,30 @@ class OperationDailyReportTests(unittest.TestCase):
         self.assertEqual(2, report["event_count"])
         self.assertEqual(1, report["action_counts"]["retarget"])
         self.assertEqual(1, report["action_counts"]["stop"])
+        self.assertNotIn("browser_observed", report["source_counts"])
         self.assertEqual("测试千川账户", report["account_name"])
         self.assertTrue(report["platform_coverage_complete"])
+
+    def test_platform_verified_browser_event_is_reported_as_platform_log(self):
+        self._event(
+            "event-browser-verified",
+            "10001",
+            "budget_update",
+            "success",
+            "browser_observed",
+            "2026-07-27 14:00:00",
+            summary="修改计划预算",
+            platform_event_id="platform-log-1",
+        )
+        report = daily.build_operation_daily_report(
+            "10001",
+            "2026-07-27",
+            database=self.db_path,
+        )
+        self.assertEqual(3, report["event_count"])
+        self.assertEqual(1, report["action_counts"]["budget_update"])
+        self.assertEqual(2, report["source_counts"]["platform_log"])
+        self.assertNotIn("browser_observed", report["source_counts"])
 
     def test_card_has_account_summary_details_and_no_leading_dot(self):
         report = daily.build_operation_daily_report(
@@ -178,6 +209,9 @@ class OperationDailyReportTests(unittest.TestCase):
         self.assertIn("追投 1", raw)
         self.assertIn("停投 1", raw)
         self.assertIn("追投成功", raw)
+        self.assertIn("投放操作日志（时间倒序）", raw)
+        self.assertNotIn("浏览器记录", raw)
+        self.assertNotIn("记录模式捕获到千川操作", raw)
         self.assertNotIn("·账户ID", raw)
 
     def test_scheduled_delivery_is_idempotent_after_restart_style_retry(self):
