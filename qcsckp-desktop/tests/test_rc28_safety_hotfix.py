@@ -586,6 +586,31 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         self.assertFalse(status["running"])
         self.assertFalse(status["relogin_complete"])
         self.assertIn("模拟登录失败", status["message"])
+        self.assertTrue(controller._target_discovery_launch_event.is_set())
+
+    def test_relogin_start_waits_for_real_launch_failure_result(self):
+        controller = ServiceController()
+
+        def fail_before_browser(_login_only=False):
+            with controller._lock:
+                controller._target_discovery_status = {
+                    "success": False,
+                    "running": False,
+                    "message": "识别失败：Chrome程序无法启动",
+                    "target": None,
+                    "relogin_complete": False,
+                }
+            controller._target_discovery_launch_event.set()
+
+        with patch.object(
+            controller,
+            "_target_discovery_entry",
+            side_effect=fail_before_browser,
+        ):
+            result = controller.start_target_discovery(login_only=True)
+        self.assertFalse(result["success"])
+        self.assertFalse(result["running"])
+        self.assertIn("Chrome程序无法启动", result["message"])
 
     def test_live_delivery_gate_fails_closed_without_ids_or_listener(self):
         fetcher = QianChuanFetcher()

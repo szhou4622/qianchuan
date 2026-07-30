@@ -664,6 +664,9 @@ class JSApi:
     def startPromotionTargetDiscovery(self):
         return self.api.startPromotionTargetDiscovery()
 
+    def startQianchuanRelogin(self):
+        return self.api.startQianchuanRelogin()
+
     def getPromotionTargetDiscoveryStatus(self):
         return self.api.getPromotionTargetDiscoveryStatus()
 

@@ -225,11 +225,26 @@
     const timer=setInterval(async()=>{const s=await a.getQianchuanCatalogSyncStatus();const progress=s?.total_accounts?`（${s.processed_accounts||0}/${s.total_accounts}${s.current_account?' · '+s.current_account:''}）`:'';message((s?.message||'正在同步授权账户和计划目录')+progress,!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;await load()}},1000);
   }
   async function relogin(){
-    const a=await waitApi();const r=await a.startQianchuanRelogin();
-    message(r?.message||'已打开可见Chrome。请完成千川登录，工具会自动确认授权账户并保存会话。',!r?.success);
-    if(!r?.success)return;$('relogin').disabled=true;
+    $('relogin').disabled=true;
+    let a,r;
+    try{
+      a=await waitApi();r=await a.startQianchuanRelogin();
+    }catch(e){
+      $('relogin').disabled=false;
+      message('启动Google Chrome失败：'+String(e?.message||e||'桌面接口不可用'),true);
+      return;
+    }
+    message(r?.message||'Google Chrome正在启动，请稍候。',!r?.success);
+    if(!r?.success){$('relogin').disabled=false;return}
     const timer=setInterval(async()=>{
-      const s=await a.getPromotionTargetDiscoveryStatus();
+      let s;
+      try{
+        s=await a.getPromotionTargetDiscoveryStatus();
+      }catch(e){
+        clearInterval(timer);$('relogin').disabled=false;
+        message('读取登录状态失败：'+String(e?.message||e||'桌面接口不可用'),true);
+        return;
+      }
       message(s?.message||'等待千川登录并确认授权账户',!s?.success);
       if(!s?.running){
         clearInterval(timer);$('relogin').disabled=false;

@@ -68,7 +68,8 @@ from services.control_panel_config import (
     load_feishu_bitable_panel_config,
 )
 from config import PROJECT_ROOT, DATA_DIR, LOGS_DIR, DB_FILE
-from utils.common import browser_runtime_info
+from utils.common import browser_runtime_info, require_executable_path
+from utils.log import logger
 
 
 """
@@ -739,6 +740,7 @@ class ServiceController:
         self._cloud_backup_password: str = ""
         self._target_discovery_thread: Optional[threading.Thread] = None
         self._target_discovery_login_only = False
+        self._target_discovery_launch_event = threading.Event()
         self._catalog_sync_thread: Optional[threading.Thread] = None
         self._catalog_scheduler_thread: Optional[threading.Thread] = None
         self._catalog_startup_sync_pending = True
@@ -1044,21 +1046,20 @@ class ServiceController:
                 self._target_discovery_thread is not None
                 and self._target_discovery_thread.is_alive()
             ):
+                logger.info(
+                    "[千川可见登录] 复用正在运行的浏览器任务 login_only=%s status=%s",
+                    self._target_discovery_login_only,
+                    self._target_discovery_status.get("message"),
+                )
                 return {
                     "success": True,
                     **self._target_discovery_status,
                 }
+            self._target_discovery_launch_event.clear()
             self._target_discovery_status = {
                 "success": True,
                 "running": True,
-                "message": (
-                    "已打开独立Chrome；请完成千川登录，工具会在确认授权账户后保存会话"
-                    if login_only
-                    else (
-                        "已打开独立Chrome；如显示登录页，请先登录千川，"
-                        "再进入要监控的计划详情"
-                    )
-                ),
+                "message": "正在启动独立Google Chrome，请稍候…",
                 "target": None,
                 "relogin_complete": False,
             }
@@ -1070,7 +1071,22 @@ class ServiceController:
                 daemon=True,
             )
             self._target_discovery_thread.start()
-        return {"success": True, **self._target_discovery_status}
+        logger.info(
+            "[千川可见登录] 已收到启动请求 login_only=%s",
+            bool(login_only),
+        )
+        self._target_discovery_launch_event.wait(timeout=8.0)
+        with self._lock:
+            result = dict(self._target_discovery_status)
+        if (
+            result.get("running")
+            and not self._target_discovery_launch_event.is_set()
+        ):
+            result["message"] = (
+                "Google Chrome仍在启动；若10秒后仍未出现，"
+                "请查看页面上的失败原因并重试"
+            )
+        return result
 
     def target_discovery_status(self) -> dict:
         with self._lock:
@@ -1687,6 +1703,10 @@ class ServiceController:
                 self._target_discovery_async(login_only=login_only)
             )
         except Exception as e:
+            logger.exception(
+                "[千川可见登录] 浏览器启动或登录识别失败 login_only=%s",
+                bool(login_only),
+            )
             with self._lock:
                 self._target_discovery_status = {
                     "success": False,
@@ -1695,6 +1715,7 @@ class ServiceController:
                     "target": None,
                     "relogin_complete": False,
                 }
+            self._target_discovery_launch_event.set()
 
     async def _target_discovery_async(
         self,
@@ -1728,7 +1749,22 @@ class ServiceController:
             owner_username=session_owner
         )
         fetcher = QianChuanFetcher(headless=False, storage_state=storage_state)
+        browser_path = require_executable_path(
+            str(
+                load_scrape_service_config().get(
+                    "browser_executable_path"
+                )
+                or ""
+            ).strip()
+            or None
+        )
+        logger.info(
+            "[千川可见登录] 正在启动Google Chrome path=%s login_only=%s",
+            browser_path,
+            bool(login_only),
+        )
         await fetcher._init_browser()
+        logger.info("[千川可见登录] Google Chrome进程已创建")
         probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
         probe.attach(fetcher.page)
         # 已有登录态时先进入计划列表，避免登录页自动跳回上次打开的旧计划并被误登记。
@@ -1749,6 +1785,17 @@ class ServiceController:
             await fetcher.page.bring_to_front()
         except Exception:
             pass
+        with self._lock:
+            self._target_discovery_status["message"] = (
+                "独立Google Chrome已打开；请完成千川登录，"
+                "工具会自动确认授权账户并保存会话"
+                if login_only
+                else (
+                    "独立Google Chrome已打开；如显示登录页，请先登录千川，"
+                    "再进入要监控的计划详情"
+                )
+            )
+        self._target_discovery_launch_event.set()
         try:
             target_url = None
             target_scene = None

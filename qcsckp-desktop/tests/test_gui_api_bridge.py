@@ -23,6 +23,7 @@ class JSApiBridgeTests(unittest.TestCase):
             "success": True
         }
         self.core.startPromotionTargetDiscovery.return_value = {"success": True}
+        self.core.startQianchuanRelogin.return_value = {"success": True}
         self.core.getPromotionTargetDiscoveryStatus.return_value = {"running": False}
 
         self.assertEqual(
@@ -62,6 +63,10 @@ class JSApiBridgeTests(unittest.TestCase):
             {"success": True},
         )
         self.assertEqual(
+            self.bridge.startQianchuanRelogin(),
+            {"success": True},
+        )
+        self.assertEqual(
             self.bridge.getPromotionTargetDiscoveryStatus(),
             {"running": False},
         )
@@ -85,6 +90,7 @@ class JSApiBridgeTests(unittest.TestCase):
             "target-1"
         )
         self.core.startPromotionTargetDiscovery.assert_called_once_with()
+        self.core.startQianchuanRelogin.assert_called_once_with()
         self.core.getPromotionTargetDiscoveryStatus.assert_called_once_with()
 
     def test_operation_daily_report_methods_are_exposed_and_forwarded(self):
