@@ -1126,7 +1126,7 @@
                             <select id="strategyTargetUid" class="rr-input rr-input--flush">
                                 <option value="">请选择监控计划</option>
                             </select>
-                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先在“监控计划”页面添加计划。</span>
+                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先在“千川账户管理”页面添加账户并勾选监控计划。</span>
                         </label>
                         <label class="block">
                             <span class="rr-label">触发层级</span>
@@ -1858,7 +1858,7 @@
             if (hint) {
                 hint.textContent = target
                     ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
-                    : '请先在“监控计划”页面添加计划。';
+                    : '请先在“千川账户管理”页面添加账户并勾选监控计划。';
             }
             renderStrategyProductOptions();
             syncRetargetMethodAvailability();

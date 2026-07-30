@@ -13,6 +13,7 @@ from api.operation_events import (
     export_operation_events_csv,
     get_operation_event,
     ingest_platform_log_rows,
+    list_operation_accounts,
     normalize_action_type,
     prune_operation_events,
     query_operation_events_page,
@@ -477,6 +478,19 @@ class OperationEventTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_operation_account_options_include_account_name_and_id(self):
+        from services.qianchuan_accounts import ensure_qianchuan_account
+
+        ensure_qianchuan_account(
+            "1001",
+            account_name="松之选专卖店",
+            db=self.db,
+        )
+        items = list_operation_accounts(db=self.db)
+        self.assertEqual(1, len(items))
+        self.assertEqual("松之选专卖店", items[0]["account_name"])
+        self.assertEqual("1001", items[0]["aavid"])
 
     def test_event_uid_is_idempotent_and_accounts_are_separate(self):
         event = {

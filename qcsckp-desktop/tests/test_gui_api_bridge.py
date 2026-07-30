@@ -155,10 +155,37 @@ class JSApiBridgeTests(unittest.TestCase):
             / "static"
             / "promotion_targets.html"
         ).read_text(encoding="utf-8")
+        self.assertIn("<title>计划高级设置</title>", page)
+        self.assertIn("返回千川账户管理", page)
+        self.assertIn("target_uid", page)
         self.assertIn('data-field="plan_system"', page)
         self.assertIn("验证追投能力", page)
         self.assertIn("probePromotionTargetRetargetCapability", page)
         self.assertIn("不会点击提交", page)
+
+    def test_primary_navigation_hides_internal_control_and_advanced_plan_pages(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "index.html"
+        ).read_text(encoding="utf-8")
+        nav = page[page.index('<nav class="menu-list">'):page.index("</nav>")]
+        self.assertNotIn('data-page="control"', nav)
+        self.assertNotIn('data-page="promotion-targets"', nav)
+        self.assertIn("'control': 'control.html'", page)
+        self.assertIn("'promotion-targets': 'promotion_targets.html'", page)
+
+    def test_operation_page_is_query_export_only_and_renders_account_names(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "operation_events.html"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('id="recordBtn"', page)
+        self.assertNotIn("startOperationRecordBrowser", page)
+        self.assertIn("导出当前结果", page)
+        self.assertIn("item.account_name", page)
+        self.assertIn("`${name}（${id}）`", page)
 
 
 if __name__ == "__main__":

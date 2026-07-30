@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>监控计划</title>
+  <title>计划高级设置</title>
   <style>
     :root{color-scheme:dark;font-family:"Microsoft YaHei",system-ui,sans-serif}
     *{box-sizing:border-box} body{margin:0;min-height:100vh;background:#08111f;color:#e2e8f0}
@@ -31,17 +31,18 @@
   <main class="page">
     <div class="head">
       <div>
-        <h1>监控计划</h1>
-        <div class="sub">可登记多个千川账户下的推直播或推商品计划。系统按最近采集耗时动态分配容量，目标5分钟一轮；预计无法在10分钟内完成的计划会明确显示“等待监控容量”，不会虚假标记为正常。</div>
+        <h1>计划高级设置</h1>
+        <div class="sub">账户启用与监控计划选择已统一放在“千川账户管理”。此处仅配置商品范围并验证该计划的追投能力。</div>
       </div>
-      <button class="primary" id="discover">打开千川添加计划</button>
+      <button class="primary" id="back">返回千川账户管理</button>
     </div>
     <div class="notice" id="notice"></div>
     <div class="grid" id="list"></div>
-    <div class="empty" id="empty">还没有监控计划，请先从千川详情页添加。</div>
+    <div class="empty" id="empty">没有找到这条计划，请返回千川账户管理刷新计划目录。</div>
   </main>
   <script>
     const $=id=>document.getElementById(id);
+    const focusedTarget=new URLSearchParams(window.location.search).get('target_uid')||'';
     const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const api=()=>window.top.pywebviewAPI||window.pywebview?.api;
     async function waitApi(){for(let i=0;i<100;i++){const a=api();if(a)return a;await new Promise(r=>setTimeout(r,100));}return null}
@@ -74,7 +75,9 @@
     }
     async function load(){
       const a=await waitApi(); const r=await a.listPromotionTargets();
-      const rows=r?.data||[]; $('empty').style.display=rows.length?'none':'block';
+      const allRows=r?.data||[];
+      const rows=focusedTarget?allRows.filter(x=>String(x.target_uid||'')===focusedTarget):allRows;
+      $('empty').style.display=rows.length?'none':'block';
       const productResults=await Promise.all(rows.map(async x=>{
         if(x.promotion_scene!=='product')return [x.target_uid,[]];
         const result=await a.listPromotionTargetProducts(x.target_uid);
@@ -124,13 +127,8 @@
       }catch(e){message(String(e?.message||e),true)}
       finally{btn.disabled=false}
     }
-    async function discover(){
-      const a=await waitApi(); const r=await a.startPromotionTargetDiscovery();
-      message(r?.message||'请在新浏览器中进入计划详情',!r?.success);
-      if(!r?.success)return; $('discover').disabled=true;
-      const timer=setInterval(async()=>{const s=await a.getPromotionTargetDiscoveryStatus();message(s?.message||'正在等待千川计划详情',!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;if(s?.target)load();}},1000);
-    }
-    $('discover').onclick=discover; load(); setInterval(load,15000);
+    $('back').onclick=()=>{window.location.href='qianchuan_accounts.html'};
+    load(); setInterval(load,15000);
   </script>
 </body>
 </html>

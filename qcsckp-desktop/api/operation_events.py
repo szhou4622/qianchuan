@@ -467,16 +467,29 @@ def get_operation_event(event_id: Any, aavid: Any = None) -> Optional[Dict[str, 
     return store.select_one(TABLE, where=where)
 
 
-def list_operation_accounts() -> List[str]:
-    init_sqlite_schema()
-    migrate_legacy_operation_runs()
+def list_operation_accounts(
+    db: Optional[SQLiteStore] = None,
+) -> List[Dict[str, str]]:
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config["database"])
+    migrate_legacy_operation_runs(store)
     from services.qianchuan_accounts import list_qianchuan_accounts
 
-    return [
-        str(item.get("aavid") or "")
-        for item in list_qianchuan_accounts()
-        if str(item.get("aavid") or "")
-    ]
+    accounts: List[Dict[str, str]] = []
+    for item in list_qianchuan_accounts(db=store):
+        aavid = str(item.get("aavid") or "").strip()
+        if not aavid:
+            continue
+        accounts.append(
+            {
+                "aavid": aavid,
+                "account_uid": str(item.get("account_uid") or "").strip(),
+                "account_name": str(
+                    item.get("account_name") or f"千川账户 {aavid}"
+                ).strip(),
+            }
+        )
+    return accounts
 
 
 def operation_sync_state(aavid: Any) -> Dict[str, Any]:
@@ -502,7 +515,7 @@ def operation_sync_state(aavid: Any) -> Dict[str, Any]:
         "coverage_to": "",
         "last_sync_at": "",
         "last_status": "not_configured",
-        "last_error": "尚未在记录模式中发现千川后台操作日志接口",
+        "last_error": "尚未发现千川后台操作日志接口；当前流水可能不完整",
     }
 
 

@@ -447,6 +447,9 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn("overflow-y:auto", html)
         self.assertIn("该账户全部计划（全域/乘方 × 推直播/推商品）", html)
         self.assertIn("请先启用此千川账户，再选择", html)
+        self.assertIn('id="diagnostics"', html)
+        self.assertIn('data-advanced="${esc(p.target_uid)}"', html)
+        self.assertIn("promotion_targets.html?target_uid=", html)
         self.assertIn(
             "const late=selected&&accountEnabled&&state==='active'&&!!p.last_sync_at",
             html,
