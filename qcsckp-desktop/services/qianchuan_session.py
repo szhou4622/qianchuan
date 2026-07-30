@@ -172,7 +172,47 @@ async def save_context_storage_state(
 ) -> Dict[str, Any]:
     if context is None:
         raise RuntimeError("浏览器上下文不存在")
-    state = await context.storage_state()
+    # Playwright 的 storage_state 默认不包含 sessionStorage；千川会把一部分
+    # 登录凭据放在这里。只保存 Cookie/localStorage 会造成“可见 Chrome 已登录，
+    # 关闭后新建无头会话立即跳回 /login”。
+    state = await context.storage_state(indexed_db=True)
+    session_storage: Dict[str, Dict[str, str]] = {}
+    for page in list(getattr(context, "pages", []) or []):
+        try:
+            closed = page.is_closed()
+            if hasattr(closed, "__await__"):
+                closed = await closed
+            if closed:
+                continue
+        except Exception:
+            pass
+        try:
+            snapshot = await page.evaluate(
+                """() => ({
+                    origin: location.origin,
+                    entries: Object.fromEntries(
+                        Array.from({length: sessionStorage.length}, (_, i) => {
+                            const key = sessionStorage.key(i);
+                            return [key, sessionStorage.getItem(key)];
+                        }).filter(([key]) => key !== null)
+                    )
+                })"""
+            )
+        except Exception:
+            continue
+        origin = str((snapshot or {}).get("origin") or "").strip()
+        entries = (snapshot or {}).get("entries")
+        if (
+            origin.startswith(("https://", "http://"))
+            and isinstance(entries, dict)
+        ):
+            session_storage[origin] = {
+                str(key): str(value)
+                for key, value in entries.items()
+                if key is not None and value is not None
+            }
+    if session_storage:
+        state["_qcsckp_session_storage"] = session_storage
     return save_qianchuan_storage_state(
         state,
         owner_username=owner_username,

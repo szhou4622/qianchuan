@@ -28,7 +28,7 @@
     .plans{display:grid;gap:8px}.plan{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px;border:1px solid #26364e;border-radius:9px;background:#101b2d}
     .plan-group{margin-top:12px}.plan-group:first-child{margin-top:0}.plan-group-title{display:flex;justify-content:space-between;color:#7dd3fc;font-size:11px;font-weight:700;margin-bottom:7px}.plan.ineligible{opacity:.65}.plan input:disabled{cursor:not-allowed}
     .plan-name{color:#e2e8f0;font-size:12px;font-weight:600;word-break:break-all}.plan-meta{margin-top:4px;color:#71839b;font-size:10px;line-height:1.55}.plan-state{white-space:nowrap;font-size:10px}.plan-state.wait{color:#fbbf24}.plan-state.late{color:#fda4af}.plan-state.active{color:#86efac}
-    .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
+    .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.danger{background:#7f1d1d;color:#fecaca}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
     @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.head{flex-direction:column}}
   </style>
 </head>
@@ -37,11 +37,12 @@
   <div class="head">
     <div>
       <h1>千川账户管理</h1>
-      <div class="sub">所有账户共用当前千川登录会话。这里只管理已授权账户、日报接收位置和明确启用的自动化计划；不会自动操作账户下的其他计划。</div>
+      <div class="sub">所有账户共用当前千川登录会话。工具不会自动导入全部授权账户；请一次选择并添加一个当前账户，之后只刷新已添加账户的计划。</div>
     </div>
     <div class="toolbar">
       <button id="relogin">打开Chrome重新登录/核验</button>
-      <button class="primary" id="discover">刷新全部账户和计划</button>
+      <button id="addAccount">选择并添加当前账户</button>
+      <button class="primary" id="discover">刷新已添加账户计划</button>
     </div>
   </div>
   <div class="onboarding" id="onboarding"></div>
@@ -60,7 +61,7 @@
     <button id="refresh">重新加载</button>
   </div>
   <div class="accounts" id="accounts"></div>
-  <div class="empty" id="empty">尚未同步授权账户。请先完成千川登录，再点击右上角“刷新全部账户和计划”。</div>
+  <div class="empty" id="empty">尚未添加千川账户。请先完成登录，再点击“选择并添加当前账户”，在Chrome中切换账户并打开任意一条计划详情。</div>
 </main>
 <script>
   const $=id=>document.getElementById(id);
@@ -170,14 +171,15 @@
           </div>
           <div class="panel">
             <div class="panel-title">四类计划目录 + 待确认</div>
-            <div class="plans">${plans.length?planRows(plans):'<div class="group-empty">此账户还没有登记计划。点击右上角刷新目录。</div>'}</div>
+            <div class="plans">${plans.length?planRows(plans):'<div class="group-empty">此账户还没有登记计划。点击右上角刷新已添加账户计划。</div>'}</div>
           </div>
         </div>
-        <div class="actions"><button data-save>保存此账户设置</button></div>
+        <div class="actions"><button class="danger" data-remove>删除此账户</button><button data-save>保存此账户设置</button></div>
       </section>`;
     }).join('');
     document.querySelectorAll('[data-field=route_mode]').forEach(el=>el.onchange=()=>{el.closest('.panel').querySelector('[data-custom-route]').style.display=el.value==='custom'?'':'none'});
     document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>saveAccount(btn.closest('.card')));
+    document.querySelectorAll('[data-remove]').forEach(btn=>btn.onclick=()=>removeAccount(btn.closest('.card')));
     document.querySelectorAll('[data-target]').forEach(input=>input.onchange=event=>{
       if(input.dataset.eligible!=='1'&&input.checked){
         input.checked=false;
@@ -219,10 +221,38 @@
     if(!r?.success){message((r?.message||'账户与计划设置保存失败')+'；本次修改已整体回滚',true);return}
     dirty=false;await load();message('账户、日报路由和监控计划已保存');
   }
+  async function removeAccount(card){
+    const name=card.querySelector('.account-name')?.textContent||'该账户';
+    if(!window.confirm(`确定从工具中删除“${name}”吗？\n\n删除后该账户不再显示，监控、追投、停投和日报会立即关闭；历史操作流水仍会保留。`))return;
+    const a=await waitApi();const r=await a.removeQianchuanAccount(card.dataset.account);
+    if(!r?.success){message(r?.message||'删除账户失败',true);return}
+    dirty=false;await load();message(r?.message||'账户已删除');
+  }
   async function discover(){
-    const a=await waitApi();const r=await a.startQianchuanCatalogSync();message(r?.message||'已在后台使用无头Chrome开始只读同步，不会提交任何千川操作',!r?.success);
+    const a=await waitApi();const r=await a.startQianchuanCatalogSync();message(r?.message||'已在后台使用无头Chrome刷新已添加账户，不会导入其他授权账户，也不会提交任何千川操作',!r?.success);
     if(!r?.success)return;$('discover').disabled=true;
-    const timer=setInterval(async()=>{const s=await a.getQianchuanCatalogSyncStatus();const progress=s?.total_accounts?`（${s.processed_accounts||0}/${s.total_accounts}${s.current_account?' · '+s.current_account:''}）`:'';message((s?.message||'正在同步授权账户和计划目录')+progress,!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;await load()}},1000);
+    const timer=setInterval(async()=>{const s=await a.getQianchuanCatalogSyncStatus();const progress=s?.total_accounts?`（${s.processed_accounts||0}/${s.total_accounts}${s.current_account?' · '+s.current_account:''}）`:'';message((s?.message||'正在同步已添加账户和计划目录')+progress,!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;await load()}},1000);
+  }
+  async function addAccount(){
+    $('addAccount').disabled=true;
+    const a=await waitApi();let r;
+    try{r=await a.startPromotionTargetDiscovery()}catch(e){r={success:false,message:String(e?.message||e)}}
+    message(r?.message||'Chrome正在启动。请切换到要添加的千川账户，并打开该账户任意一条计划详情。',!r?.success);
+    if(!r?.success){$('addAccount').disabled=false;return}
+    const timer=setInterval(async()=>{
+      const s=await a.getPromotionTargetDiscoveryStatus();
+      message(s?.message||'请在Chrome中切换到要添加的账户，并打开任意一条计划详情。',!s?.success);
+      if(!s?.running){
+        clearInterval(timer);$('addAccount').disabled=false;
+        await load();
+        if(s?.success&&s?.target){
+          message('当前千川账户已添加，正在刷新这个账户及其他已添加账户的计划。');
+          await discover();
+        }else{
+          message(s?.message||'未完成账户添加，请重试。',true);
+        }
+      }
+    },1000);
   }
   async function relogin(){
     $('relogin').disabled=true;
@@ -250,9 +280,7 @@
         clearInterval(timer);$('relogin').disabled=false;
         if(s?.success&&s?.relogin_complete){
           await load();
-          message('千川登录成功，正在重新同步全部账户和计划。');
-          await new Promise(resolve=>setTimeout(resolve,1200));
-          await discover();
+          message('千川登录成功并已加密保存。工具没有自动添加任何授权账户；请点击“选择并添加当前账户”。');
         }else{
           await load();
           message(s?.message||'千川重新登录未完成，请重试。',true);
@@ -260,7 +288,7 @@
       }
     },1000);
   }
-  $('relogin').onclick=relogin;$('discover').onclick=discover;$('refresh').onclick=load;
+  $('relogin').onclick=relogin;$('addAccount').onclick=addAccount;$('discover').onclick=discover;$('refresh').onclick=load;
   function rerenderCatalogFilter(){
     if(dirty){
       message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);

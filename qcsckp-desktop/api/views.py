@@ -205,6 +205,21 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def removeQianchuanAccount(self, account_uid=None):
+        from services.qianchuan_accounts import remove_qianchuan_account
+
+        try:
+            return {
+                "success": True,
+                "data": remove_qianchuan_account(
+                    account_uid,
+                    db=self.db,
+                ),
+                "message": "账户已从工具中移除，相关自动化和日报已关闭",
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
     def startQianchuanCatalogSync(self):
         try:
             return self.service.start_catalog_sync()

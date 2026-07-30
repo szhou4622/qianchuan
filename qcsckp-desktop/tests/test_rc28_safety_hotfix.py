@@ -23,6 +23,7 @@ from services.qianchuan_accounts import (
     migrate_existing_qianchuan_accounts,
     save_qianchuan_account_automation_setup,
 )
+from services.qianchuan_session import save_context_storage_state
 from services.retargeting_service import QianChuanRetargetingService
 from services.run_services import (
     CatalogLoginRequired,
@@ -66,6 +67,99 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
             trusted_catalog=True,
             db=self.db,
         )
+
+    def test_visible_login_state_captures_session_storage(self):
+        class FakePage:
+            async def is_closed(self):
+                return False
+
+            async def evaluate(self, _script):
+                return {
+                    "origin": "https://qianchuan.jinritemai.com",
+                    "entries": {"session-token": "opaque-value"},
+                }
+
+        class FakeContext:
+            pages = [FakePage()]
+
+            async def storage_state(self, *, indexed_db=None):
+                self.indexed_db = indexed_db
+                return {"cookies": [], "origins": []}
+
+        context = FakeContext()
+        with patch(
+            "services.qianchuan_session.save_qianchuan_storage_state",
+            side_effect=lambda state, **_kwargs: state,
+        ):
+            saved = asyncio.run(
+                save_context_storage_state(
+                    context,
+                    owner_username=self.owner,
+                )
+            )
+        self.assertTrue(context.indexed_db)
+        self.assertEqual(
+            saved["_qcsckp_session_storage"][
+                "https://qianchuan.jinritemai.com"
+            ]["session-token"],
+            "opaque-value",
+        )
+
+    def test_fetcher_restores_encrypted_session_storage_before_navigation(self):
+        captured = {}
+
+        class FakeContext:
+            async def add_init_script(self, *, script):
+                captured["script"] = script
+
+            async def new_page(self):
+                return object()
+
+        class FakeBrowser:
+            async def new_context(self, **kwargs):
+                captured["context_kwargs"] = kwargs
+                return FakeContext()
+
+        class FakeChromium:
+            async def launch(self, **_kwargs):
+                return FakeBrowser()
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        class FakeStarter:
+            async def start(self):
+                return FakePlaywright()
+
+        fetcher = QianChuanFetcher(
+            headless=True,
+            storage_state={
+                "cookies": [],
+                "origins": [],
+                "_qcsckp_session_storage": {
+                    "https://qianchuan.jinritemai.com": {
+                        "session-token": "opaque-value"
+                    }
+                },
+            },
+        )
+        with (
+            patch(
+                "services.fetcher.async_playwright",
+                return_value=FakeStarter(),
+            ),
+            patch(
+                "services.fetcher.require_executable_path",
+                return_value="chrome.exe",
+            ),
+        ):
+            asyncio.run(fetcher._init_browser())
+        self.assertNotIn(
+            "_qcsckp_session_storage",
+            captured["context_kwargs"]["storage_state"],
+        )
+        self.assertIn("sessionStorage.setItem", captured["script"])
+        self.assertIn("session-token", captured["script"])
 
     def test_existing_ineligible_selection_no_longer_deadlocks_account_save(self):
         account = ensure_qianchuan_account(
@@ -820,6 +914,12 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         cfg.normalize_paths = lambda: cfg
         controller = ServiceController()
         invalid = Mock()
+        ensure_qianchuan_account(
+            "10001",
+            account_name="账户",
+            owner_username=self.owner,
+            db=self.db,
+        )
         with (
             patch(
                 "services.run_services.current_session_owner",
@@ -929,6 +1029,12 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         cfg.normalize_paths = lambda: cfg
         controller = ServiceController()
         invalid = Mock()
+        ensure_qianchuan_account(
+            "10001",
+            account_name="账户",
+            owner_username=self.owner,
+            db=self.db,
+        )
         with (
             patch(
                 "services.run_services.current_session_owner",

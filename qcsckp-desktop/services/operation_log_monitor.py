@@ -588,6 +588,7 @@ async def _handle_response(
             ensure_qianchuan_account(
                 aavid,
                 owner_username=owner_username or None,
+                directory_selected=False,
             ).get("account_uid")
             or ""
         )

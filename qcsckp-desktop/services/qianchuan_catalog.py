@@ -56,7 +56,7 @@ def mark_catalog_sync_started(*, owner_username: Any = None) -> Dict[str, Any]:
                 "running": True,
                 "started_at": _text(now),
                 "finished_at": "",
-                "message": "正在只读同步授权账户和计划目录",
+                "message": "正在只读同步已添加账户和计划目录",
                 "status": "syncing",
                 "error": "",
                 "failure_kind": "",
@@ -86,6 +86,41 @@ def mark_catalog_sync_progress(
                 "total_accounts": max(0, int(total_accounts)),
                 "current_account": str(current_account or "")[:256],
                 "message": str(message or "正在只读同步账户计划目录")[:1000],
+            }
+        )
+        return dict(_STATE)
+
+
+def clear_catalog_login_failure(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """可见 Chrome 重新登录成功后清除旧目录任务留下的登录失败状态。"""
+    owner = _owner_key(owner_username)
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    store.update(
+        "qianchuan_account",
+        {
+            "catalog_status": "not_synced",
+            "catalog_error": "",
+        },
+        where={"owner_username": owner, "directory_selected": 1},
+    )
+    with _LOCK:
+        _STATE.update(
+            {
+                "owner_username": owner,
+                "running": False,
+                "message": "千川登录已更新；请选择并添加账户，或刷新已添加账户计划",
+                "status": "not_synced",
+                "error": "",
+                "failure_kind": "",
+                "recovery_action": "",
+                "processed_accounts": 0,
+                "total_accounts": 0,
+                "current_account": "",
             }
         )
         return dict(_STATE)

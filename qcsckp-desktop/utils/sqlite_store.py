@@ -119,6 +119,9 @@ class SQLiteStore:
                 'owner_username': "TEXT NOT NULL DEFAULT 'local_default'",
                 'aavid': 'TEXT NOT NULL',
                 'account_name': 'TEXT',
+                # 只有用户明确选择/添加的账户才进入账户管理和自动化。
+                # NULL 仅用于从旧版本一次性迁移，0 为已移除，1 为已选择。
+                'directory_selected': 'INTEGER CHECK (directory_selected IN (0, 1))',
                 'enabled': 'INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))',
                 'report_enabled': 'INTEGER NOT NULL DEFAULT 0 CHECK (report_enabled IN (0, 1))',
                 'route_mode': "TEXT NOT NULL DEFAULT 'default' CHECK (route_mode IN ('default', 'custom'))",

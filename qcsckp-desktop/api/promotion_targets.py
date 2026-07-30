@@ -471,11 +471,14 @@ def list_promotion_targets(
 ) -> List[Dict[str, Any]]:
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
+    from services.qianchuan_accounts import _initialize_directory_selection
+
+    _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     sql = (
         "SELECT t.* FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
-        "WHERE a.owner_username=?"
+        "WHERE a.owner_username=? AND a.directory_selected=1"
     )
     params: List[Any] = [owner]
     if enabled is not None:
@@ -503,10 +506,14 @@ def get_promotion_target(
         )
         return _target_row(row) if row else None
     init_sqlite_schema(database=store.config.get("database"))
+    from services.qianchuan_accounts import _initialize_directory_selection
+
+    _initialize_directory_selection(store)
     rows = store.execute(
         "SELECT t.* FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
-        "WHERE t.target_uid=? AND a.owner_username=? LIMIT 1",
+        "WHERE t.target_uid=? AND a.owner_username=? "
+        "AND a.directory_selected=1 LIMIT 1",
         (uid, _owner_key(owner_username)),
         fetch=True,
     ) or []
@@ -737,6 +744,7 @@ def upsert_promotion_target(
         aavid,
         account_name=data.get("account_name") or "",
         owner_username=owner_username,
+        directory_selected=True,
         seen=True,
         db=store,
     )

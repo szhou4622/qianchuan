@@ -122,6 +122,7 @@ def ensure_qianchuan_account(
     *,
     account_name: Any = "",
     owner_username: Any = None,
+    directory_selected: Optional[bool] = True,
     enabled: Optional[bool] = None,
     report_enabled: Optional[bool] = None,
     seen: bool = False,
@@ -129,6 +130,7 @@ def ensure_qianchuan_account(
 ) -> Dict[str, Any]:
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
+    _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     aid = str(aavid or "").strip()
     uid = make_account_uid(aid, owner)
@@ -145,6 +147,14 @@ def ensure_qianchuan_account(
             or (existing or {}).get("account_name")
             or f"千川账户 {aid}"
         ).strip()[:256],
+        "directory_selected": (
+            1
+            if (
+                bool((existing or {}).get("directory_selected"))
+                or bool(directory_selected)
+            )
+            else 0
+        ),
         "enabled": (
             1
             if (
@@ -189,6 +199,7 @@ def ensure_qianchuan_account(
 
 def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
     out = dict(row)
+    out["directory_selected"] = bool(out.get("directory_selected"))
     out["enabled"] = bool(out.get("enabled"))
     out["report_enabled"] = bool(out.get("report_enabled"))
     out["route_send_personal"] = bool(out.get("route_send_personal"))
@@ -255,10 +266,11 @@ def list_qianchuan_accounts(
 ) -> List[Dict[str, Any]]:
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
+    _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     rows = store.select(
         "qianchuan_account",
-        where={"owner_username": owner},
+        where={"owner_username": owner, "directory_selected": 1},
         order_by="enabled DESC, account_name ASC, aavid ASC",
     )
     return [_account_row(row, store) for row in rows]
@@ -272,6 +284,7 @@ def get_qianchuan_account(
 ) -> Optional[Dict[str, Any]]:
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
+    _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     text = str(value or "").strip()
     if not text:
@@ -287,6 +300,91 @@ def get_qianchuan_account(
             where={"aavid": text, "owner_username": owner},
         )
     return _account_row(row, store) if row else None
+
+
+def _initialize_directory_selection(store: SQLiteStore) -> None:
+    """把 rc28.2 以前真正使用过的账户保留为已选择，其余自动发现账户隐藏。"""
+    store.execute(
+        "UPDATE qianchuan_account SET directory_selected=1 "
+        "WHERE directory_selected IS NULL AND ("
+        "enabled=1 OR report_enabled=1 OR EXISTS("
+        "SELECT 1 FROM promotion_target t "
+        "WHERE t.account_uid=qianchuan_account.account_uid"
+        "))"
+    )
+    store.execute(
+        "UPDATE qianchuan_account SET directory_selected=0 "
+        "WHERE directory_selected IS NULL"
+    )
+
+
+def remove_qianchuan_account(
+    value: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """从用户目录移除账户，同时关闭该账户全部自动化但保留历史流水。"""
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    account = get_qianchuan_account(
+        value,
+        owner_username=owner_username,
+        db=store,
+    )
+    if not account or not account.get("directory_selected"):
+        raise ValueError("千川账户不存在或已经移除")
+    now_text = _now_text()
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        store.update(
+            "qianchuan_account",
+            {
+                "directory_selected": 0,
+                "enabled": 0,
+                "report_enabled": 0,
+                "last_status": "removed",
+                "last_error": "",
+            },
+            where={
+                "account_uid": account["account_uid"],
+                "owner_username": account["owner_username"],
+            },
+            connection=conn,
+        )
+        store.update(
+            "promotion_target",
+            {"enabled": 0, "capacity_state": "disabled"},
+            where={"account_uid": account["account_uid"]},
+            connection=conn,
+        )
+        store.execute(
+            "UPDATE local_retarget_task SET status='cancelled',"
+            "active_dedupe_key=NULL,result_message=?,finished_at=?,updated_at=? "
+            "WHERE qianchuan_account_uid=? "
+            "AND status IN ('pending','approved_queued','claimed')",
+            (
+                "千川账户已从工具中移除",
+                now_text,
+                now_text,
+                account["account_uid"],
+            ),
+            connection=conn,
+        )
+    refresh_monitor_capacity(
+        owner_username=account.get("owner_username"),
+        db=store,
+    )
+    _sync_daily_selected_aavids(
+        account.get("owner_username"),
+        db=store,
+    )
+    return {
+        "account_uid": account["account_uid"],
+        "aavid": account["aavid"],
+        "account_name": account.get("account_name") or "",
+        "removed": True,
+    }
 
 
 def save_qianchuan_account_settings(
@@ -546,6 +644,7 @@ def bind_target_account_scope(
         account_view = ensure_qianchuan_account(
             target.get("aadvid"),
             owner_username=owner_username,
+            directory_selected=False,
             db=store,
         )
         account_uid = str(account_view["account_uid"])
@@ -855,6 +954,11 @@ def migrate_existing_qianchuan_accounts(
             aid,
             account_name=weak_legacy_name,
             owner_username=owner,
+            directory_selected=(
+                bool((existing or {}).get("directory_selected"))
+                if existing
+                else True
+            ),
             # 旧日报配置只用于首次建目录；后续读取页面不能覆盖用户刚保存的选择。
             report_enabled=(aid in selected) if not existing else None,
             db=store,
@@ -944,6 +1048,7 @@ def upsert_authorized_accounts(
                     or ""
                 ),
                 owner_username=owner_username,
+                directory_selected=False,
                 seen=True,
                 db=store,
             )

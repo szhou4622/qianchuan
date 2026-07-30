@@ -199,11 +199,42 @@ class QianChuanFetcher:
         else:
             # 默认 win UA
             user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        context_state = self.storage_state
+        session_storage = {}
+        if isinstance(context_state, dict):
+            session_storage = context_state.get(
+                "_qcsckp_session_storage"
+            ) or {}
+            # Playwright 不接受自定义字段；只把标准 storage_state 交给
+            # new_context，sessionStorage 通过初始化脚本恢复。
+            context_state = {
+                key: value
+                for key, value in context_state.items()
+                if key in {"cookies", "origins"}
+            }
         self.context = await self.browser.new_context(
             user_agent=user_agent,
             viewport={'width': 1280, 'height': 720},
-            storage_state=self.storage_state
+            storage_state=context_state
         )
+        if isinstance(session_storage, dict) and session_storage:
+            serialized = json.dumps(
+                session_storage,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            await self.context.add_init_script(
+                script=(
+                    "(() => {"
+                    f"const stores={serialized};"
+                    "const values=stores[location.origin];"
+                    "if(!values||typeof values!=='object')return;"
+                    "for(const [key,value] of Object.entries(values)){"
+                    "try{sessionStorage.setItem(key,String(value));}catch(_e){}"
+                    "}"
+                    "})();"
+                )
+            )
         self.page = await self.context.new_page()
 
     @staticmethod

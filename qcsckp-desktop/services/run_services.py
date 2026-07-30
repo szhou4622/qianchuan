@@ -35,7 +35,6 @@ from services.qianchuan_accounts import (
     migrate_existing_qianchuan_accounts,
     record_target_duration,
     schedulable_promotion_targets,
-    upsert_authorized_accounts,
 )
 from services.qianchuan_session import (
     automation_session_ready,
@@ -1157,6 +1156,17 @@ class ServiceController:
                 "failure_kind": "login_required",
                 "recovery_action": "open_visible_chrome",
             }
+        cfg = ServiceConfig().normalize_paths()
+        if not list_qianchuan_accounts(
+            owner_username=owner,
+            db=SQLiteStore(database=cfg.db_path),
+        ):
+            return {
+                "success": False,
+                "running": False,
+                "message": "尚未添加千川账户，请先选择并添加当前账户",
+                "failure_kind": "account_required",
+            }
         mark_catalog_sync_started(
             owner_username=owner
         )
@@ -1610,15 +1620,14 @@ class ServiceController:
             raise RuntimeError("千川登录状态不存在")
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
+        accounts = list_qianchuan_accounts(
+            owner_username=owner,
+            db=db,
+        )
         fetcher = QianChuanFetcher(headless=True, storage_state=state)
         account_results: Dict[str, Dict[str, Any]] = {}
-        account_catalog_status: Dict[str, Any] = {
-            "complete": False,
-            "observed": 0,
-            "total": 0,
-        }
         async with exclusive_browser_operation(
-            "账户计划目录同步",
+            "已添加账户计划目录同步",
             timeout_seconds=1800,
         ):
             await fetcher._init_browser()
@@ -1631,24 +1640,17 @@ class ServiceController:
                     timeout=60_000,
                 )
                 _require_catalog_login(fetcher.page)
-                accounts = await probe.discover_authorized_accounts(
-                    fetcher.page,
-                    timeout_ms=30_000,
-                )
-                if not accounts:
-                    raise RuntimeError("未能读取千川右上角的授权账户目录")
                 _require_session_owner(owner)
-                _require_catalog_login(fetcher.page)
-                account_catalog_status = (
-                    probe.authorized_account_catalog_status()
-                )
-                upsert_authorized_accounts(
-                    accounts,
-                    owner_username=owner,
-                    db=db,
-                )
-                # 旧版无归属数据只能在当前千川会话已经明确授权该 aavid 后迁移，
-                # 不能由第一个登录的工具账号直接认领全部历史记录。
+                if not accounts:
+                    finalize_catalog_sync(
+                        owner_username=owner,
+                        account_results={},
+                        error="尚未添加千川账户；请先选择当前账户并添加",
+                        db=db,
+                    )
+                    return
+                # 只迁移用户已经明确添加的账户。右上角授权账户列表不再用于
+                # 自动建目录，也不会把同一登录身份下的全部 aavid 写入工具。
                 migrate_existing_qianchuan_accounts(
                     owner_username=owner,
                     authorized_aavids={
@@ -1656,36 +1658,6 @@ class ServiceController:
                     },
                     db=db,
                 )
-                authorized_ids = {
-                    str(item.get("aavid") or "") for item in accounts
-                }
-                if account_catalog_status.get("complete"):
-                    for old_account in list_qianchuan_accounts(
-                        owner_username=owner,
-                        db=db,
-                    ):
-                        if str(old_account.get("aavid") or "") in authorized_ids:
-                            continue
-                        db.update(
-                            "qianchuan_account",
-                            {
-                                "enabled": 0,
-                                "last_status": "authorization_missing",
-                                "last_error": "本次完整授权账户目录中未发现该账户",
-                            },
-                            where={
-                                "account_uid": old_account["account_uid"],
-                                "owner_username": owner,
-                            },
-                        )
-                        db.update(
-                            "promotion_target",
-                            {
-                                "enabled": 0,
-                                "capacity_state": "disabled",
-                            },
-                            where={"account_uid": old_account["account_uid"]},
-                        )
                 total = len(accounts)
                 for index, account in enumerate(accounts, 1):
                     _require_session_owner(owner)
@@ -1726,7 +1698,7 @@ class ServiceController:
                         processed_accounts=index,
                         total_accounts=total,
                         current_account=account.get("account_name"),
-                        message=f"已处理 {index}/{total} 个授权账户",
+                        message=f"已处理 {index}/{total} 个已添加账户",
                     )
                 _require_session_owner(owner)
                 await save_context_storage_state(
@@ -1738,15 +1710,7 @@ class ServiceController:
         finalize_catalog_sync(
             owner_username=owner,
             account_results=account_results,
-            error=(
-                ""
-                if account_catalog_status.get("complete")
-                else (
-                    "授权账户目录分页未完整，已保留历史账户启用状态；"
-                    f"本次观察 {account_catalog_status.get('observed', 0)}/"
-                    f"{account_catalog_status.get('total', 0)} 个账户"
-                )
-            ),
+            error="",
             db=db,
         )
 
@@ -1787,6 +1751,13 @@ class ServiceController:
             owner_username=session_owner,
             db=db,
         )
+        selected_account_uids = {
+            str(item.get("account_uid") or "")
+            for item in list_qianchuan_accounts(
+                owner_username=session_owner,
+                db=db,
+            )
+        }
         # 已登记但尚未经过 rc27 详情核验的旧计划，允许用户重新打开详情
         # 完成验证；只有已验证主计划才提示“已在列表中”。
         known_verified_target_keys = {
@@ -1795,6 +1766,7 @@ class ServiceController:
                 str(item.get("ad_id") or ""),
             )
             for item in known_targets
+            if str(item.get("account_uid") or "") in selected_account_uids
             if str(item.get("verification_state") or "").strip().lower()
             == "verified"
         }
@@ -1916,12 +1888,6 @@ class ServiceController:
                         authenticated = bool(accounts)
                     if authenticated:
                         _require_session_owner(session_owner)
-                        if accounts:
-                            upsert_authorized_accounts(
-                                accounts,
-                                owner_username=session_owner,
-                                db=db,
-                            )
                         if fetcher.context:
                             await save_context_storage_state(
                                 fetcher.context,
@@ -1930,13 +1896,22 @@ class ServiceController:
                         mark_qianchuan_session_available(
                             owner_username=session_owner,
                         )
+                        from services.qianchuan_catalog import (
+                            clear_catalog_login_failure,
+                        )
+
+                        clear_catalog_login_failure(
+                            owner_username=session_owner,
+                            db=db,
+                        )
                         with self._lock:
                             self._target_discovery_status = {
                                 "success": True,
                                 "running": False,
                                 "message": (
-                                    "千川重新登录成功，Cookie已保存；"
-                                    "登录Chrome已自动关闭，正在准备无头同步账户和计划"
+                                    "千川重新登录成功，会话已加密保存；"
+                                    "登录Chrome已自动关闭。不会自动添加授权账户，"
+                                    "请按需选择并添加当前账户"
                                 ),
                                 "target": None,
                                 "relogin_complete": True,
@@ -2073,10 +2048,21 @@ class ServiceController:
                 else None,
             )
             _require_session_owner(session_owner)
+            selected_account = next(
+                (
+                    item
+                    for item in probe.authorized_accounts()
+                    if str(item.get("aavid") or "") == str(aavid)
+                ),
+                {},
+            )
             target = upsert_promotion_target(
                 {
                     "aavid": aavid,
                     "ad_id": ad_id,
+                    "account_name": str(
+                        selected_account.get("account_name") or ""
+                    ),
                     "plan_name": plan_name,
                     "promotion_scene": target_scene,
                     "plan_system": target_plan_system,
@@ -2092,11 +2078,6 @@ class ServiceController:
                 },
                 owner_username=session_owner,
                 trusted_catalog=True,
-                db=db,
-            )
-            upsert_authorized_accounts(
-                probe.authorized_accounts(),
-                owner_username=session_owner,
                 db=db,
             )
             if target_scene == "product":
@@ -2343,10 +2324,21 @@ class ServiceController:
                     )
                     break
         _require_session_owner(session_owner)
+        selected_account = next(
+            (
+                item
+                for item in probe.authorized_accounts()
+                if str(item.get("aavid") or "") == str(aavid)
+            ),
+            {},
+        )
         target = upsert_promotion_target(
             {
                 "aavid": aavid,
                 "ad_id": ad_id,
+                "account_name": str(
+                    selected_account.get("account_name") or ""
+                ),
                 "plan_name": plan_name,
                 "promotion_scene": promotion_scene,
                 "plan_system": plan_system,
@@ -2373,11 +2365,6 @@ class ServiceController:
             },
             owner_username=session_owner,
             trusted_catalog=True,
-            db=db,
-        )
-        upsert_authorized_accounts(
-            probe.authorized_accounts(),
-            owner_username=session_owner,
             db=db,
         )
         if promotion_scene == "product":

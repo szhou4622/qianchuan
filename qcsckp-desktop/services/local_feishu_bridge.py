@@ -2121,6 +2121,7 @@ def _create_local_retarget_task_for(
         required["aavid"],
         account_name=payload.get("account_name") or "",
         owner_username=account,
+        directory_selected=False,
         db=task_store,
     )
     target, _target_account = bind_target_account_scope(
@@ -2355,6 +2356,7 @@ def create_local_stop_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         required["aavid"],
         account_name=snapshot.get("account_name") or "",
         owner_username=account,
+        directory_selected=False,
         db=store,
     )
     if not qianchuan_account.get("enabled"):

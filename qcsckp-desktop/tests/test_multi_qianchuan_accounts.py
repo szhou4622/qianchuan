@@ -23,10 +23,12 @@ from services.qianchuan_accounts import (
     get_qianchuan_account,
     list_qianchuan_accounts,
     migrate_existing_qianchuan_accounts,
+    remove_qianchuan_account,
     resolve_account_feishu_targets,
     record_target_duration,
     save_qianchuan_account_settings,
     schedulable_promotion_targets,
+    upsert_authorized_accounts,
 )
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -115,6 +117,105 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         )
         self.assertEqual(["retarget"], [row["action_type"] for row in rows_a])
         self.assertEqual(["stop"], [row["action_type"] for row in rows_b])
+
+    def test_authorized_account_catalog_is_not_auto_added_to_user_directory(self):
+        upsert_authorized_accounts(
+            [
+                {"aavid": "10001", "account_name": "授权账户一"},
+                {"aavid": "10002", "account_name": "授权账户二"},
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertEqual(
+            list_qianchuan_accounts(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+            [],
+        )
+        self.assertEqual(
+            list_promotion_targets(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+            [],
+        )
+        ensure_qianchuan_account(
+            "10002",
+            account_name="用户选择的账户",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        accounts = list_qianchuan_accounts(
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertEqual([item["aavid"] for item in accounts], ["10002"])
+        self.assertEqual(accounts[0]["account_name"], "用户选择的账户")
+
+    def test_remove_account_hides_it_and_disables_all_targets(self):
+        target = self._target("10001", 1)
+        account = get_qianchuan_account(
+            "10001",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        result = remove_qianchuan_account(
+            account["account_uid"],
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertTrue(result["removed"])
+        self.assertEqual(
+            list_qianchuan_accounts(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+            [],
+        )
+        self.assertEqual(
+            list_promotion_targets(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+            [],
+        )
+        removed = self.db.select_one(
+            "qianchuan_account",
+            where={"account_uid": account["account_uid"]},
+        )
+        self.assertEqual(int(removed["directory_selected"]), 0)
+        self.assertEqual(int(removed["enabled"]), 0)
+        saved_target = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertEqual(int(saved_target["enabled"]), 0)
+        self.assertEqual(saved_target["capacity_state"], "disabled")
+        migrate_existing_qianchuan_accounts(
+            owner_username="tool-owner",
+            authorized_aavids={"10001"},
+            db=self.db,
+        )
+        upsert_operation_event(
+            {
+                "event_uid": "removed-account-history",
+                "aavid": "10001",
+                "source": "platform_log",
+                "action_type": "other",
+                "status": "success",
+                "occurred_at": "2026-07-30 22:00:00",
+            },
+            db=self.db,
+        )
+        self.assertEqual(
+            list_qianchuan_accounts(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+            [],
+        )
 
     def test_legacy_user_display_name_does_not_overwrite_account_name(self):
         account = ensure_qianchuan_account(

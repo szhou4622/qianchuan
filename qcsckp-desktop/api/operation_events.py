@@ -189,7 +189,11 @@ def upsert_operation_event(data: Dict[str, Any], db: Optional[SQLiteStore] = Non
     if aavid and not account_uid:
         from services.qianchuan_accounts import ensure_qianchuan_account
 
-        account_uid = ensure_qianchuan_account(aavid, db=store)["account_uid"]
+        account_uid = ensure_qianchuan_account(
+            aavid,
+            directory_selected=False,
+            db=store,
+        )["account_uid"]
     elif aavid and account_uid:
         account = store.select_one(
             "qianchuan_account",
@@ -525,6 +529,7 @@ def update_platform_sync_state(
         "account_uid": ensure_qianchuan_account(
             aid,
             owner_username=owner_username,
+            directory_selected=False,
             db=store,
         )["account_uid"],
     }
@@ -653,6 +658,7 @@ def ingest_platform_log_rows(
         ensure_qianchuan_account(
             aid,
             owner_username=owner_username,
+            directory_selected=False,
             db=store,
         ).get("account_uid")
         or ""

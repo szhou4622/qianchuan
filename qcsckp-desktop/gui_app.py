@@ -625,6 +625,9 @@ class JSApi:
             planStates,
         )
 
+    def removeQianchuanAccount(self, accountUid=None):
+        return self.api.removeQianchuanAccount(accountUid)
+
     def startQianchuanCatalogSync(self):
         return self.api.startQianchuanCatalogSync()
 
