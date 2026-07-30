@@ -136,6 +136,7 @@ class MultiQianchuanAccountTests(unittest.TestCase):
 
         migrate_existing_qianchuan_accounts(
             owner_username="tool-owner",
+            authorized_aavids={"10001"},
             db=self.db,
         )
 

@@ -35,6 +35,7 @@ from services.fetcher import build_qianchuan_url_by_params
 from services.product_scene_adapter import (
     find_visible_exact_text,
     goto_and_confirm_product_target,
+    validate_exact_product_target_payload,
 )
 from services.plan_system import (
     confirm_live_page_plan_system,
@@ -289,6 +290,121 @@ class QianChuanRetargetingService:
             retargeting_json=_safe_json(r),
             finished_at=_now_ts(),
             headless=bool(self._opt.headless),
+        )
+
+    async def _confirm_live_target_delivering(
+        self,
+        page: Page,
+        *,
+        expected_aavid: Any,
+        expected_ad_id: Any,
+    ) -> Optional[str]:
+        """提交前只读复核直播主计划身份与明确的投放中状态。"""
+        aavid = str(expected_aavid or "").strip()
+        ad_id = str(expected_ad_id or "").strip()
+        if not aavid.isdigit() or not ad_id.isdigit():
+            return "直播追投缺少有效账户或计划ID，已安全停止"
+        try:
+            response = await page.evaluate(
+                """async ({ aavid, adId }) => {
+                    const query = new URLSearchParams({ aavid, adid: adId });
+                    const result = await fetch(
+                        `/ad/api/creation/v1/ad/ad-detail-basic?${query.toString()}`,
+                        { credentials: "include" }
+                    );
+                    let payload = null;
+                    try { payload = await result.json(); } catch (_) {}
+                    return { httpStatus: result.status, payload };
+                }""",
+                {"aavid": aavid, "adId": ad_id},
+            )
+        except Exception as exc:
+            return f"直播计划投放状态复核失败：{exc}"
+        if not isinstance(response, dict) or int(
+            response.get("httpStatus") or 0
+        ) != 200:
+            return "直播计划投放状态接口无有效响应，已安全停止"
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            return "直播计划投放状态响应格式异常，已安全停止"
+        status_code = payload.get("status_code")
+        if status_code not in (None, 0, "0"):
+            return str(payload.get("message") or "直播计划投放状态接口返回失败")
+        data = payload.get("data")
+        data = data if isinstance(data, dict) else {}
+        detail = data.get("adDetailInfo")
+        if not isinstance(detail, dict):
+            return "直播计划详情未返回主计划，已安全停止"
+        actual_ad_id = str(
+            detail.get("id") or detail.get("adId") or detail.get("ad_id") or ""
+        ).strip()
+        if actual_ad_id != ad_id:
+            return (
+                f"直播计划不匹配：期望 {ad_id}，实际 "
+                f"{actual_ad_id or '未返回'}"
+            )
+        actual_aavid = str(
+            detail.get("advId")
+            or detail.get("aavid")
+            or detail.get("advertiserId")
+            or data.get("advId")
+            or data.get("aavid")
+            or data.get("advertiserId")
+            or ""
+        ).strip()
+        if actual_aavid != aavid:
+            return (
+                f"直播计划账户不匹配：期望 {aavid}，实际 "
+                f"{actual_aavid or '未返回'}"
+            )
+        delivery_name = str(detail.get("adDeliveryName") or "").strip()
+        try:
+            delivery_type = int(detail.get("adDeliveryType"))
+        except (TypeError, ValueError):
+            delivery_type = -1
+        if delivery_name != "投放中" or delivery_type != 0:
+            return (
+                "直播计划当前未取得明确投放中证据："
+                f"{delivery_name or '未知状态'} / {delivery_type}"
+            )
+        return None
+
+    async def _confirm_product_target_delivering(
+        self,
+        page: Page,
+        *,
+        expected_aavid: Any,
+        expected_ad_id: Any,
+        expected_plan_system: Any,
+    ) -> Optional[str]:
+        """商品追投最终提交前重新读取精确主计划详情，未知即拒绝。"""
+        aavid = str(expected_aavid or "").strip()
+        ad_id = str(expected_ad_id or "").strip()
+        if not aavid.isdigit() or not ad_id.isdigit():
+            return "商品追投缺少有效账户或计划ID，已安全停止"
+        try:
+            payload = await page.evaluate(
+                """async ({ aavid, adId }) => {
+                    const query = new URLSearchParams({ aavid, adid: adId });
+                    const response = await fetch(
+                        `/ad/api/creation/v1/ad/ad-detail-plus?${query.toString()}`,
+                        { credentials: "include" }
+                    );
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return await response.json();
+                }""",
+                {"aavid": aavid, "adId": ad_id},
+            )
+        except Exception as exc:
+            return f"商品计划投放状态复核失败：{exc}"
+        return validate_exact_product_target_payload(
+            payload,
+            expected_aavid=aavid,
+            expected_ad_id=ad_id,
+            expected_plan_system=expected_plan_system,
+            require_delivering=True,
         )
 
     # ---------- 页面操作（与 fetcher 一致：先素材 Tab 再视频） ----------
@@ -1351,6 +1467,42 @@ class QianChuanRetargetingService:
                         ad_id=ad_id,
                         material_id=material_id,
                     )
+
+                if scene == "live":
+                    live_gate_error = await self._confirm_live_target_delivering(
+                        page,
+                        expected_aavid=aavid,
+                        expected_ad_id=ad_id,
+                    )
+                    if live_gate_error:
+                        return self._make_result(
+                            success=False,
+                            message=live_gate_error,
+                            step="live_delivery_recheck",
+                            retargeting=rdict,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=material_id,
+                        )
+                else:
+                    product_gate_error = (
+                        await self._confirm_product_target_delivering(
+                            page,
+                            expected_aavid=aavid,
+                            expected_ad_id=ad_id,
+                            expected_plan_system=system,
+                        )
+                    )
+                    if product_gate_error:
+                        return self._make_result(
+                            success=False,
+                            message=product_gate_error,
+                            step="product_delivery_recheck",
+                            retargeting=rdict,
+                            aavid=aavid,
+                            ad_id=ad_id,
+                            material_id=material_id,
+                        )
 
                 api_err, api_detail, rid = await self._click_submit_and_wait_assist(page)
                 if api_err:

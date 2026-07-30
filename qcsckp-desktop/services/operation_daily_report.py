@@ -252,6 +252,9 @@ def save_operation_daily_report_config(
         store = _store(database)
         migrate_existing_qianchuan_accounts(
             owner_username=account,
+            # 用户在日报配置中明确勾选的账户只获得报表归属；迁移后的
+            # 自动化计划仍保持禁用并等待千川目录精确核验。
+            authorized_aavids=selected,
             db=store,
         )
         for item in list_qianchuan_accounts(owner_username=account, db=store):

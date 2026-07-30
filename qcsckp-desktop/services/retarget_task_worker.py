@@ -45,10 +45,30 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 POLL_SECONDS = 5
+MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _timestamp_is_fresh(
+    value: Any,
+    *,
+    max_age_seconds: int = MAX_REVALIDATION_AGE_SECONDS,
+) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        observed_at = datetime.strptime(
+            text.replace("T", " ")[:19],
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except (TypeError, ValueError):
+        return False
+    age_seconds = (datetime.now() - observed_at).total_seconds()
+    return -300 <= age_seconds <= max(1, int(max_age_seconds))
 
 
 def _json(value: Any) -> str:
@@ -494,6 +514,13 @@ def _validate_task(
         raise RuntimeError("追投任务的千川账户归属已被篡改")
     if str(target.get("last_status") or "").strip().lower() != "ok":
         raise RuntimeError("监控计划当前不是投放中状态，已阻止追投")
+    if not legacy_test_double and not _timestamp_is_fresh(
+        target.get("last_sync_at")
+    ):
+        raise RuntimeError(
+            "监控计划最近一次采集已超过10分钟或时间无效，"
+            "必须等待新一轮实时数据后重新确认"
+        )
     if bool(target.get("automation_write_blocked")):
         raise RuntimeError(
             "该计划已触发自动写入安全封锁："
@@ -557,7 +584,39 @@ def _validate_task(
 
     period = str(cfg.get("trigger_query_period") or "1h")
     if target_uid:
-        target_rows = _latest_target_rows(target_uid, period)
+        raw_target_rows = _latest_target_rows(target_uid, period)
+        if not legacy_test_double:
+            selected_ids = {
+                material["material_id"] for material in materials
+            }
+            stale_ids = {
+                str(item.get("id") or "")
+                for item in raw_target_rows
+                if str(item.get("id") or "") in selected_ids
+                and not _timestamp_is_fresh(
+                    item.get("periodEndTime")
+                    or item.get("period_end_time")
+                    or item.get("createdAt")
+                    or item.get("created_at")
+                )
+            }
+            if stale_ids:
+                raise RuntimeError(
+                    "以下素材的实时数据已超过10分钟或时间无效："
+                    + "、".join(sorted(stale_ids))
+                )
+            target_rows = [
+                item
+                for item in raw_target_rows
+                if _timestamp_is_fresh(
+                    item.get("periodEndTime")
+                    or item.get("period_end_time")
+                    or item.get("createdAt")
+                    or item.get("created_at")
+                )
+            ]
+        else:
+            target_rows = raw_target_rows
         rows_by_id = {
             str(item.get("id") or ""): item
             for item in target_rows
@@ -569,6 +628,19 @@ def _validate_task(
         for material in materials:
             material_id = material["material_id"]
             row = _latest_material_row(aavid, material_id, period)
+            if (
+                row
+                and not legacy_test_double
+                and not _timestamp_is_fresh(
+                    row.get("periodEndTime")
+                    or row.get("period_end_time")
+                    or row.get("createdAt")
+                    or row.get("created_at")
+                )
+            ):
+                raise RuntimeError(
+                    f"素材 {material_id} 的实时数据已超过10分钟或时间无效"
+                )
             if row:
                 rows_by_id[material_id] = row
     missing_ids = [

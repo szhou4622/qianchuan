@@ -99,6 +99,16 @@ class Api:
             targets = self.listPromotionTargets().get("data") or []
             session = session_status()
             catalog = catalog_sync_status(db=self.db)
+            if catalog.get("failure_kind") == "login_required":
+                session = {
+                    **session,
+                    "status": "login_required",
+                    "last_error": str(
+                        catalog.get("error")
+                        or catalog.get("message")
+                        or "千川登录状态已失效"
+                    ),
+                }
             profile = feishu.get("profile") or {}
             feishu_bound = bool(feishu.get("connected")) and bool(
                 str(profile.get("authorized_open_id") or "").strip()
@@ -110,11 +120,15 @@ class Api:
             )
             retarget_config = load_rule_retargeting_config()
             stop_config = load_rule_regulation_config()
+            rules_saved = bool(retarget_config.get("enabled")) or bool(
+                stop_config.get("enabled")
+            )
             onboarding = {
                 "qianchuan_login": bool(session.get("available"))
                 and session.get("status") != "login_required",
-                "catalog_synced": bool(catalog.get("account_count"))
-                and catalog.get("status") in {"complete", "partial"},
+                "catalog_synced": bool(catalog.get("complete")),
+                "catalog_attempted": bool(catalog.get("account_count"))
+                and catalog.get("status") not in {"not_synced", "syncing"},
                 "catalog_complete": bool(catalog.get("complete")),
                 "feishu_bound": feishu_bound,
                 "account_routes": (
@@ -125,8 +139,10 @@ class Api:
                     )
                 ),
                 "plans_selected": plans_selected,
-                "rules_configured": bool(retarget_config.get("enabled"))
-                or bool(stop_config.get("enabled")),
+                "rules_configured": rules_saved and plans_selected,
+                "rules_saved_without_eligible_plan": (
+                    rules_saved and not plans_selected
+                ),
             }
             return {
                 "success": True,
@@ -547,6 +563,12 @@ class Api:
     def startPromotionTargetDiscovery(self):
         try:
             return self.service.start_target_discovery()
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def startQianchuanRelogin(self):
+        try:
+            return self.service.start_target_discovery(login_only=True)
         except Exception as e:
             return {"success": False, "message": str(e)}
 

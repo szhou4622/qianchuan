@@ -57,6 +57,7 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 DEFAULT_INTERVAL_SEC = 180
+MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 
 # 多策略并行上限（同一轮内各策略各起一个浏览器任务）
 MAX_STRATEGY_PARALLEL = 5
@@ -103,6 +104,25 @@ def _beijing_now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _timestamp_is_fresh(
+    value: Any,
+    *,
+    max_age_seconds: int = MAX_REVALIDATION_AGE_SECONDS,
+) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        observed_at = datetime.strptime(
+            text.replace("T", " ")[:19],
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except (TypeError, ValueError):
+        return False
+    age_seconds = (datetime.now() - observed_at).total_seconds()
+    return -300 <= age_seconds <= max(1, int(max_age_seconds))
+
+
 def _json_dumps(obj: Any) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
@@ -123,6 +143,7 @@ def block_target_after_rate_record_failure(
         db.execute(
             "UPDATE promotion_target SET last_status='error',last_error=?,"
             "automation_write_blocked=1,write_block_reason=?,"
+            "write_block_origin='rate_record_failure',"
             "write_blocked_at=datetime('now','+8 hours'),"
             "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
             (
@@ -297,6 +318,11 @@ def _revalidate_auto_retarget_under_lock(
         raise RuntimeError("当前账户、计划、推广场景或计划体系已经变化")
     if str(target.get("last_status") or "").strip().lower() != "ok":
         raise RuntimeError("监控计划当前状态异常")
+    if not _timestamp_is_fresh(target.get("last_sync_at")):
+        raise RuntimeError(
+            "监控计划最近一次采集已超过10分钟或时间无效，"
+            "必须等待新一轮实时数据"
+        )
     if bool(target.get("automation_write_blocked")):
         raise RuntimeError(
             "该计划已触发自动写入安全封锁："
@@ -337,7 +363,7 @@ def _revalidate_auto_retarget_under_lock(
         if isinstance(row, dict)
         and str(row.get("targetUid") or target_uid) == target_uid
     ]
-    material_row = next(
+    raw_material_row = next(
         (
             row
             for row in target_rows
@@ -346,8 +372,26 @@ def _revalidate_auto_retarget_under_lock(
         ),
         None,
     )
-    if not material_row:
+    if not raw_material_row:
         raise RuntimeError("素材已不在当前计划的最新数据中")
+    if not _timestamp_is_fresh(
+        raw_material_row.get("periodEndTime")
+        or raw_material_row.get("period_end_time")
+        or raw_material_row.get("createdAt")
+        or raw_material_row.get("created_at")
+    ):
+        raise RuntimeError("素材实时数据已超过10分钟或时间无效")
+    target_rows = [
+        row
+        for row in target_rows
+        if _timestamp_is_fresh(
+            row.get("periodEndTime")
+            or row.get("period_end_time")
+            or row.get("createdAt")
+            or row.get("created_at")
+        )
+    ]
+    material_row = raw_material_row
 
     trigger_level = str(
         current_strategy.get("trigger_level") or "material"

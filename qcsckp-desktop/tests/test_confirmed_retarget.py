@@ -159,6 +159,7 @@ class RetargetConfigTests(unittest.TestCase):
             "promotion_scene": "live",
             "plan_system": "global",
             "last_status": "ok",
+            "last_sync_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "enabled": 1,
             "monitor_eligible": 1,
             "retarget_eligible": 1,
@@ -184,6 +185,9 @@ class RetargetConfigTests(unittest.TestCase):
                             "targetUid": "target-live",
                             "aadvid": "10001",
                             "id": "m1",
+                            "periodEndTime": datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
                         }
                     ],
                 }
@@ -233,6 +237,81 @@ class RetargetConfigTests(unittest.TestCase):
         self.assertIs(cfg, current_cfg)
         self.assertEqual("auto-s1", current_strategy["id"])
         self.assertEqual("target-live", current_target["target_uid"])
+
+        stale_target = copy.deepcopy(target)
+        stale_target["last_sync_at"] = (
+            datetime.now() - timedelta(minutes=11)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        with patch(
+            "services.retargeting_rule_runner.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.retargeting_rule_runner.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retargeting_rule_runner.schedulable_promotion_targets",
+            return_value=[stale_target],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "超过10分钟"):
+                retargeting_rule_runner._revalidate_auto_retarget_under_lock(
+                    FakeStore(),
+                    original_strategy=strategy,
+                    target_uid="target-live",
+                    aavid="10001",
+                    ad_id="30001",
+                    promotion_scene="live",
+                    plan_system="global",
+                    material_id="m1",
+                    product_id="",
+                )
+
+        class FakeStaleDashboard:
+            def get_table_data(self, **_kwargs):
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "targetUid": "target-live",
+                            "aadvid": "10001",
+                            "id": "m1",
+                            "periodEndTime": (
+                                datetime.now() - timedelta(minutes=11)
+                            ).strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    ],
+                }
+
+        with patch(
+            "services.retargeting_rule_runner.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.retargeting_rule_runner.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retargeting_rule_runner.schedulable_promotion_targets",
+            return_value=[target],
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeStaleDashboard(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "素材实时数据已超过10分钟"):
+                retargeting_rule_runner._revalidate_auto_retarget_under_lock(
+                    FakeStore(),
+                    original_strategy=strategy,
+                    target_uid="target-live",
+                    aavid="10001",
+                    ad_id="30001",
+                    promotion_scene="live",
+                    plan_system="global",
+                    material_id="m1",
+                    product_id="",
+                )
 
         changed = copy.deepcopy(cfg)
         changed["strategies"][0]["retargeting"]["volume"][

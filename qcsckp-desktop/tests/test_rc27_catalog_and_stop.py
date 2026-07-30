@@ -87,6 +87,9 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
                 "platform_status",
                 "verification_state",
                 "catalog_seen_at",
+                "last_verified_at",
+                "last_verification_error",
+                "write_block_origin",
                 "monitor_eligible",
                 "retarget_eligible",
                 "stop_eligible",
@@ -432,18 +435,22 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             return {"complete": True, "message": ""}
 
         controller._wait_catalog_class = wait_for_existing_capture
-        result = asyncio.run(
-            controller._scan_catalog_class(
-                fetcher=SimpleNamespace(page=object()),
-                probe=CapturedProbe(),
-                db=self.db,
-                owner_username=self.owner,
-                account={"aavid": "10001", "account_name": "测试账户"},
-                promotion_scene="product",
-                plan_system="global",
-                page_url="https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            result = asyncio.run(
+                controller._scan_catalog_class(
+                    fetcher=SimpleNamespace(page=object()),
+                    probe=CapturedProbe(),
+                    db=self.db,
+                    owner_username=self.owner,
+                    account={"aavid": "10001", "account_name": "测试账户"},
+                    promotion_scene="product",
+                    plan_system="global",
+                    page_url="https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+                )
             )
-        )
         self.assertTrue(result["complete"])
 
     def test_expired_cookie_never_bypasses_visible_login(self):

@@ -25,11 +25,15 @@ FOUR_CLASSES = (
 )
 _LOCK = threading.RLock()
 _STATE: Dict[str, Any] = {
+    "owner_username": "",
     "running": False,
     "started_at": "",
     "finished_at": "",
     "message": "尚未同步完整账户计划目录",
     "status": "not_synced",
+    "error": "",
+    "failure_kind": "",
+    "recovery_action": "",
     "next_due_at": "",
 }
 
@@ -42,16 +46,21 @@ def _text(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def mark_catalog_sync_started() -> Dict[str, Any]:
+def mark_catalog_sync_started(*, owner_username: Any = None) -> Dict[str, Any]:
     now = _now()
+    owner = _owner_key(owner_username)
     with _LOCK:
         _STATE.update(
             {
+                "owner_username": owner,
                 "running": True,
                 "started_at": _text(now),
                 "finished_at": "",
                 "message": "正在只读同步授权账户和计划目录",
                 "status": "syncing",
+                "error": "",
+                "failure_kind": "",
+                "recovery_action": "",
                 "next_due_at": _text(now + timedelta(minutes=CATALOG_INTERVAL_MINUTES)),
                 "processed_accounts": 0,
                 "total_accounts": 0,
@@ -183,17 +192,37 @@ def finalize_catalog_sync(
         and not error
         else "partial"
     )
+    error_text = str(error or "").strip()
+    login_required = bool(
+        error_text
+        and ("登录" in error_text or "login" in error_text.lower())
+    )
+    if error_text:
+        state_status = "login_required" if login_required else "error"
     with _LOCK:
         _STATE.update(
             {
+                "owner_username": owner,
                 "running": False,
                 "finished_at": now,
                 "message": (
-                    "账户计划目录同步完成"
-                    if state_status == "complete"
-                    else "目录已更新，但部分分类或分页尚未取得完整证据"
+                    error_text
+                    or (
+                        "账户计划目录同步完成"
+                        if state_status == "complete"
+                        else "目录已更新，但部分分类或分页尚未取得完整证据"
+                    )
                 ),
                 "status": state_status,
+                "error": error_text,
+                "failure_kind": (
+                    "login_required"
+                    if login_required
+                    else ("sync_error" if error_text else "")
+                ),
+                "recovery_action": (
+                    "open_visible_chrome" if login_required else ""
+                ),
                 "next_due_at": _text(
                     _now() + timedelta(minutes=CATALOG_INTERVAL_MINUTES)
                 ),
@@ -217,6 +246,19 @@ def catalog_sync_status(
     targets = list_promotion_targets(owner_username=owner, db=store)
     with _LOCK:
         state = dict(_STATE)
+    if str(state.get("owner_username") or "") not in {"", owner}:
+        state = {
+            "owner_username": owner,
+            "running": False,
+            "started_at": "",
+            "finished_at": "",
+            "message": "尚未同步完整账户计划目录",
+            "status": "not_synced",
+            "error": "",
+            "failure_kind": "",
+            "recovery_action": "",
+            "next_due_at": "",
+        }
     account_states = [
         {
             "account_uid": item.get("account_uid"),
@@ -228,9 +270,32 @@ def catalog_sync_status(
         }
         for item in accounts
     ]
+    persisted_errors = [
+        str(item.get("error") or "").strip()
+        for item in account_states
+        if str(item.get("error") or "").strip()
+    ]
+    if (
+        not state.get("running")
+        and not state.get("error")
+        and any(
+            "登录" in text or "login" in text.lower()
+            for text in persisted_errors
+        )
+    ):
+        state.update(
+            {
+                "status": "login_required",
+                "message": persisted_errors[0],
+                "error": persisted_errors[0],
+                "failure_kind": "login_required",
+                "recovery_action": "open_visible_chrome",
+            }
+        )
+    state_error = str(state.get("error") or "")
     state.update(
         {
-            "success": True,
+            "success": not bool(state_error),
             "account_count": len(accounts),
             "plan_count": len(targets),
             "accounts": account_states,

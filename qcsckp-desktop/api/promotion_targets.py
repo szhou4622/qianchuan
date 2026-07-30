@@ -158,6 +158,107 @@ def _owner_key(value: Any = None) -> str:
     return text or "local_default"
 
 
+def _legacy_quarantine_account_uid(
+    scoped_target_uid: Any,
+    legacy_target_uid: Any,
+) -> str:
+    digest = hashlib.sha256(
+        (
+            f"{str(scoped_target_uid or '').strip()}:"
+            f"{str(legacy_target_uid or '').strip()}"
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"legacy_quarantined_{digest}"
+
+
+def _quarantine_unowned_target_conflicts(
+    store: SQLiteStore,
+    *,
+    aavid: str,
+    ad_id: str,
+    scoped_target_uid: str,
+    connection: Any = None,
+) -> int:
+    """保留冲突旧行用于审计，但永久移除其自动化和待认领权力。"""
+    rows = store.execute(
+        "SELECT target_uid FROM promotion_target "
+        "WHERE aadvid=? AND ad_id=? AND COALESCE(account_uid,'')=''",
+        (aavid, ad_id),
+        connection=connection,
+        fetch=True,
+    ) or []
+    changed = 0
+    for row in rows:
+        legacy_uid = str(row.get("target_uid") or "").strip()
+        if not legacy_uid or legacy_uid == scoped_target_uid:
+            continue
+        reason = "旧计划与当前账号计划重复，已安全隔离并保留历史记录"
+        store.update(
+            "promotion_target",
+            {
+                "account_uid": _legacy_quarantine_account_uid(
+                    scoped_target_uid,
+                    legacy_uid,
+                ),
+                "enabled": 0,
+                "platform_status": "unknown",
+                "verification_state": "legacy_unverified",
+                "catalog_seen_at": None,
+                "last_verified_at": None,
+                "last_verification_error": reason,
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+                "ineligible_reason": reason,
+                "capability_json": "{}",
+                "automation_write_blocked": 1,
+                "write_block_reason": reason,
+                "write_block_origin": "legacy_quarantine",
+                "write_blocked_at": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "capacity_state": "disabled",
+            },
+            where={"target_uid": legacy_uid},
+            connection=connection,
+        )
+        changed += 1
+    return changed
+
+
+def _reconcile_legacy_target_conflicts(
+    store: SQLiteStore,
+    *,
+    owner_username: Any = None,
+) -> int:
+    owner = _owner_key(owner_username)
+    conflicts = store.execute(
+        "SELECT l.target_uid AS legacy_uid,s.target_uid AS scoped_uid,"
+        "s.account_uid,s.aadvid,s.ad_id "
+        "FROM promotion_target l "
+        "JOIN promotion_target s ON s.aadvid=l.aadvid AND s.ad_id=l.ad_id "
+        "JOIN qianchuan_account a ON a.account_uid=s.account_uid "
+        "WHERE COALESCE(l.account_uid,'')='' "
+        "AND COALESCE(s.account_uid,'')<>'' AND a.owner_username=?",
+        (owner,),
+        fetch=True,
+    ) or []
+    if not conflicts:
+        return 0
+    changed = 0
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        for conflict in conflicts:
+            changed += _quarantine_unowned_target_conflicts(
+                store,
+                aavid=str(conflict.get("aadvid") or ""),
+                ad_id=str(conflict.get("ad_id") or ""),
+                scoped_target_uid=str(conflict.get("scoped_uid") or ""),
+                connection=conn,
+            )
+    return changed
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -465,22 +566,151 @@ def update_target_catalog_evidence(
     """Persist trusted read-only catalog evidence and recompute safety gates."""
     uid = str(target_uid or "").strip()
     store = db or SQLiteStore()
-    row = store.select_one("promotion_target", where={"target_uid": uid})
-    if not row:
-        raise ValueError("监控计划不存在")
-    values: Dict[str, Any] = {
-        "platform_status": normalize_platform_status(platform_status),
-        "verification_state": normalize_verification_state(verification_state),
-        "catalog_seen_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    if plan_system is not None:
-        values["plan_system"] = normalize_plan_system(plan_system)
-    if promotion_scene is not None:
-        values["promotion_scene"] = normalize_scene(promotion_scene)
-    store.update("promotion_target", values, where={"target_uid": uid})
-    saved = refresh_target_eligibility(uid, db=store)
+    normalized_status = normalize_platform_status(platform_status)
+    normalized_verification = normalize_verification_state(
+        verification_state
+    )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    account_uid = ""
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        row = store.select_one(
+            "promotion_target",
+            where={"target_uid": uid},
+            connection=conn,
+        )
+        if not row:
+            raise ValueError("监控计划不存在")
+        account_uid = str(row.get("account_uid") or "")
+        scene = (
+            normalize_scene(promotion_scene)
+            if promotion_scene is not None
+            else normalize_scene(row.get("promotion_scene"))
+        )
+        system = (
+            normalize_plan_system(plan_system)
+            if plan_system is not None
+            else normalize_plan_system(row.get("plan_system"))
+        )
+        try:
+            capability = json.loads(str(row.get("capability_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            capability = {}
+        eligibility = target_eligibility(
+            promotion_scene=scene,
+            plan_system=system,
+            platform_status=normalized_status,
+            verification_state=normalized_verification,
+            capability=capability,
+        )
+        values: Dict[str, Any] = {
+            "platform_status": eligibility["platform_status"],
+            "verification_state": eligibility["verification_state"],
+            "catalog_seen_at": now,
+            "promotion_scene": scene,
+            "plan_system": system,
+            "monitor_eligible": 1 if eligibility["monitor_eligible"] else 0,
+            "retarget_eligible": 1 if eligibility["retarget_eligible"] else 0,
+            "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
+            "ineligible_reason": str(
+                eligibility["ineligible_reason"] or ""
+            )[:1000],
+        }
+        if values["verification_state"] == "verified":
+            values["last_verified_at"] = now
+            values["last_verification_error"] = ""
+        store.update(
+            "promotion_target",
+            values,
+            where={"target_uid": uid},
+            connection=conn,
+        )
+        explicitly_delivering = (
+            values["verification_state"] == "verified"
+            and values["platform_status"] in ACTIVE_PLATFORM_STATUSES
+        )
+        if explicitly_delivering:
+            store.update(
+                "promotion_target",
+                {
+                    "automation_write_blocked": 0,
+                    "write_block_reason": "",
+                    "write_block_origin": "",
+                    "write_blocked_at": None,
+                },
+                where=(
+                    "target_uid=? AND automation_write_blocked=1 "
+                    "AND write_block_origin='verification_failure'"
+                ),
+                params=(uid,),
+                connection=conn,
+            )
+    from services.qianchuan_accounts import refresh_monitor_capacity
+
+    account = store.select_one(
+        "qianchuan_account",
+        fields="owner_username",
+        where={"account_uid": account_uid},
+    )
+    refresh_monitor_capacity(
+        owner_username=(account or {}).get("owner_username"),
+        db=store,
+    )
+    saved = store.select_one("promotion_target", where={"target_uid": uid})
     assert saved is not None
-    return saved
+    return _target_row(saved)
+
+
+def record_target_verification_failure(
+    target_uid: Any,
+    error: Any,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """原子关闭自动化权力，且不改写上一次成功核验时间。"""
+    uid = str(target_uid or "").strip()
+    store = db or SQLiteStore()
+    reason = str(error or "本轮未取得明确投放状态")[:1000]
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        row = store.select_one(
+            "promotion_target",
+            where={"target_uid": uid},
+            connection=conn,
+        )
+        if not row:
+            raise ValueError("监控计划不存在")
+        block_values: Dict[str, Any] = {}
+        if not bool(row.get("automation_write_blocked")):
+            block_values = {
+                "automation_write_blocked": 1,
+                "write_block_reason": reason,
+                "write_block_origin": "verification_failure",
+                "write_blocked_at": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        store.update(
+            "promotion_target",
+            {
+                "platform_status": "unknown",
+                "verification_state": "error",
+                "last_verification_error": reason,
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+                "ineligible_reason": reason,
+                "capacity_state": "disabled",
+                "last_status": "verification_error",
+                "last_error": reason,
+                **block_values,
+            },
+            where={"target_uid": uid},
+            connection=conn,
+        )
+    saved = store.select_one("promotion_target", where={"target_uid": uid})
+    assert saved is not None
+    return _target_row(saved)
 
 
 def upsert_promotion_target(
@@ -524,20 +754,8 @@ def upsert_promotion_target(
         where={"aadvid": aavid, "ad_id": ad_id},
         order_by="id ASC",
     )
-    if (
-        not existing
-        and existing_any
-        and not str(existing_any.get("account_uid") or "").strip()
-    ):
-        store.update(
-            "promotion_target",
-            {"account_uid": account_uid},
-            where={"id": existing_any["id"]},
-        )
-        existing = store.select_one(
-            "promotion_target",
-            where={"id": existing_any["id"]},
-        )
+    # 普通 upsert 绝不能把无归属的历史目标直接认领给当前工具账号。
+    # 旧数据只能经显式迁移流程归属；迁移时会清空启用状态和写能力证据。
     target_uid = (
         str(existing.get("target_uid") or "")
         if existing
@@ -625,6 +843,7 @@ def upsert_promotion_target(
             )
         )
     )
+    incoming_verification_state = verification_state
     if (
         existing
         and normalize_verification_state(existing.get("verification_state"))
@@ -632,6 +851,13 @@ def upsert_promotion_target(
         and verification_state == "candidate"
     ):
         verification_state = "verified"
+        # 列表候选只能用于“仍可看见”的只读发现，不能把未知、暂停、
+        # 消失或失败状态提升回 active。恢复写资格必须依赖本轮精确详情。
+        existing_status = normalize_platform_status(
+            existing.get("platform_status")
+        )
+        if platform_status in ACTIVE_PLATFORM_STATUSES:
+            platform_status = existing_status
     eligibility = target_eligibility(
         promotion_scene=scene,
         plan_system=plan_system,
@@ -668,6 +894,20 @@ def upsert_promotion_target(
             if trusted_catalog
             else (existing.get("catalog_seen_at") if existing else None)
         ),
+        "last_verified_at": (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if trusted_catalog and incoming_verification_state == "verified"
+            else (existing.get("last_verified_at") if existing else None)
+        ),
+        "last_verification_error": (
+            ""
+            if trusted_catalog and incoming_verification_state == "verified"
+            else (
+                existing.get("last_verification_error")
+                if existing
+                else None
+            )
+        ),
         "monitor_eligible": 1 if eligibility["monitor_eligible"] else 0,
         "retarget_eligible": 1 if eligibility["retarget_eligible"] else 0,
         "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
@@ -680,11 +920,21 @@ def upsert_promotion_target(
         "last_status": str(last_status_source or "pending").strip()[:64],
         "last_error": str(last_error_source or "").strip()[:2000],
     }
-    store.insert_or_update(
-        "promotion_target",
-        row,
-        unique_fields=["account_uid", "aadvid", "ad_id"],
-    )
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        _quarantine_unowned_target_conflicts(
+            store,
+            aavid=aavid,
+            ad_id=ad_id,
+            scoped_target_uid=target_uid,
+            connection=conn,
+        )
+        store.insert_or_update(
+            "promotion_target",
+            row,
+            unique_fields=["account_uid", "aadvid", "ad_id"],
+            connection=conn,
+        )
     saved = store.select_one(
         "promotion_target",
         where={
@@ -765,14 +1015,15 @@ def set_target_automation_write_block(
     if blocked:
         store.execute(
             "UPDATE promotion_target SET automation_write_blocked=1,"
-            "write_block_reason=?,write_blocked_at=datetime('now','+8 hours'),"
+            "write_block_reason=?,write_block_origin='manual',"
+            "write_blocked_at=datetime('now','+8 hours'),"
             "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
             (str(reason or "自动写入安全封锁")[:2000], uid),
         )
     else:
         store.execute(
             "UPDATE promotion_target SET automation_write_blocked=0,"
-            "write_block_reason='',write_blocked_at=NULL,"
+            "write_block_reason='',write_block_origin='',write_blocked_at=NULL,"
             "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
             (uid,),
         )
@@ -1025,6 +1276,7 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
     """把可明确归属的旧直播数据迁入稳定 target_uid；歧义数据保持 legacy。"""
     init_sqlite_schema()
     store = db or SQLiteStore()
+    reconciled = _reconcile_legacy_target_conflicts(store)
     details = store.select(
         "pmc_ad_detail_basic",
         fields=(
@@ -1034,7 +1286,7 @@ def migrate_legacy_target_scope(*, db: Optional[SQLiteStore] = None) -> int:
         order_by="updated_at DESC, id DESC",
     )
     owner = _owner_key()
-    migrated = 0
+    migrated = reconciled
     by_account: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for detail in details:
         detail_account_uid = str(detail.get("account_uid") or "").strip()

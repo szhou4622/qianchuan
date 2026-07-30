@@ -32,11 +32,13 @@ from services.plan_system import detect_plan_system, normalize_plan_system
 from services.qianchuan_accounts import (
     ensure_qianchuan_account,
     list_qianchuan_accounts,
+    migrate_existing_qianchuan_accounts,
     record_target_duration,
     schedulable_promotion_targets,
     upsert_authorized_accounts,
 )
 from services.qianchuan_session import (
+    automation_session_ready,
     current_session_owner,
     load_qianchuan_storage_state,
     mark_qianchuan_session_available,
@@ -51,6 +53,7 @@ from api.promotion_targets import (
     extract_plan_name,
     list_promotion_targets,
     patch_target_sync_state,
+    record_target_verification_failure,
     replace_material_product_links,
     update_target_catalog_evidence,
     update_target_sync_state,
@@ -79,6 +82,16 @@ def _require_session_owner(expected_owner: str) -> None:
         raise RuntimeError(
             "工具账号已经切换或退出，旧千川浏览器会话已安全停止"
         )
+
+
+class CatalogLoginRequired(RuntimeError):
+    """目录同步期间发现千川登录失效，必须整体关闭自动化会话门。"""
+
+
+def _require_catalog_login(page: Any) -> None:
+    if _is_qianchuan_login_url(getattr(page, "url", "")):
+        raise CatalogLoginRequired("千川登录状态已失效，请重新登录")
+
 
 # 轮询抓取阶段：浏览器持续运行超过此时长则关闭并用 Cookie 重建，缓解长时间运行内存增长（秒）
 POLL_BROWSER_RECYCLE_INTERVAL_SEC = 2 * 3600
@@ -725,13 +738,16 @@ class ServiceController:
         self._cloud_backup_username: Optional[str] = None
         self._cloud_backup_password: str = ""
         self._target_discovery_thread: Optional[threading.Thread] = None
+        self._target_discovery_login_only = False
         self._catalog_sync_thread: Optional[threading.Thread] = None
         self._catalog_scheduler_thread: Optional[threading.Thread] = None
         self._catalog_startup_sync_pending = True
         self._target_discovery_status: dict = {
+            "success": True,
             "running": False,
             "message": "",
             "target": None,
+            "relogin_complete": False,
         }
 
         # 飞书「整点推送」：避免重复推同一小时窗口（进程内；重启后会从当前整点窗口重新判断）
@@ -1021,7 +1037,7 @@ class ServiceController:
             status["message"] = "旧千川会话仍在安全退出，请稍后重试"
         return status
 
-    def start_target_discovery(self) -> dict:
+    def start_target_discovery(self, *, login_only: bool = False) -> dict:
         """打开独立有头浏览器，用户进入计划详情后自动登记监控目标。"""
         with self._lock:
             if (
@@ -1033,15 +1049,23 @@ class ServiceController:
                     **self._target_discovery_status,
                 }
             self._target_discovery_status = {
+                "success": True,
                 "running": True,
                 "message": (
-                    "已打开独立Chrome；如显示登录页，请先登录千川，"
-                    "再进入要监控的计划详情"
+                    "已打开独立Chrome；请完成千川登录，工具会在确认授权账户后保存会话"
+                    if login_only
+                    else (
+                        "已打开独立Chrome；如显示登录页，请先登录千川，"
+                        "再进入要监控的计划详情"
+                    )
                 ),
                 "target": None,
+                "relogin_complete": False,
             }
+            self._target_discovery_login_only = bool(login_only)
             self._target_discovery_thread = threading.Thread(
                 target=self._target_discovery_entry,
+                args=(bool(login_only),),
                 name="promotion-target-discovery",
                 daemon=True,
             )
@@ -1050,7 +1074,7 @@ class ServiceController:
 
     def target_discovery_status(self) -> dict:
         with self._lock:
-            return {"success": True, **dict(self._target_discovery_status)}
+            return dict(self._target_discovery_status)
 
     def start_catalog_sync(self) -> dict:
         """Start the independent read-only all-account catalog scanner."""
@@ -1066,20 +1090,30 @@ class ServiceController:
             )
         if running:
             return catalog_sync_status()
-        if not current_session_owner():
+        owner = current_session_owner()
+        if not owner:
             return {
                 "success": False,
                 "message": "请先登录工具账号，再同步千川账户计划目录",
             }
-        if not load_qianchuan_storage_state():
+        session_gate = automation_session_ready()
+        if not session_gate.get("ready"):
             return {
                 "success": False,
-                "message": "请先在可见Chrome完成一次千川登录",
+                "message": str(
+                    session_gate.get("message")
+                    or "请先在可见Chrome完成一次千川登录"
+                ),
+                "failure_kind": "login_required",
+                "recovery_action": "open_visible_chrome",
             }
-        mark_catalog_sync_started()
+        mark_catalog_sync_started(
+            owner_username=owner
+        )
         with self._lock:
             self._catalog_sync_thread = threading.Thread(
                 target=self._catalog_sync_entry,
+                args=(owner,),
                 name="qianchuan-catalog-sync",
                 daemon=True,
             )
@@ -1126,13 +1160,29 @@ class ServiceController:
                 pass
             time.sleep(60)
 
-    def _catalog_sync_entry(self) -> None:
+    def _catalog_sync_entry(self, owner_username: str) -> None:
         try:
-            asyncio.run(self._catalog_sync_async())
+            asyncio.run(
+                self._catalog_sync_async(owner_username=owner_username)
+            )
+        except CatalogLoginRequired as exc:
+            from services.qianchuan_catalog import finalize_catalog_sync
+
+            mark_qianchuan_session_invalid(
+                str(exc),
+                owner_username=owner_username,
+            )
+            finalize_catalog_sync(
+                owner_username=owner_username,
+                error=str(exc),
+            )
         except Exception as exc:
             from services.qianchuan_catalog import finalize_catalog_sync
 
-            finalize_catalog_sync(error=f"账户计划目录同步失败：{exc}")
+            finalize_catalog_sync(
+                owner_username=owner_username,
+                error=f"账户计划目录同步失败：{exc}",
+            )
 
     async def _wait_catalog_class(
         self,
@@ -1198,8 +1248,7 @@ class ServiceController:
                     wait_until="domcontentloaded",
                     timeout=60_000,
                 )
-                if _is_qianchuan_login_url(page.url):
-                    return False
+                _require_catalog_login(page)
             for text in entry_texts:
                 for role in roles:
                     locator = page.get_by_role(role, name=text, exact=True)
@@ -1259,6 +1308,7 @@ class ServiceController:
         page_url: str,
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
+        _require_catalog_login(fetcher.page)
         # 调用方必须在导航/切换分类前设置探针上下文。列表响应通常会在
         # 页面加载或点击页签后立刻返回；这里若再次 reset，会把刚收到的
         # 全部分页证据清掉，最终错误地显示“没有计划”。
@@ -1268,17 +1318,21 @@ class ServiceController:
             promotion_scene=promotion_scene,
             plan_system=plan_system,
         )
+        _require_catalog_login(fetcher.page)
         candidates = probe.catalog_rows(
             aavid=aavid,
             promotion_scene=promotion_scene,
             plan_system=plan_system,
         )
+        _require_catalog_login(fetcher.page)
         verification = await probe.verify_catalog_plans(
             fetcher.page,
             aavid=aavid,
             promotion_scene=promotion_scene,
             plan_system=plan_system,
         )
+        _require_catalog_login(fetcher.page)
+        _require_session_owner(owner_username)
         persisted = _persist_verified_catalog_class(
             db,
             aavid=aavid,
@@ -1333,8 +1387,7 @@ class ServiceController:
             wait_until="domcontentloaded",
             timeout=60_000,
         )
-        if _is_qianchuan_login_url(fetcher.page.url):
-            raise RuntimeError("千川登录状态失效")
+        _require_catalog_login(fetcher.page)
         try:
             title = fetcher.page.get_by_text("全域投放", exact=True)
             await title.last.wait_for(state="visible", timeout=20_000)
@@ -1370,6 +1423,7 @@ class ServiceController:
             fetcher.page,
             ["推直播间", "推直播"],
         )
+        _require_catalog_login(fetcher.page)
         if opened_live:
             classes["global_live"] = await self._scan_catalog_class(
                 fetcher=fetcher,
@@ -1403,6 +1457,7 @@ class ServiceController:
             fetcher.page,
             aavid=aavid,
         )
+        _require_catalog_login(fetcher.page)
         if opened_chengfang:
             await self._click_visible_exact(
                 fetcher.page,
@@ -1433,6 +1488,7 @@ class ServiceController:
                 fetcher.page,
                 ["推直播间", "推直播"],
             )
+            _require_catalog_login(fetcher.page)
             if opened_chengfang_live:
                 classes["chengfang_live"] = await self._scan_catalog_class(
                     fetcher=fetcher,
@@ -1470,15 +1526,16 @@ class ServiceController:
             )[:2000],
         }
 
-    async def _catalog_sync_async(self) -> None:
+    async def _catalog_sync_async(self, *, owner_username: str) -> None:
         from services.qianchuan_catalog import (
             finalize_catalog_sync,
             mark_catalog_sync_progress,
         )
 
-        owner = current_session_owner()
+        owner = str(owner_username or "").strip().casefold()
         if not owner:
             raise RuntimeError("工具账号未登录")
+        _require_session_owner(owner)
         state = load_qianchuan_storage_state(owner_username=owner)
         if not state:
             raise RuntimeError("千川登录状态不存在")
@@ -1504,20 +1561,30 @@ class ServiceController:
                     wait_until="domcontentloaded",
                     timeout=60_000,
                 )
-                if _is_qianchuan_login_url(fetcher.page.url):
-                    raise RuntimeError("千川登录状态已失效，请重新登录")
+                _require_catalog_login(fetcher.page)
                 accounts = await probe.discover_authorized_accounts(
                     fetcher.page,
                     timeout_ms=30_000,
                 )
                 if not accounts:
                     raise RuntimeError("未能读取千川右上角的授权账户目录")
+                _require_session_owner(owner)
+                _require_catalog_login(fetcher.page)
                 account_catalog_status = (
                     probe.authorized_account_catalog_status()
                 )
                 upsert_authorized_accounts(
                     accounts,
                     owner_username=owner,
+                    db=db,
+                )
+                # 旧版无归属数据只能在当前千川会话已经明确授权该 aavid 后迁移，
+                # 不能由第一个登录的工具账号直接认领全部历史记录。
+                migrate_existing_qianchuan_accounts(
+                    owner_username=owner,
+                    authorized_aavids={
+                        str(item.get("aavid") or "") for item in accounts
+                    },
                     db=db,
                 )
                 authorized_ids = {
@@ -1577,6 +1644,8 @@ class ServiceController:
                             owner_username=owner,
                             account=account,
                         )
+                    except CatalogLoginRequired:
+                        raise
                     except Exception as exc:
                         result = {
                             "complete": False,
@@ -1612,18 +1681,26 @@ class ServiceController:
             db=db,
         )
 
-    def _target_discovery_entry(self) -> None:
+    def _target_discovery_entry(self, login_only: bool = False) -> None:
         try:
-            asyncio.run(self._target_discovery_async())
+            asyncio.run(
+                self._target_discovery_async(login_only=login_only)
+            )
         except Exception as e:
             with self._lock:
                 self._target_discovery_status = {
+                    "success": False,
                     "running": False,
                     "message": f"识别失败：{e}",
                     "target": None,
+                    "relogin_complete": False,
                 }
 
-    async def _target_discovery_async(self) -> None:
+    async def _target_discovery_async(
+        self,
+        *,
+        login_only: bool = False,
+    ) -> None:
         # 这是用户控制的只读Chrome，可能停留10分钟等待选计划；不长期占用
         # 自动化队列，否则会阻塞已确认追投。实际采集和所有写操作仍走全局锁。
         session_owner = current_session_owner()
@@ -1694,7 +1771,11 @@ class ServiceController:
                     with self._lock:
                         self._target_discovery_status["message"] = (
                             "等待千川登录：请在新Chrome完成登录，"
-                            "然后进入要监控的计划详情"
+                            + (
+                                "工具会自动确认授权账户并保存会话"
+                                if login_only
+                                else "然后进入要监控的计划详情"
+                            )
                         )
                     stable_candidate = None
                     stable_count = 0
@@ -1703,6 +1784,38 @@ class ServiceController:
                 if time.time() - last_probe_at >= 1.0:
                     await probe.observe_page(fetcher.page)
                     last_probe_at = time.time()
+                if login_only:
+                    accounts = await probe.discover_authorized_accounts(
+                        fetcher.page,
+                        timeout_ms=15_000,
+                    )
+                    if accounts:
+                        _require_session_owner(session_owner)
+                        upsert_authorized_accounts(
+                            accounts,
+                            owner_username=session_owner,
+                            db=db,
+                        )
+                        if fetcher.context:
+                            await save_context_storage_state(
+                                fetcher.context,
+                                owner_username=session_owner,
+                            )
+                        mark_qianchuan_session_available(
+                            owner_username=session_owner,
+                        )
+                        with self._lock:
+                            self._target_discovery_status = {
+                                "success": True,
+                                "running": False,
+                                "message": (
+                                    "千川重新登录成功，授权账户已确认；"
+                                    "可以开始刷新全部账户和计划"
+                                ),
+                                "target": None,
+                                "relogin_complete": True,
+                            }
+                        return
                 if urlparse(cur).path == "/uni-prom":
                     product_target = probe.confirmed_product_target()
                     if product_target:
@@ -1877,6 +1990,7 @@ class ServiceController:
                 )
             with self._lock:
                 self._target_discovery_status = {
+                    "success": True,
                     "running": False,
                     "message": (
                         "监控计划已添加；"
@@ -1886,6 +2000,7 @@ class ServiceController:
                         else "监控计划已添加"
                     ),
                     "target": target,
+                    "relogin_complete": False,
                 }
         finally:
             await fetcher.close()
@@ -2406,7 +2521,10 @@ class ServiceController:
                     try:
                         patch_target_sync_state(
                             current_uid,
-                            status=None,
+                            # 先关闭旧的 ok 状态，再等待浏览器锁。否则上一轮
+                            # 的成功状态会在本轮门禁超时尚未落库时继续放行发卡
+                            # 或写操作。
+                            status="verifying",
                             error="调控任务正在同步，本轮自动停投暂不可用",
                             capability_updates={
                                 "assist_sync_in_progress": True,
@@ -2449,6 +2567,10 @@ class ServiceController:
                         delivery_reason = str(
                             delivery_gate.get("reason") or ""
                         ).strip()
+                        delivery_gate_ok = (
+                            delivery_gate.get("ok") is True
+                            and delivery_reason == "delivering"
+                        )
                         delivery_name = str(
                             delivery_gate.get("delivery_name") or ""
                         ).strip()
@@ -2491,6 +2613,37 @@ class ServiceController:
                             self._log(
                                 f"[抓取 {target_index}/{len(targets)}] "
                                 f"计划当前为{delivery_name or '非投放中'}，已安全跳过"
+                            )
+                        elif not delivery_gate_ok:
+                            verification_error = (
+                                "未取得明确的投放中证据"
+                                + (
+                                    f"（{delivery_reason}）"
+                                    if delivery_reason
+                                    else ""
+                                )
+                                + "；本轮保持历史目录状态并禁止自动写入"
+                            )
+                            record_target_verification_failure(
+                                current_uid,
+                                verification_error,
+                                db=db,
+                            )
+                            patch_target_sync_state(
+                                current_uid,
+                                status="verification_error",
+                                error=verification_error,
+                                capability_updates={
+                                    "assist_sync_enabled": assist_sync_enabled,
+                                    "assist_sync_in_progress": False,
+                                    "assist_sync_ok": False,
+                                    "assist_synced_at": "",
+                                },
+                                db=db,
+                            )
+                            self._log(
+                                f"[抓取 {target_index}/{len(targets)}] "
+                                f"{verification_error}"
                             )
                         elif current_scene == "product" and material_count <= 0:
                             patch_target_sync_state(

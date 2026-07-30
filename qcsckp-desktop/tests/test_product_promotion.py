@@ -47,6 +47,7 @@ from services.product_scene_adapter import (
     merge_product_scene_snapshots,
     scope_product_scene_snapshot,
     validate_exact_product_plan_payload,
+    validate_exact_product_target_payload,
 )
 from services.retargeting_rule_runner import (
     block_target_after_rate_record_failure,
@@ -332,6 +333,67 @@ class ProductPromotionTests(unittest.TestCase):
             validate_exact_product_plan_payload(
                 paused,
                 expected_ad_id="20001",
+            ),
+        )
+        for contradictory in (
+            {
+                "status_code": 0,
+                "data": {
+                    "adDetailInfo": {
+                        "id": "20001",
+                        "adDeliveryName": "已暂停",
+                        "adDeliveryType": 0,
+                    }
+                },
+            },
+            {
+                "status_code": 0,
+                "data": {
+                    "adDetailInfo": {
+                        "id": "20001",
+                        "adDeliveryName": "投放中",
+                        "adDeliveryType": 5,
+                    }
+                },
+            },
+        ):
+            self.assertIn(
+                "非投放中",
+                validate_exact_product_plan_payload(
+                    contradictory,
+                    expected_ad_id="20001",
+                ),
+            )
+
+    def test_exact_product_target_requires_account_plan_system_and_delivery(self):
+        payload = {
+            "status_code": 0,
+            "data": {
+                "aavid": "10001",
+                "planSystem": "global",
+                "adDetailInfo": {
+                    "id": "20001",
+                    "aavid": "10001",
+                    "adDeliveryName": "投放中",
+                    "adDeliveryType": 0,
+                },
+            },
+        }
+        self.assertIsNone(
+            validate_exact_product_target_payload(
+                payload,
+                expected_aavid="10001",
+                expected_ad_id="20001",
+                expected_plan_system="global",
+            )
+        )
+        self.assertIn(
+            "账户不匹配",
+            validate_exact_product_target_payload(
+                payload,
+                expected_aavid="10002",
+                expected_ad_id="20001",
+                expected_plan_system="global",
             ),
         )
 

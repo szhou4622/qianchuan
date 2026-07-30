@@ -363,9 +363,9 @@ def save_qianchuan_account_settings(
 
 
 def _require_feishu_binding_for_automation(settings: Dict[str, Any]) -> None:
-    if not bool(settings.get("enabled")) and str(
-        settings.get("route_mode") or "default"
-    ) != "custom":
+    # 安全关闭账户永远不应依赖飞书状态。即使旧配置使用自定义路由，
+    # 用户也必须能在飞书断线时立即停掉全部自动化。
+    if not bool(settings.get("enabled")):
         return
     from services.local_feishu_bridge import get_local_feishu_status
 
@@ -420,6 +420,8 @@ def save_qianchuan_account_automation_setup(
     if normalized_settings["route_mode"] not in {"default", "custom"}:
         raise ValueError("飞书路由模式无效")
     if (
+        normalized_settings["enabled"]
+        and
         normalized_settings["route_mode"] == "custom"
         and not normalized_settings["route_send_personal"]
         and not normalized_settings["route_group_ids"]
@@ -453,7 +455,11 @@ def save_qianchuan_account_automation_setup(
             raise ValueError("计划不属于当前千川账户，已取消全部保存")
         enabled = bool(item.get("enabled"))
         target = target_by_uid[uid]
-        if enabled and not bool(target.get("monitor_eligible")):
+        if (
+            enabled
+            and not bool(target.get("monitor_eligible"))
+            and not bool(target.get("enabled"))
+        ):
             raise ValueError(
                 str(
                     target.get("ineligible_reason")
@@ -780,28 +786,42 @@ def resolve_account_feishu_targets(
 def migrate_existing_qianchuan_accounts(
     *,
     owner_username: Any = None,
+    authorized_aavids: Optional[Iterable[Any]] = None,
     db: Optional[SQLiteStore] = None,
 ) -> int:
-    """从现有计划、素材账户和操作流水创建账户目录并回填关联。"""
+    """从旧数据创建账户目录；无归属数据只按当前会话已授权账户迁移。"""
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
     owner = _owner_key(owner_username)
     # 尚未登录工具账号时不抢占旧数据；登录成功后由明确账号完成一次性归属迁移。
     if owner == DEFAULT_OWNER:
         return 0
+    authorized = (
+        {
+            str(item or "").strip()
+            for item in authorized_aavids
+            if str(item or "").strip().isdigit()
+        }
+        if authorized_aavids is not None
+        else None
+    )
     selected = _daily_selected_aavids(owner)
+    scope_clause = (
+        "(COALESCE(account_uid,'')='' OR account_uid IN "
+        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?))"
+        if authorized is not None
+        else "account_uid IN "
+        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)"
+    )
     rows = store.execute(
         # user_info_name 只用于旧数据首次建档的可读名称兜底，后续不能覆盖
         # 已经从 advName/accountName 得到的权威广告主账户名。
         "SELECT aadvid AS aavid,user_info_name AS account_name,updated_at FROM pmc_ad_detail_basic "
-        "WHERE COALESCE(aadvid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
-        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        f"WHERE COALESCE(aadvid,'')<>'' AND {scope_clause} "
         "UNION ALL SELECT aadvid AS aavid,'' AS account_name,updated_at FROM promotion_target "
-        "WHERE COALESCE(aadvid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
-        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        f"WHERE COALESCE(aadvid,'')<>'' AND {scope_clause} "
         "UNION ALL SELECT aavid,'' AS account_name,occurred_at AS updated_at FROM account_operation_event "
-        "WHERE COALESCE(aavid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
-        "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
+        f"WHERE COALESCE(aavid,'')<>'' AND {scope_clause} "
         "ORDER BY updated_at DESC",
         (owner, owner, owner),
         fetch=True,
@@ -810,6 +830,8 @@ def migrate_existing_qianchuan_accounts(
     for row in rows:
         aid = str(row.get("aavid") or "").strip()
         if not aid or not aid.isdigit():
+            continue
+        if authorized is not None and aid not in authorized:
             continue
         name = str(row.get("account_name") or "").strip()
         if aid not in by_aavid or (name and not by_aavid[aid]):
@@ -841,8 +863,32 @@ def migrate_existing_qianchuan_accounts(
         store.execute("BEGIN IMMEDIATE", connection=conn)
         for aid in by_aavid:
             uid = make_account_uid(aid, owner)
+            # 无归属旧计划的迁移只能恢复“可查看的历史记录”，不能继承旧工具
+            # 账号的启用意图、目录核验或写能力证据。用户必须重新精确核验并启用。
+            store.update(
+                "promotion_target",
+                {
+                    "account_uid": uid,
+                    "enabled": 0,
+                    "platform_status": "unknown",
+                    "verification_state": "legacy_unverified",
+                    "catalog_seen_at": None,
+                    "last_verified_at": None,
+                    "last_verification_error": "旧计划已安全迁移，等待重新核验",
+                    "monitor_eligible": 0,
+                    "retarget_eligible": 0,
+                    "stop_eligible": 0,
+                    "ineligible_reason": "旧计划等待当前工具账号重新核验",
+                    "capability_json": "{}",
+                    "last_status": "pending",
+                    "last_error": "",
+                    "capacity_state": "disabled",
+                },
+                where="aadvid=? AND COALESCE(account_uid,'')=''",
+                params=(aid,),
+                connection=conn,
+            )
             for table, column in (
-                ("promotion_target", "aadvid"),
                 ("pmc_ad_detail_basic", "aadvid"),
                 ("pmc_retargeting_run", "aavid"),
                 ("pmc_regulation_run", "aavid"),

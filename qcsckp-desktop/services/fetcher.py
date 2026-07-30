@@ -521,21 +521,22 @@ class QianChuanFetcher:
         """
         等待 ad-detail-basic 响应：仅「投放中」返回 True 继续抓取；
         若先收到非投放中则 False；若 AD_DETAIL_GATE_TIMEOUT_SEC 内无有效投放中则 False。
-        若 URL 未带 adId/aavid 则不做门控，返回 True。
+        URL 缺少 adId/aavid 或监听队列不可用时也必须安全失败，不能把未知状态
+        当成投放中继续。
         """
         if not self._current_aadvid or not self._current_adid:
-            logger.info("[抓取] URL 未包含 adId 与 aavid，跳过投放中门控")
+            logger.warning("[抓取] URL 未包含 adId 与 aavid，无法核验投放状态")
             self._delivery_gate_detail = {
-                "ok": True,
-                "reason": "ids_missing_gate_skipped",
+                "ok": False,
+                "reason": "ids_missing",
             }
-            return True
+            return False
         if not self._ad_detail_gate_queue:
             self._delivery_gate_detail = {
-                "ok": True,
+                "ok": False,
                 "reason": "gate_unavailable",
             }
-            return True
+            return False
 
         logger.info(
             f"[抓取] 等待 ad-detail-basic 投放中（adId={self._current_adid}, "

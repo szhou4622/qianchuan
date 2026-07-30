@@ -420,12 +420,54 @@ def validate_exact_product_plan_payload(
             delivery_type = int(detail.get("adDeliveryType"))
         except (TypeError, ValueError):
             delivery_type = -1
-        if delivery_name != "投放中" and delivery_type != 0:
+        if delivery_name != "投放中" or delivery_type != 0:
             return (
                 "商品全域计划当前非投放中："
-                f"{delivery_name or '未知状态'}"
+                f"{delivery_name or '未知状态'} / {delivery_type}"
             )
     return None
+
+
+def validate_exact_product_target_payload(
+    payload: Any,
+    *,
+    expected_aavid: Any,
+    expected_ad_id: Any,
+    expected_plan_system: Any = None,
+    page_text: Any = "",
+    require_delivering: bool = True,
+) -> Optional[str]:
+    """严格核对商品主计划账户、计划、体系与投放状态。"""
+    expected_account = _text(expected_aavid, 64)
+    if not expected_account:
+        return "商品全域任务缺少账户ID，已安全停止"
+    actual_account = _find_identifier(
+        payload,
+        frozenset({"aavid", "aadvid", "advertiserId", "advertiser_id"}),
+    )
+    if actual_account != expected_account:
+        return (
+            f"商品全域账户不匹配：期望 {expected_account}，实际 "
+            f"{actual_account or '未返回'}"
+        )
+    if expected_plan_system not in (None, ""):
+        expected_system = normalize_plan_system(expected_plan_system)
+        actual_system = detect_plan_system(
+            payload=payload,
+            page_text=str(page_text or ""),
+        )
+        if actual_system == "unknown":
+            return "商品计划体系无法从千川详情响应中确认，已安全停止"
+        if actual_system != expected_system:
+            return (
+                f"商品计划体系不匹配：配置为 {expected_system}，"
+                f"页面实际为 {actual_system}"
+            )
+    return validate_exact_product_plan_payload(
+        payload,
+        expected_ad_id=expected_ad_id,
+        require_delivering=require_delivering,
+    )
 
 
 async def goto_and_confirm_product_target(
@@ -539,30 +581,11 @@ async def goto_and_confirm_product_target(
     except Exception as exc:
         return f"商品全域精确计划定位或详情读取失败：{exc}"
 
-    actual_account = _find_identifier(
+    return validate_exact_product_target_payload(
         payload,
-        frozenset({"aavid", "aadvid", "advertiserId", "advertiser_id"}),
-    )
-    if actual_account and actual_account != expected_account:
-        return (
-            f"商品全域账户不匹配：期望 {expected_account}，实际 "
-            f"{actual_account}"
-        )
-    if expected_plan_system not in (None, ""):
-        expected_system = normalize_plan_system(expected_plan_system)
-        actual_system = detect_plan_system(
-            payload=payload,
-            page_text=row_text,
-        )
-        if actual_system == "unknown":
-            return "商品计划体系无法从千川详情响应中确认，已安全停止"
-        if actual_system != expected_system:
-            return (
-                f"商品计划体系不匹配：配置为 {expected_system}，"
-                f"页面实际为 {actual_system}"
-            )
-    return validate_exact_product_plan_payload(
-        payload,
+        expected_aavid=expected_account,
         expected_ad_id=expected_plan,
+        expected_plan_system=expected_plan_system,
+        page_text=row_text,
         require_delivering=True,
     )
