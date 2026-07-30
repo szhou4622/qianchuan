@@ -76,6 +76,8 @@ class Api:
     # ========== 直播 / 商品全域监控计划 ==========
 
     def getQianchuanAccountOverview(self):
+        from api.rule_regulation_config import load_rule_regulation_config
+        from api.rule_retargeting_config import load_rule_retargeting_config
         from services.local_feishu_bridge import get_local_feishu_status
         from services.operation_daily_report import (
             get_operation_daily_report_config,
@@ -87,17 +89,53 @@ class Api:
             migrate_existing_qianchuan_accounts,
         )
         from services.qianchuan_session import session_status
+        from services.qianchuan_catalog import catalog_sync_status
         from services.windows_autostart import get_windows_autostart_status
 
         try:
             migrate_existing_qianchuan_accounts(db=self.db)
             feishu = get_local_feishu_status()
+            accounts = list_qianchuan_accounts(db=self.db)
+            targets = self.listPromotionTargets().get("data") or []
+            session = session_status()
+            catalog = catalog_sync_status(db=self.db)
+            profile = feishu.get("profile") or {}
+            feishu_bound = bool(feishu.get("connected")) and bool(
+                str(profile.get("authorized_open_id") or "").strip()
+            )
+            enabled_accounts = [item for item in accounts if item.get("enabled")]
+            plans_selected = any(
+                item.get("enabled") and item.get("monitor_eligible")
+                for item in targets
+            )
+            retarget_config = load_rule_retargeting_config()
+            stop_config = load_rule_regulation_config()
+            onboarding = {
+                "qianchuan_login": bool(session.get("available"))
+                and session.get("status") != "login_required",
+                "catalog_synced": bool(catalog.get("account_count"))
+                and catalog.get("status") in {"complete", "partial"},
+                "catalog_complete": bool(catalog.get("complete")),
+                "feishu_bound": feishu_bound,
+                "account_routes": (
+                    feishu_bound
+                    and all(
+                        item.get("route_mode") in {"default", "custom"}
+                        for item in enabled_accounts
+                    )
+                ),
+                "plans_selected": plans_selected,
+                "rules_configured": bool(retarget_config.get("enabled"))
+                or bool(stop_config.get("enabled")),
+            }
             return {
                 "success": True,
-                "accounts": list_qianchuan_accounts(db=self.db),
-                "targets": self.listPromotionTargets().get("data") or [],
+                "accounts": accounts,
+                "targets": targets,
                 "capacity": capacity_snapshot(db=self.db),
-                "session": session_status(),
+                "session": session,
+                "catalog": catalog,
+                "onboarding": onboarding,
                 "browser_queue": browser_queue_snapshot(),
                 "feishu": {
                     "connected": bool(feishu.get("connected")),
@@ -125,6 +163,41 @@ class Api:
                     db=self.db,
                 ),
             }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def saveQianchuanAccountAutomationSetup(
+        self,
+        account_uid=None,
+        settings=None,
+        plan_states=None,
+    ):
+        from services.qianchuan_accounts import (
+            save_qianchuan_account_automation_setup,
+        )
+
+        try:
+            return {
+                "success": True,
+                "data": save_qianchuan_account_automation_setup(
+                    account_uid,
+                    settings if isinstance(settings, dict) else {},
+                    plan_states if isinstance(plan_states, (list, dict)) else [],
+                    db=self.db,
+                ),
+            }
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def startQianchuanCatalogSync(self):
+        try:
+            return self.service.start_catalog_sync()
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def getQianchuanCatalogSyncStatus(self):
+        try:
+            return self.service.catalog_sync_status()
         except Exception as e:
             return {"success": False, "message": str(e)}
 

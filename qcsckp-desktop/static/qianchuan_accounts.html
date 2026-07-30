@@ -15,19 +15,21 @@
     .metric,.card{background:#101b2d;border:1px solid #26364e;border-radius:14px}.metric{padding:14px}
     .metric .label{color:#8295ae;font-size:11px}.metric .value{margin-top:6px;color:#f8fafc;font-weight:700;font-size:17px}.metric .hint{margin-top:5px;color:#71839b;font-size:10px;line-height:1.5}
     .notice{display:none;padding:11px 14px;margin-bottom:14px;border:1px solid #1d4ed866;background:#17255466;color:#bfdbfe;border-radius:10px;font-size:12px}.notice.show{display:block}
+    .onboarding{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-bottom:14px}.step{padding:10px;border:1px solid #26364e;border-radius:10px;background:#0b1627;color:#8295ae;font-size:11px}.step.done{border-color:#166534;color:#86efac}.step.warn{border-color:#92400e;color:#fbbf24}
     .toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.toolbar .spacer{flex:1}.toggle-line{display:flex;align-items:center;gap:8px;color:#a8b6c9;font-size:12px}
     input[type=checkbox]{accent-color:#0ea5e9}.accounts{display:grid;gap:14px}.card{padding:17px}.card.off{opacity:.68}
     .card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.account-name{font-weight:700;color:#f8fafc;font-size:16px}.account-id{margin-top:5px;color:#8295ae;font-size:11px}
     .badges{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.badge{padding:4px 8px;border-radius:999px;background:#153552;color:#7dd3fc;font-size:10px}.badge.warn{background:#4b3318;color:#fbbf24}.badge.bad{background:#4a2030;color:#fda4af}.badge.ok{background:#173b2a;color:#86efac}
     .account-grid{display:grid;grid-template-columns:minmax(220px,.8fr) minmax(320px,1.2fr);gap:14px;margin-top:15px}.panel{border:1px solid #26364e;background:#091322;border-radius:11px;padding:13px}
     .panel-title{font-size:12px;font-weight:700;color:#cbd5e1;margin-bottom:10px}.field{margin-top:10px}.field:first-child{margin-top:0}.field label{display:block;color:#8295ae;font-size:11px;margin-bottom:5px}
-    select{width:100%;height:36px;border:1px solid #33445e;border-radius:8px;background:#07101d;color:#e2e8f0;padding:0 9px}
+    select,input[type=search]{height:36px;border:1px solid #33445e;border-radius:8px;background:#07101d;color:#e2e8f0;padding:0 9px}select{width:100%}input[type=search]{min-width:220px}
     .check{display:flex;gap:8px;align-items:flex-start;color:#cbd5e1;font-size:12px;line-height:1.5;margin-top:8px}.check input{margin-top:2px}
     .group-list{max-height:130px;overflow:auto}.group-empty{color:#71839b;font-size:11px}.sync{margin-top:11px;padding:9px;border-radius:8px;background:#07101d;color:#8494aa;font-size:10px;line-height:1.7}
     .plans{display:grid;gap:8px}.plan{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px;border:1px solid #26364e;border-radius:9px;background:#101b2d}
+    .plan-group{margin-top:12px}.plan-group:first-child{margin-top:0}.plan-group-title{display:flex;justify-content:space-between;color:#7dd3fc;font-size:11px;font-weight:700;margin-bottom:7px}.plan.ineligible{opacity:.65}.plan input:disabled{cursor:not-allowed}
     .plan-name{color:#e2e8f0;font-size:12px;font-weight:600;word-break:break-all}.plan-meta{margin-top:4px;color:#71839b;font-size:10px;line-height:1.55}.plan-state{white-space:nowrap;font-size:10px}.plan-state.wait{color:#fbbf24}.plan-state.late{color:#fda4af}.plan-state.active{color:#86efac}
     .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
-    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.account-grid{grid-template-columns:1fr}.head{flex-direction:column}}
+    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.head{flex-direction:column}}
   </style>
 </head>
 <body>
@@ -37,8 +39,9 @@
       <h1>千川账户管理</h1>
       <div class="sub">所有账户共用当前千川登录会话。这里只管理已授权账户、日报接收位置和明确启用的自动化计划；不会自动操作账户下的其他计划。</div>
     </div>
-    <button class="primary" id="discover">打开Chrome识别账户/计划</button>
+    <button class="primary" id="discover">刷新全部账户和计划</button>
   </div>
+  <div class="onboarding" id="onboarding"></div>
   <div class="summary">
     <div class="metric"><div class="label">千川主登录会话</div><div class="value" id="sessionValue">读取中</div><div class="hint" id="sessionHint">—</div></div>
     <div class="metric"><div class="label">监控容量</div><div class="value" id="capacityValue">—</div><div class="hint" id="capacityHint">—</div></div>
@@ -49,10 +52,12 @@
   <div class="toolbar">
     <label class="toggle-line"><input type="checkbox" id="autostart"> Windows开机自动启动工具（默认关闭）</label>
     <span class="spacer"></span>
+    <input type="search" id="planSearch" placeholder="搜索计划名称或ID">
+    <select id="planStatus" style="width:150px"><option value="all">全部状态</option><option value="eligible">可监控</option><option value="unverified">待确认/不可用</option><option value="active">投放中</option><option value="paused">暂停/结束</option></select>
     <button id="refresh">重新加载</button>
   </div>
   <div class="accounts" id="accounts"></div>
-  <div class="empty" id="empty">尚未识别千川账户。请点击右上角按钮，在独立Chrome中进入任意计划详情。</div>
+  <div class="empty" id="empty">尚未同步授权账户。请先完成千川登录，再点击右上角“刷新全部账户和计划”。</div>
 </main>
 <script>
   const $=id=>document.getElementById(id);
@@ -63,7 +68,37 @@
   const scene=x=>x==='product'?'推商品':x==='live'?'推直播':'场景待确认';
   const system=x=>x==='global'?'全域':x==='chengfang'?'乘方':'体系待确认';
   const capText=x=>x==='active'?'正常监控':x==='capacity_waiting'?'等待监控容量':'未参与监控';
+  const platformStatus=x=>({active:'投放中',enabled:'已启用',delivering:'投放中',learning:'学习中',paused:'已暂停',ended:'已结束',deleted:'已删除',historical:'历史计划',unknown:'状态待确认'}[x]||x||'状态待确认');
+  const groupDefs=[['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['unknown','all','待确认/其他']];
   let latest=null,dirty=false;
+
+  function filteredPlans(plans){
+    const query=($('planSearch')?.value||'').trim().toLowerCase();
+    const status=$('planStatus')?.value||'all';
+    return plans.filter(p=>{
+      if(query&&!`${p.plan_name||''} ${p.ad_id||''}`.toLowerCase().includes(query))return false;
+      if(status==='eligible'&&!p.monitor_eligible)return false;
+      if(status==='unverified'&&p.monitor_eligible)return false;
+      if(status==='active'&&!['active','enabled','delivering','learning'].includes(p.platform_status))return false;
+      if(status==='paused'&&!['paused','ended','deleted','historical'].includes(p.platform_status))return false;
+      return true;
+    });
+  }
+
+  function planRows(plans){
+    const rows=filteredPlans(plans);
+    if(!rows.length)return '<div class="group-empty">当前筛选条件下没有计划。</div>';
+    return groupDefs.map(([sys,sc,label])=>{
+      const items=rows.filter(p=>sys==='unknown'?(!['global','chengfang'].includes(p.plan_system)||!['live','product'].includes(p.promotion_scene)):(p.plan_system===sys&&p.promotion_scene===sc));
+      if(!items.length)return '';
+      return `<div class="plan-group"><div class="plan-group-title"><span>${label}</span><span>${items.length} 条</span></div>${items.map(p=>{
+        const state=p.capacity_state||'disabled'; const late=Number(p.last_lag_seconds||0)>600;
+        const blocked=!!p.automation_write_blocked;const eligible=!!p.monitor_eligible;
+        const reason=p.ineligible_reason||(!eligible?'目录尚未核验':'');
+        return `<label class="plan ${eligible?'':'ineligible'}"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)} · ${platformStatus(p.platform_status)}<br>计划ID ${esc(p.ad_id||'')} · 核验 ${esc(p.verification_state||'legacy_unverified')}${reason?`<br>不可启用：${esc(reason)}`:''}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span><input type="checkbox" data-target="${esc(p.target_uid)}" ${p.enabled?'checked':''} ${eligible?'':'disabled'}><span class="plan-state ${blocked||late||!eligible?'late':state==='active'?'active':state==='capacity_waiting'?'wait':''}">${!eligible?'禁止自动化':blocked?'自动写入已封锁':late?'监控延迟':capText(state)}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
+      }).join('')}</div>`;
+    }).join('');
+  }
 
   function render(data){
     latest=data;
@@ -78,6 +113,14 @@
     const queue=data.browser_queue||{};
     $('queueValue').textContent=queue.active?`执行中 · 等待${queue.waiting_count||0}`:`空闲 · 等待${queue.waiting_count||0}`;
     $('autostart').checked=!!data.autostart?.enabled;
+    const progress=data.onboarding||{};
+    $('onboarding').innerHTML=[
+      ['qianchuan_login','1. 千川登录'],
+      ['catalog_synced','2. 账户与计划目录'],
+      ['feishu_bound','3. 飞书长连接与绑定'],
+      ['plans_selected','4. 路由与监控计划'],
+      ['rules_configured','5. 追投/停投策略']
+    ].map(([key,label])=>`<div class="step ${progress[key]?'done':key==='catalog_synced'&&progress.qianchuan_login?'warn':''}">${progress[key]?'✓':'○'} ${label}${key==='catalog_synced'&&progress[key]&&!progress.catalog_complete?'<br>已同步但目录不完整':''}</div>`).join('');
     const groups=data.feishu?.groups||[];
     const targets=data.targets||[];
     const accounts=data.accounts||[];
@@ -95,27 +138,23 @@
       const statusClass=acc.last_status==='available'?'ok':acc.last_error?'bad':'warn';
       return `<section class="card ${acc.enabled?'':'off'}" data-account="${esc(acc.account_uid)}">
         <div class="card-head"><div><div class="account-name">${esc(acc.account_name||'未命名账户')}</div><div class="account-id">账户ID ${esc(acc.aavid)}</div></div>
-          <div class="badges"><span class="badge ${statusClass}">${esc(acc.last_status||'待识别')}</span><span class="badge">${acc.enabled_plan_count||0} 条已启用</span>${acc.waiting_plan_count?`<span class="badge warn">${acc.waiting_plan_count} 条等待容量</span>`:''}</div>
+          <div class="badges"><span class="badge ${statusClass}">${esc(acc.last_status||'待识别')}</span><span class="badge ${acc.catalog_status==='complete'?'ok':'warn'}">目录${acc.catalog_status==='complete'?'完整':'不完整'}</span><span class="badge">${acc.plan_count||0} 条 / ${acc.eligible_plan_count||0} 条可监控</span>${acc.waiting_plan_count?`<span class="badge warn">${acc.waiting_plan_count} 条等待容量</span>`:''}</div>
         </div>
         <div class="account-grid">
           <div class="panel">
             <div class="panel-title">账户与日报</div>
-            <label class="check"><input type="checkbox" data-field="enabled" ${acc.enabled?'checked':''}>启用此千川账户；关闭后该账户全部自动化暂停</label>
+            <label class="check"><input type="checkbox" data-field="enabled" ${acc.enabled?'checked':''} ${data.feishu?.connected&&data.feishu?.authorized_open_id?'':'disabled'}>启用此千川账户；关闭后该账户全部自动化暂停</label>
             <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''}>同步昨日操作日志并纳入09:00日报</label>
             <div class="field"><label>飞书接收位置</label><select data-field="route_mode"><option value="default" ${acc.route_mode==='default'?'selected':''}>使用管理员默认位置</option><option value="custom" ${acc.route_mode==='custom'?'selected':''}>为此账户单独配置</option></select></div>
             <div data-custom-route style="${acc.route_mode==='custom'?'':'display:none'}">
               <label class="check"><input type="checkbox" data-field="route_send_personal" ${acc.route_send_personal?'checked':''}>发送给已绑定的唯一确认人</label>
               <div class="field"><label>发送到已绑定群</label><div class="group-list">${groups.length?groups.map(g=>`<label class="check"><input type="checkbox" data-group="${esc(g.chat_id)}" ${routeGroups.has(String(g.chat_id))?'checked':''}>${esc(g.name||g.chat_name||g.chat_id)}</label>`).join(''):'<div class="group-empty">还没有绑定群，请先到“飞书绑定”页面绑定。</div>'}</div></div>
             </div>
-            <div class="sync">后台日志：${esc(log.last_status||'not_configured')}<br>最后同步：${esc(log.last_sync_at||'—')}<br>覆盖：${esc(log.coverage_from||'—')} 至 ${esc(log.coverage_to||'—')}${log.last_error?'<br>异常：'+esc(log.last_error):''}</div>
+            <div class="sync">计划目录：${esc(acc.catalog_status||'not_synced')} · ${esc(acc.catalog_last_sync_at||'—')}${acc.catalog_error?'<br>目录说明：'+esc(acc.catalog_error):''}<br>后台日志：${esc(log.last_status||'not_configured')}<br>最后同步：${esc(log.last_sync_at||'—')}<br>覆盖：${esc(log.coverage_from||'—')} 至 ${esc(log.coverage_to||'—')}${log.last_error?'<br>异常：'+esc(log.last_error):''}</div>
           </div>
           <div class="panel">
-            <div class="panel-title">明确启用的自动化计划</div>
-            <div class="plans">${plans.length?plans.map(p=>{
-              const state=p.capacity_state||'disabled'; const late=Number(p.last_lag_seconds||0)>600;
-              const blocked=!!p.automation_write_blocked;
-              return `<label class="plan"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)}<br>计划ID ${esc(p.ad_id||'')} · ${esc(p.target_uid||'')}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span><input type="checkbox" data-target="${esc(p.target_uid)}" ${p.enabled?'checked':''}><span class="plan-state ${blocked||late?'late':state==='active'?'active':state==='capacity_waiting'?'wait':''}">${blocked?'自动写入已封锁':late?'监控延迟':capText(state)}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
-            }).join(''):'<div class="group-empty">此账户还没有登记计划。点击右上角进入计划详情即可添加。</div>'}</div>
+            <div class="panel-title">全部计划目录（四类分组）</div>
+            <div class="plans">${plans.length?planRows(plans):'<div class="group-empty">此账户还没有登记计划。点击右上角刷新目录。</div>'}</div>
           </div>
         </div>
         <div class="actions"><button data-save>保存此账户设置</button></div>
@@ -145,25 +184,26 @@
       route_send_personal:card.querySelector('[data-field=route_send_personal]').checked,
       route_group_ids:Array.from(card.querySelectorAll('[data-group]:checked')).map(x=>x.dataset.group)
     };
-    let r=await a.saveQianchuanAccountSettings(uid,settings);
-    if(!r?.success){message(r?.message||'账户设置保存失败',true);return}
-    let savedPlans=0;
-    for(const checkbox of card.querySelectorAll('[data-target]')){
-      const one=await a.getPromotionTarget(checkbox.dataset.target);
-      if(!one?.success){message(`部分保存：账户设置和${savedPlans}条计划已保存；${one?.message||'读取计划失败'}`,true);return}
-      const target=one.data;target.enabled=checkbox.checked;
-      r=await a.savePromotionTarget(target);
-      if(!r?.success){message(`部分保存：账户设置和${savedPlans}条计划已保存；${r?.message||'计划设置保存失败'}`,true);return}
-      savedPlans++;
-    }
+    const planStates=Array.from(card.querySelectorAll('[data-target]')).map(x=>({target_uid:x.dataset.target,enabled:x.checked}));
+    const r=await a.saveQianchuanAccountAutomationSetup(uid,settings,planStates);
+    if(!r?.success){message((r?.message||'账户与计划设置保存失败')+'；本次修改已整体回滚',true);return}
     dirty=false;await load();message('账户、日报路由和监控计划已保存');
   }
   async function discover(){
-    const a=await waitApi();const r=await a.startPromotionTargetDiscovery();message(r?.message||'请在Chrome中进入计划详情',!r?.success);
+    const a=await waitApi();const r=await a.startQianchuanCatalogSync();message(r?.message||'已在后台使用无头Chrome开始只读同步，不会提交任何千川操作',!r?.success);
     if(!r?.success)return;$('discover').disabled=true;
-    const timer=setInterval(async()=>{const s=await a.getPromotionTargetDiscoveryStatus();message(s?.message||'正在等待千川计划详情',!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;await load()}},1000);
+    const timer=setInterval(async()=>{const s=await a.getQianchuanCatalogSyncStatus();const progress=s?.total_accounts?`（${s.processed_accounts||0}/${s.total_accounts}${s.current_account?' · '+s.current_account:''}）`:'';message((s?.message||'正在同步授权账户和计划目录')+progress,!s?.success);if(!s?.running){clearInterval(timer);$('discover').disabled=false;await load()}},1000);
   }
   $('discover').onclick=discover;$('refresh').onclick=load;
+  function rerenderCatalogFilter(){
+    if(dirty){
+      message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);
+      return;
+    }
+    if(latest)render(latest);
+  }
+  $('planSearch').oninput=rerenderCatalogFilter;
+  $('planStatus').onchange=rerenderCatalogFilter;
   $('autostart').onchange=async()=>{const a=await waitApi();const r=await a.setWindowsAutostart($('autostart').checked);message(r?.message||($('autostart').checked?'开机自启已开启':'开机自启已关闭'),!r?.success);if(!r?.success)$('autostart').checked=!$('autostart').checked};
   load();setInterval(()=>{if(!dirty)load()},15000);
 </script>

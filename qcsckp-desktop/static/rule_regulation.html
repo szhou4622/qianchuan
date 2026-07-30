@@ -570,6 +570,20 @@
                         停投操作
                     </div>
                     <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <div class="rr-label">命中后的处理方式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" id="btnStopModeCard" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200 inline-flex items-center gap-1.5">
+                                <i data-lucide="message-square-check" class="w-4 h-4 opacity-90 shrink-0"></i>
+                                飞书卡片确认
+                            </button>
+                            <button type="button" id="btnStopModeAuto" class="seg-btn px-4 py-2 rounded-lg text-sm text-slate-200 inline-flex items-center gap-1.5">
+                                <i data-lucide="zap" class="w-4 h-4 opacity-90 shrink-0"></i>
+                                自动执行
+                            </button>
+                        </div>
+                        <p class="text-[11px] text-slate-600 leading-relaxed max-w-xl">
+                            新建策略默认发飞书卡片；旧策略保持自动执行，避免升级后改变原有行为。
+                        </p>
                         <div class="rr-label">停投执行方式</div>
                         <div class="flex flex-wrap gap-2.5">
                             <button type="button" id="btnStopActionPause" class="seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm text-slate-200 inline-flex items-center gap-1.5">

@@ -1930,7 +1930,9 @@
         async function loadPromotionTargetOptions(api) {
             if (!api?.listPromotionTargets) return;
             const res = await api.listPromotionTargets(true);
-            promotionTargetsState = Array.isArray(res?.data) ? res.data : [];
+            promotionTargetsState = Array.isArray(res?.data)
+                ? res.data.filter(x => !!x.retarget_eligible)
+                : [];
             const productEntries = await Promise.all(promotionTargetsState.map(async target => {
                 if (target.promotion_scene !== 'product' || !api.listPromotionTargetProducts) {
                     return [target.target_uid, []];

@@ -48,6 +48,13 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _target(self, aavid: str, index: int):
+        ensure_qianchuan_account(
+            aavid,
+            owner_username="tool-owner",
+            enabled=True,
+            seen=True,
+            db=self.db,
+        )
         return upsert_promotion_target(
             {
                 "aavid": aavid,
@@ -55,8 +62,11 @@ class MultiQianchuanAccountTests(unittest.TestCase):
                 "plan_name": f"计划{index}",
                 "promotion_scene": "live" if index % 2 else "product",
                 "plan_system": "global" if index % 3 else "chengfang",
+                "platform_status": "active",
+                "verification_state": "verified",
                 "enabled": True,
             },
+            trusted_catalog=True,
             db=self.db,
         )
 
@@ -275,15 +285,22 @@ class MultiQianchuanAccountTests(unittest.TestCase):
 
     def test_account_specific_feishu_route_only_uses_selected_bound_targets(self):
         account = ensure_qianchuan_account("10001", db=self.db)
-        save_qianchuan_account_settings(
-            account["account_uid"],
-            {
-                "route_mode": "custom",
-                "route_send_personal": True,
-                "route_group_ids": ["oc_selected", "oc_not_bound"],
+        with patch(
+            "services.local_feishu_bridge.get_local_feishu_status",
+            return_value={
+                "connected": True,
+                "profile": {"authorized_open_id": "ou_owner"},
             },
-            db=self.db,
-        )
+        ):
+            save_qianchuan_account_settings(
+                account["account_uid"],
+                {
+                    "route_mode": "custom",
+                    "route_send_personal": True,
+                    "route_group_ids": ["oc_selected", "oc_not_bound"],
+                },
+                db=self.db,
+            )
         with patch(
             "services.local_feishu_bridge.list_local_feishu_bound_targets",
             return_value=[("open_id", "ou_owner"), ("chat_id", "oc_selected")],

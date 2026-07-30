@@ -66,6 +66,7 @@ from services.regulation_rule_runner import (
     has_completed_stop,
 )
 from services.run_services import _sync_discovered_product_targets
+from services.qianchuan_accounts import ensure_qianchuan_account
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -98,6 +99,12 @@ class ProductPromotionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _target(self, index, *, enabled=True, scene="product"):
+        ensure_qianchuan_account(
+            "10001",
+            enabled=True,
+            seen=True,
+            db=self.db,
+        )
         return upsert_promotion_target(
             {
                 "aavid": "10001",
@@ -105,12 +112,15 @@ class ProductPromotionTests(unittest.TestCase):
                 "plan_name": f"计划{index}",
                 "promotion_scene": scene,
                 "plan_system": "global",
+                "platform_status": "active",
+                "verification_state": "verified",
                 "enabled": enabled,
                 "page_url": (
                     "https://qianchuan.jinritemai.com/uni-prom/detail"
                     f"?aavid=10001&adId={20000 + index}&token=secret"
                 ),
             },
+            trusted_catalog=True,
             db=self.db,
         )
 

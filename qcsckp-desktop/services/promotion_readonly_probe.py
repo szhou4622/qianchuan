@@ -16,7 +16,7 @@ import threading
 import time
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import unquote, urlparse
 
 from services.product_scene_adapter import (
@@ -25,7 +25,9 @@ from services.product_scene_adapter import (
     extract_product_scene_snapshot,
     extract_safe_query_identifiers,
     merge_product_scene_snapshots,
+    validate_exact_product_plan_payload,
 )
+from services.plan_system import detect_plan_system
 
 SENSITIVE_KEY_PARTS = (
     "token",
@@ -108,6 +110,7 @@ ACCOUNT_NAME_KEYS = (
     ("userInfoName", 10),
     ("user_info_name", 10),
 )
+ACCOUNT_LIST_PATH = "/ad/api/v1/account/user-list"
 
 
 def _safe_text(value: Any, limit: int = 160) -> str:
@@ -222,6 +225,24 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
                     and len(account_candidates) < 100
                 ):
                     account_candidates.append(account)
+            # 千川右上角“切换”面板使用 userAccountInfos，
+            # 行内字段只有 id/name，不应被当成广告计划。
+            if (
+                "userAccountInfos" in path
+                and str(candidate.get("id") or "").isdigit()
+                and candidate.get("name")
+            ):
+                account = {
+                    "aavid": str(candidate["id"]),
+                    "account_name": str(candidate["name"])[:256],
+                    "name_source": "userAccountInfos.name",
+                    "name_priority": 110,
+                }
+                if (
+                    account not in account_candidates
+                    and len(account_candidates) < 100
+                ):
+                    account_candidates.append(account)
             for key, one in value.items():
                 lower = str(key).lower()
                 if any(part in lower for part in SENSITIVE_KEY_PARTS):
@@ -313,7 +334,17 @@ class PromotionReadOnlyProbe:
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._pagination_replays = set()
         self._pagination_inflight = set()
+        self._all_status_replays = set()
+        self._full_catalog_request_variants = set()
         self._attached_page_ids = set()
+        self._catalog_context: Dict[str, str] = {}
+        self._catalog_rows: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+        self._catalog_variants: Dict[
+            tuple[str, str, str, str], Dict[str, Any]
+        ] = {}
+        self._authorized_account_total = 0
+        self._authorized_account_pages_seen = set()
+        self._authorized_accounts_ui: Dict[str, Dict[str, str]] = {}
         self._write(
             {
                 "version": 1,
@@ -359,6 +390,291 @@ class PromotionReadOnlyProbe:
         page.on("request", self._on_request)
         page.on("response", self._on_response)
 
+    def set_catalog_context(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> None:
+        """标记接下来只读列表响应所属的账户、推广方式和计划体系。"""
+        aid = str(aavid or "").strip()
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        self._catalog_context = {
+            "aavid": aid if aid.isdigit() else "",
+            "promotion_scene": scene if scene in {"live", "product"} else "",
+            "plan_system": (
+                system if system in {"global", "chengfang"} else "unknown"
+            ),
+        }
+
+    def reset_catalog_class(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> None:
+        prefix = (
+            str(aavid or "").strip(),
+            str(promotion_scene or "").strip().lower(),
+            str(plan_system or "").strip().lower(),
+        )
+        self._catalog_rows = {
+            key: value
+            for key, value in self._catalog_rows.items()
+            if key[:3] != prefix
+        }
+        self._catalog_variants = {
+            key: value
+            for key, value in self._catalog_variants.items()
+            if key[:3] != prefix
+        }
+
+    @staticmethod
+    def _request_catalog_scene(body: Any) -> str:
+        if not isinstance(body, Mapping):
+            return ""
+        params = body.get("Params")
+        params = params if isinstance(params, Mapping) else {}
+        ad_filter = params.get("AdFilter")
+        ad_filter = ad_filter if isinstance(ad_filter, Mapping) else {}
+        raw = (
+            ad_filter.get("MarGoal")
+            or ad_filter.get("marGoal")
+            or body.get("mar_goal")
+            or body.get("marGoal")
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return ""
+        return "product" if value == 1 else ("live" if value == 2 else "")
+
+    @staticmethod
+    def _request_catalog_aavid(body: Any) -> str:
+        if not isinstance(body, Mapping):
+            return ""
+        value = str(
+            body.get("aavid")
+            or body.get("aadvid")
+            or body.get("advertiserId")
+            or ""
+        ).strip()
+        return value if value.isdigit() else ""
+
+    @classmethod
+    def _request_page_number(cls, body: Any) -> int:
+        page_params = cls._request_page_params(body)
+        raw = None
+        if page_params:
+            raw = page_params.get("Page")
+            if raw in (None, ""):
+                raw = page_params.get("page")
+        elif isinstance(body, Mapping):
+            raw = body.get("page")
+            if raw in (None, ""):
+                raw = body.get("Page")
+        try:
+            return max(1, int(raw or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    @classmethod
+    def _catalog_variant_key(
+        cls,
+        path: str,
+        body: Any,
+    ) -> str:
+        if not isinstance(body, Mapping):
+            return str(path)
+        stable = deepcopy(dict(body))
+        page_params = cls._request_page_params(stable)
+        if page_params:
+            if "Page" in page_params:
+                page_params["Page"] = 1
+            if "page" in page_params:
+                page_params["page"] = 1
+        else:
+            if "page" in stable:
+                stable["page"] = 1
+            if "Page" in stable:
+                stable["Page"] = 1
+        # 飞书/千川会话类字段不参与筛选变体身份，也绝不落盘。
+        for key in list(stable):
+            if any(part in str(key).lower() for part in SENSITIVE_KEY_PARTS):
+                stable.pop(key, None)
+        digest = hashlib.sha256(
+            json.dumps(
+                stable,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        return f"{path}|{digest}"
+
+    def catalog_rows(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> List[Dict[str, Any]]:
+        prefix = (
+            str(aavid or "").strip(),
+            str(promotion_scene or "").strip().lower(),
+            str(plan_system or "").strip().lower(),
+        )
+        rows = [
+            dict(row)
+            for key, row in self._catalog_rows.items()
+            if key[:3] == prefix
+        ]
+        rows.sort(key=lambda item: (str(item.get("plan_name") or ""), item["ad_id"]))
+        return rows
+
+    def catalog_class_status(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> Dict[str, Any]:
+        prefix = (
+            str(aavid or "").strip(),
+            str(promotion_scene or "").strip().lower(),
+            str(plan_system or "").strip().lower(),
+        )
+        variants = [
+            dict(item)
+            for key, item in self._catalog_variants.items()
+            if key[:3] == prefix
+        ]
+        if not variants:
+            return {
+                "complete": False,
+                "variants": 0,
+                "message": "未观察到该分类的计划列表接口",
+            }
+        full_variants = [
+            item for item in variants if bool(item.get("full_catalog"))
+        ]
+        complete = bool(full_variants) and all(
+            not item.get("error")
+            and set(item.get("seen_pages") or [])
+            >= set(range(1, int(item.get("total_pages") or 1) + 1))
+            for item in full_variants
+        )
+        return {
+            "complete": complete,
+            "variants": len(variants),
+            "message": (
+                ""
+                if complete
+                else (
+                    "尚未取得无状态排除条件的完整计划列表"
+                    if not full_variants
+                    else "该分类存在未完成分页或接口错误"
+                )
+            ),
+        }
+
+    async def discover_authorized_accounts(
+        self,
+        page: Any,
+        *,
+        timeout_ms: int = 30_000,
+    ) -> List[Dict[str, str]]:
+        """通过千川只读“切换账户”面板滚动取得完整授权账户目录。"""
+        switch_text = "\u5207\u6362"
+        try:
+            account_button = page.locator("#navigator-right-account")
+            await account_button.wait_for(state="visible", timeout=timeout_ms)
+            await account_button.hover()
+            switch = page.get_by_text(switch_text, exact=True)
+            await switch.last.wait_for(state="visible", timeout=timeout_ms)
+            await switch.last.click()
+            scroll = page.locator(
+                ".qc-ui-navigator-account-list "
+                ".tools-vmok-plugin-infinite-scroll"
+            )
+            await scroll.wait_for(state="visible", timeout=timeout_ms)
+            stable = 0
+            last_count = -1
+            for _ in range(60):
+                count = await page.locator(
+                    ".qc-ui-navigator-account-item"
+                ).count()
+                if count == last_count:
+                    stable += 1
+                else:
+                    stable = 0
+                    last_count = count
+                expected_total = max(
+                    0,
+                    int(self._authorized_account_total or 0),
+                )
+                if (
+                    expected_total
+                    and count >= expected_total
+                    and stable >= 2
+                ):
+                    break
+                if not expected_total and stable >= 6:
+                    break
+                await scroll.evaluate(
+                    "(node) => { node.scrollTop = node.scrollHeight; }"
+                )
+                await page.wait_for_timeout(450)
+            raw = await page.locator(
+                ".qc-ui-navigator-account-item"
+            ).evaluate_all(
+                """(nodes) => nodes.map((node) => ({
+                    name: (
+                        node.querySelector('.account-name')?.getAttribute('title')
+                        || node.querySelector('.account-name')?.textContent
+                        || ''
+                    ).trim(),
+                    idText: (
+                        node.querySelector('.account-id')?.textContent || ''
+                    ).trim()
+                }))"""
+            )
+        except Exception:
+            raw = []
+        result: Dict[str, Dict[str, str]] = {}
+        for item in raw or []:
+            match = re.search(r"(\d{8,})", str((item or {}).get("idText") or ""))
+            aid = match.group(1) if match else ""
+            name = _safe_text((item or {}).get("name"), 256)
+            if aid and name:
+                result[aid] = {"aavid": aid, "account_name": name}
+        self._authorized_accounts_ui = dict(result)
+        for item in self.authorized_accounts():
+            aid = str(item.get("aavid") or "")
+            if aid and aid not in result:
+                result[aid] = item
+        return list(result.values())
+
+    def authorized_account_catalog_status(self) -> Dict[str, Any]:
+        observed = len(
+            self._authorized_accounts_ui or {
+                str(item.get("aavid") or ""): item
+                for item in self.authorized_accounts()
+                if str(item.get("aavid") or "")
+            }
+        )
+        total = max(0, int(self._authorized_account_total or 0))
+        pages = sorted(int(value) for value in self._authorized_account_pages_seen)
+        return {
+            "complete": bool(total) and observed >= total,
+            "observed": observed,
+            "total": total,
+            "pages_seen": pages,
+        }
+
     def latest_product_snapshot(self) -> Dict[str, Any]:
         items = [
             item
@@ -376,7 +692,17 @@ class PromotionReadOnlyProbe:
 
     def authorized_accounts(self) -> List[Dict[str, str]]:
         """返回只读响应中明确同时出现账户ID和账户名称的候选账户。"""
-        result: Dict[str, Dict[str, Any]] = {}
+        result: Dict[str, Dict[str, Any]] = {
+            aid: {
+                "aavid": aid,
+                "account_name": str(item.get("account_name") or "")[:256],
+                "name_priority": 120,
+            }
+            for aid, item in getattr(
+                self, "_authorized_accounts_ui", {}
+            ).items()
+            if aid.isdigit() and str(item.get("account_name") or "").strip()
+        }
         for item in list(self._apis.values()) + list(self._requests.values()):
             for account in item.get("account_candidates") or []:
                 aid = str((account or {}).get("aavid") or "").strip()
@@ -411,6 +737,145 @@ class PromotionReadOnlyProbe:
             await asyncio.sleep(0.05)
         # page.evaluate 返回后，Playwright 的 response 回调可能仍在解析最后一页。
         await asyncio.sleep(0.1)
+
+    async def verify_catalog_plans(
+        self,
+        page: Any,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+        max_plans: int = 500,
+    ) -> Dict[str, Any]:
+        """逐条读取精确详情；只有账户、计划、场景、体系都一致才返回 verified。"""
+        aid = str(aavid or "").strip()
+        scene = str(promotion_scene or "").strip().lower()
+        expected_system = str(plan_system or "").strip().lower()
+        rows = self.catalog_rows(
+            aavid=aid,
+            promotion_scene=scene,
+            plan_system=expected_system,
+        )[: max(1, int(max_plans))]
+        verified: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, str]] = []
+        endpoint = (
+            "/ad/api/creation/v1/ad/ad-detail-plus"
+            if scene == "product"
+            else "/ad/api/creation/v1/ad/ad-detail-basic"
+        )
+        for row in rows:
+            ad_id = str(row.get("ad_id") or "").strip()
+            try:
+                response = await page.evaluate(
+                    """async ({endpoint, aavid, adId}) => {
+                        const query = new URLSearchParams({
+                            aavid,
+                            adid: adId
+                        });
+                        const result = await fetch(
+                            `${endpoint}?${query.toString()}`,
+                            {credentials: 'include'}
+                        );
+                        let payload = null;
+                        try { payload = await result.json(); } catch (_) {}
+                        return {status: result.status, payload};
+                    }""",
+                    {
+                        "endpoint": endpoint,
+                        "aavid": aid,
+                        "adId": ad_id,
+                    },
+                )
+                payload = (
+                    response.get("payload")
+                    if isinstance(response, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(response, Mapping)
+                    or int(response.get("status") or 0) != 200
+                    or not isinstance(payload, Mapping)
+                ):
+                    raise RuntimeError(
+                        f"HTTP {response.get('status') if isinstance(response, Mapping) else 0}"
+                    )
+                reason = validate_exact_product_plan_payload(
+                    payload,
+                    expected_ad_id=ad_id,
+                    require_delivering=False,
+                )
+                if reason:
+                    raise RuntimeError(reason)
+                data = payload.get("data")
+                data = data if isinstance(data, Mapping) else {}
+                detail = data.get("adDetailInfo")
+                detail = detail if isinstance(detail, Mapping) else {}
+                actual_account = str(
+                    detail.get("advId")
+                    or detail.get("aavid")
+                    or detail.get("advertiserId")
+                    or ""
+                ).strip()
+                if actual_account and actual_account != aid:
+                    raise RuntimeError(
+                        f"精确详情账户不匹配：期望 {aid}，实际 {actual_account}"
+                    )
+                raw_goal = detail.get("marGoal")
+                if raw_goal not in (None, ""):
+                    try:
+                        actual_scene = (
+                            "product"
+                            if int(raw_goal) == 1
+                            else ("live" if int(raw_goal) == 2 else "")
+                        )
+                    except (TypeError, ValueError):
+                        actual_scene = ""
+                    if actual_scene and actual_scene != scene:
+                        raise RuntimeError(
+                            f"精确详情推广方式不匹配：期望 {scene}，实际 {actual_scene}"
+                        )
+                detected_system = detect_plan_system(payload=payload)
+                if (
+                    detected_system != "unknown"
+                    and detected_system != expected_system
+                ):
+                    raise RuntimeError(
+                        "精确详情计划体系与分类页面不一致："
+                        f"{detected_system} != {expected_system}"
+                    )
+                snapshot = extract_product_scene_snapshot(payload)
+                plan = snapshot.get("plan") or {}
+                verified.append(
+                    {
+                        **row,
+                        "plan_name": str(
+                            plan.get("plan_name")
+                            or row.get("plan_name")
+                            or ""
+                        ).strip()[:256],
+                        "platform_status": (
+                            plan.get("platform_status")
+                            or plan.get("delivery_name")
+                            or row.get("platform_status")
+                            or "unknown"
+                        ),
+                        "verification_state": "verified",
+                        "detail_snapshot": snapshot,
+                    }
+                )
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "ad_id": ad_id,
+                        "reason": _safe_text(exc, 500),
+                    }
+                )
+        return {
+            "verified": verified,
+            "rejected": rejected,
+            "candidate_count": len(rows),
+            "complete": len(rows) == len(verified),
+        }
 
     def confirmed_product_target(self) -> Optional[Dict[str, Any]]:
         """返回当前商品全域页已由主计划接口确认的目标。"""
@@ -524,6 +989,22 @@ class PromotionReadOnlyProbe:
             if "json" not in content_type.lower():
                 return
             payload = await response.json()
+            if path == ACCOUNT_LIST_PATH and isinstance(payload, Mapping):
+                account_data = payload.get("data")
+                if isinstance(account_data, Mapping):
+                    try:
+                        self._authorized_account_total = max(
+                            self._authorized_account_total,
+                            int(account_data.get("totalCount") or 0),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        self._authorized_account_pages_seen.add(
+                            int(account_data.get("currentPage") or 1)
+                        )
+                    except (TypeError, ValueError):
+                        pass
             summary = summarize_json(payload)
             product_snapshot = (
                 extract_product_scene_snapshot(payload)
@@ -550,8 +1031,101 @@ class PromotionReadOnlyProbe:
             post_data = getattr(response.request, "post_data", None)
             response_key = self._observation_key(path, post_data)
             self._apis[response_key] = item
+            if path in PRODUCT_AD_LIST_API_PATHS:
+                try:
+                    request_body = json.loads(post_data or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    request_body = {}
+                request_aavid = (
+                    self._request_catalog_aavid(request_body)
+                    or str(item.get("identifiers", {}).get("aavid") or "")
+                    or str(self._catalog_context.get("aavid") or "")
+                )
+                request_scene = (
+                    self._request_catalog_scene(request_body)
+                    or str(self._catalog_context.get("promotion_scene") or "")
+                )
+                request_system = str(
+                    self._catalog_context.get("plan_system") or "unknown"
+                )
+                if (
+                    request_aavid.isdigit()
+                    and request_scene in {"live", "product"}
+                    and request_system in {"global", "chengfang"}
+                ):
+                    variant = self._catalog_variant_key(path, request_body)
+                    variant_key = (
+                        request_aavid,
+                        request_scene,
+                        request_system,
+                        variant,
+                    )
+                    page_number = self._request_page_number(request_body)
+                    current = dict(self._catalog_variants.get(variant_key) or {})
+                    pages = {
+                        int(value)
+                        for value in current.get("seen_pages") or []
+                        if str(value).isdigit()
+                    }
+                    pages.add(page_number)
+                    current.update(
+                        {
+                            "path": path,
+                            "status": int(response.status),
+                            "total_pages": self._response_total_pages(payload),
+                            "seen_pages": sorted(pages),
+                            "full_catalog": self._is_full_catalog_request(
+                                request_body
+                            )
+                            or variant
+                            in self._full_catalog_request_variants,
+                            "error": (
+                                ""
+                                if int(response.status) == 200
+                                and (
+                                    not isinstance(payload, Mapping)
+                                    or payload.get("status_code") in (None, 0)
+                                )
+                                else str(
+                                    (payload or {}).get("message")
+                                    if isinstance(payload, Mapping)
+                                    else f"HTTP {response.status}"
+                                )[:500]
+                            ),
+                        }
+                    )
+                    self._catalog_variants[variant_key] = current
+                    for row in product_snapshot.get("ad_rows") or []:
+                        if not isinstance(row, Mapping):
+                            continue
+                        ad_id = str(row.get("ad_id") or "").strip()
+                        if not ad_id.isdigit():
+                            continue
+                        self._catalog_rows[
+                            (
+                                request_aavid,
+                                request_scene,
+                                request_system,
+                                ad_id,
+                            )
+                        ] = {
+                            "aavid": request_aavid,
+                            "ad_id": ad_id,
+                            "plan_name": str(
+                                row.get("ad_name") or ""
+                            ).strip()[:256],
+                            "promotion_scene": request_scene,
+                            "plan_system": request_system,
+                            "platform_status": row.get("platform_status")
+                            or "unknown",
+                            "product_ids": list(row.get("product_ids") or []),
+                        }
             self._flush()
             if path in PRODUCT_AD_LIST_API_PATHS:
+                await self._replay_all_status_variant(
+                    response,
+                    post_data=post_data,
+                )
                 await self._replay_remaining_product_pages(
                     response,
                     payload,
@@ -584,6 +1158,140 @@ class PromotionReadOnlyProbe:
         return page_params if isinstance(page_params, dict) else None
 
     @staticmethod
+    def _catalog_ad_filter(body: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(body, dict):
+            return None
+        params = body.get("Params")
+        if not isinstance(params, dict):
+            params = body.get("params")
+        if not isinstance(params, dict):
+            return None
+        value = params.get("AdFilter")
+        if not isinstance(value, dict):
+            value = params.get("adFilter")
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def _is_full_catalog_request(cls, body: Any) -> bool:
+        if not isinstance(body, dict):
+            return False
+        ad_filter = cls._catalog_ad_filter(body)
+        if ad_filter is None:
+            # 仅对已观察并清理过的嵌套请求宣称“全目录”；
+            # 老的平铺报表请求带日期窗口，不能作为完整目录证据。
+            return bool(body.get("__qcsckp_full_catalog__"))
+        restrictive_keys = {
+            "NotInEcpAdStatuses",
+            "notInEcpAdStatuses",
+            "EcpAdStatuses",
+            "ecpAdStatuses",
+        }
+        params = body.get("Params")
+        params = params if isinstance(params, dict) else body.get("params")
+        return bool(body.get("__qcsckp_full_catalog__")) and not any(
+            key in ad_filter for key in restrictive_keys
+        ) and not (
+            isinstance(params, dict)
+            and ("HavingFilter" in params or "havingFilter" in params)
+        )
+
+    async def _replay_all_status_variant(
+        self,
+        response: Any,
+        *,
+        post_data: Any,
+    ) -> None:
+        """基于页面真实请求派生无状态排除/无消耗门槛的只读目录请求。"""
+        try:
+            body = json.loads(post_data or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        ad_filter = self._catalog_ad_filter(body)
+        if ad_filter is None or self._is_full_catalog_request(body):
+            return
+        params = body.get("Params")
+        params_key = "Params"
+        if not isinstance(params, dict):
+            params = body.get("params")
+            params_key = "params"
+        if not isinstance(params, dict):
+            return
+        marker = (
+            str(urlparse(str(response.url or "")).path),
+            self._request_catalog_aavid(body),
+            self._request_catalog_scene(body),
+            str(self._catalog_context.get("plan_system") or "unknown"),
+        )
+        if marker in self._all_status_replays:
+            return
+        self._all_status_replays.add(marker)
+        replay_body = deepcopy(body)
+        replay_filter = self._catalog_ad_filter(replay_body)
+        replay_params = replay_body.get(params_key)
+        if not isinstance(replay_filter, dict) or not isinstance(replay_params, dict):
+            return
+        for key in (
+            "NotInEcpAdStatuses",
+            "notInEcpAdStatuses",
+            "EcpAdStatuses",
+            "ecpAdStatuses",
+        ):
+            replay_filter.pop(key, None)
+        replay_params.pop("HavingFilter", None)
+        replay_params.pop("havingFilter", None)
+        replay_body["__qcsckp_full_catalog__"] = True
+        page_params = self._request_page_params(replay_body)
+        if page_params is not None:
+            if "Page" in page_params:
+                page_params["Page"] = 1
+            else:
+                page_params["page"] = 1
+            if "PageSize" in page_params:
+                page_params["PageSize"] = 100
+            elif "pageSize" in page_params:
+                page_params["pageSize"] = 100
+        frame = getattr(response.request, "frame", None)
+        page = getattr(frame, "page", None)
+        if page is None:
+            return
+        # __qcsckp_full_catalog__ 仅是本地证据标记，发给平台前移除；
+        # response 回调通过正在执行的 marker 识别这次派生请求。
+        send_body = deepcopy(replay_body)
+        send_body.pop("__qcsckp_full_catalog__", None)
+        full_variant = self._catalog_variant_key(
+            str(urlparse(str(response.url or "")).path),
+            send_body,
+        )
+        self._full_catalog_request_variants.add(full_variant)
+        await page.evaluate(
+            """async ({url, body}) => {
+                const result = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {'content-type': 'application/json;charset=UTF-8'},
+                    body: JSON.stringify(body)
+                });
+                await result.text();
+                return result.status;
+            }""",
+            {"url": str(response.url or ""), "body": send_body},
+        )
+
+    @classmethod
+    def _set_request_page(cls, body: Any, page_number: int) -> bool:
+        page_params = cls._request_page_params(body)
+        if page_params is not None:
+            key = "Page" if "Page" in page_params else "page"
+            page_params[key] = int(page_number)
+            return True
+        if isinstance(body, dict):
+            key = "page" if "page" in body else ("Page" if "Page" in body else "")
+            if key:
+                body[key] = int(page_number)
+                return True
+        return False
+
+    @staticmethod
     def _response_total_pages(payload: Any) -> int:
         queue = [payload]
         seen = 0
@@ -591,12 +1299,37 @@ class PromotionReadOnlyProbe:
             value = queue.pop(0)
             seen += 1
             if isinstance(value, dict):
-                for key, one in value.items():
-                    if str(key).casefold() == "totalpage":
+                lowered = {
+                    str(key).casefold(): one for key, one in value.items()
+                }
+                for key in ("totalpage", "totalpages"):
+                    if key in lowered:
                         try:
-                            return max(1, min(50, int(one)))
+                            return max(1, int(lowered[key]))
                         except (TypeError, ValueError):
                             return 1
+                if (
+                    "totalcount" in lowered
+                    and (
+                        "pagesize" in lowered
+                        or "page_size" in lowered
+                        or "limit" in lowered
+                    )
+                ):
+                    try:
+                        total = max(0, int(lowered["totalcount"]))
+                        size = max(
+                            1,
+                            int(
+                                lowered.get("pagesize")
+                                or lowered.get("page_size")
+                                or lowered.get("limit")
+                            ),
+                        )
+                        return max(1, (total + size - 1) // size)
+                    except (TypeError, ValueError):
+                        pass
+                for one in value.values():
                     if isinstance(one, (dict, list)):
                         queue.append(one)
             elif isinstance(value, list):
@@ -617,26 +1350,16 @@ class PromotionReadOnlyProbe:
             body = json.loads(post_data)
         except (TypeError, ValueError, json.JSONDecodeError):
             return
-        page_params = self._request_page_params(body)
-        if not page_params:
+        current_page = self._request_page_number(body)
+        if not self._set_request_page(deepcopy(body), current_page):
             return
-        page_key = "Page" if "Page" in page_params else "page"
-        try:
-            current_page = int(page_params.get(page_key) or 1)
-        except (TypeError, ValueError):
-            current_page = 1
         total_pages = self._response_total_pages(payload)
         if total_pages <= current_page:
             return
         variant_body = deepcopy(body)
-        variant_params = self._request_page_params(variant_body)
-        if not variant_params:
-            return
         base_body = deepcopy(variant_body)
-        base_params = self._request_page_params(base_body)
-        if not base_params:
+        if not self._set_request_page(base_body, 1):
             return
-        base_params[page_key] = 1
         variant_hash = hashlib.sha256(
             json.dumps(
                 base_body,
@@ -657,11 +1380,9 @@ class PromotionReadOnlyProbe:
                 return
             for page_number in range(current_page + 1, total_pages + 1):
                 replay_body = deepcopy(body)
-                replay_params = self._request_page_params(replay_body)
-                if not replay_params:
+                if not self._set_request_page(replay_body, page_number):
                     break
-                replay_params[page_key] = page_number
-                await page.evaluate(
+                replay_result = await page.evaluate(
                     """async ({url, body}) => {
                         const result = await fetch(url, {
                             method: 'POST',
@@ -669,10 +1390,23 @@ class PromotionReadOnlyProbe:
                             headers: {'content-type': 'application/json;charset=UTF-8'},
                             body: JSON.stringify(body)
                         });
-                        await result.text();
-                        return result.status;
+                        let payload = null;
+                        try { payload = await result.json(); } catch (_) {}
+                        return {status: result.status, payload};
                     }""",
                     {"url": str(response.url or ""), "body": replay_body},
                 )
+                # page.evaluate 发起的 fetch 仍会触发 Playwright response 事件；
+                # 若平台拒绝签名或业务失败，额外记录错误，避免把分页误报为完整。
+                if (
+                    not isinstance(replay_result, Mapping)
+                    or int(replay_result.get("status") or 0) != 200
+                    or (
+                        isinstance(replay_result.get("payload"), Mapping)
+                        and replay_result["payload"].get("status_code")
+                        not in (None, 0)
+                    )
+                ):
+                    break
         finally:
             self._pagination_inflight.discard(marker)

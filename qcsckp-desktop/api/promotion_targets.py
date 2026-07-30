@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
@@ -22,6 +23,99 @@ MAX_ENABLED_TARGETS = 0
 LEGACY_TARGET_UID = "legacy_unscoped"
 ALLOWED_SCENES = frozenset({"live", "product"})
 ALLOWED_FILTER_MODES = frozenset({"all", "selected"})
+ALLOWED_VERIFICATION_STATES = frozenset(
+    {"legacy_unverified", "candidate", "verified", "missing", "error"}
+)
+ACTIVE_PLATFORM_STATUSES = frozenset(
+    {"active", "enabled", "delivering", "learning", "running"}
+)
+
+
+def normalize_platform_status(value: Any) -> str:
+    """Normalize only explicit platform status evidence; unknown remains blocked."""
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "1": "active",
+        "2": "paused",
+        "3": "ended",
+        "4": "deleted",
+        "投放中": "active",
+        "生效中": "active",
+        "学习中": "learning",
+        "启用": "enabled",
+        "已启用": "enabled",
+        "暂停": "paused",
+        "已暂停": "paused",
+        "结束": "ended",
+        "已结束": "ended",
+        "删除": "deleted",
+        "已删除": "deleted",
+        "历史": "historical",
+    }
+    return aliases.get(raw, raw or "unknown")[:64]
+
+
+def normalize_verification_state(value: Any) -> str:
+    state = str(value or "").strip().lower()
+    return state if state in ALLOWED_VERIFICATION_STATES else "legacy_unverified"
+
+
+def target_eligibility(
+    *,
+    promotion_scene: Any,
+    plan_system: Any,
+    platform_status: Any,
+    verification_state: Any,
+    capability: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Derive all automation gates from persisted, explicit catalog evidence."""
+    scene = str(promotion_scene or "").strip().lower()
+    system = normalize_plan_system(plan_system)
+    status = normalize_platform_status(platform_status)
+    verification = normalize_verification_state(verification_state)
+    reasons: List[str] = []
+    if verification != "verified":
+        reasons.append("计划身份尚未通过精确详情核验")
+    if scene not in ALLOWED_SCENES:
+        reasons.append("推广方式待确认")
+    if system not in {"global", "chengfang"}:
+        reasons.append("计划体系待确认")
+    if status not in ACTIVE_PLATFORM_STATUSES:
+        if status == "unknown":
+            reasons.append("平台状态待确认")
+        else:
+            reasons.append(f"平台状态为{status}，不可参与自动化")
+    monitor = not reasons
+    cap = capability if isinstance(capability, dict) else {}
+    from services.promotion_capability import capability_is_required
+
+    requires_capability = capability_is_required(
+        promotion_scene=scene,
+        plan_system=system,
+    )
+    retarget_capable = bool(
+        cap.get("retarget_supported")
+        or cap.get("retarget_submit_supported")
+        or cap.get("retarget")
+        or cap.get("retarget_execute")
+        or not requires_capability
+    )
+    stop_capable = bool(
+        cap.get("stop_supported")
+        or cap.get("regulation_supported")
+        or cap.get("pause_supported")
+        or cap.get("delete_supported")
+        or cap.get("regulation_execute")
+        or not requires_capability
+    )
+    return {
+        "platform_status": status,
+        "verification_state": verification,
+        "monitor_eligible": monitor,
+        "retarget_eligible": monitor and retarget_capable,
+        "stop_eligible": monitor and stop_capable,
+        "ineligible_reason": "；".join(reasons),
+    }
 
 
 def make_target_uid(aavid: Any, ad_id: Any) -> str:
@@ -250,6 +344,8 @@ def sanitize_target_url(url: str) -> str:
 def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
+    for key in ("monitor_eligible", "retarget_eligible", "stop_eligible"):
+        out[key] = bool(out.get(key))
     out["automation_write_blocked"] = bool(
         out.get("automation_write_blocked")
     )
@@ -317,10 +413,81 @@ def get_promotion_target(
     return _target_row(row) if row else None
 
 
+def refresh_target_eligibility(
+    target_uid: Any,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> Optional[Dict[str, Any]]:
+    """Recalculate persisted gates after capability or catalog evidence changes."""
+    uid = str(target_uid or "").strip()
+    if not uid:
+        return None
+    store = db or SQLiteStore()
+    row = store.select_one("promotion_target", where={"target_uid": uid})
+    if not row:
+        return None
+    try:
+        capability = json.loads(str(row.get("capability_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        capability = {}
+    eligibility = target_eligibility(
+        promotion_scene=row.get("promotion_scene"),
+        plan_system=row.get("plan_system"),
+        platform_status=row.get("platform_status"),
+        verification_state=row.get("verification_state"),
+        capability=capability,
+    )
+    store.update(
+        "promotion_target",
+        {
+            "platform_status": eligibility["platform_status"],
+            "verification_state": eligibility["verification_state"],
+            "monitor_eligible": 1 if eligibility["monitor_eligible"] else 0,
+            "retarget_eligible": 1 if eligibility["retarget_eligible"] else 0,
+            "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
+            "ineligible_reason": str(eligibility["ineligible_reason"] or "")[:1000],
+        },
+        where={"target_uid": uid},
+    )
+    saved = store.select_one("promotion_target", where={"target_uid": uid})
+    return _target_row(saved) if saved else None
+
+
+def update_target_catalog_evidence(
+    target_uid: Any,
+    *,
+    platform_status: Any,
+    verification_state: Any,
+    plan_system: Any = None,
+    promotion_scene: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """Persist trusted read-only catalog evidence and recompute safety gates."""
+    uid = str(target_uid or "").strip()
+    store = db or SQLiteStore()
+    row = store.select_one("promotion_target", where={"target_uid": uid})
+    if not row:
+        raise ValueError("监控计划不存在")
+    values: Dict[str, Any] = {
+        "platform_status": normalize_platform_status(platform_status),
+        "verification_state": normalize_verification_state(verification_state),
+        "catalog_seen_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if plan_system is not None:
+        values["plan_system"] = normalize_plan_system(plan_system)
+    if promotion_scene is not None:
+        values["promotion_scene"] = normalize_scene(promotion_scene)
+    store.update("promotion_target", values, where={"target_uid": uid})
+    saved = refresh_target_eligibility(uid, db=store)
+    assert saved is not None
+    return saved
+
+
 def upsert_promotion_target(
     data: Dict[str, Any],
     *,
     owner_username: Any = None,
+    trusted_catalog: bool = False,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     if not isinstance(data, dict):
@@ -440,6 +607,38 @@ def upsert_promotion_target(
             capability = {}
     if not isinstance(capability, dict):
         capability = {}
+    platform_status = normalize_platform_status(
+        (
+            data.get("platform_status")
+            if trusted_catalog and "platform_status" in data
+            else (existing.get("platform_status") if existing else "unknown")
+        )
+    )
+    verification_state = normalize_verification_state(
+        (
+            data.get("verification_state")
+            if trusted_catalog and "verification_state" in data
+            else (
+                existing.get("verification_state")
+                if existing
+                else "legacy_unverified"
+            )
+        )
+    )
+    if (
+        existing
+        and normalize_verification_state(existing.get("verification_state"))
+        == "verified"
+        and verification_state == "candidate"
+    ):
+        verification_state = "verified"
+    eligibility = target_eligibility(
+        promotion_scene=scene,
+        plan_system=plan_system,
+        platform_status=platform_status,
+        verification_state=verification_state,
+        capability=capability,
+    )
     last_status_source = (
         data.get("last_status")
         if "last_status" in data
@@ -462,6 +661,17 @@ def upsert_promotion_target(
         ).strip()[:256],
         "promotion_scene": scene,
         "plan_system": plan_system,
+        "platform_status": eligibility["platform_status"],
+        "verification_state": eligibility["verification_state"],
+        "catalog_seen_at": (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if trusted_catalog
+            else (existing.get("catalog_seen_at") if existing else None)
+        ),
+        "monitor_eligible": 1 if eligibility["monitor_eligible"] else 0,
+        "retarget_eligible": 1 if eligibility["retarget_eligible"] else 0,
+        "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
+        "ineligible_reason": str(eligibility["ineligible_reason"] or "")[:1000],
         "enabled": enabled,
         "product_filter_mode": filter_mode,
         "product_ids_json": _json_dumps(product_ids),
@@ -516,6 +726,10 @@ def set_promotion_target_enabled(
         account = get_qianchuan_account(target.get("account_uid"), db=store)
         if account and not account.get("enabled"):
             raise ValueError("请先启用该千川账户")
+        if not target.get("monitor_eligible"):
+            raise ValueError(
+                str(target.get("ineligible_reason") or "该计划尚未通过目录核验，不能启用自动监控")
+            )
     store.update(
         "promotion_target",
         {
@@ -605,12 +819,15 @@ def update_target_sync_state(
                 {"capability_json": values["capability_json"]},
                 where={"target_uid": str(target_uid or "").strip()},
             )
+        refresh_target_eligibility(target_uid, db=store)
         return
     store.update(
         "promotion_target",
         values,
         where={"target_uid": str(target_uid or "").strip()},
     )
+    if capability is not None:
+        refresh_target_eligibility(target_uid, db=store)
 
 
 def patch_target_sync_state(
@@ -684,6 +901,7 @@ def patch_target_sync_state(
                 where={"target_uid": uid},
                 connection=conn,
             )
+    refresh_target_eligibility(uid, db=store)
     return capability
 
 

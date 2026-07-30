@@ -459,6 +459,13 @@ def _validate_task(
         or not bool(target.get("enabled"))
         or (
             not legacy_test_double
+            and (
+                not bool(target.get("monitor_eligible"))
+                or not bool(target.get("retarget_eligible"))
+            )
+        )
+        or (
+            not legacy_test_double
             and str(target.get("capacity_state") or "") != "active"
         )
         or (
@@ -466,7 +473,12 @@ def _validate_task(
             and (not account or not bool(account.get("enabled")))
         )
     ):
-        raise RuntimeError("监控计划已删除、停用或正在等待监控容量")
+        raise RuntimeError(
+            str(
+                target.get("ineligible_reason")
+                or "监控计划已删除、停用、未核验或正在等待监控容量"
+            )
+        )
     if (
         not legacy_test_double
         and str((account or {}).get("owner_username") or "").strip().casefold()

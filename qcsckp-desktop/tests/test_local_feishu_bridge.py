@@ -6,11 +6,14 @@ import os
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from api.promotion_targets import upsert_promotion_target
+from services.qianchuan_accounts import ensure_qianchuan_account
 from services import local_feishu_bridge as bridge
-from utils.sqlite_store import init_sqlite_schema
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 def task_payload(material_count: int = 2) -> dict:
@@ -60,7 +63,10 @@ class FakeFeishuBridge:
             "send_groups": False,
         }
 
-    def send_task_cards(self, _task):
+    def bound_targets(self):
+        return [("open_id", "ou_owner")]
+
+    def send_task_cards(self, _task, **_kwargs):
         return [
             {
                 "receive_type": "open_id",
@@ -109,6 +115,78 @@ class LocalFeishuTaskTests(unittest.TestCase):
             "tool-user-a",
             {"authorized_open_id": "ou_owner", "groups": []},
         )
+        ensure_qianchuan_account(
+            "10001",
+            account_name="测试千川账户",
+            owner_username="tool-user-a",
+            enabled=True,
+            seen=True,
+            db=SQLiteStore(database=self.db_path),
+        )
+
+    def _stop_payload(self) -> dict:
+        db = SQLiteStore(database=self.db_path)
+        ensure_qianchuan_account(
+            "10001",
+            account_name="测试千川账户",
+            owner_username="tool-user-a",
+            enabled=True,
+            seen=True,
+            db=db,
+        )
+        target = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20002",
+                "account_name": "测试千川账户",
+                "plan_name": "全域推直播测试计划",
+                "promotion_scene": "live",
+                "plan_system": "global",
+                "platform_status": "active",
+                "verification_state": "verified",
+                "enabled": True,
+            },
+            owner_username="tool-user-a",
+            trusted_catalog=True,
+            db=db,
+        )
+        return {
+            "aavid": "10001",
+            "ad_id": "20002",
+            "target_uid": target["target_uid"],
+            "account_name": "测试千川账户",
+            "plan_name": "全域推直播测试计划",
+            "assist_task_id": "assist-30003",
+            "assist_task_name": "调控任务A",
+            "strategy_id": "stop-strategy-1",
+            "strategy_name": "低ROI停投",
+            "strategy_hash": "b" * 64,
+            "rule_snapshot": {
+                "id": "stop-strategy-1",
+                "title": "低ROI停投",
+                "action_mode": "card_confirm",
+            },
+            "trigger": {
+                "group_combine": "or",
+                "groups": [
+                    {
+                        "join": "and",
+                        "conditions": [
+                            {
+                                "metric": "total_prepay_and_pay_order_roi2_assist",
+                                "op": "lt",
+                                "value": 1.5,
+                            }
+                        ],
+                    }
+                ],
+            },
+            "trigger_snapshot": {"reason": "ROI低于1.5"},
+            "metrics_snapshot": {
+                "total_prepay_and_pay_order_roi2_assist": 1.2
+            },
+            "regulation_stop_action": "pause",
+        }
 
     def tearDown(self):
         for item in reversed(self.patches):
@@ -190,6 +268,87 @@ class LocalFeishuTaskTests(unittest.TestCase):
             {**task_payload(21), "strategy_id": "strategy-2"}
         )
         self.assertFalse(rejected["success"])
+
+    def test_stop_card_is_authorized_deduplicated_and_pulled_separately(self):
+        created = bridge.create_local_stop_task(self._stop_payload())
+        self.assertTrue(created["success"])
+        duplicate = bridge.create_local_stop_task(self._stop_payload())
+        self.assertTrue(duplicate["success"])
+        self.assertTrue(duplicate["duplicate"])
+        task_uid = created["data"]["task_uid"]
+        row = bridge._task_row(task_uid, "tool-user-a")
+        self.assertEqual("stop", row["action_type"])
+
+        card = bridge.build_local_task_card(bridge._task_payload(row))
+        raw = json.dumps(card, ensure_ascii=False)
+        self.assertIn("全域", raw)
+        self.assertIn("推直播", raw)
+        self.assertIn("调控任务A", raw)
+        self.assertIn("确认停投", raw)
+
+        denied = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_other",
+        )
+        self.assertFalse(denied["success"])
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        repeated = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(repeated["success"])
+        self.assertIsNone(bridge.pull_local_retarget_task()["data"])
+        pulled = bridge.pull_local_stop_task()["data"]
+        self.assertEqual(task_uid, pulled["task_uid"])
+        self.assertEqual("tool-user-a", pulled["account_username"])
+
+    def test_expired_execution_lease_recovers_while_card_is_still_valid(self):
+        created = bridge.create_local_stop_task(self._stop_payload())
+        task_uid = created["data"]["task_uid"]
+        row = bridge._task_row(task_uid, "tool-user-a")
+        bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        claimed = bridge.pull_local_stop_task()["data"]
+        self.assertEqual("claimed", bridge._task_row(task_uid)["status"])
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET claim_expires_at=?,expires_at=? "
+                "WHERE task_uid=?",
+                (
+                    (datetime.now() - timedelta(minutes=1)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    (datetime.now() + timedelta(minutes=10)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    task_uid,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        recovered = bridge.pull_local_stop_task()["data"]
+        self.assertEqual(task_uid, recovered["task_uid"])
+        self.assertNotEqual(claimed["claim_token"], recovered["claim_token"])
 
     def test_card_shows_plan_scene_account_and_materials(self):
         task = task_payload(3)

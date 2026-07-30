@@ -30,6 +30,8 @@ from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.product_scene_adapter import scope_product_scene_snapshot
 from services.plan_system import detect_plan_system, normalize_plan_system
 from services.qianchuan_accounts import (
+    ensure_qianchuan_account,
+    list_qianchuan_accounts,
     record_target_duration,
     schedulable_promotion_targets,
     upsert_authorized_accounts,
@@ -50,6 +52,7 @@ from api.promotion_targets import (
     list_promotion_targets,
     patch_target_sync_state,
     replace_material_product_links,
+    update_target_catalog_evidence,
     update_target_sync_state,
     upsert_products,
     upsert_promotion_target,
@@ -106,6 +109,28 @@ _WRITE_CAPABILITY_SCOPE_KEYS = (
     "regulation_aavid",
     "regulation_ad_id",
 )
+
+
+def _explicit_platform_status(page_text: Any, payload_status: Any = None) -> str:
+    """Return a status only when the read-only response/page makes it explicit."""
+    value = str(payload_status or "").strip()
+    if value:
+        return value
+    text = str(page_text or "")
+    for marker, status in (
+        ("已删除", "deleted"),
+        ("已结束", "ended"),
+        ("历史计划", "historical"),
+        ("已暂停", "paused"),
+        ("暂停中", "paused"),
+        ("投放中", "active"),
+        ("生效中", "active"),
+        ("学习中", "learning"),
+        ("已启用", "enabled"),
+    ):
+        if marker in text:
+            return status
+    return "unknown"
 
 
 def _persist_product_snapshot(
@@ -191,7 +216,11 @@ def _sync_discovered_product_targets(
                 "plan_name": str(row.get("ad_name") or "").strip()[:256],
                 "promotion_scene": "product",
                 "plan_system": str(row.get("plan_system") or "unknown"),
+                "platform_status": str(row.get("platform_status") or "unknown"),
+                "verification_state": "candidate",
                 "page_url": page_url,
+                # 商品列表里的 adInfos 可能是子广告或调控行；保留展示，
+                # 但只有精确主计划详情核验后才允许恢复原勾选意图。
                 "enabled": bool(existing.get("enabled")) if existing else False,
                 "last_status": (
                     str(existing.get("last_status") or "pending")
@@ -205,10 +234,124 @@ def _sync_discovered_product_targets(
                 ),
             },
             owner_username=owner_username,
+            trusted_catalog=True,
             db=db,
         )
         _persist_product_snapshot(db, target["target_uid"], snapshot)
     return {"discovered": discovered, "created": created}
+
+
+def _persist_verified_catalog_class(
+    db: SQLiteStore,
+    *,
+    aavid: str,
+    account_name: str,
+    promotion_scene: str,
+    plan_system: str,
+    page_url: str,
+    candidates: List[Dict[str, Any]],
+    verification: Dict[str, Any],
+    owner_username: str,
+    class_complete: bool,
+) -> Dict[str, int]:
+    """Persist one catalog class without allowing list candidates to write-enable."""
+    existing_rows = {
+        str(item.get("ad_id") or ""): item
+        for item in list_promotion_targets(
+            owner_username=owner_username,
+            db=db,
+        )
+        if str(item.get("aadvid") or "") == str(aavid)
+    }
+    verified_by_id = {
+        str(item.get("ad_id") or ""): item
+        for item in verification.get("verified") or []
+        if isinstance(item, dict)
+    }
+    seen_ids = set()
+    verified_count = 0
+    candidate_count = 0
+    for candidate in candidates:
+        ad_id = str(candidate.get("ad_id") or "").strip()
+        if not ad_id.isdigit():
+            continue
+        seen_ids.add(ad_id)
+        exact = verified_by_id.get(ad_id)
+        existing = existing_rows.get(ad_id) or {}
+        is_verified = isinstance(exact, dict)
+        source = exact if is_verified else candidate
+        target = upsert_promotion_target(
+            {
+                "aavid": aavid,
+                "account_name": account_name,
+                "ad_id": ad_id,
+                "plan_name": str(
+                    source.get("plan_name")
+                    or candidate.get("plan_name")
+                    or ""
+                ).strip()[:256],
+                "promotion_scene": promotion_scene,
+                "plan_system": plan_system,
+                "platform_status": str(
+                    source.get("platform_status")
+                    or candidate.get("platform_status")
+                    or "unknown"
+                ),
+                "verification_state": (
+                    "verified" if is_verified else "candidate"
+                ),
+                "page_url": page_url,
+                "enabled": bool(existing.get("enabled")) if existing else False,
+                "last_status": str(
+                    existing.get("last_status") or "pending"
+                ),
+                "last_error": (
+                    ""
+                    if is_verified
+                    else str(existing.get("last_error") or "")
+                ),
+            },
+            owner_username=owner_username,
+            trusted_catalog=True,
+            db=db,
+        )
+        if is_verified:
+            verified_count += 1
+            if promotion_scene == "product":
+                _persist_product_snapshot(
+                    db,
+                    target["target_uid"],
+                    source.get("detail_snapshot"),
+                )
+        else:
+            candidate_count += 1
+
+    # 只有无日期/状态排除的全部分页真正完成后，才把消失计划标成 missing。
+    # 接口失败或分类入口缺失时保留原状态，避免误停用。
+    if class_complete:
+        for ad_id, existing in existing_rows.items():
+            if (
+                str(existing.get("promotion_scene") or "") != promotion_scene
+                or str(existing.get("plan_system") or "") != plan_system
+                or ad_id in seen_ids
+            ):
+                continue
+            update_target_catalog_evidence(
+                existing["target_uid"],
+                platform_status=existing.get("platform_status") or "unknown",
+                verification_state="missing",
+                db=db,
+            )
+            db.update(
+                "promotion_target",
+                {"enabled": 0, "capacity_state": "disabled"},
+                where={"target_uid": existing["target_uid"]},
+            )
+    return {
+        "seen": len(seen_ids),
+        "verified": verified_count,
+        "candidates": candidate_count,
+    }
 
 
 def _ensure_data_dir():
@@ -438,6 +581,22 @@ def _trusted_startup_discovery(
     }
 
 
+def _can_reuse_startup_target(
+    *,
+    storage_state_available: bool,
+    reuse_last_target: bool,
+    startup_target: Optional[Dict[str, Any]],
+    current_url: Any,
+) -> bool:
+    """Never bypass visible login merely because an old target is remembered."""
+    return bool(
+        storage_state_available
+        and reuse_last_target
+        and startup_target
+        and not _is_qianchuan_login_url(current_url)
+    )
+
+
 def _parse_query_and_fragment(url: str) -> dict:
     """
     千川很多参数会出现在 query 或 fragment（# 后面），这里合并解析。
@@ -560,11 +719,15 @@ class ServiceController:
         self._fetch_ready = False
         self._last_fetch_time: float = 0  # 上次抓取完成的时间戳（秒）
         self._last_round_started_time: float = 0  # 上一轮自动监控开始时间
+        self._last_catalog_sync_time: float = 0
 
         # 启动服务时校验通过的账号密码，仅内存保存，用于入库后云端备份 API（不写盘）
         self._cloud_backup_username: Optional[str] = None
         self._cloud_backup_password: str = ""
         self._target_discovery_thread: Optional[threading.Thread] = None
+        self._catalog_sync_thread: Optional[threading.Thread] = None
+        self._catalog_scheduler_thread: Optional[threading.Thread] = None
+        self._catalog_startup_sync_pending = True
         self._target_discovery_status: dict = {
             "running": False,
             "message": "",
@@ -889,6 +1052,566 @@ class ServiceController:
         with self._lock:
             return {"success": True, **dict(self._target_discovery_status)}
 
+    def start_catalog_sync(self) -> dict:
+        """Start the independent read-only all-account catalog scanner."""
+        from services.qianchuan_catalog import (
+            catalog_sync_status,
+            mark_catalog_sync_started,
+        )
+
+        with self._lock:
+            running = (
+                self._catalog_sync_thread is not None
+                and self._catalog_sync_thread.is_alive()
+            )
+        if running:
+            return catalog_sync_status()
+        if not current_session_owner():
+            return {
+                "success": False,
+                "message": "请先登录工具账号，再同步千川账户计划目录",
+            }
+        if not load_qianchuan_storage_state():
+            return {
+                "success": False,
+                "message": "请先在可见Chrome完成一次千川登录",
+            }
+        mark_catalog_sync_started()
+        with self._lock:
+            self._catalog_sync_thread = threading.Thread(
+                target=self._catalog_sync_entry,
+                name="qianchuan-catalog-sync",
+                daemon=True,
+            )
+            self._catalog_sync_thread.start()
+        return catalog_sync_status()
+
+    def catalog_sync_status(self) -> dict:
+        from services.qianchuan_catalog import catalog_sync_status
+
+        base = catalog_sync_status()
+        return base
+
+    def start_catalog_scheduler(self) -> None:
+        with self._lock:
+            if (
+                self._catalog_scheduler_thread is not None
+                and self._catalog_scheduler_thread.is_alive()
+            ):
+                return
+            self._catalog_scheduler_thread = threading.Thread(
+                target=self._catalog_scheduler_entry,
+                name="qianchuan-catalog-scheduler",
+                daemon=True,
+            )
+            self._catalog_scheduler_thread.start()
+
+    def _catalog_scheduler_entry(self) -> None:
+        while True:
+            try:
+                from services.qianchuan_catalog import catalog_sync_due
+
+                if (
+                    current_session_owner()
+                    and load_qianchuan_storage_state()
+                    and (
+                        self._catalog_startup_sync_pending
+                        or catalog_sync_due()
+                    )
+                ):
+                    started = self.start_catalog_sync()
+                    if started.get("success"):
+                        self._catalog_startup_sync_pending = False
+            except Exception:
+                pass
+            time.sleep(60)
+
+    def _catalog_sync_entry(self) -> None:
+        try:
+            asyncio.run(self._catalog_sync_async())
+        except Exception as exc:
+            from services.qianchuan_catalog import finalize_catalog_sync
+
+            finalize_catalog_sync(error=f"账户计划目录同步失败：{exc}")
+
+    async def _wait_catalog_class(
+        self,
+        probe: PromotionReadOnlyProbe,
+        *,
+        aavid: str,
+        promotion_scene: str,
+        plan_system: str,
+        timeout_seconds: float = 18.0,
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + max(3.0, float(timeout_seconds))
+        last = {}
+        while time.monotonic() < deadline:
+            await probe.wait_for_product_pagination(timeout=0.5)
+            last = probe.catalog_class_status(
+                aavid=aavid,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
+            if last.get("complete"):
+                break
+            await asyncio.sleep(0.35)
+        return last or probe.catalog_class_status(
+            aavid=aavid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+        )
+
+    @staticmethod
+    async def _click_visible_exact(
+        page: Any,
+        texts: List[str],
+        *,
+        timeout_ms: int = 8_000,
+    ) -> bool:
+        for text in texts:
+            locator = page.get_by_text(text, exact=True)
+            try:
+                await locator.last.wait_for(
+                    state="visible",
+                    timeout=timeout_ms,
+                )
+                await locator.last.click()
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    async def _open_explicit_chengfang_catalog(
+        page: Any,
+        *,
+        aavid: str,
+    ) -> bool:
+        """Open Chengfang only from an explicit clickable platform label."""
+        entry_texts = ["千川乘方", "乘方投放", "乘方计划"]
+        roles = ["tab", "link", "button", "menuitem"]
+        for pass_index in range(2):
+            if pass_index:
+                await page.goto(
+                    "https://qianchuan.jinritemai.com/home"
+                    f"?aavid={aavid}",
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+                if _is_qianchuan_login_url(page.url):
+                    return False
+            for text in entry_texts:
+                for role in roles:
+                    locator = page.get_by_role(role, name=text, exact=True)
+                    try:
+                        count = await locator.count()
+                    except Exception:
+                        count = 0
+                    for index in range(count - 1, -1, -1):
+                        candidate = locator.nth(index)
+                        try:
+                            if not await candidate.is_visible():
+                                continue
+                            await candidate.click()
+                            try:
+                                await page.wait_for_load_state(
+                                    "domcontentloaded",
+                                    timeout=15_000,
+                                )
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(1_000)
+                            page_text = await page.locator("body").inner_text(
+                                timeout=5_000
+                            )
+                            visible_lines = {
+                                " ".join(line.split())
+                                for line in page_text.splitlines()
+                                if line.strip()
+                            }
+                            if (
+                                detect_plan_system(page_text=page_text)
+                                == "chengfang"
+                                and visible_lines.intersection(
+                                    {
+                                        "千川乘方",
+                                        "乘方投放",
+                                        "乘方计划",
+                                        "千川乘方投放",
+                                    }
+                                )
+                            ):
+                                return True
+                        except Exception:
+                            continue
+        return False
+
+    async def _scan_catalog_class(
+        self,
+        *,
+        fetcher: QianChuanFetcher,
+        probe: PromotionReadOnlyProbe,
+        db: SQLiteStore,
+        owner_username: str,
+        account: Dict[str, str],
+        promotion_scene: str,
+        plan_system: str,
+        page_url: str,
+    ) -> Dict[str, Any]:
+        aavid = str(account["aavid"])
+        # 调用方必须在导航/切换分类前设置探针上下文。列表响应通常会在
+        # 页面加载或点击页签后立刻返回；这里若再次 reset，会把刚收到的
+        # 全部分页证据清掉，最终错误地显示“没有计划”。
+        status = await self._wait_catalog_class(
+            probe,
+            aavid=aavid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+        )
+        candidates = probe.catalog_rows(
+            aavid=aavid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+        )
+        verification = await probe.verify_catalog_plans(
+            fetcher.page,
+            aavid=aavid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+        )
+        persisted = _persist_verified_catalog_class(
+            db,
+            aavid=aavid,
+            account_name=str(account.get("account_name") or ""),
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+            page_url=page_url,
+            candidates=candidates,
+            verification=verification,
+            owner_username=owner_username,
+            class_complete=bool(status.get("complete")),
+        )
+        complete = bool(status.get("complete")) and bool(
+            verification.get("complete")
+        )
+        message = str(status.get("message") or "")
+        if status.get("complete") and not verification.get("complete"):
+            message = (
+                f"{len(verification.get('rejected') or [])} 条候选未通过"
+                "账户＋精确计划详情核验"
+            )
+        return {
+            **persisted,
+            "complete": complete,
+            "message": message,
+        }
+
+    async def _scan_global_account_catalog(
+        self,
+        *,
+        fetcher: QianChuanFetcher,
+        probe: PromotionReadOnlyProbe,
+        db: SQLiteStore,
+        owner_username: str,
+        account: Dict[str, str],
+    ) -> Dict[str, Any]:
+        aavid = str(account["aavid"])
+        classes: Dict[str, Dict[str, Any]] = {}
+        probe.reset_catalog_class(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        probe.set_catalog_context(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        page_url = f"https://qianchuan.jinritemai.com/uni-prom?aavid={aavid}"
+        await fetcher.page.goto(
+            page_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        if _is_qianchuan_login_url(fetcher.page.url):
+            raise RuntimeError("千川登录状态失效")
+        try:
+            title = fetcher.page.get_by_text("全域投放", exact=True)
+            await title.last.wait_for(state="visible", timeout=20_000)
+            page_text = await fetcher.page.locator("body").inner_text(
+                timeout=5_000
+            )
+        except Exception as exc:
+            raise RuntimeError(f"未找到明确的全域投放页面证据：{exc}") from exc
+        if detect_plan_system(page_text=page_text) != "global":
+            raise RuntimeError("当前页面无法明确确认是全域计划体系")
+        classes["global_product"] = await self._scan_catalog_class(
+            fetcher=fetcher,
+            probe=probe,
+            db=db,
+            owner_username=owner_username,
+            account=account,
+            promotion_scene="product",
+            plan_system="global",
+            page_url=page_url,
+        )
+
+        probe.reset_catalog_class(
+            aavid=aavid,
+            promotion_scene="live",
+            plan_system="global",
+        )
+        probe.set_catalog_context(
+            aavid=aavid,
+            promotion_scene="live",
+            plan_system="global",
+        )
+        opened_live = await self._click_visible_exact(
+            fetcher.page,
+            ["推直播间", "推直播"],
+        )
+        if opened_live:
+            classes["global_live"] = await self._scan_catalog_class(
+                fetcher=fetcher,
+                probe=probe,
+                db=db,
+                owner_username=owner_username,
+                account=account,
+                promotion_scene="live",
+                plan_system="global",
+                page_url=str(fetcher.page.url or page_url),
+            )
+        else:
+            classes["global_live"] = {
+                "complete": False,
+                "message": "未找到推直播计划目录入口",
+            }
+
+        # 乘方只从千川页面上明确可点击的“千川乘方/乘方投放/乘方计划”
+        # 入口进入。没有该证据就保持目录不完整，绝不按 URL 或计划名称猜测。
+        probe.reset_catalog_class(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="chengfang",
+        )
+        probe.set_catalog_context(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="chengfang",
+        )
+        opened_chengfang = await self._open_explicit_chengfang_catalog(
+            fetcher.page,
+            aavid=aavid,
+        )
+        if opened_chengfang:
+            await self._click_visible_exact(
+                fetcher.page,
+                ["推商品", "商品自选"],
+                timeout_ms=3_000,
+            )
+            classes["chengfang_product"] = await self._scan_catalog_class(
+                fetcher=fetcher,
+                probe=probe,
+                db=db,
+                owner_username=owner_username,
+                account=account,
+                promotion_scene="product",
+                plan_system="chengfang",
+                page_url=str(fetcher.page.url or ""),
+            )
+            probe.reset_catalog_class(
+                aavid=aavid,
+                promotion_scene="live",
+                plan_system="chengfang",
+            )
+            probe.set_catalog_context(
+                aavid=aavid,
+                promotion_scene="live",
+                plan_system="chengfang",
+            )
+            opened_chengfang_live = await self._click_visible_exact(
+                fetcher.page,
+                ["推直播间", "推直播"],
+            )
+            if opened_chengfang_live:
+                classes["chengfang_live"] = await self._scan_catalog_class(
+                    fetcher=fetcher,
+                    probe=probe,
+                    db=db,
+                    owner_username=owner_username,
+                    account=account,
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                    page_url=str(fetcher.page.url or ""),
+                )
+            else:
+                classes["chengfang_live"] = {
+                    "complete": False,
+                    "message": "千川乘方页面未找到推直播计划目录入口",
+                }
+        else:
+            classes["chengfang_product"] = {
+                "complete": False,
+                "message": "未取得千川乘方·推商品目录的明确页面证据",
+            }
+            classes["chengfang_live"] = {
+                "complete": False,
+                "message": "未取得千川乘方·推直播目录的明确页面证据",
+            }
+        return {
+            "complete": all(
+                bool(item.get("complete")) for item in classes.values()
+            ),
+            "classes": classes,
+            "error": "；".join(
+                f"{key}: {item.get('message')}"
+                for key, item in classes.items()
+                if not item.get("complete") and item.get("message")
+            )[:2000],
+        }
+
+    async def _catalog_sync_async(self) -> None:
+        from services.qianchuan_catalog import (
+            finalize_catalog_sync,
+            mark_catalog_sync_progress,
+        )
+
+        owner = current_session_owner()
+        if not owner:
+            raise RuntimeError("工具账号未登录")
+        state = load_qianchuan_storage_state(owner_username=owner)
+        if not state:
+            raise RuntimeError("千川登录状态不存在")
+        cfg = ServiceConfig().normalize_paths()
+        db = SQLiteStore(database=cfg.db_path)
+        fetcher = QianChuanFetcher(headless=True, storage_state=state)
+        account_results: Dict[str, Dict[str, Any]] = {}
+        account_catalog_status: Dict[str, Any] = {
+            "complete": False,
+            "observed": 0,
+            "total": 0,
+        }
+        async with exclusive_browser_operation(
+            "账户计划目录同步",
+            timeout_seconds=1800,
+        ):
+            await fetcher._init_browser()
+            probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
+            probe.attach(fetcher.page)
+            try:
+                await fetcher.page.goto(
+                    "https://qianchuan.jinritemai.com/home",
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+                if _is_qianchuan_login_url(fetcher.page.url):
+                    raise RuntimeError("千川登录状态已失效，请重新登录")
+                accounts = await probe.discover_authorized_accounts(
+                    fetcher.page,
+                    timeout_ms=30_000,
+                )
+                if not accounts:
+                    raise RuntimeError("未能读取千川右上角的授权账户目录")
+                account_catalog_status = (
+                    probe.authorized_account_catalog_status()
+                )
+                upsert_authorized_accounts(
+                    accounts,
+                    owner_username=owner,
+                    db=db,
+                )
+                authorized_ids = {
+                    str(item.get("aavid") or "") for item in accounts
+                }
+                if account_catalog_status.get("complete"):
+                    for old_account in list_qianchuan_accounts(
+                        owner_username=owner,
+                        db=db,
+                    ):
+                        if str(old_account.get("aavid") or "") in authorized_ids:
+                            continue
+                        db.update(
+                            "qianchuan_account",
+                            {
+                                "enabled": 0,
+                                "last_status": "authorization_missing",
+                                "last_error": "本次完整授权账户目录中未发现该账户",
+                            },
+                            where={
+                                "account_uid": old_account["account_uid"],
+                                "owner_username": owner,
+                            },
+                        )
+                        db.update(
+                            "promotion_target",
+                            {
+                                "enabled": 0,
+                                "capacity_state": "disabled",
+                            },
+                            where={"account_uid": old_account["account_uid"]},
+                        )
+                total = len(accounts)
+                for index, account in enumerate(accounts, 1):
+                    _require_session_owner(owner)
+                    mark_catalog_sync_progress(
+                        processed_accounts=index - 1,
+                        total_accounts=total,
+                        current_account=account.get("account_name"),
+                        message=(
+                            f"正在同步 {index}/{total}："
+                            f"{account.get('account_name') or account.get('aavid')}"
+                        ),
+                    )
+                    account_row = ensure_qianchuan_account(
+                        account["aavid"],
+                        account_name=account.get("account_name") or "",
+                        owner_username=owner,
+                        seen=True,
+                        db=db,
+                    )
+                    try:
+                        result = await self._scan_global_account_catalog(
+                            fetcher=fetcher,
+                            probe=probe,
+                            db=db,
+                            owner_username=owner,
+                            account=account,
+                        )
+                    except Exception as exc:
+                        result = {
+                            "complete": False,
+                            "classes": {},
+                            "error": str(exc)[:2000],
+                        }
+                    account_results[str(account_row["account_uid"])] = result
+                    mark_catalog_sync_progress(
+                        processed_accounts=index,
+                        total_accounts=total,
+                        current_account=account.get("account_name"),
+                        message=f"已处理 {index}/{total} 个授权账户",
+                    )
+                _require_session_owner(owner)
+                await save_context_storage_state(
+                    fetcher.context,
+                    owner_username=owner,
+                )
+            finally:
+                await fetcher.close()
+        finalize_catalog_sync(
+            owner_username=owner,
+            account_results=account_results,
+            error=(
+                ""
+                if account_catalog_status.get("complete")
+                else (
+                    "授权账户目录分页未完整，已保留历史账户启用状态；"
+                    f"本次观察 {account_catalog_status.get('observed', 0)}/"
+                    f"{account_catalog_status.get('total', 0)} 个账户"
+                )
+            ),
+            db=db,
+        )
+
     def _target_discovery_entry(self) -> None:
         try:
             asyncio.run(self._target_discovery_async())
@@ -909,9 +1632,21 @@ class ServiceController:
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
         migrate_legacy_qcookie()
-        known_target_keys = _known_promotion_target_keys(
-            list_promotion_targets(owner_username=session_owner, db=db)
+        known_targets = list_promotion_targets(
+            owner_username=session_owner,
+            db=db,
         )
+        # 已登记但尚未经过 rc27 详情核验的旧计划，允许用户重新打开详情
+        # 完成验证；只有已验证主计划才提示“已在列表中”。
+        known_verified_target_keys = {
+            _promotion_target_key(
+                str(item.get("aadvid") or ""),
+                str(item.get("ad_id") or ""),
+            )
+            for item in known_targets
+            if str(item.get("verification_state") or "").strip().lower()
+            == "verified"
+        }
         storage_state = load_qianchuan_storage_state(
             owner_username=session_owner
         )
@@ -1025,7 +1760,7 @@ class ServiceController:
                         candidate[0],
                         candidate[1],
                     )
-                    if scene_probe and candidate_key in known_target_keys:
+                    if scene_probe and candidate_key in known_verified_target_keys:
                         stable_candidate = None
                         stable_count = 0
                         if candidate_key != last_ignored_existing:
@@ -1078,6 +1813,21 @@ class ServiceController:
                 product_snapshot = probe.latest_product_snapshot()
                 plan = product_snapshot.get("plan") or {}
                 plan_name = str(plan.get("plan_name") or plan_name).strip()[:256]
+            existing_target = next(
+                (
+                    item
+                    for item in known_targets
+                    if str(item.get("aadvid") or "") == str(aavid)
+                    and str(item.get("ad_id") or "") == str(ad_id)
+                ),
+                None,
+            )
+            explicit_status = _explicit_platform_status(
+                target_page_text,
+                (product_snapshot.get("plan") or {}).get("platform_status")
+                if target_scene == "product"
+                else None,
+            )
             _require_session_owner(session_owner)
             target = upsert_promotion_target(
                 {
@@ -1086,11 +1836,18 @@ class ServiceController:
                     "plan_name": plan_name,
                     "promotion_scene": target_scene,
                     "plan_system": target_plan_system,
+                    "platform_status": explicit_status,
+                    "verification_state": "verified",
                     "page_url": target_url,
-                    "enabled": True,
+                    "enabled": (
+                        bool(existing_target.get("enabled"))
+                        if existing_target
+                        else False
+                    ),
                     "last_status": "pending",
                 },
                 owner_username=session_owner,
+                trusted_catalog=True,
                 db=db,
             )
             upsert_authorized_accounts(
@@ -1252,7 +2009,12 @@ class ServiceController:
             self._message = "等待识别 URL（进入投放详情页后自动开始抓取）"
 
         discovered = None
-        if storage_state_path and reuse_last_target and startup_target:
+        if _can_reuse_startup_target(
+            storage_state_available=bool(storage_state_path),
+            reuse_last_target=reuse_last_target,
+            startup_target=startup_target,
+            current_url=fetcher.page.url,
+        ):
             discovered = _trusted_startup_discovery(startup_target, startup_url)
             if discovered:
                 self._log(
@@ -1340,11 +2102,29 @@ class ServiceController:
                 "plan_name": plan_name,
                 "promotion_scene": promotion_scene,
                 "plan_system": plan_system,
+                "platform_status": _explicit_platform_status(
+                    page_text,
+                    (
+                        (discovered.get("snapshot") or {}).get("plan") or {}
+                    ).get("platform_status"),
+                ),
+                "verification_state": "verified",
                 "page_url": target_url,
-                "enabled": True,
+                "enabled": bool(
+                    next(
+                        (
+                            item.get("enabled")
+                            for item in known_targets
+                            if str(item.get("aadvid") or "") == str(aavid)
+                            and str(item.get("ad_id") or "") == str(ad_id)
+                        ),
+                        False,
+                    )
+                ),
                 "last_status": "pending",
             },
             owner_username=session_owner,
+            trusted_catalog=True,
             db=db,
         )
         upsert_authorized_accounts(
@@ -1552,6 +2332,12 @@ class ServiceController:
                 )
                 if not targets:
                     self._log("[抓取] 没有启用的监控计划，本轮跳过")
+                    if (
+                        self._last_catalog_sync_time <= 0
+                        or time.time() - self._last_catalog_sync_time >= 30 * 60
+                    ):
+                        self.start_catalog_sync()
+                        self._last_catalog_sync_time = time.time()
                     self._last_fetch_time = time.time()
                     continue
                 self._log(f"[抓取] 开始一轮抓取，共 {len(targets)} 条监控计划")
@@ -1674,6 +2460,12 @@ class ServiceController:
                             target_status = (
                                 "paused" if "暂停" in delivery_name else "not_delivering"
                             )
+                            update_target_catalog_evidence(
+                                current_uid,
+                                platform_status=target_status,
+                                verification_state="verified",
+                                db=db,
+                            )
                             patch_target_sync_state(
                                 current_uid,
                                 status=target_status,
@@ -1722,6 +2514,12 @@ class ServiceController:
                                 f"[抓取 {target_index}/{len(targets)}] 商品页面能力未识别，已安全跳过"
                             )
                         else:
+                            update_target_catalog_evidence(
+                                current_uid,
+                                platform_status="active",
+                                verification_state="verified",
+                                db=db,
+                            )
                             patch_target_sync_state(
                                 current_uid,
                                 status="ok",
@@ -1819,6 +2617,12 @@ class ServiceController:
                 except Exception:
                     pass
                 self._last_fetch_time = time.time()
+                if (
+                    self._last_catalog_sync_time <= 0
+                    or time.time() - self._last_catalog_sync_time >= 30 * 60
+                ):
+                    self.start_catalog_sync()
+                    self._last_catalog_sync_time = time.time()
                 mark_qianchuan_session_available(
                     owner_username=session_owner,
                 )

@@ -61,11 +61,18 @@ _RATE_METRICS_ROI2 = frozenset(
 
 # 停投执行方式（与前端单选一致，执行侧读取）
 ALLOWED_REGULATION_STOP_ACTION = frozenset({"pause", "delete"})
+ALLOWED_ACTION_MODES = frozenset({"card_confirm", "auto_execute"})
 
 
 def _normalize_regulation_stop_action(raw: Any) -> str:
     s = str(raw or "pause").strip().lower()
     return s if s in ALLOWED_REGULATION_STOP_ACTION else "pause"
+
+
+def _normalize_action_mode(raw: Any, *, legacy: bool = False) -> str:
+    if raw in ALLOWED_ACTION_MODES:
+        return str(raw)
+    return "auto_execute" if legacy else "card_confirm"
 
 
 def _default_condition_roi2() -> Dict[str, Any]:
@@ -139,6 +146,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "target_uid": "",
         "trigger": _normalize_trigger_roi2(None),
         "regulation_stop_action": "pause",
+        "action_mode": "card_confirm",
     }
 
 
@@ -154,7 +162,11 @@ def _default_full() -> Dict[str, Any]:
 
 
 def _normalize_strategy_entry(
-    raw: Any, index: int, legacy_stop: Optional[str] = None
+    raw: Any,
+    index: int,
+    legacy_stop: Optional[str] = None,
+    *,
+    legacy_existing: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raw = {}
@@ -180,6 +192,10 @@ def _normalize_strategy_entry(
         "target_uid": str(raw.get("target_uid") or "").strip(),
         "trigger": trig,
         "regulation_stop_action": rsa,
+        "action_mode": _normalize_action_mode(
+            raw.get("action_mode"),
+            legacy=legacy_existing and "action_mode" not in raw,
+        ),
     }
 
 
@@ -233,6 +249,7 @@ def _normalize_full(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             legacy_root_stop
             if isinstance(s, dict) and s.get("regulation_stop_action") is None
             else None,
+            legacy_existing=bool(raw),
         )
         for i, s in enumerate(strategies_in)
     ]
@@ -245,7 +262,23 @@ def _normalize_full(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def load_rule_regulation_config() -> Dict[str, Any]:
     with _lock:
         disk = _read_json(config_path())
-        return _normalize_full(disk if isinstance(disk, dict) else None)
+        normalized = _normalize_full(disk if isinstance(disk, dict) else None)
+        # rc27: existing stop strategies historically executed automatically.
+        # Persist the compatibility decision once so later edits cannot silently
+        # reinterpret an old strategy as a new card-confirm strategy.
+        if isinstance(disk, dict):
+            old_strategies = disk.get("strategies")
+            needs_action_mode_migration = (
+                isinstance(old_strategies, list)
+                and any(
+                    isinstance(item, dict)
+                    and "action_mode" not in item
+                    for item in old_strategies
+                )
+            )
+            if needs_action_mode_migration:
+                _atomic_write(config_path(), normalized)
+        return normalized
 
 
 def _cond_value_ok(metric: str, val: float) -> bool:
@@ -281,6 +314,8 @@ def validate_rule_regulation_config(data: Dict[str, Any]) -> Tuple[bool, str]:
             rsa = _normalize_regulation_stop_action(st.get("regulation_stop_action"))
             if rsa not in ALLOWED_REGULATION_STOP_ACTION:
                 return False, f"策略{i + 1} 停投执行方式无效"
+            if str(st.get("action_mode") or "") not in ALLOWED_ACTION_MODES:
+                return False, f"策略{i + 1} 飞书确认方式无效"
             trig = st.get("trigger")
             if not isinstance(trig, dict):
                 return False, f"策略{i + 1} 缺少监测指标"

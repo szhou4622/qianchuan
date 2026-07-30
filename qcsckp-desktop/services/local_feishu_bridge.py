@@ -201,10 +201,20 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     payload.update(
         {
             "task_uid": str(row.get("task_uid") or ""),
+            "account_username": str(
+                row.get("account_username")
+                or payload.get("account_username")
+                or ""
+            ),
             "qianchuan_account_uid": str(
                 row.get("qianchuan_account_uid")
                 or payload.get("qianchuan_account_uid")
                 or ""
+            ),
+            "action_type": str(
+                row.get("action_type")
+                or payload.get("action_type")
+                or "retarget"
             ),
             "status": str(row.get("status") or "pending"),
             "action_nonce": str(row.get("action_nonce") or ""),
@@ -1008,6 +1018,163 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
     }
 
 
+def build_stop_task_card(
+    task: Dict[str, Any],
+    *,
+    expanded: bool = False,
+) -> Dict[str, Any]:
+    status = str(task.get("status") or "pending")
+    status_text = {
+        "pending": "等待确认",
+        "approved_queued": "已批准，等待工具执行",
+        "claimed": "工具已领取",
+        "executing": "正在停投",
+        "succeeded": "停投成功",
+        "failed": "停投失败",
+        "rejected": "已暂不停投",
+        "expired": "已过期",
+        "cancelled": "已取消",
+    }.get(status, status)
+    template = (
+        "green"
+        if status == "succeeded"
+        else "red"
+        if status in {"failed", "expired", "rejected"}
+        else "orange"
+    )
+    scene_text = (
+        "推商品"
+        if str(task.get("promotion_scene") or "") == "product"
+        else "推直播"
+    )
+    system_text = {
+        "global": "全域",
+        "chengfang": "乘方",
+        "unknown": "待确认",
+    }.get(str(task.get("plan_system") or "unknown"), "待确认")
+    stop_action = (
+        "删除调控任务"
+        if str(task.get("regulation_stop_action") or "pause") == "delete"
+        else "暂停调控"
+    )
+    trigger = (
+        task.get("trigger_snapshot")
+        if isinstance(task.get("trigger_snapshot"), dict)
+        else {}
+    )
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "plain_text",
+                "content": "\n".join(
+                    [
+                        f"千川账户：{task.get('account_name') or '未命名账户'}",
+                        f"账户ID：{task.get('aavid') or ''}",
+                        f"计划名称：{task.get('plan_name') or '未命名计划'}",
+                        f"计划ID：{task.get('ad_id') or ''}",
+                        f"计划分类：{system_text} · {scene_text}",
+                        f"调控任务：{task.get('assist_task_name') or '未命名任务'}",
+                        f"调控任务ID：{task.get('assist_task_id') or ''}",
+                        f"停投动作：{stop_action}",
+                        f"策略：{task.get('strategy_name') or '停投策略命中'}",
+                    ]
+                ),
+            },
+        },
+        {
+            "tag": "markdown",
+            "content": (
+                f"**命中原因：** {_trigger_summary(trigger)}"
+                f"\n**有效期至：** {task.get('expires_at') or ''}"
+                f"\n**当前状态：** {status_text}"
+            ),
+        },
+    ]
+    if task.get("result_message"):
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**执行结果：** {str(task.get('result_message'))[:500]}",
+            }
+        )
+    if expanded:
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**完整触发指标与策略快照**\n```json\n"
+                        + json.dumps(
+                            {
+                                "trigger": trigger,
+                                "strategy": task.get("rule_snapshot") or {},
+                                "metrics": task.get("metrics_snapshot") or {},
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )[:4000]
+                        + "\n```"
+                    ),
+                },
+            ]
+        )
+    if status == "pending":
+        base = {
+            "task_uid": str(task.get("task_uid") or ""),
+            "nonce": str(task.get("action_nonce") or ""),
+        }
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "danger",
+                        "text": {"tag": "plain_text", "content": "确认停投"},
+                        "value": {**base, "action": "approve"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "暂不停投"},
+                        "value": {**base, "action": "reject"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "查看详情"},
+                        "value": {**base, "action": "view"},
+                    },
+                ],
+            }
+        )
+    return {
+        "config": {
+            "wide_screen_mode": True,
+            "enable_forward": False,
+            "update_multi": True,
+        },
+        "header": {
+            "template": template,
+            "title": {
+                "tag": "plain_text",
+                "content": f"千川停投提醒 · {system_text} · {scene_text} · {status_text}",
+            },
+        },
+        "elements": elements,
+    }
+
+
+def build_local_task_card(
+    task: Dict[str, Any],
+    *,
+    expanded: bool = False,
+) -> Dict[str, Any]:
+    if str(task.get("action_type") or "retarget") == "stop":
+        return build_stop_task_card(task, expanded=expanded)
+    return build_task_card(task, expanded=expanded)
+
+
 class LocalFeishuBridge:
     def __init__(self, account_username: str):
         self.account_username = _account_key(account_username)
@@ -1154,14 +1321,17 @@ class LocalFeishuBridge:
         *,
         targets: Optional[List[Tuple[str, str]]] = None,
     ) -> List[Dict[str, str]]:
-        return self.send_bound_card(build_task_card(task), targets=targets)
+        return self.send_bound_card(
+            build_local_task_card(task),
+            targets=targets,
+        )
 
     def update_task_cards(self, task_uid: str, *, expanded: bool = False) -> None:
         row = _task_row(task_uid, self.account_username)
         if not row:
             return
         task = _task_payload(row)
-        card = build_task_card(task, expanded=expanded)
+        card = build_local_task_card(task, expanded=expanded)
         content = json.dumps(card, ensure_ascii=False)
         messages = _loads(row.get("card_messages_json"), [])
         for message in messages if isinstance(messages, list) else []:
@@ -1785,18 +1955,18 @@ def _expire_local_tasks(account_username: str) -> List[str]:
     if not account:
         return []
     now_text = _dt(_now())
-    expired: List[str] = []
+    changed: List[str] = []
     conn = _db()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
+        expired_rows = conn.execute(
             "SELECT task_uid FROM local_retarget_task "
-            "WHERE account_username=? AND active_dedupe_key IS NOT NULL AND ("
-            "(status IN ('pending','approved_queued') AND expires_at<=?) OR "
-            "(status IN ('claimed','executing') AND claim_expires_at IS NOT NULL AND claim_expires_at<=?))",
-            (account, now_text, now_text),
+            "WHERE account_username=? AND active_dedupe_key IS NOT NULL "
+            "AND status IN ('pending','approved_queued','claimed','executing') "
+            "AND expires_at<=?",
+            (account, now_text),
         ).fetchall()
-        expired = [str(row["task_uid"]) for row in rows]
+        expired = [str(row["task_uid"]) for row in expired_rows]
         if expired:
             placeholders = ",".join("?" for _ in expired)
             conn.execute(
@@ -1806,10 +1976,32 @@ def _expire_local_tasks(account_username: str) -> List[str]:
                 f"WHERE task_uid IN ({placeholders})",
                 [now_text, now_text, *expired],
             )
+            changed.extend(expired)
+
+        # 领取租约只代表某一轮桌面执行权。工具异常退出后，如果卡片仍在
+        # 总有效期内，应恢复到待领取，而不是把一次临时中断误判成任务过期。
+        recover_rows = conn.execute(
+            "SELECT task_uid FROM local_retarget_task "
+            "WHERE account_username=? AND active_dedupe_key IS NOT NULL "
+            "AND status IN ('claimed','executing') AND expires_at>? "
+            "AND claim_expires_at IS NOT NULL AND claim_expires_at<=?",
+            (account, now_text, now_text),
+        ).fetchall()
+        recovered = [str(row["task_uid"]) for row in recover_rows]
+        if recovered:
+            placeholders = ",".join("?" for _ in recovered)
+            conn.execute(
+                f"UPDATE local_retarget_task SET status='approved_queued',"
+                f"claim_token=NULL,claim_expires_at=NULL,claimed_at=NULL,"
+                f"result_message='上次执行租约已失效，任务已恢复待领取',"
+                f"updated_at=? WHERE task_uid IN ({placeholders})",
+                [now_text, *recovered],
+            )
+            changed.extend(recovered)
         conn.commit()
     finally:
         conn.close()
-    return expired
+    return changed
 
 
 def cancel_active_local_retarget_tasks(
@@ -2084,6 +2276,206 @@ def create_local_retarget_task(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def create_local_stop_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create one idempotent local stop-confirmation task."""
+    account = _MANAGER.account
+    bridge = _MANAGER.bridge()
+    if not account or bridge is None:
+        return {
+            "success": False,
+            "message": "请先登录工具账号并配置飞书长连接",
+        }
+    status = bridge.status()
+    if not status.get("connected"):
+        return {
+            "success": False,
+            "message": "飞书长连接尚未就绪，请先完成飞书绑定",
+        }
+    profile = bridge.profile()
+    if not str(profile.get("authorized_open_id") or "").strip():
+        return {"success": False, "message": "请先完成飞书个人绑定"}
+    snapshot = dict(payload or {})
+    required = {
+        key: str(snapshot.get(key) or "").strip()
+        for key in (
+            "aavid",
+            "ad_id",
+            "target_uid",
+            "assist_task_id",
+            "strategy_id",
+            "strategy_hash",
+        )
+    }
+    if (
+        any(not value for value in required.values())
+        or not re.fullmatch(r"[a-f0-9]{64}", required["strategy_hash"])
+    ):
+        return {
+            "success": False,
+            "message": "账户、计划、调控任务或策略快照不完整",
+        }
+    from api.promotion_targets import get_promotion_target
+    from services.qianchuan_accounts import (
+        ensure_qianchuan_account,
+        resolve_account_feishu_targets,
+    )
+    from services.qianchuan_session import automation_session_ready
+    from utils.sqlite_store import SQLiteStore
+
+    session_gate = automation_session_ready(account)
+    if not session_gate.get("ready"):
+        return {
+            "success": False,
+            "message": str(
+                session_gate.get("message") or "千川登录状态不存在或已失效"
+            ),
+        }
+    store = SQLiteStore(database=DB_FILE)
+    target = get_promotion_target(
+        required["target_uid"],
+        owner_username=account,
+        db=store,
+    )
+    if not target:
+        return {"success": False, "message": "停投计划不存在或不属于当前账号"}
+    if (
+        str(target.get("aadvid") or "") != required["aavid"]
+        or str(target.get("ad_id") or "") != required["ad_id"]
+    ):
+        return {"success": False, "message": "停投计划与账户快照不一致"}
+    if not target.get("enabled") or not target.get("stop_eligible"):
+        return {
+            "success": False,
+            "message": str(
+                target.get("ineligible_reason")
+                or "该计划尚未取得可停投资格"
+            ),
+        }
+    qianchuan_account = ensure_qianchuan_account(
+        required["aavid"],
+        account_name=snapshot.get("account_name") or "",
+        owner_username=account,
+        db=store,
+    )
+    if not qianchuan_account.get("enabled"):
+        return {"success": False, "message": "该千川账户已停用"}
+    snapshot.update(
+        {
+            "action_type": "stop",
+            "qianchuan_account_uid": qianchuan_account["account_uid"],
+            "qianchuan_session_epoch": int(
+                session_gate.get("session_epoch") or 1
+            ),
+            "promotion_scene": target.get("promotion_scene") or "live",
+            "plan_system": target.get("plan_system") or "unknown",
+            "plan_name": (
+                snapshot.get("plan_name")
+                or target.get("plan_name")
+                or ""
+            ),
+        }
+    )
+    for expired_uid in _expire_local_tasks(account):
+        threading.Thread(
+            target=bridge.update_task_cards,
+            args=(expired_uid,),
+            daemon=True,
+        ).start()
+    dedupe = hashlib.sha256(
+        (
+            f"{account}|stop|{required['aavid']}|{required['ad_id']}|"
+            f"{required['assist_task_id']}|{required['strategy_id']}"
+        ).encode("utf-8")
+    ).hexdigest()
+    task_uid = str(uuid.uuid4())
+    nonce = secrets.token_hex(32)
+    now_text = _dt(_now())
+    expires_at = _dt(_now() + timedelta(minutes=30))
+    conn = _db()
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO local_retarget_task("
+                "task_uid,account_username,qianchuan_account_uid,action_type,"
+                "active_dedupe_key,status,action_nonce,payload_json,"
+                "expires_at,created_at,updated_at"
+                ") VALUES(?,?,?,'stop',?,'pending',?,?,?,?,?)",
+                (
+                    task_uid,
+                    account,
+                    qianchuan_account["account_uid"],
+                    dedupe,
+                    nonce,
+                    _json(snapshot),
+                    expires_at,
+                    now_text,
+                    now_text,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT task_uid,status,expires_at FROM local_retarget_task "
+                "WHERE account_username=? AND active_dedupe_key=? LIMIT 1",
+                (account, dedupe),
+            ).fetchone()
+            if row:
+                return {
+                    "success": True,
+                    "duplicate": True,
+                    "data": dict(row),
+                }
+            raise
+    finally:
+        conn.close()
+    task = _task_payload(_task_row(task_uid, account) or {})
+    try:
+        route_targets = resolve_account_feishu_targets(
+            required["aavid"],
+            owner_username=account,
+            db=store,
+        )
+        messages = bridge.send_task_cards(task, targets=route_targets or None)
+    except Exception as exc:
+        conn = _db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='failed',"
+                "active_dedupe_key=NULL,result_message=?,finished_at=?,"
+                "updated_at=? WHERE task_uid=?",
+                (
+                    f"飞书停投卡片发送失败：{exc}",
+                    now_text,
+                    now_text,
+                    task_uid,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {"success": False, "message": str(exc), "task_uid": task_uid}
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE local_retarget_task SET card_messages_json=?,updated_at=? "
+            "WHERE task_uid=?",
+            (_json(messages), _dt(_now()), task_uid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "success": True,
+        "duplicate": False,
+        "data": {
+            "task_uid": task_uid,
+            "status": "pending",
+            "expires_at": expires_at,
+            "sent_count": len(messages),
+        },
+    }
+
+
 def send_local_material_selection_preview(account_username: str) -> Dict[str, Any]:
     """发送一张有本机任务记录、确认后绝不会进入执行队列的素材自选测试卡。"""
     account = _account_key(account_username)
@@ -2128,6 +2520,83 @@ def send_local_material_selection_preview(account_username: str) -> Dict[str, An
     )
 
 
+def _handle_local_stop_card_action(
+    account: str,
+    row: Dict[str, Any],
+    *,
+    task_uid: str,
+    action: str,
+    operator_open_id: str,
+) -> Dict[str, Any]:
+    if action not in {"approve", "reject"}:
+        return {"success": False, "message": "停投卡片不支持该操作"}
+    conn = _db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT status FROM local_retarget_task WHERE task_uid=? "
+            "AND account_username=? AND action_type='stop'",
+            (task_uid, account),
+        ).fetchone()
+        if not current:
+            conn.rollback()
+            return {"success": False, "message": "停投任务不存在"}
+        current_status = str(current["status"] or "")
+        if current_status != "pending":
+            conn.rollback()
+            return {
+                "success": current_status
+                in {
+                    "approved_queued",
+                    "claimed",
+                    "executing",
+                    "succeeded",
+                    "rejected",
+                },
+                "message": "该停投卡片已经处理，不会重复执行",
+                "update": True,
+            }
+        now_text = _dt(_now())
+        if action == "approve":
+            updated = conn.execute(
+                "UPDATE local_retarget_task SET status='approved_queued',"
+                "approved_by=?,approved_at=?,updated_at=? "
+                "WHERE task_uid=? AND account_username=? "
+                "AND action_type='stop' AND status='pending'",
+                (
+                    operator_open_id,
+                    now_text,
+                    now_text,
+                    task_uid,
+                    account,
+                ),
+            )
+            message = "已确认停投，工具执行前会重新核验全部安全条件"
+        else:
+            updated = conn.execute(
+                "UPDATE local_retarget_task SET status='rejected',"
+                "approved_by=?,active_dedupe_key=NULL,finished_at=?,"
+                "result_message='授权人暂不停投',updated_at=? "
+                "WHERE task_uid=? AND account_username=? "
+                "AND action_type='stop' AND status='pending'",
+                (
+                    operator_open_id,
+                    now_text,
+                    now_text,
+                    task_uid,
+                    account,
+                ),
+            )
+            message = "本次提醒已结束，不会停投"
+        if updated.rowcount != 1:
+            conn.rollback()
+            return {"success": False, "message": "停投任务状态已经变化"}
+        conn.commit()
+        return {"success": True, "message": message, "update": True}
+    finally:
+        conn.close()
+
+
 def handle_local_card_action(
     account_username: str,
     *,
@@ -2141,7 +2610,7 @@ def handle_local_card_action(
     account = _account_key(account_username)
     profile = _profile_for(account)
     if operator_open_id != str(profile.get("authorized_open_id") or ""):
-        return {"success": False, "message": "你不是该工具账号绑定的追投授权人"}
+        return {"success": False, "message": "你不是该工具账号绑定的操作授权人"}
     row = _task_row(task_uid, account)
     if not row:
         return {"success": False, "message": "追投任务不存在或不属于当前账号"}
@@ -2149,13 +2618,23 @@ def handle_local_card_action(
         return {"success": False, "message": "卡片任务校验失败"}
     expires = _parse_dt(row.get("expires_at"))
     if expires and expires <= _now() and str(row.get("status")) in ACTIVE_STATUSES:
+        action_label = (
+            "停投"
+            if str(row.get("action_type") or "retarget") == "stop"
+            else "追投"
+        )
         conn = _db()
         try:
             conn.execute(
                 "UPDATE local_retarget_task SET status='expired',active_dedupe_key=NULL,"
-                "result_message='追投卡片已超过30分钟有效期',finished_at=?,updated_at=? "
+                "result_message=?,finished_at=?,updated_at=? "
                 "WHERE task_uid=?",
-                (_dt(_now()), _dt(_now()), task_uid),
+                (
+                    f"{action_label}卡片已超过30分钟有效期",
+                    _dt(_now()),
+                    _dt(_now()),
+                    task_uid,
+                ),
             )
             conn.commit()
         finally:
@@ -2167,6 +2646,14 @@ def handle_local_card_action(
         }
     if action == "view":
         return {"success": True, "message": "已展开详情", "update": True, "expanded": True}
+    if str(row.get("action_type") or "retarget") == "stop":
+        return _handle_local_stop_card_action(
+            account,
+            row,
+            task_uid=task_uid,
+            action=action,
+            operator_open_id=operator_open_id,
+        )
     edit_actions = {
         "select_all",
         "clear_selection",
@@ -2477,7 +2964,8 @@ def handle_local_card_action(
         conn.close()
 
 
-def pull_local_retarget_task() -> Dict[str, Any]:
+def pull_local_retarget_task(*, action_type: str = "retarget") -> Dict[str, Any]:
+    task_action = "stop" if str(action_type or "") == "stop" else "retarget"
     account = _MANAGER.account
     bridge = _MANAGER.bridge()
     if not account or bridge is None:
@@ -2508,8 +2996,9 @@ def pull_local_retarget_task() -> Dict[str, Any]:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM local_retarget_task WHERE account_username=? "
-            "AND status='approved_queued' AND expires_at>? ORDER BY id ASC LIMIT 1",
-            (account, now_text),
+            "AND action_type=? AND status='approved_queued' AND expires_at>? "
+            "ORDER BY id ASC LIMIT 1",
+            (account, task_action, now_text),
         ).fetchone()
         if not row:
             conn.commit()
@@ -2562,6 +3051,10 @@ def pull_local_retarget_task() -> Dict[str, Any]:
     task = _task_payload(claimed or {})
     task["claim_token"] = claim_token
     return {"success": True, "data": task}
+
+
+def pull_local_stop_task() -> Dict[str, Any]:
+    return pull_local_retarget_task(action_type="stop")
 
 
 def report_local_retarget_task(
@@ -2632,3 +3125,25 @@ def report_local_retarget_task(
             name="feishu-result-card-update",
         ).start()
     return {"success": True}
+
+
+def report_local_stop_task(
+    task_uid: str,
+    claim_token: str,
+    status: str,
+    *,
+    message: str = "",
+    detail: str = "",
+    result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    row = _task_row(task_uid)
+    if not row or str(row.get("action_type") or "retarget") != "stop":
+        return {"success": False, "message": "本地停投任务不存在"}
+    return report_local_retarget_task(
+        task_uid,
+        claim_token,
+        status,
+        message=message,
+        detail=detail,
+        result=result,
+    )

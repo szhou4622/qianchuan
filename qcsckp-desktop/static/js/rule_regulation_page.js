@@ -352,7 +352,9 @@
     async function loadRegulationTargetOptions(api) {
         if (!api?.listPromotionTargets) return;
         const res = await api.listPromotionTargets(true);
-        promotionTargetsState = Array.isArray(res?.data) ? res.data : [];
+        promotionTargetsState = Array.isArray(res?.data)
+            ? res.data.filter((x) => !!x.stop_eligible)
+            : [];
         const select = document.getElementById('regStrategyTargetUid');
         if (!select) return;
         const current = select.value;
@@ -677,6 +679,7 @@
                 target_uid: '',
                 trigger: defaultTriggerPayload(),
                 regulation_stop_action: 'pause',
+                action_mode: 'card_confirm',
             });
             activeStrategyIndex = 0;
         }
@@ -687,6 +690,9 @@
         const stopAct = document.getElementById('btnStopActionDelete').classList.contains('seg-btn-active')
             ? 'delete'
             : 'pause';
+        const actionMode = document.getElementById('btnStopModeAuto').classList.contains('seg-btn-active')
+            ? 'auto_execute'
+            : 'card_confirm';
         const cur = strategiesState[activeStrategyIndex];
         if (!cur) return;
         strategiesState[activeStrategyIndex] = {
@@ -695,6 +701,7 @@
             target_uid: document.getElementById('regStrategyTargetUid')?.value || '',
             trigger: trig,
             regulation_stop_action: stopAct,
+            action_mode: actionMode,
         };
     }
 
@@ -717,6 +724,7 @@
                 target_uid: s.target_uid || '',
                 trigger: s.trigger,
                 regulation_stop_action: s.regulation_stop_action === 'delete' ? 'delete' : 'pause',
+                action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
             })),
         };
     }
@@ -967,6 +975,7 @@
             target_uid: '',
             trigger: defaultTriggerPayload(),
             regulation_stop_action: 'pause',
+            action_mode: 'card_confirm',
         });
         activeStrategyIndex = strategiesState.length - 1;
         strategyRenameIndex = activeStrategyIndex;
@@ -986,6 +995,16 @@
         if (window.lucide) lucide.createIcons();
     }
 
+    function applyActionModeToDom(mode) {
+        const auto = mode === 'auto_execute';
+        const card = document.getElementById('btnStopModeCard');
+        const autoBtn = document.getElementById('btnStopModeAuto');
+        if (card && autoBtn) {
+            card.classList.toggle('seg-btn-active', !auto);
+            autoBtn.classList.toggle('seg-btn-active', auto);
+        }
+    }
+
     function applyStrategyToDom(index) {
         const s = strategiesState[index];
         if (!s) return;
@@ -997,6 +1016,7 @@
         _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
         renderTriggerGroups(_groupsRef);
         applyStopActionToDom(s.regulation_stop_action);
+        applyActionModeToDom(s.action_mode);
     }
 
     function applyData(data) {
@@ -1023,6 +1043,7 @@
                 target_uid: s.target_uid || '',
                 trigger: s.trigger || defaultTriggerPayload(),
                 regulation_stop_action: normStrategyStopAct(s.regulation_stop_action),
+                action_mode: s.action_mode === 'card_confirm' ? 'card_confirm' : 'auto_execute',
             }));
         } else {
             const t = data.trigger || defaultTriggerPayload();
@@ -1033,6 +1054,7 @@
                     target_uid: '',
                     trigger: t,
                     regulation_stop_action: normStrategyStopAct(undefined),
+                    action_mode: 'auto_execute',
                 },
             ];
         }
@@ -1325,6 +1347,20 @@
                 bp.classList.remove('seg-btn-active');
                 rgScheduleDirtyCheck();
                 if (window.lucide) lucide.createIcons();
+            });
+        }
+        const modeCard = document.getElementById('btnStopModeCard');
+        const modeAuto = document.getElementById('btnStopModeAuto');
+        if (modeCard && modeAuto) {
+            modeCard.addEventListener('click', () => {
+                modeCard.classList.add('seg-btn-active');
+                modeAuto.classList.remove('seg-btn-active');
+                rgScheduleDirtyCheck();
+            });
+            modeAuto.addEventListener('click', () => {
+                modeAuto.classList.add('seg-btn-active');
+                modeCard.classList.remove('seg-btn-active');
+                rgScheduleDirtyCheck();
             });
         }
 

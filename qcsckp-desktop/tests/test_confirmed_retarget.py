@@ -160,6 +160,8 @@ class RetargetConfigTests(unittest.TestCase):
             "plan_system": "global",
             "last_status": "ok",
             "enabled": 1,
+            "monitor_eligible": 1,
+            "retarget_eligible": 1,
             "capability_json": _retarget_capability_json(
                 target_uid="target-live",
                 aavid="10001",
@@ -297,6 +299,8 @@ class RetargetConfigTests(unittest.TestCase):
             "plan_system": "global",
             "last_status": "ok",
             "enabled": 1,
+            "monitor_eligible": 1,
+            "retarget_eligible": 1,
             "capability_json": _retarget_capability_json(
                 target_uid="target-product",
                 aavid="10001",

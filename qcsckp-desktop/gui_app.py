@@ -613,6 +613,24 @@ class JSApi:
     def saveQianchuanAccountSettings(self, accountUid=None, settings=None):
         return self.api.saveQianchuanAccountSettings(accountUid, settings)
 
+    def saveQianchuanAccountAutomationSetup(
+        self,
+        accountUid=None,
+        settings=None,
+        planStates=None,
+    ):
+        return self.api.saveQianchuanAccountAutomationSetup(
+            accountUid,
+            settings,
+            planStates,
+        )
+
+    def startQianchuanCatalogSync(self):
+        return self.api.startQianchuanCatalogSync()
+
+    def getQianchuanCatalogSyncStatus(self):
+        return self.api.getQianchuanCatalogSyncStatus()
+
     def setWindowsAutostart(self, enabled=False):
         return self.api.setWindowsAutostart(enabled)
 
@@ -1080,6 +1098,9 @@ def main():
 
         # ===== 规则化停投调度（见 services/regulation_rule_runner.py；enabled 见 rule_regulation.json，默认 10 分钟一轮）=====
         start_regulation_rule_runner_background_thread()
+
+        # ===== 授权账户和四类计划目录：启动同步一次，之后每30分钟只读刷新 =====
+        js_api.api.service.start_catalog_scheduler()
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")

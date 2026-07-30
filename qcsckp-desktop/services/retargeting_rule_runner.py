@@ -282,6 +282,10 @@ def _revalidate_auto_retarget_under_lock(
     )
     if not target:
         raise RuntimeError("监控计划已停用或正在等待监控容量")
+    if not bool(target.get("retarget_eligible")):
+        raise RuntimeError(
+            str(target.get("ineligible_reason") or "监控计划尚未取得可追投资格")
+        )
     current_scene = str(target.get("promotion_scene") or "live").strip().lower()
     current_system = normalize_plan_system(target.get("plan_system") or "unknown")
     if (
@@ -1196,6 +1200,14 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     _log_sched,
                     st.get("id"),
                     target_uid,
+                )
+                return
+            if not bool(target.get("retarget_eligible")):
+                logger.warning(
+                    "%s 策略 %s 对应计划尚未取得可追投资格，已跳过：%s",
+                    _log_sched,
+                    st.get("id"),
+                    target.get("ineligible_reason") or "unknown",
                 )
                 return
             if bool(target.get("automation_write_blocked")):

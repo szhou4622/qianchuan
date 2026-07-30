@@ -96,14 +96,27 @@ def detect_plan_system(
         }:
             return "global"
 
-    visible = re.sub(r"\s+", " ", str(page_text or "")).strip().lower()
-    if "千川乘方" in visible or "乘方计划" in visible or "乘方" in visible:
+    raw_visible = str(page_text or "")
+    visible_lines = {
+        re.sub(r"\s+", " ", line).strip().lower()
+        for line in raw_visible.splitlines()
+        if str(line or "").strip()
+    }
+    visible = re.sub(r"\s+", " ", raw_visible).strip().lower()
+    if (
+        "千川乘方" in visible
+        or "乘方计划" in visible
+        or "乘方投放" in visible
+    ):
         return "chengfang"
     if (
         "传统全域" in visible
         or "全域计划（旧版）" in visible
         or "直播全域" in visible
         or "全域计划" in visible
+        # 当前千川导航页以独立标题“全域投放”标识该计划体系。
+        # 只接受整行标题，不因商品名或宣传文案中的“商品全域”猜测。
+        or "全域投放" in visible_lines
     ):
         return "global"
     # “商品全域推广”是推广场景名称，并不能单独证明计划属于传统全域；

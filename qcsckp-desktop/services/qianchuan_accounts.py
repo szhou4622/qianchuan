@@ -147,7 +147,11 @@ def ensure_qianchuan_account(
         ).strip()[:256],
         "enabled": (
             1
-            if (enabled if enabled is not None else bool((existing or {}).get("enabled", 1)))
+            if (
+                enabled
+                if enabled is not None
+                else bool((existing or {}).get("enabled", 0))
+            )
             else 0
         ),
         "report_enabled": (
@@ -189,12 +193,24 @@ def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
     out["report_enabled"] = bool(out.get("report_enabled"))
     out["route_send_personal"] = bool(out.get("route_send_personal"))
     out["route_group_ids"] = _json_list(out.pop("route_group_ids_json", "[]"))
+    try:
+        out["catalog_counts"] = json.loads(
+            str(out.pop("catalog_counts_json", "{}") or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        out["catalog_counts"] = {}
     aid = str(out.get("aavid") or "")
     counts = store.execute(
         "SELECT COUNT(*) AS total,"
         "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS enabled_count,"
         "SUM(CASE WHEN enabled=1 AND capacity_state='active' THEN 1 ELSE 0 END) AS active_count,"
-        "SUM(CASE WHEN enabled=1 AND capacity_state='capacity_waiting' THEN 1 ELSE 0 END) AS waiting_count "
+        "SUM(CASE WHEN enabled=1 AND capacity_state='capacity_waiting' THEN 1 ELSE 0 END) AS waiting_count,"
+        "SUM(CASE WHEN monitor_eligible=1 THEN 1 ELSE 0 END) AS eligible_count,"
+        "SUM(CASE WHEN promotion_scene='live' AND plan_system='global' THEN 1 ELSE 0 END) AS global_live_count,"
+        "SUM(CASE WHEN promotion_scene='product' AND plan_system='global' THEN 1 ELSE 0 END) AS global_product_count,"
+        "SUM(CASE WHEN promotion_scene='live' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_live_count,"
+        "SUM(CASE WHEN promotion_scene='product' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_product_count,"
+        "SUM(CASE WHEN plan_system='unknown' OR verification_state!='verified' THEN 1 ELSE 0 END) AS unverified_count "
         "FROM promotion_target WHERE account_uid=?",
         (str(out.get("account_uid") or ""),),
         fetch=True,
@@ -205,6 +221,14 @@ def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
             "enabled_plan_count": int(counts[0].get("enabled_count") or 0),
             "active_plan_count": int(counts[0].get("active_count") or 0),
             "waiting_plan_count": int(counts[0].get("waiting_count") or 0),
+            "eligible_plan_count": int(counts[0].get("eligible_count") or 0),
+            "four_class_counts": {
+                "global_live": int(counts[0].get("global_live_count") or 0),
+                "global_product": int(counts[0].get("global_product_count") or 0),
+                "chengfang_live": int(counts[0].get("chengfang_live_count") or 0),
+                "chengfang_product": int(counts[0].get("chengfang_product_count") or 0),
+            },
+            "unverified_plan_count": int(counts[0].get("unverified_count") or 0),
         }
     )
     sync = store.select_one(
@@ -307,6 +331,12 @@ def save_qianchuan_account_settings(
         ),
         "route_group_ids_json": json.dumps(groups, ensure_ascii=False),
     }
+    _require_feishu_binding_for_automation(
+        {
+            "enabled": bool(values["enabled"]),
+            "route_mode": route_mode,
+        }
+    )
     store.update(
         "qianchuan_account",
         values,
@@ -319,6 +349,159 @@ def save_qianchuan_account_settings(
             where={"account_uid": account["account_uid"]},
         )
     refresh_monitor_capacity(db=store)
+    _sync_daily_selected_aavids(
+        account.get("owner_username") or owner_username,
+        db=store,
+    )
+    saved = get_qianchuan_account(
+        account["account_uid"],
+        owner_username=owner_username,
+        db=store,
+    )
+    assert saved is not None
+    return saved
+
+
+def _require_feishu_binding_for_automation(settings: Dict[str, Any]) -> None:
+    if not bool(settings.get("enabled")) and str(
+        settings.get("route_mode") or "default"
+    ) != "custom":
+        return
+    from services.local_feishu_bridge import get_local_feishu_status
+
+    status = get_local_feishu_status()
+    profile = status.get("profile") or {}
+    if not bool(status.get("connected")):
+        raise ValueError("请先完成飞书长连接，再启用千川账户自动化")
+    if not str(profile.get("authorized_open_id") or "").strip():
+        raise ValueError("请先使用绑定码完成飞书个人绑定")
+
+
+def save_qianchuan_account_automation_setup(
+    value: Any,
+    settings: Dict[str, Any],
+    plan_states: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """Atomically persist account route/report settings and every plan intent."""
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    account = get_qianchuan_account(
+        value,
+        owner_username=owner_username,
+        db=store,
+    )
+    if not account:
+        raise ValueError("千川账户不存在")
+    raw_settings = dict(settings or {})
+    normalized_settings = {
+        "enabled": bool(raw_settings.get("enabled", account.get("enabled"))),
+        "report_enabled": bool(
+            raw_settings.get("report_enabled", account.get("report_enabled"))
+        ),
+        "route_mode": str(
+            raw_settings.get("route_mode", account.get("route_mode") or "default")
+        ).strip(),
+        "route_send_personal": bool(
+            raw_settings.get(
+                "route_send_personal",
+                account.get("route_send_personal"),
+            )
+        ),
+        "route_group_ids": _json_list(
+            raw_settings.get(
+                "route_group_ids",
+                account.get("route_group_ids") or [],
+            )
+        ),
+    }
+    if normalized_settings["route_mode"] not in {"default", "custom"}:
+        raise ValueError("飞书路由模式无效")
+    if (
+        normalized_settings["route_mode"] == "custom"
+        and not normalized_settings["route_send_personal"]
+        and not normalized_settings["route_group_ids"]
+    ):
+        raise ValueError("账户单独路由至少选择个人或一个已绑定群")
+    _require_feishu_binding_for_automation(normalized_settings)
+
+    if isinstance(plan_states, dict):
+        plan_items = [
+            {"target_uid": key, "enabled": value}
+            for key, value in plan_states.items()
+        ]
+    elif isinstance(plan_states, list):
+        plan_items = plan_states
+    else:
+        raise ValueError("计划设置必须为列表或对象")
+
+    targets = store.select(
+        "promotion_target",
+        where={"account_uid": account["account_uid"]},
+    )
+    target_by_uid = {
+        str(item.get("target_uid") or ""): item for item in targets
+    }
+    requested: Dict[str, bool] = {}
+    for item in plan_items:
+        if not isinstance(item, dict):
+            raise ValueError("计划设置格式无效")
+        uid = str(item.get("target_uid") or "").strip()
+        if uid not in target_by_uid:
+            raise ValueError("计划不属于当前千川账户，已取消全部保存")
+        enabled = bool(item.get("enabled"))
+        target = target_by_uid[uid]
+        if enabled and not bool(target.get("monitor_eligible")):
+            raise ValueError(
+                str(
+                    target.get("ineligible_reason")
+                    or f"计划 {target.get('plan_name') or uid} 尚不可监控"
+                )
+            )
+        requested[uid] = enabled
+
+    with store.transaction() as conn:
+        store.execute("BEGIN IMMEDIATE", connection=conn)
+        store.update(
+            "qianchuan_account",
+            {
+                "enabled": 1 if normalized_settings["enabled"] else 0,
+                "report_enabled": (
+                    1 if normalized_settings["report_enabled"] else 0
+                ),
+                "route_mode": normalized_settings["route_mode"],
+                "route_send_personal": (
+                    1 if normalized_settings["route_send_personal"] else 0
+                ),
+                "route_group_ids_json": json.dumps(
+                    normalized_settings["route_group_ids"],
+                    ensure_ascii=False,
+                ),
+            },
+            where={"account_uid": account["account_uid"]},
+            connection=conn,
+        )
+        for uid, enabled in requested.items():
+            store.update(
+                "promotion_target",
+                {
+                    "enabled": 1 if enabled else 0,
+                    "capacity_state": (
+                        "active"
+                        if enabled and normalized_settings["enabled"]
+                        else "disabled"
+                    ),
+                },
+                where={
+                    "target_uid": uid,
+                    "account_uid": account["account_uid"],
+                },
+                connection=conn,
+            )
+
+    refresh_monitor_capacity(owner_username=owner_username, db=store)
     _sync_daily_selected_aavids(
         account.get("owner_username") or owner_username,
         db=store,
@@ -394,7 +577,7 @@ def refresh_monitor_capacity(
     init_sqlite_schema(database=store.config.get("database"))
     owner = _owner_key(owner_username)
     rows = store.execute(
-        "SELECT t.target_uid,t.enabled,t.capacity_state,t.last_duration_ms,"
+        "SELECT t.target_uid,t.enabled,t.monitor_eligible,t.capacity_state,t.last_duration_ms,"
         "a.enabled AS account_enabled "
         "FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -412,7 +595,11 @@ def refresh_monitor_capacity(
     with store.transaction() as conn:
         store.execute("BEGIN IMMEDIATE", connection=conn)
         for row in rows:
-            desired = bool(row.get("enabled")) and bool(row.get("account_enabled"))
+            desired = (
+                bool(row.get("enabled"))
+                and bool(row.get("account_enabled"))
+                and bool(row.get("monitor_eligible"))
+            )
             if not desired:
                 state = "disabled"
                 disabled += 1
@@ -539,7 +726,8 @@ def schedulable_promotion_targets(
     rows = store.execute(
         "SELECT t.* FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
-        "WHERE t.enabled=1 AND t.capacity_state='active' AND a.enabled=1 "
+        "WHERE t.enabled=1 AND t.monitor_eligible=1 "
+        "AND t.capacity_state='active' AND a.enabled=1 "
         "AND a.owner_username=? "
         "ORDER BY COALESCE(t.last_sync_at,'') ASC,t.created_at ASC,t.id ASC",
         (owner,),

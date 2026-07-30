@@ -142,6 +142,18 @@ def _plan(plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         ),
         "plan_system": detect_plan_system(payload=dict(plan)),
     }
+    for status_key in (
+        "deliveryStatus",
+        "adDeliveryStatus",
+        "effectiveStatus",
+        "adStatus",
+        "status",
+        "adDeliveryName",
+    ):
+        if plan.get(status_key) not in (None, ""):
+            result["platform_status"] = plan.get(status_key)
+            result["platform_status_source"] = status_key
+            break
     for source, target in (
         ("adDeliveryName", "delivery_name"),
         ("adDeliveryType", "delivery_type"),
@@ -211,6 +223,7 @@ def extract_product_scene_snapshot(payload: Any) -> Dict[str, Any]:
                 "ad_id": parsed_plan["ad_id"],
                 "ad_name": parsed_plan.get("plan_name") or "",
                 "plan_system": parsed_plan.get("plan_system") or "unknown",
+                "platform_status": parsed_plan.get("platform_status") or "unknown",
                 "product_ids": list(ad_product_map.get(parsed_plan["ad_id"], [])),
             }
         )
