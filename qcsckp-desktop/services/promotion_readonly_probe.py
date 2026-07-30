@@ -746,6 +746,82 @@ class PromotionReadOnlyProbe:
                 latest_value = value
         return latest_value
 
+    def latest_observed_detail_ad_id(self, aavid: Any = "") -> str:
+        """返回最近一次计划详情请求明确携带的主计划 ID。
+
+        账户选择模式只用这个信号确认“用户已经主动打开计划详情”。计划列表
+        响应即使包含很多 adId 也不会命中，避免工具刚打开列表就误关 Chrome。
+        """
+        expected_aavid = str(aavid or "").strip()
+        latest_value = ""
+        latest_key = ("", -1)
+        detail_paths = {value.lower() for value in PRODUCT_PLAN_API_PATHS}
+        observations = list(self._requests.values()) + list(self._apis.values())
+        for index, item in enumerate(observations):
+            path = str(item.get("path") or "").strip().lower()
+            is_detail_request = (
+                path in detail_paths
+                or "ad-detail" in path
+                or "/ad/detail" in path
+                or path.endswith("/get-config")
+            )
+            if not is_detail_request:
+                continue
+
+            identifiers = item.get("identifiers") or {}
+            item_aavids = {
+                str(identifiers.get("aavid") or "").strip(),
+            }
+            detail_ids = {
+                str(identifiers.get("ad_id") or "").strip(),
+                str(identifiers.get("adId") or "").strip(),
+            }
+            for field in item.get("fields") or []:
+                field_key = str((field or {}).get("key") or "")
+                field_value = str(
+                    (field or {}).get("value") or ""
+                ).strip()
+                if field_key in {
+                    "aavid",
+                    "advId",
+                    "adv_id",
+                    "advertiserId",
+                    "advertiser_id",
+                    "accountId",
+                    "account_id",
+                }:
+                    item_aavids.add(field_value)
+                elif field_key in {"adId", "ad_id"}:
+                    detail_ids.add(field_value)
+            for candidate in item.get("plan_candidates") or []:
+                detail_ids.add(
+                    str(
+                        (candidate or {}).get("adId")
+                        or (candidate or {}).get("ad_id")
+                        or ""
+                    ).strip()
+                )
+            snapshot_plan = (
+                (item.get("product_snapshot") or {}).get("plan") or {}
+            )
+            detail_ids.add(str(snapshot_plan.get("ad_id") or "").strip())
+
+            item_aavids = {value for value in item_aavids if value.isdigit()}
+            if (
+                expected_aavid
+                and item_aavids
+                and expected_aavid not in item_aavids
+            ):
+                continue
+            values = sorted(value for value in detail_ids if value.isdigit())
+            if len(values) != 1:
+                continue
+            key = (str(item.get("observed_at") or ""), index)
+            if key >= latest_key:
+                latest_key = key
+                latest_value = values[0]
+        return latest_value
+
     async def current_account_name(self, page: Any) -> str:
         """只读当前导航栏中已选账户的名称，不展开或导入授权账户目录。"""
         if page is None:

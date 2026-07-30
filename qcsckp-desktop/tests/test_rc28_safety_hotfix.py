@@ -18,6 +18,7 @@ from api.promotion_targets import (
     upsert_promotion_target,
 )
 from services.fetcher import QianChuanFetcher
+from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.qianchuan_accounts import (
     ensure_qianchuan_account,
     migrate_existing_qianchuan_accounts,
@@ -29,6 +30,7 @@ from services.run_services import (
     CatalogLoginRequired,
     ServiceController,
     _qianchuan_authenticated_shell_visible,
+    _visible_plan_detail_ad_id,
 )
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -771,6 +773,157 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         save_state.assert_awaited_once()
         mark_available.assert_called_once_with(owner_username=self.owner)
         self.assertTrue(fetcher.closed)
+
+    def test_existing_account_plan_detail_confirms_and_closes_browser(self):
+        ensure_qianchuan_account(
+            "10001",
+            account_name="已添加账户",
+            owner_username=self.owner,
+            directory_selected=True,
+            seen=True,
+            db=self.db,
+        )
+
+        class FakePage:
+            url = "https://qianchuan.jinritemai.com/uni-prom"
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            async def bring_to_front(self):
+                return None
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+
+        class FakeFetcher:
+            def __init__(self):
+                self.page = FakePage()
+                self.context = FakeContext(self.page)
+                self.closed = False
+
+            async def _init_browser(self):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class FakeProbe:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def attach(self, _page):
+                return None
+
+            async def observe_page(self, _page):
+                return None
+
+            def latest_observed_aavid(self):
+                return "10001"
+
+            def latest_observed_detail_ad_id(self, aavid=""):
+                return "30001" if aavid == "10001" else ""
+
+        cfg = SimpleNamespace(
+            db_path=self.db_path,
+            open_url="https://qianchuan.jinritemai.com/home",
+            wait_url_prefix="https://qianchuan.jinritemai.com/",
+        )
+        cfg.normalize_paths = lambda: cfg
+        controller = ServiceController()
+        fetcher = FakeFetcher()
+        save_state = AsyncMock()
+        mark_available = Mock()
+        with (
+            patch(
+                "services.run_services.current_session_owner",
+                return_value=self.owner,
+            ),
+            patch("services.run_services.ServiceConfig", return_value=cfg),
+            patch(
+                "services.run_services.load_qianchuan_storage_state",
+                return_value={"cookies": []},
+            ),
+            patch("services.run_services.migrate_legacy_qcookie"),
+            patch(
+                "services.run_services.QianChuanFetcher",
+                return_value=fetcher,
+            ),
+            patch(
+                "services.run_services.PromotionReadOnlyProbe",
+                FakeProbe,
+            ),
+            patch(
+                "services.run_services.save_context_storage_state",
+                save_state,
+            ),
+            patch(
+                "services.run_services.mark_qianchuan_session_available",
+                mark_available,
+            ),
+        ):
+            asyncio.run(
+                controller._target_discovery_async(account_only=True)
+            )
+        status = controller.target_discovery_status()
+        self.assertTrue(status["success"])
+        self.assertFalse(status["running"])
+        self.assertEqual("10001", status["account"]["aavid"])
+        self.assertIn("检测到计划详情", status["message"])
+        self.assertIsNone(status["target"])
+        rows = self.db.select(
+            "qianchuan_account",
+            where={"owner_username": self.owner, "aavid": "10001"},
+        )
+        self.assertEqual(1, len(rows))
+        save_state.assert_awaited_once()
+        mark_available.assert_called_once_with(owner_username=self.owner)
+        self.assertTrue(fetcher.closed)
+
+    def test_detail_probe_ignores_plan_list_and_accepts_detail_request(self):
+        probe = PromotionReadOnlyProbe.__new__(PromotionReadOnlyProbe)
+        probe._requests = {
+            "list": {
+                "path": "/ad/api/pmc/v1/uni-promotion/ad/list-required",
+                "observed_at": "2026-07-30 23:00:00",
+                "identifiers": {"aavid": "10001"},
+                "fields": [{"key": "adId", "value": "20001"}],
+            },
+            "detail": {
+                "path": "/ad/api/creation/v1/ad/ad-detail-basic",
+                "observed_at": "2026-07-30 23:00:01",
+                "identifiers": {"aavid": "10001"},
+                "fields": [{"key": "adId", "value": "30001"}],
+            },
+        }
+        probe._apis = {}
+        self.assertEqual(
+            "30001",
+            probe.latest_observed_detail_ad_id("10001"),
+        )
+        self.assertEqual(
+            "",
+            probe.latest_observed_detail_ad_id("10002"),
+        )
+
+    def test_visible_product_detail_marker_is_fast_fallback(self):
+        detail_text = (
+            "减咖鲜酱油2.5 投放中 ID：1869678213573940 "
+            "预算(元)：每日5,000.00 净成交ROI目标：3.00 "
+            "数据 商品 素材 调控 详情 日志 保障历史 "
+            "素材ID: 766496681368721450"
+        )
+        self.assertEqual(
+            "1869678213573940",
+            _visible_plan_detail_ad_id(detail_text),
+        )
+        self.assertEqual(
+            "",
+            _visible_plan_detail_ad_id(
+                "计划列表 ID：1869678213573940 预算(元)：每日5,000.00"
+            ),
+        )
 
     def test_login_success_can_be_confirmed_by_authenticated_shell(self):
         class FakeLocator:

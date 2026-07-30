@@ -237,11 +237,11 @@
     $('addAccount').disabled=true;
     const a=await waitApi();let r;
     try{r=await a.startQianchuanAccountSelection()}catch(e){r={success:false,message:String(e?.message||e)}}
-    message(r?.message||'Chrome正在启动。请切换到要添加的千川账户；识别后窗口会自动关闭，不需要进入计划详情。',!r?.success);
+    message(r?.message||'Chrome正在启动。请切换到要添加的千川账户；如果当前账户已经添加，打开该账户任意计划详情即可确认。识别后窗口会自动关闭。',!r?.success);
     if(!r?.success){$('addAccount').disabled=false;return}
     const timer=setInterval(async()=>{
       const s=await a.getPromotionTargetDiscoveryStatus();
-      message(s?.message||'请在Chrome中切换到要添加的账户；识别后窗口会自动关闭。',!s?.success);
+      message(s?.message||'请在Chrome中切换到要添加的账户；如果当前账户已经添加，打开任意计划详情即可确认并自动关闭窗口。',!s?.success);
       if(!s?.running){
         clearInterval(timer);$('addAccount').disabled=false;
         await load();

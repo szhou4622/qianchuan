@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -654,6 +655,27 @@ def _extract_aavid_adid(url: str) -> Tuple[Optional[str], Optional[str]]:
     aavid = params.get("aavid") or params.get("aavid".upper()) or params.get("aAvid")
     ad_id = params.get("adId") or params.get("ad_id") or params.get("adID")
     return aavid, ad_id
+
+
+def _visible_plan_detail_ad_id(page_text: Any) -> str:
+    """从可见详情抽屉识别主计划 ID；列表页不能命中。"""
+    text = re.sub(r"\s+", " ", str(page_text or "")).strip()
+    if not text:
+        return ""
+    detail_tabs = sum(
+        marker in text
+        for marker in ("数据", "商品", "素材", "调控", "详情", "日志", "保障历史")
+    )
+    header_markers = (
+        "预算(元)" in text
+        or "预算（元）" in text
+        or "净成交ROI目标" in text
+        or "综合营销ROI目标" in text
+    )
+    if detail_tabs < 4 or not header_markers:
+        return ""
+    match = re.search(r"(?<!素材)(?<!商品)\bID\s*[：:]\s*(\d{8,})", text)
+    return str(match.group(1)) if match else ""
 
 
 def _feishu_hourly_push_window_sync(
@@ -1865,7 +1887,8 @@ class ServiceController:
                 if login_only
                 else (
                     "独立Google Chrome已打开；请切换到要添加的千川账户。"
-                    "识别稳定后会自动保存该账户并关闭Chrome，不需要进入计划详情"
+                    "如果当前账户已经添加，打开该账户任意计划详情即可确认；"
+                    "识别稳定后会自动保存并关闭Chrome"
                     if account_only
                     else
                     "独立Google Chrome已打开；如显示登录页，请先登录千川，"
@@ -1991,14 +2014,102 @@ class ServiceController:
                         else ""
                     )
                     if latest_aavid in selected_aavids:
-                        stable_candidate = None
-                        stable_count = 0
+                        detail_ad_id = ""
+                        detail_loader = getattr(
+                            probe,
+                            "latest_observed_detail_ad_id",
+                            None,
+                        )
+                        if callable(detail_loader):
+                            detail_ad_id = str(
+                                detail_loader(latest_aavid) or ""
+                            ).strip()
+                        url_aavid, url_ad_id = _extract_aavid_adid(cur)
+                        if (
+                            str(url_aavid or "") == latest_aavid
+                            and str(url_ad_id or "").isdigit()
+                        ):
+                            detail_ad_id = str(url_ad_id)
+                        if not detail_ad_id and urlparse(cur).path == "/uni-prom":
+                            try:
+                                visible_text = await fetcher.page.locator(
+                                    "body"
+                                ).inner_text(timeout=1500)
+                            except Exception:
+                                visible_text = ""
+                            detail_ad_id = _visible_plan_detail_ad_id(
+                                visible_text
+                            )
+                        if detail_ad_id.isdigit():
+                            candidate = (
+                                "existing_account_detail",
+                                latest_aavid,
+                                detail_ad_id,
+                            )
+                            if candidate == stable_candidate:
+                                stable_count += 1
+                            else:
+                                stable_candidate = candidate
+                                stable_count = 1
+                        else:
+                            stable_candidate = None
+                            stable_count = 0
+                        if stable_count >= 2:
+                            account = next(
+                                (
+                                    item
+                                    for item in selected_accounts
+                                    if str(item.get("aavid") or "")
+                                    == latest_aavid
+                                ),
+                                {
+                                    "aavid": latest_aavid,
+                                    "account_name": latest_aavid,
+                                },
+                            )
+                            _require_session_owner(session_owner)
+                            if fetcher.context:
+                                await save_context_storage_state(
+                                    fetcher.context,
+                                    owner_username=session_owner,
+                                )
+                            mark_qianchuan_session_available(
+                                owner_username=session_owner,
+                            )
+                            from services.qianchuan_catalog import (
+                                clear_catalog_login_failure,
+                            )
+
+                            clear_catalog_login_failure(
+                                owner_username=session_owner,
+                                db=db,
+                            )
+                            with self._lock:
+                                self._target_discovery_status = {
+                                    "success": True,
+                                    "running": False,
+                                    "message": (
+                                        "当前账户已在工具中；检测到计划详情，"
+                                        "Chrome已自动关闭，正在刷新该账户的计划目录"
+                                    ),
+                                    "target": None,
+                                    "account": account,
+                                    "relogin_complete": False,
+                                }
+                            logger.info(
+                                "[千川账户选择] 已添加账户通过计划详情确认，"
+                                "将关闭可见Chrome aavid=%s ad_id=%s",
+                                latest_aavid,
+                                detail_ad_id,
+                            )
+                            return
                         with self._lock:
                             self._target_discovery_status["message"] = (
-                                "当前千川账户已经添加；请在Chrome右上角切换到"
-                                "另一个要添加的账户。识别后窗口会自动关闭"
+                                "当前千川账户已经添加；如需添加其他账户，请在"
+                                "Chrome右上角切换；如需确认当前账户，请打开"
+                                "任意计划详情，识别后窗口会自动关闭"
                             )
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.25)
                         continue
                     if latest_aavid.isdigit():
                         candidate = ("account", latest_aavid)
@@ -2010,13 +2121,13 @@ class ServiceController:
                     else:
                         stable_candidate = None
                         stable_count = 0
-                    if stable_count < 3:
+                    if stable_count < 2:
                         with self._lock:
                             self._target_discovery_status["message"] = (
                                 "正在识别Chrome当前千川账户；只需完成账户切换，"
                                 "不需要进入计划详情"
                             )
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.25)
                         continue
 
                     account_name = ""
