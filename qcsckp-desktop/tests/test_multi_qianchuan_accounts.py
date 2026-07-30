@@ -430,6 +430,18 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn("data.daily_report?.config||{}", html)
         self.assertNotIn("const daily=data.daily_report||{}", html)
 
+    def test_account_page_keeps_equal_cards_and_scrolls_each_plan_catalog(self):
+        html = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "qianchuan_accounts.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".card{height:620px", html)
+        self.assertIn(".plans{min-height:0", html)
+        self.assertIn("overflow-y:auto", html)
+        self.assertIn("该账户全部计划（全域/乘方 × 推直播/推商品）", html)
+        self.assertIn("请先启用此千川账户，再选择", html)
+
 
 class QianchuanSessionTests(unittest.TestCase):
     def setUp(self):

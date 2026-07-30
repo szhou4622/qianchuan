@@ -986,17 +986,30 @@ class PromotionReadOnlyProbe:
                     }
                 )
             except Exception as exc:
+                reason = _safe_text(exc, 500)
+                resolved = any(
+                    marker in reason
+                    for marker in (
+                        "精确详情账户不匹配",
+                        "精确详情推广方式不匹配",
+                        "精确详情计划体系与分类页面不一致",
+                    )
+                )
                 rejected.append(
                     {
                         "ad_id": ad_id,
-                        "reason": _safe_text(exc, 500),
+                        "reason": reason,
+                        "resolved": resolved,
                     }
                 )
+        resolved_rejections = sum(
+            1 for item in rejected if item.get("resolved")
+        )
         return {
             "verified": verified,
             "rejected": rejected,
             "candidate_count": len(rows),
-            "complete": len(rows) == len(verified),
+            "complete": len(rows) == len(verified) + resolved_rejections,
         }
 
     def confirmed_product_target(self) -> Optional[Dict[str, Any]]:

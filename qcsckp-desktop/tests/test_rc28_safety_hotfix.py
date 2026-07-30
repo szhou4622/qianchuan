@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from api.promotion_targets import (
     migrate_legacy_target_scope,
+    normalize_platform_status,
     patch_target_sync_state,
     record_target_verification_failure,
     set_target_automation_write_block,
@@ -29,6 +30,7 @@ from services.retargeting_service import QianChuanRetargetingService
 from services.run_services import (
     CatalogLoginRequired,
     ServiceController,
+    _persist_verified_catalog_class,
     _qianchuan_authenticated_shell_visible,
     _visible_plan_detail_ad_id,
 )
@@ -42,6 +44,40 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         init_sqlite_schema(database=self.db_path)
         self.db = SQLiteStore(database=self.db_path)
         self.owner = "rc28-owner"
+
+    def test_system_paused_status_is_normalized_and_remains_ineligible(self):
+        self.assertEqual("paused", normalize_platform_status("系统暂停"))
+
+    def test_resolved_cross_scene_catalog_candidate_is_not_persisted(self):
+        result = _persist_verified_catalog_class(
+            self.db,
+            aavid="10001",
+            account_name="账户",
+            promotion_scene="product",
+            plan_system="global",
+            page_url="https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+            candidates=[{"ad_id": "30001", "plan_name": "直播候选"}],
+            verification={
+                "verified": [],
+                "rejected": [
+                    {
+                        "ad_id": "30001",
+                        "reason": "精确详情推广方式不匹配",
+                        "resolved": True,
+                    }
+                ],
+                "complete": True,
+            },
+            owner_username=self.owner,
+            class_complete=True,
+        )
+        self.assertEqual([], result["seen_ids"])
+        self.assertIsNone(
+            self.db.select_one(
+                "promotion_target",
+                where={"aadvid": "10001", "ad_id": "30001"},
+            )
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1146,6 +1182,7 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         class FakeFetcher:
             def __init__(self):
                 self.page = FakePage()
+                self.context = object()
 
             async def _init_browser(self):
                 return None
@@ -1158,6 +1195,12 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
                 pass
 
             def attach(self, _page):
+                return None
+
+            def reset_catalog_class(self, **_kwargs):
+                return None
+
+            def set_catalog_context(self, **_kwargs):
                 return None
 
         @asynccontextmanager
@@ -1206,6 +1249,30 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         ):
             controller._catalog_sync_entry(self.owner)
         invalid.assert_called_once()
+
+    def test_active_catalog_system_uses_selected_navigation_not_page_copy(self):
+        class FakePage:
+            async def evaluate(self, _script):
+                return "global"
+
+        self.assertEqual(
+            "global",
+            asyncio.run(
+                ServiceController._active_catalog_plan_system(FakePage())
+            ),
+        )
+
+    def test_active_catalog_system_keeps_unknown_without_active_navigation(self):
+        class FakePage:
+            async def evaluate(self, _script):
+                return "unknown"
+
+        self.assertEqual(
+            "unknown",
+            asyncio.run(
+                ServiceController._active_catalog_plan_system(FakePage())
+            ),
+        )
 
     def test_stale_catalog_login_failure_cannot_override_visible_relogin(self):
         controller = ServiceController()

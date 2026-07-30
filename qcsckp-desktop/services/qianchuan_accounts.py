@@ -212,16 +212,17 @@ def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
         out["catalog_counts"] = {}
     aid = str(out.get("aavid") or "")
     counts = store.execute(
-        "SELECT COUNT(*) AS total,"
+        "SELECT SUM(CASE WHEN verification_state!='missing' THEN 1 ELSE 0 END) AS total,"
         "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS enabled_count,"
         "SUM(CASE WHEN enabled=1 AND capacity_state='active' THEN 1 ELSE 0 END) AS active_count,"
         "SUM(CASE WHEN enabled=1 AND capacity_state='capacity_waiting' THEN 1 ELSE 0 END) AS waiting_count,"
         "SUM(CASE WHEN monitor_eligible=1 THEN 1 ELSE 0 END) AS eligible_count,"
-        "SUM(CASE WHEN promotion_scene='live' AND plan_system='global' THEN 1 ELSE 0 END) AS global_live_count,"
-        "SUM(CASE WHEN promotion_scene='product' AND plan_system='global' THEN 1 ELSE 0 END) AS global_product_count,"
-        "SUM(CASE WHEN promotion_scene='live' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_live_count,"
-        "SUM(CASE WHEN promotion_scene='product' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_product_count,"
-        "SUM(CASE WHEN plan_system='unknown' OR verification_state!='verified' THEN 1 ELSE 0 END) AS unverified_count "
+        "SUM(CASE WHEN verification_state!='missing' AND promotion_scene='live' AND plan_system='global' THEN 1 ELSE 0 END) AS global_live_count,"
+        "SUM(CASE WHEN verification_state!='missing' AND promotion_scene='product' AND plan_system='global' THEN 1 ELSE 0 END) AS global_product_count,"
+        "SUM(CASE WHEN verification_state!='missing' AND promotion_scene='live' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_live_count,"
+        "SUM(CASE WHEN verification_state!='missing' AND promotion_scene='product' AND plan_system='chengfang' THEN 1 ELSE 0 END) AS chengfang_product_count,"
+        "SUM(CASE WHEN verification_state!='missing' AND (plan_system='unknown' OR verification_state!='verified') THEN 1 ELSE 0 END) AS unverified_count,"
+        "SUM(CASE WHEN verification_state='missing' THEN 1 ELSE 0 END) AS historical_count "
         "FROM promotion_target WHERE account_uid=?",
         (str(out.get("account_uid") or ""),),
         fetch=True,
@@ -240,6 +241,7 @@ def _account_row(row: Dict[str, Any], store: SQLiteStore) -> Dict[str, Any]:
                 "chengfang_product": int(counts[0].get("chengfang_product_count") or 0),
             },
             "unverified_plan_count": int(counts[0].get("unverified_count") or 0),
+            "historical_plan_count": int(counts[0].get("historical_count") or 0),
         }
     )
     sync = store.select_one(

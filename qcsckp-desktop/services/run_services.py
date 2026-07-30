@@ -267,7 +267,7 @@ def _persist_verified_catalog_class(
     verification: Dict[str, Any],
     owner_username: str,
     class_complete: bool,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Persist one catalog class without allowing list candidates to write-enable."""
     existing_rows = {
         str(item.get("ad_id") or ""): item
@@ -282,12 +282,19 @@ def _persist_verified_catalog_class(
         for item in verification.get("verified") or []
         if isinstance(item, dict)
     }
+    resolved_excluded_ids = {
+        str(item.get("ad_id") or "")
+        for item in verification.get("rejected") or []
+        if isinstance(item, dict) and item.get("resolved")
+    }
     seen_ids = set()
     verified_count = 0
     candidate_count = 0
     for candidate in candidates:
         ad_id = str(candidate.get("ad_id") or "").strip()
         if not ad_id.isdigit():
+            continue
+        if ad_id in resolved_excluded_ids:
             continue
         seen_ids.add(ad_id)
         exact = verified_by_id.get(ad_id)
@@ -363,6 +370,7 @@ def _persist_verified_catalog_class(
             )
     return {
         "seen": len(seen_ids),
+        "seen_ids": sorted(seen_ids),
         "verified": verified_count,
         "candidates": candidate_count,
     }
@@ -1199,15 +1207,19 @@ class ServiceController:
             }
         session_gate = automation_session_ready()
         if not session_gate.get("ready"):
-            return {
-                "success": False,
-                "message": str(
-                    session_gate.get("message")
-                    or "请先在可见Chrome完成一次千川登录"
-                ),
-                "failure_kind": "login_required",
-                "recovery_action": "open_visible_chrome",
-            }
+            # 目录同步只读。缓存状态可能来自已经失效的通用首页探测；
+            # 只要仍有加密会话，就允许用已添加账户的 account-scoped
+            # 地址重新核验。若会话真的失效，同步线程仍会安全拦截。
+            if not load_qianchuan_storage_state(owner_username=owner):
+                return {
+                    "success": False,
+                    "message": str(
+                        session_gate.get("message")
+                        or "请先在可见Chrome完成一次千川登录"
+                    ),
+                    "failure_kind": "login_required",
+                    "recovery_action": "open_visible_chrome",
+                }
         cfg = ServiceConfig().normalize_paths()
         if not list_qianchuan_accounts(
             owner_username=owner,
@@ -1363,67 +1375,156 @@ class ServiceController:
         return False
 
     @staticmethod
+    async def _has_visible_exact(page: Any, texts: List[str]) -> bool:
+        for text in texts:
+            locator = page.get_by_text(text, exact=True)
+            try:
+                count = await locator.count()
+            except Exception:
+                count = 0
+            for index in range(count - 1, -1, -1):
+                try:
+                    if await locator.nth(index).is_visible():
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    @staticmethod
+    async def _active_catalog_plan_system(page: Any) -> str:
+        """Read the active top-level catalog tab without scanning page copy.
+
+        The global page contains promotional text mentioning 千川乘方, so the
+        whole body is not reliable evidence for the current catalog system.
+        """
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const definitions = [
+                    ["global", new Set(["全域投放", "全域"])],
+                    ["chengfang", new Set(["乘方", "千川乘方", "乘方投放", "乘方计划"])]
+                  ];
+                  const visible = (node) => {
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      rect.width > 0 && rect.height > 0;
+                  };
+                  const isActive = (node) => {
+                    let current = node;
+                    for (let depth = 0; current && depth < 5; depth += 1) {
+                      const cls = String(current.className || "")
+                        .toLowerCase().split(/\\s+/).filter(Boolean);
+                      if (
+                        current.getAttribute?.("aria-selected") === "true" ||
+                        current.getAttribute?.("aria-current") === "page" ||
+                        current.getAttribute?.("data-state") === "active" ||
+                        cls.some((item) =>
+                          ["active", "selected", "is-active", "is-selected"].includes(item)
+                        )
+                      ) return true;
+                      current = current.parentElement;
+                    }
+                    return false;
+                  };
+                  const nodes = Array.from(document.querySelectorAll(
+                    '[role="tab"],[role="link"],a,button,div,span'
+                  ));
+                  const visibleLabels = new Set();
+                  for (const [system, labels] of definitions) {
+                    for (const node of nodes) {
+                      const text = String(node.textContent || "").trim();
+                      if (labels.has(text) && visible(node)) {
+                        visibleLabels.add(text);
+                        if (isActive(node)) return system;
+                      }
+                    }
+                  }
+                  // Some authorized accounts only expose the global catalog,
+                  // and that single navigation item has no active class.
+                  // The exact visible navigation label, together with the
+                  // absence of any Chengfang entry, is still explicit page
+                  // evidence rather than a plan-name guess.
+                  if (
+                    visibleLabels.has("全域投放") &&
+                    !["乘方", "千川乘方", "乘方投放", "乘方计划"]
+                      .some((label) => visibleLabels.has(label))
+                  ) return "global";
+                  if (
+                    window.location.pathname.includes("/uni-prom/overall") &&
+                    visibleLabels.has("千川乘方")
+                  ) return "chengfang";
+                  return "unknown";
+                }
+                """
+            )
+        except Exception:
+            return "unknown"
+        return normalize_plan_system(result)
+
+    @staticmethod
+    async def _open_explicit_global_catalog(page: Any, *, aavid: str) -> str:
+        page_url = f"https://qianchuan.jinritemai.com/uni-prom?aavid={aavid}"
+        await page.goto(
+            page_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        _require_catalog_login(page)
+        try:
+            title = page.get_by_text("全域投放", exact=True)
+            await title.last.wait_for(state="visible", timeout=20_000)
+        except Exception as exc:
+            raise RuntimeError(f"未找到明确的全域投放页面证据：{exc}") from exc
+        if await ServiceController._active_catalog_plan_system(page) != "global":
+            raise RuntimeError("当前页面无法明确确认是全域计划体系")
+        return str(page.url or page_url)
+
+    @staticmethod
     async def _open_explicit_chengfang_catalog(
         page: Any,
         *,
         aavid: str,
     ) -> bool:
         """Open Chengfang only from an explicit clickable platform label."""
-        entry_texts = ["千川乘方", "乘方投放", "乘方计划"]
+        entry_texts = ["乘方", "千川乘方", "乘方投放", "乘方计划"]
         roles = ["tab", "link", "button", "menuitem"]
-        for pass_index in range(2):
-            if pass_index:
-                await page.goto(
-                    "https://qianchuan.jinritemai.com/home"
-                    f"?aavid={aavid}",
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                _require_catalog_login(page)
-            for text in entry_texts:
-                for role in roles:
-                    locator = page.get_by_role(role, name=text, exact=True)
+        for text in entry_texts:
+            locators = [
+                page.get_by_role(role, name=text, exact=True)
+                for role in roles
+            ]
+            locators.append(page.get_by_text(text, exact=True))
+            for locator in locators:
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+                for index in range(count - 1, -1, -1):
+                    candidate = locator.nth(index)
                     try:
-                        count = await locator.count()
-                    except Exception:
-                        count = 0
-                    for index in range(count - 1, -1, -1):
-                        candidate = locator.nth(index)
-                        try:
-                            if not await candidate.is_visible():
-                                continue
-                            await candidate.click()
-                            try:
-                                await page.wait_for_load_state(
-                                    "domcontentloaded",
-                                    timeout=15_000,
-                                )
-                            except Exception:
-                                pass
-                            await page.wait_for_timeout(1_000)
-                            page_text = await page.locator("body").inner_text(
-                                timeout=5_000
-                            )
-                            visible_lines = {
-                                " ".join(line.split())
-                                for line in page_text.splitlines()
-                                if line.strip()
-                            }
-                            if (
-                                detect_plan_system(page_text=page_text)
-                                == "chengfang"
-                                and visible_lines.intersection(
-                                    {
-                                        "千川乘方",
-                                        "乘方投放",
-                                        "乘方计划",
-                                        "千川乘方投放",
-                                    }
-                                )
-                            ):
-                                return True
-                        except Exception:
+                        if not await candidate.is_visible():
                             continue
+                        await candidate.click()
+                        try:
+                            await page.wait_for_load_state(
+                                "domcontentloaded",
+                                timeout=15_000,
+                            )
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(1_000)
+                        if (
+                            await ServiceController._active_catalog_plan_system(
+                                page
+                            )
+                            == "chengfang"
+                        ):
+                            return True
+                    except Exception:
+                        continue
         return False
 
     async def _scan_catalog_class(
@@ -1512,23 +1613,15 @@ class ServiceController:
             promotion_scene="product",
             plan_system="global",
         )
-        page_url = f"https://qianchuan.jinritemai.com/uni-prom?aavid={aavid}"
-        await fetcher.page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=60_000,
+        page_url = await self._open_explicit_global_catalog(
+            fetcher.page,
+            aavid=aavid,
         )
-        _require_catalog_login(fetcher.page)
-        try:
-            title = fetcher.page.get_by_text("全域投放", exact=True)
-            await title.last.wait_for(state="visible", timeout=20_000)
-            page_text = await fetcher.page.locator("body").inner_text(
-                timeout=5_000
-            )
-        except Exception as exc:
-            raise RuntimeError(f"未找到明确的全域投放页面证据：{exc}") from exc
-        if detect_plan_system(page_text=page_text) != "global":
-            raise RuntimeError("当前页面无法明确确认是全域计划体系")
+        await self._click_visible_exact(
+            fetcher.page,
+            ["推商品"],
+            timeout_ms=3_000,
+        )
         classes["global_product"] = await self._scan_catalog_class(
             fetcher=fetcher,
             probe=probe,
@@ -1540,6 +1633,20 @@ class ServiceController:
             page_url=page_url,
         )
 
+        probe.reset_catalog_class(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        probe.set_catalog_context(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        await self._open_explicit_global_catalog(
+            fetcher.page,
+            aavid=aavid,
+        )
         probe.reset_catalog_class(
             aavid=aavid,
             promotion_scene="live",
@@ -1572,7 +1679,24 @@ class ServiceController:
                 "message": "未找到推直播计划目录入口",
             }
 
-        # 乘方只从千川页面上明确可点击的“千川乘方/乘方投放/乘方计划”
+        # 验证计划详情后页面可能停在抽屉或详情页。每个分类都先回到
+        # account-scoped 全域目录，再从明确导航进入，避免后续分类丢失。
+        probe.reset_catalog_class(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        probe.set_catalog_context(
+            aavid=aavid,
+            promotion_scene="product",
+            plan_system="global",
+        )
+        await self._open_explicit_global_catalog(
+            fetcher.page,
+            aavid=aavid,
+        )
+
+        # 乘方只从千川页面上明确可点击的“乘方/千川乘方/乘方投放/乘方计划”
         # 入口进入。没有该证据就保持目录不完整，绝不按 URL 或计划名称猜测。
         probe.reset_catalog_class(
             aavid=aavid,
@@ -1584,27 +1708,66 @@ class ServiceController:
             promotion_scene="product",
             plan_system="chengfang",
         )
+        has_chengfang_entry = await self._has_visible_exact(
+            fetcher.page,
+            ["乘方", "千川乘方", "乘方投放", "乘方计划"],
+        )
         opened_chengfang = await self._open_explicit_chengfang_catalog(
             fetcher.page,
             aavid=aavid,
         )
         _require_catalog_login(fetcher.page)
         if opened_chengfang:
-            await self._click_visible_exact(
+            opened_chengfang_product = await self._click_visible_exact(
                 fetcher.page,
-                ["推商品", "商品自选"],
+                ["商品", "推商品"],
                 timeout_ms=3_000,
             )
-            classes["chengfang_product"] = await self._scan_catalog_class(
-                fetcher=fetcher,
-                probe=probe,
-                db=db,
-                owner_username=owner_username,
-                account=account,
+            if opened_chengfang_product:
+                classes["chengfang_product"] = await self._scan_catalog_class(
+                    fetcher=fetcher,
+                    probe=probe,
+                    db=db,
+                    owner_username=owner_username,
+                    account=account,
+                    promotion_scene="product",
+                    plan_system="chengfang",
+                    page_url=str(fetcher.page.url or ""),
+                )
+            else:
+                classes["chengfang_product"] = {
+                    "complete": False,
+                    "message": "千川乘方页面未找到商品计划目录入口",
+                }
+            probe.reset_catalog_class(
+                aavid=aavid,
+                promotion_scene="product",
+                plan_system="global",
+            )
+            probe.set_catalog_context(
+                aavid=aavid,
+                promotion_scene="product",
+                plan_system="global",
+            )
+            await self._open_explicit_global_catalog(
+                fetcher.page,
+                aavid=aavid,
+            )
+            probe.reset_catalog_class(
+                aavid=aavid,
                 promotion_scene="product",
                 plan_system="chengfang",
-                page_url=str(fetcher.page.url or ""),
             )
+            probe.set_catalog_context(
+                aavid=aavid,
+                promotion_scene="product",
+                plan_system="chengfang",
+            )
+            reopened_chengfang = await self._open_explicit_chengfang_catalog(
+                fetcher.page,
+                aavid=aavid,
+            )
+            _require_catalog_login(fetcher.page)
             probe.reset_catalog_class(
                 aavid=aavid,
                 promotion_scene="live",
@@ -1615,11 +1778,12 @@ class ServiceController:
                 promotion_scene="live",
                 plan_system="chengfang",
             )
-            opened_chengfang_live = await self._click_visible_exact(
-                fetcher.page,
-                ["推直播间", "推直播"],
+            opened_chengfang_live = reopened_chengfang and (
+                await self._click_visible_exact(
+                    fetcher.page,
+                    ["直播", "推直播间", "推直播"],
+                )
             )
-            _require_catalog_login(fetcher.page)
             if opened_chengfang_live:
                 classes["chengfang_live"] = await self._scan_catalog_class(
                     fetcher=fetcher,
@@ -1637,18 +1801,67 @@ class ServiceController:
                     "message": "千川乘方页面未找到推直播计划目录入口",
                 }
         else:
+            unavailable = not has_chengfang_entry
             classes["chengfang_product"] = {
-                "complete": False,
-                "message": "未取得千川乘方·推商品目录的明确页面证据",
+                "complete": unavailable,
+                "seen": 0,
+                "seen_ids": [],
+                "verified": 0,
+                "candidates": 0,
+                "message": (
+                    "该账户未显示乘方入口，目录记为0条"
+                    if unavailable
+                    else "未取得千川乘方·推商品目录的明确页面证据"
+                ),
             }
             classes["chengfang_live"] = {
-                "complete": False,
-                "message": "未取得千川乘方·推直播目录的明确页面证据",
+                "complete": unavailable,
+                "seen": 0,
+                "seen_ids": [],
+                "verified": 0,
+                "candidates": 0,
+                "message": (
+                    "该账户未显示乘方入口，目录记为0条"
+                    if unavailable
+                    else "未取得千川乘方·推直播目录的明确页面证据"
+                ),
             }
+        complete = all(
+            bool(item.get("complete")) for item in classes.values()
+        )
+        if complete:
+            seen_ids = {
+                str(ad_id)
+                for item in classes.values()
+                for ad_id in (item.get("seen_ids") or [])
+            }
+            # Once all four explicit classes are complete, old unscoped rows
+            # that were not seen are historical residue, not a fifth
+            # "待确认" catalog. Keep them for audit but remove automation.
+            for existing in list_promotion_targets(
+                owner_username=owner_username,
+                db=db,
+            ):
+                if (
+                    str(existing.get("aadvid") or "") != aavid
+                    or normalize_plan_system(existing.get("plan_system"))
+                    != "unknown"
+                    or str(existing.get("ad_id") or "") in seen_ids
+                ):
+                    continue
+                update_target_catalog_evidence(
+                    existing["target_uid"],
+                    platform_status=existing.get("platform_status") or "unknown",
+                    verification_state="missing",
+                    db=db,
+                )
+                db.update(
+                    "promotion_target",
+                    {"enabled": 0, "capacity_state": "disabled"},
+                    where={"target_uid": existing["target_uid"]},
+                )
         return {
-            "complete": all(
-                bool(item.get("complete")) for item in classes.values()
-            ),
+            "complete": complete,
             "classes": classes,
             "error": "；".join(
                 f"{key}: {item.get('message')}"
@@ -1676,6 +1889,14 @@ class ServiceController:
             owner_username=owner,
             db=db,
         )
+        if not accounts:
+            finalize_catalog_sync(
+                owner_username=owner,
+                account_results={},
+                error="尚未添加千川账户；请先选择当前账户并添加",
+                db=db,
+            )
+            return
         fetcher = QianChuanFetcher(headless=True, storage_state=state)
         account_results: Dict[str, Dict[str, Any]] = {}
         async with exclusive_browser_operation(
@@ -1686,21 +1907,7 @@ class ServiceController:
             probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
             probe.attach(fetcher.page)
             try:
-                await fetcher.page.goto(
-                    "https://qianchuan.jinritemai.com/home",
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                _require_catalog_login(fetcher.page)
                 _require_session_owner(owner)
-                if not accounts:
-                    finalize_catalog_sync(
-                        owner_username=owner,
-                        account_results={},
-                        error="尚未添加千川账户；请先选择当前账户并添加",
-                        db=db,
-                    )
-                    return
                 # 只迁移用户已经明确添加的账户。右上角授权账户列表不再用于
                 # 自动建目录，也不会把同一登录身份下的全部 aavid 写入工具。
                 migrate_existing_qianchuan_accounts(
@@ -1756,6 +1963,15 @@ class ServiceController:
                 await save_context_storage_state(
                     fetcher.context,
                     owner_username=owner,
+                )
+                mark_qianchuan_session_available(owner_username=owner)
+                from services.qianchuan_catalog import (
+                    clear_catalog_login_failure,
+                )
+
+                clear_catalog_login_failure(
+                    owner_username=owner,
+                    db=db,
                 )
             finally:
                 await fetcher.close()
@@ -2013,6 +2229,15 @@ class ServiceController:
                         if callable(latest_aavid_loader)
                         else ""
                     )
+                    url_aavid, url_ad_id = _extract_aavid_adid(cur)
+                    if (
+                        not latest_aavid.isdigit()
+                        and str(url_aavid or "").isdigit()
+                    ):
+                        # 账户切换会先更新 account-scoped URL，列表接口可能
+                        # 稍后才返回。直接使用 URL 中的 aavid 可以避免新增
+                        # 第二个账户时无意义地等待很久。
+                        latest_aavid = str(url_aavid)
                     if latest_aavid in selected_aavids:
                         detail_ad_id = ""
                         detail_loader = getattr(
@@ -2024,7 +2249,6 @@ class ServiceController:
                             detail_ad_id = str(
                                 detail_loader(latest_aavid) or ""
                             ).strip()
-                        url_aavid, url_ad_id = _extract_aavid_adid(cur)
                         if (
                             str(url_aavid or "") == latest_aavid
                             and str(url_ad_id or "").isdigit()

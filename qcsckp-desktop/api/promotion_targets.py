@@ -46,6 +46,7 @@ def normalize_platform_status(value: Any) -> str:
         "已启用": "enabled",
         "暂停": "paused",
         "已暂停": "paused",
+        "系统暂停": "paused",
         "结束": "ended",
         "已结束": "ended",
         "删除": "deleted",
