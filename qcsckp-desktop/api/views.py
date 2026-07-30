@@ -581,6 +581,12 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def startQianchuanAccountSelection(self):
+        try:
+            return self.service.start_target_discovery(account_only=True)
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
     def startQianchuanRelogin(self):
         try:
             return self.service.start_target_discovery(login_only=True)

@@ -730,6 +730,52 @@ class PromotionReadOnlyProbe:
             for item in result.values()
         ]
 
+    def latest_observed_aavid(self) -> str:
+        """返回最近一次只读请求明确携带的当前千川账户 ID。"""
+        latest_value = ""
+        latest_key = ("", -1)
+        observations = list(self._requests.values()) + list(self._apis.values())
+        for index, item in enumerate(observations):
+            identifiers = item.get("identifiers") or {}
+            value = str(identifiers.get("aavid") or "").strip()
+            if not value.isdigit():
+                continue
+            key = (str(item.get("observed_at") or ""), index)
+            if key >= latest_key:
+                latest_key = key
+                latest_value = value
+        return latest_value
+
+    async def current_account_name(self, page: Any) -> str:
+        """只读当前导航栏中已选账户的名称，不展开或导入授权账户目录。"""
+        if page is None:
+            return ""
+        selectors = (
+            "#navigator-right-account .account-name",
+            "#navigator-right-account [title]",
+            "#navigator-right-account",
+        )
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                title = str(await locator.get_attribute("title") or "").strip()
+                text = str(await locator.inner_text(timeout=1500) or "").strip()
+            except Exception:
+                continue
+            candidate = title or text
+            if not candidate:
+                continue
+            candidate = re.sub(r"\s+", " ", candidate)
+            candidate = re.sub(
+                r"(?:账户\s*ID|ID)\s*[:：]?\s*\d{8,}",
+                "",
+                candidate,
+                flags=re.IGNORECASE,
+            ).strip(" -|")
+            if candidate:
+                return candidate[:256]
+        return ""
+
     async def wait_for_product_pagination(self, timeout: float = 5.0) -> None:
         """等待已发现的商品计划列表分页只读请求完成。"""
         deadline = time.monotonic() + max(0.1, float(timeout))

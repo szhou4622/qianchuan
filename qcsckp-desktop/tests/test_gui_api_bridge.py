@@ -23,6 +23,7 @@ class JSApiBridgeTests(unittest.TestCase):
             "success": True
         }
         self.core.startPromotionTargetDiscovery.return_value = {"success": True}
+        self.core.startQianchuanAccountSelection.return_value = {"success": True}
         self.core.startQianchuanRelogin.return_value = {"success": True}
         self.core.getPromotionTargetDiscoveryStatus.return_value = {"running": False}
 
@@ -63,6 +64,10 @@ class JSApiBridgeTests(unittest.TestCase):
             {"success": True},
         )
         self.assertEqual(
+            self.bridge.startQianchuanAccountSelection(),
+            {"success": True},
+        )
+        self.assertEqual(
             self.bridge.startQianchuanRelogin(),
             {"success": True},
         )
@@ -90,6 +95,7 @@ class JSApiBridgeTests(unittest.TestCase):
             "target-1"
         )
         self.core.startPromotionTargetDiscovery.assert_called_once_with()
+        self.core.startQianchuanAccountSelection.assert_called_once_with()
         self.core.startQianchuanRelogin.assert_called_once_with()
         self.core.getPromotionTargetDiscoveryStatus.assert_called_once_with()
 

@@ -761,6 +761,7 @@ class ServiceController:
         self._cloud_backup_password: str = ""
         self._target_discovery_thread: Optional[threading.Thread] = None
         self._target_discovery_login_only = False
+        self._target_discovery_account_only = False
         self._target_discovery_launch_event = threading.Event()
         self._catalog_sync_thread: Optional[threading.Thread] = None
         self._catalog_scheduler_thread: Optional[threading.Thread] = None
@@ -770,6 +771,7 @@ class ServiceController:
             "running": False,
             "message": "",
             "target": None,
+            "account": None,
             "relogin_complete": False,
         }
 
@@ -1060,16 +1062,29 @@ class ServiceController:
             status["message"] = "旧千川会话仍在安全退出，请稍后重试"
         return status
 
-    def start_target_discovery(self, *, login_only: bool = False) -> dict:
-        """打开独立有头浏览器，用户进入计划详情后自动登记监控目标。"""
+    def start_target_discovery(
+        self,
+        *,
+        login_only: bool = False,
+        account_only: bool = False,
+    ) -> dict:
+        """打开独立有头浏览器，执行重新登录、选择账户或旧版计划识别。"""
+        if login_only and account_only:
+            return {
+                "success": False,
+                "running": False,
+                "message": "登录核验和账户选择不能同时启动",
+            }
         with self._lock:
             if (
                 self._target_discovery_thread is not None
                 and self._target_discovery_thread.is_alive()
             ):
                 logger.info(
-                    "[千川可见登录] 复用正在运行的浏览器任务 login_only=%s status=%s",
+                    "[千川可见登录] 复用正在运行的浏览器任务 "
+                    "login_only=%s account_only=%s status=%s",
                     self._target_discovery_login_only,
+                    self._target_discovery_account_only,
                     self._target_discovery_status.get("message"),
                 )
                 return {
@@ -1082,19 +1097,26 @@ class ServiceController:
                 "running": True,
                 "message": "正在启动独立Google Chrome，请稍候…",
                 "target": None,
+                "account": None,
                 "relogin_complete": False,
             }
             self._target_discovery_login_only = bool(login_only)
+            self._target_discovery_account_only = bool(account_only)
             self._target_discovery_thread = threading.Thread(
                 target=self._target_discovery_entry,
-                args=(bool(login_only),),
+                args=(
+                    (bool(login_only), bool(account_only))
+                    if account_only
+                    else (bool(login_only),)
+                ),
                 name="promotion-target-discovery",
                 daemon=True,
             )
             self._target_discovery_thread.start()
         logger.info(
-            "[千川可见登录] 已收到启动请求 login_only=%s",
+            "[千川可见登录] 已收到启动请求 login_only=%s account_only=%s",
             bool(login_only),
+            bool(account_only),
         )
         self._target_discovery_launch_event.wait(timeout=8.0)
         with self._lock:
@@ -1125,17 +1147,25 @@ class ServiceController:
                 self._catalog_sync_thread is not None
                 and self._catalog_sync_thread.is_alive()
             )
-            visible_login_running = (
+            visible_browser_running = (
                 self._target_discovery_thread is not None
                 and self._target_discovery_thread.is_alive()
-                and self._target_discovery_login_only
             )
-        if visible_login_running:
+        if visible_browser_running:
+            relogin_running = bool(self._target_discovery_login_only)
             return {
                 "success": False,
                 "running": False,
-                "message": "正在可见Chrome中确认千川登录，完成后将自动同步目录",
-                "failure_kind": "relogin_in_progress",
+                "message": (
+                    "正在可见Chrome中确认千川登录，完成后再同步目录"
+                    if relogin_running
+                    else "正在可见Chrome中选择账户，完成后再同步目录"
+                ),
+                "failure_kind": (
+                    "relogin_in_progress"
+                    if relogin_running
+                    else "account_selection_in_progress"
+                ),
             }
         if running:
             return catalog_sync_status()
@@ -1714,15 +1744,24 @@ class ServiceController:
             db=db,
         )
 
-    def _target_discovery_entry(self, login_only: bool = False) -> None:
+    def _target_discovery_entry(
+        self,
+        login_only: bool = False,
+        account_only: bool = False,
+    ) -> None:
         try:
             asyncio.run(
-                self._target_discovery_async(login_only=login_only)
+                self._target_discovery_async(
+                    login_only=login_only,
+                    account_only=account_only,
+                )
             )
         except Exception as e:
             logger.exception(
-                "[千川可见登录] 浏览器启动或登录识别失败 login_only=%s",
+                "[千川可见登录] 浏览器启动或识别失败 "
+                "login_only=%s account_only=%s",
                 bool(login_only),
+                bool(account_only),
             )
             with self._lock:
                 self._target_discovery_status = {
@@ -1730,6 +1769,7 @@ class ServiceController:
                     "running": False,
                     "message": f"识别失败：{e}",
                     "target": None,
+                    "account": None,
                     "relogin_complete": False,
                 }
             self._target_discovery_launch_event.set()
@@ -1738,8 +1778,9 @@ class ServiceController:
         self,
         *,
         login_only: bool = False,
+        account_only: bool = False,
     ) -> None:
-        # 这是用户控制的只读Chrome，可能停留10分钟等待选计划；不长期占用
+        # 这是用户控制的只读Chrome，可能停留10分钟等待选账户/计划；不长期占用
         # 自动化队列，否则会阻塞已确认追投。实际采集和所有写操作仍走全局锁。
         session_owner = current_session_owner()
         if not session_owner:
@@ -1751,12 +1792,17 @@ class ServiceController:
             owner_username=session_owner,
             db=db,
         )
+        selected_accounts = list_qianchuan_accounts(
+            owner_username=session_owner,
+            db=db,
+        )
         selected_account_uids = {
-            str(item.get("account_uid") or "")
-            for item in list_qianchuan_accounts(
-                owner_username=session_owner,
-                db=db,
-            )
+            str(item.get("account_uid") or "") for item in selected_accounts
+        }
+        selected_aavids = {
+            str(item.get("aavid") or "")
+            for item in selected_accounts
+            if str(item.get("aavid") or "").isdigit()
         }
         # 已登记但尚未经过 rc27 详情核验的旧计划，允许用户重新打开详情
         # 完成验证；只有已验证主计划才提示“已在列表中”。
@@ -1784,9 +1830,11 @@ class ServiceController:
             or None
         )
         logger.info(
-            "[千川可见登录] 正在启动Google Chrome path=%s login_only=%s",
+            "[千川可见登录] 正在启动Google Chrome path=%s "
+            "login_only=%s account_only=%s",
             browser_path,
             bool(login_only),
+            bool(account_only),
         )
         await fetcher._init_browser()
         logger.info("[千川可见登录] Google Chrome进程已创建")
@@ -1816,6 +1864,10 @@ class ServiceController:
                 "工具会自动确认授权账户并保存会话"
                 if login_only
                 else (
+                    "独立Google Chrome已打开；请切换到要添加的千川账户。"
+                    "识别稳定后会自动保存该账户并关闭Chrome，不需要进入计划详情"
+                    if account_only
+                    else
                     "独立Google Chrome已打开；如显示登录页，请先登录千川，"
                     "再进入要监控的计划详情"
                 )
@@ -1846,7 +1898,11 @@ class ServiceController:
                             + (
                                 "工具会自动确认授权账户并保存会话"
                                 if login_only
-                                else "然后进入要监控的计划详情"
+                                else (
+                                    "然后切换到要添加的千川账户"
+                                    if account_only
+                                    else "然后进入要监控的计划详情"
+                                )
                             )
                         )
                     stable_candidate = None
@@ -1914,6 +1970,7 @@ class ServiceController:
                                     "请按需选择并添加当前账户"
                                 ),
                                 "target": None,
+                                "account": None,
                                 "relogin_complete": True,
                             }
                         logger.info(
@@ -1922,6 +1979,128 @@ class ServiceController:
                             len(accounts),
                         )
                         return
+                if account_only:
+                    latest_aavid_loader = getattr(
+                        probe,
+                        "latest_observed_aavid",
+                        None,
+                    )
+                    latest_aavid = (
+                        str(latest_aavid_loader() or "").strip()
+                        if callable(latest_aavid_loader)
+                        else ""
+                    )
+                    if latest_aavid in selected_aavids:
+                        stable_candidate = None
+                        stable_count = 0
+                        with self._lock:
+                            self._target_discovery_status["message"] = (
+                                "当前千川账户已经添加；请在Chrome右上角切换到"
+                                "另一个要添加的账户。识别后窗口会自动关闭"
+                            )
+                        await asyncio.sleep(0.5)
+                        continue
+                    if latest_aavid.isdigit():
+                        candidate = ("account", latest_aavid)
+                        if candidate == stable_candidate:
+                            stable_count += 1
+                        else:
+                            stable_candidate = candidate
+                            stable_count = 1
+                    else:
+                        stable_candidate = None
+                        stable_count = 0
+                    if stable_count < 3:
+                        with self._lock:
+                            self._target_discovery_status["message"] = (
+                                "正在识别Chrome当前千川账户；只需完成账户切换，"
+                                "不需要进入计划详情"
+                            )
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    account_name = ""
+                    account_name_loader = getattr(
+                        probe,
+                        "current_account_name",
+                        None,
+                    )
+                    if callable(account_name_loader):
+                        try:
+                            account_name = str(
+                                await account_name_loader(fetcher.page) or ""
+                            ).strip()
+                        except Exception:
+                            account_name = ""
+                    if not account_name:
+                        selected_account = next(
+                            (
+                                item
+                                for item in probe.authorized_accounts()
+                                if str(item.get("aavid") or "")
+                                == latest_aavid
+                            ),
+                            {},
+                        )
+                        account_name = str(
+                            selected_account.get("account_name") or ""
+                        ).strip()
+                    existing_account = db.select_one(
+                        "qianchuan_account",
+                        where={
+                            "owner_username": session_owner,
+                            "aavid": latest_aavid,
+                        },
+                    )
+                    if not account_name:
+                        account_name = str(
+                            (existing_account or {}).get("account_name") or ""
+                        ).strip()
+                    _require_session_owner(session_owner)
+                    account = ensure_qianchuan_account(
+                        latest_aavid,
+                        account_name=account_name,
+                        owner_username=session_owner,
+                        directory_selected=True,
+                        seen=True,
+                        db=db,
+                    )
+                    if fetcher.context:
+                        await save_context_storage_state(
+                            fetcher.context,
+                            owner_username=session_owner,
+                        )
+                    mark_qianchuan_session_available(
+                        owner_username=session_owner,
+                    )
+                    from services.qianchuan_catalog import (
+                        clear_catalog_login_failure,
+                    )
+
+                    clear_catalog_login_failure(
+                        owner_username=session_owner,
+                        db=db,
+                    )
+                    with self._lock:
+                        self._target_discovery_status = {
+                            "success": True,
+                            "running": False,
+                            "message": (
+                                f"已添加千川账户："
+                                f"{account.get('account_name') or latest_aavid}；"
+                                "Chrome已自动关闭，接下来将只同步已添加账户的计划"
+                            ),
+                            "target": None,
+                            "account": account,
+                            "relogin_complete": False,
+                        }
+                    logger.info(
+                        "[千川账户选择] 已添加账户并将关闭可见Chrome "
+                        "aavid=%s account_name=%s",
+                        latest_aavid,
+                        account.get("account_name") or "",
+                    )
+                    return
                 if urlparse(cur).path == "/uni-prom":
                     product_target = probe.confirmed_product_target()
                     if product_target:
@@ -2011,7 +2190,11 @@ class ServiceController:
                         break
                 await asyncio.sleep(0.5)
             if not target_url:
-                raise RuntimeError("10分钟内未识别到计划详情页")
+                raise RuntimeError(
+                    "10分钟内未识别到可添加的千川账户"
+                    if account_only
+                    else "10分钟内未识别到计划详情页"
+                )
             if target_scene == "product" and stable_candidate:
                 aavid, ad_id = stable_candidate[0], stable_candidate[1]
             else:
@@ -2112,11 +2295,16 @@ class ServiceController:
                         else "监控计划已添加"
                     ),
                     "target": target,
+                    "account": None,
                     "relogin_complete": False,
                 }
         finally:
-            if login_only:
-                logger.info("[千川可见登录] 正在关闭独立Google Chrome")
+            logger.info(
+                "[千川可见登录] 正在关闭独立Google Chrome "
+                "login_only=%s account_only=%s",
+                bool(login_only),
+                bool(account_only),
+            )
             await fetcher.close()
 
     # ---------------- thread main ----------------

@@ -671,6 +671,107 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         mark_available.assert_called_once_with(owner_username=self.owner)
         self.assertTrue(fetcher.closed)
 
+    def test_account_selection_adds_current_account_without_plan_detail(self):
+        class FakePage:
+            url = "https://qianchuan.jinritemai.com/uni-prom"
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            async def bring_to_front(self):
+                return None
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+
+        class FakeFetcher:
+            def __init__(self):
+                self.page = FakePage()
+                self.context = FakeContext(self.page)
+                self.closed = False
+
+            async def _init_browser(self):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class FakeProbe:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def attach(self, _page):
+                return None
+
+            async def observe_page(self, _page):
+                return None
+
+            def latest_observed_aavid(self):
+                return "10002"
+
+            async def current_account_name(self, _page):
+                return "第二个千川账户"
+
+            def authorized_accounts(self):
+                return []
+
+        cfg = SimpleNamespace(
+            db_path=self.db_path,
+            open_url="https://qianchuan.jinritemai.com/home",
+            wait_url_prefix="https://qianchuan.jinritemai.com/",
+        )
+        cfg.normalize_paths = lambda: cfg
+        controller = ServiceController()
+        fetcher = FakeFetcher()
+        save_state = AsyncMock()
+        mark_available = Mock()
+        with (
+            patch(
+                "services.run_services.current_session_owner",
+                return_value=self.owner,
+            ),
+            patch("services.run_services.ServiceConfig", return_value=cfg),
+            patch(
+                "services.run_services.load_qianchuan_storage_state",
+                return_value={"cookies": []},
+            ),
+            patch("services.run_services.migrate_legacy_qcookie"),
+            patch(
+                "services.run_services.QianChuanFetcher",
+                return_value=fetcher,
+            ),
+            patch(
+                "services.run_services.PromotionReadOnlyProbe",
+                FakeProbe,
+            ),
+            patch(
+                "services.run_services.save_context_storage_state",
+                save_state,
+            ),
+            patch(
+                "services.run_services.mark_qianchuan_session_available",
+                mark_available,
+            ),
+        ):
+            asyncio.run(
+                controller._target_discovery_async(account_only=True)
+            )
+        status = controller.target_discovery_status()
+        self.assertTrue(status["success"])
+        self.assertFalse(status["running"])
+        self.assertEqual("10002", status["account"]["aavid"])
+        self.assertIsNone(status["target"])
+        saved = self.db.select_one(
+            "qianchuan_account",
+            where={"owner_username": self.owner, "aavid": "10002"},
+        )
+        self.assertEqual(1, int(saved["directory_selected"]))
+        self.assertEqual("第二个千川账户", saved["account_name"])
+        save_state.assert_awaited_once()
+        mark_available.assert_called_once_with(owner_username=self.owner)
+        self.assertTrue(fetcher.closed)
+
     def test_login_success_can_be_confirmed_by_authenticated_shell(self):
         class FakeLocator:
             @property
