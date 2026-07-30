@@ -450,6 +450,9 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn('id="diagnostics"', html)
         self.assertIn('data-advanced="${esc(p.target_uid)}"', html)
         self.assertIn("promotion_targets.html?target_uid=", html)
+        self.assertIn('class="head-actions"', html)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", html)
+        self.assertIn("@media(max-width:560px){.head-actions{grid-template-columns:1fr}}", html)
         self.assertIn(
             "const late=selected&&accountEnabled&&state==='active'&&!!p.last_sync_at",
             html,

@@ -7,10 +7,11 @@
   <style>
     :root{color-scheme:dark;font-family:"Microsoft YaHei",system-ui,sans-serif}
     *{box-sizing:border-box}body{margin:0;min-height:100vh;background:#08111f;color:#e2e8f0}
-    .page{max-width:1480px;margin:auto;padding:24px}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+    .page{max-width:1480px;margin:auto;padding:24px}.head{display:flex;align-items:flex-start;justify-content:space-between;gap:28px;margin-bottom:16px}.head-copy{min-width:0;flex:1}
     h1{margin:0;color:#f8fafc;font-size:22px}.sub{margin-top:7px;color:#8494aa;font-size:12px;line-height:1.75}
     button,input,select{font:inherit}button{border:0;border-radius:9px;min-height:38px;padding:0 14px;background:#263750;color:#e2e8f0;cursor:pointer}
     button.primary{background:#0284c7;color:#fff}button:disabled{opacity:.45;cursor:not-allowed}
+    .head-actions{width:min(100%,460px);flex:0 0 460px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.head-actions button{width:100%;min-height:40px;padding:0 12px;white-space:nowrap}.head-actions .primary{box-shadow:0 8px 22px #0284c724}.head-actions .secondary{background:#1d2d44}.head-actions .diagnostic{color:#9fb0c6;background:#152237}
     .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
     .metric,.card{background:#101b2d;border:1px solid #26364e;border-radius:14px}.metric{padding:14px}
     .metric .label{color:#8295ae;font-size:11px}.metric .value{margin-top:6px;color:#f8fafc;font-weight:700;font-size:17px}.metric .hint{margin-top:5px;color:#71839b;font-size:10px;line-height:1.5}
@@ -29,21 +30,23 @@
     .plan-group{margin-top:12px}.plan-group:first-child{margin-top:0}.plan-group-title{display:flex;justify-content:space-between;color:#7dd3fc;font-size:11px;font-weight:700;margin-bottom:7px}.plan.ineligible{opacity:.65}.plan input:disabled{cursor:not-allowed}
     .plan-name{color:#e2e8f0;font-size:12px;font-weight:600;word-break:break-all}.plan-meta{margin-top:4px;color:#71839b;font-size:10px;line-height:1.55}.plan-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.plan-actions button{height:28px;min-height:28px;padding:0 9px;font-size:10px}.plan-state{white-space:nowrap;font-size:10px}.plan-state.wait{color:#fbbf24}.plan-state.late{color:#fda4af}.plan-state.active{color:#86efac}
     .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.danger{background:#7f1d1d;color:#fecaca}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
-    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.head{flex-direction:column}.card{height:auto;min-height:620px;overflow:visible}.panel{min-height:260px}.plans{max-height:480px}}
+    @media(max-width:1050px){.head{flex-direction:column;gap:14px}.head-actions{width:100%;flex-basis:auto}}
+    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.card{height:auto;min-height:620px;overflow:visible}.panel{min-height:260px}.plans{max-height:480px}}
+    @media(max-width:560px){.head-actions{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <main class="page">
   <div class="head">
-    <div>
+    <div class="head-copy">
       <h1>千川账户管理</h1>
       <div class="sub">所有账户共用当前千川登录会话。工具不会自动导入全部授权账户；请一次选择并添加一个当前账户，之后只刷新已添加账户的计划。</div>
     </div>
-    <div class="toolbar">
-      <button id="diagnostics" title="仅在采集、浏览器或推送异常时使用">故障诊断</button>
-      <button id="relogin">打开Chrome重新登录/核验</button>
-      <button id="addAccount">选择并添加当前账户</button>
-      <button class="primary" id="discover">刷新已添加账户计划</button>
+    <div class="head-actions" aria-label="千川账户操作">
+      <button class="primary" id="addAccount">选择并添加账户</button>
+      <button class="secondary" id="discover">刷新账户计划</button>
+      <button class="secondary" id="relogin">打开Chrome重新登录/核验</button>
+      <button class="diagnostic" id="diagnostics" title="仅在采集、浏览器或推送异常时使用">故障诊断</button>
     </div>
   </div>
   <div class="onboarding" id="onboarding"></div>
