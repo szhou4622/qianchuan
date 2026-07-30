@@ -20,7 +20,9 @@ from services import promotion_browser_lock, qianchuan_session, rc23_rollback
 from services.qianchuan_accounts import (
     capacity_snapshot,
     ensure_qianchuan_account,
+    get_qianchuan_account,
     list_qianchuan_accounts,
+    migrate_existing_qianchuan_accounts,
     resolve_account_feishu_targets,
     record_target_duration,
     save_qianchuan_account_settings,
@@ -103,6 +105,36 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         )
         self.assertEqual(["retarget"], [row["action_type"] for row in rows_a])
         self.assertEqual(["stop"], [row["action_type"] for row in rows_b])
+
+    def test_legacy_user_display_name_does_not_overwrite_account_name(self):
+        account = ensure_qianchuan_account(
+            "10001",
+            account_name="权威千川账户名",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.db.insert(
+            "pmc_ad_detail_basic",
+            {
+                "aadvid": "10001",
+                "account_uid": account["account_uid"],
+                "ad_id": "20001",
+                "target_uid": "legacy_unscoped",
+                "user_info_name": "错误店铺展示名",
+            },
+        )
+
+        migrate_existing_qianchuan_accounts(
+            owner_username="tool-owner",
+            db=self.db,
+        )
+
+        saved = get_qianchuan_account(
+            "10001",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertEqual("权威千川账户名", saved["account_name"])
 
     def test_captured_owner_is_used_even_if_current_owner_changes_before_write(self):
         with patch.dict(

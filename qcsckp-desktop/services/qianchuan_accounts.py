@@ -603,6 +603,8 @@ def migrate_existing_qianchuan_accounts(
         return 0
     selected = _daily_selected_aavids(owner)
     rows = store.execute(
+        # user_info_name 只用于旧数据首次建档的可读名称兜底，后续不能覆盖
+        # 已经从 advName/accountName 得到的权威广告主账户名。
         "SELECT aadvid AS aavid,user_info_name AS account_name,updated_at FROM pmc_ad_detail_basic "
         "WHERE COALESCE(aadvid,'')<>'' AND (COALESCE(account_uid,'')='' OR account_uid IN "
         "(SELECT account_uid FROM qianchuan_account WHERE owner_username=?)) "
@@ -622,16 +624,26 @@ def migrate_existing_qianchuan_accounts(
         if not aid or not aid.isdigit():
             continue
         name = str(row.get("account_name") or "").strip()
-        if aid not in by_aavid or (name and by_aavid[aid].startswith("千川账户 ")):
-            by_aavid[aid] = name or f"千川账户 {aid}"
+        if aid not in by_aavid or (name and not by_aavid[aid]):
+            by_aavid[aid] = name
     for aid, name in by_aavid.items():
         existing = store.select_one(
             "qianchuan_account",
             where={"owner_username": owner, "aavid": aid},
         )
+        existing_name = str((existing or {}).get("account_name") or "").strip()
+        weak_legacy_name = (
+            name
+            if (
+                not existing
+                or not existing_name
+                or existing_name == f"千川账户 {aid}"
+            )
+            else ""
+        )
         ensure_qianchuan_account(
             aid,
-            account_name=name,
+            account_name=weak_legacy_name,
             owner_username=owner,
             # 旧日报配置只用于首次建目录；后续读取页面不能覆盖用户刚保存的选择。
             report_enabled=(aid in selected) if not existing else None,

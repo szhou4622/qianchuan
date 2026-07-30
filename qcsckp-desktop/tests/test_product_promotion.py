@@ -65,6 +65,7 @@ from services.regulation_rule_runner import (
     _target_assist_sync_ready,
     has_completed_stop,
 )
+from services.run_services import _sync_discovered_product_targets
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -142,6 +143,114 @@ class ProductPromotionTests(unittest.TestCase):
 
         self.assertEqual("new-plan", snapshot["plan"]["ad_id"])
         self.assertEqual("新计划", snapshot["plan"]["plan_name"])
+
+    def test_account_probe_prefers_authoritative_advertiser_name(self):
+        strong = summarize_json(
+            {
+                "data": {
+                    "advId": "1782685702496260",
+                    "advName": "正确千川账户名",
+                }
+            }
+        )
+        weak = summarize_json(
+            {
+                "data": {
+                    "aavid": "1782685702496260",
+                    "userInfoName": "错误店铺展示名",
+                }
+            }
+        )
+        probe = PromotionReadOnlyProbe.__new__(PromotionReadOnlyProbe)
+        probe._apis = {
+            "strong": {"account_candidates": strong["account_candidates"]},
+        }
+        probe._requests = {
+            "weak": {"account_candidates": weak["account_candidates"]},
+        }
+
+        self.assertEqual(
+            [
+                {
+                    "aavid": "1782685702496260",
+                    "account_name": "正确千川账户名",
+                }
+            ],
+            probe.authorized_accounts(),
+        )
+
+    def test_product_probe_keeps_multiple_pages_from_same_api_path(self):
+        path = "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+        probe = PromotionReadOnlyProbe.__new__(PromotionReadOnlyProbe)
+        probe._apis = {
+            f"{path}|page1": {
+                "path": path,
+                "observed_at": "2026-07-30 10:00:00",
+                "product_snapshot": {
+                    "ad_rows": [
+                        {"ad_id": "20001", "ad_name": "第一页计划"},
+                    ]
+                },
+            },
+            f"{path}|page2": {
+                "path": path,
+                "observed_at": "2026-07-30 10:00:01",
+                "product_snapshot": {
+                    "ad_rows": [
+                        {"ad_id": "20002", "ad_name": "第二页计划"},
+                    ]
+                },
+            },
+        }
+
+        snapshot = probe.latest_product_snapshot()
+
+        self.assertEqual(
+            {"20001", "20002"},
+            {str(item["ad_id"]) for item in snapshot["ad_rows"]},
+        )
+
+    def test_discovered_product_targets_are_complete_and_new_rows_stay_disabled(self):
+        existing = upsert_promotion_target(
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "旧名称",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "enabled": True,
+            },
+            owner_username="owner1",
+            db=self.db,
+        )
+        result = _sync_discovered_product_targets(
+            self.db,
+            aavid="10001",
+            snapshot={
+                "ad_rows": [
+                    {
+                        "ad_id": "20001",
+                        "ad_name": "更新后的计划1",
+                        "plan_system": "global",
+                    },
+                    {
+                        "ad_id": "20002",
+                        "ad_name": "新发现计划2",
+                        "plan_system": "chengfang",
+                    },
+                ]
+            },
+            owner_username="owner1",
+            page_url="https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+        )
+        rows = list_promotion_targets(owner_username="owner1", db=self.db)
+        by_id = {str(item["ad_id"]): item for item in rows}
+
+        self.assertEqual({"discovered": 2, "created": 1}, result)
+        self.assertTrue(by_id["20001"]["enabled"])
+        self.assertEqual(existing["target_uid"], by_id["20001"]["target_uid"])
+        self.assertFalse(by_id["20002"]["enabled"])
+        self.assertEqual("chengfang", by_id["20002"]["plan_system"])
 
     def test_account_snapshot_is_scoped_to_selected_plan(self):
         snapshot = {

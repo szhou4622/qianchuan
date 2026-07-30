@@ -7,10 +7,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
 import threading
+import time
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import unquote, urlparse
@@ -37,8 +41,13 @@ ID_KEYS = {
     "id",
     "adId",
     "ad_id",
+    "advId",
+    "adv_id",
     "advertiserId",
+    "advertiser_id",
     "aavid",
+    "accountId",
+    "account_id",
     "materialId",
     "productId",
     "goodsId",
@@ -54,6 +63,8 @@ NAME_KEYS = {
     "title",
     "advertiserName",
     "advertiser_name",
+    "advName",
+    "adv_name",
     "userInfoName",
     "user_info_name",
     "accountName",
@@ -85,6 +96,18 @@ PLAN_HINT_KEYS = {
     "roiGoal",
     "bid",
 }
+ACCOUNT_NAME_KEYS = (
+    ("advName", 100),
+    ("adv_name", 100),
+    ("advertiserName", 95),
+    ("advertiser_name", 95),
+    ("accountName", 90),
+    ("account_name", 90),
+    # 千川部分旧接口中的 userInfoName 是登录用户或店铺展示名，
+    # 只能作为没有明确广告主名称时的弱兜底。
+    ("userInfoName", 10),
+    ("user_info_name", 10),
+)
 
 
 def _safe_text(value: Any, limit: int = 160) -> str:
@@ -109,7 +132,7 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
     queue: List[tuple[str, Any]] = [("$", payload)]
     fields: List[Dict[str, str]] = []
     plan_candidates: List[Dict[str, Any]] = []
-    account_candidates: List[Dict[str, str]] = []
+    account_candidates: List[Dict[str, Any]] = []
     seen_fields = set()
     nodes = 0
 
@@ -167,16 +190,22 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
                     plan_candidates.append(plan)
             account_id = (
                 candidate.get("aavid")
+                or candidate.get("advId")
+                or candidate.get("adv_id")
                 or candidate.get("advertiserId")
+                or candidate.get("advertiser_id")
+                or candidate.get("accountId")
+                or candidate.get("account_id")
             )
-            account_name = (
-                candidate.get("advertiserName")
-                or candidate.get("advertiser_name")
-                or candidate.get("userInfoName")
-                or candidate.get("user_info_name")
-                or candidate.get("accountName")
-                or candidate.get("account_name")
-            )
+            account_name = ""
+            account_name_source = ""
+            account_name_priority = 0
+            for name_key, priority in ACCOUNT_NAME_KEYS:
+                if candidate.get(name_key):
+                    account_name = candidate[name_key]
+                    account_name_source = name_key
+                    account_name_priority = priority
+                    break
             if (
                 account_id
                 and str(account_id).isdigit()
@@ -185,6 +214,8 @@ def summarize_json(payload: Any, *, max_nodes: int = 240) -> Dict[str, Any]:
                 account = {
                     "aavid": str(account_id),
                     "account_name": str(account_name)[:256],
+                    "name_source": account_name_source,
+                    "name_priority": account_name_priority,
                 }
                 if (
                     account not in account_candidates
@@ -280,6 +311,8 @@ class PromotionReadOnlyProbe:
         self._pages: Dict[str, Dict[str, Any]] = {}
         self._apis: Dict[str, Dict[str, Any]] = {}
         self._requests: Dict[str, Dict[str, Any]] = {}
+        self._pagination_replays = set()
+        self._pagination_inflight = set()
         self._attached_page_ids = set()
         self._write(
             {
@@ -343,17 +376,41 @@ class PromotionReadOnlyProbe:
 
     def authorized_accounts(self) -> List[Dict[str, str]]:
         """返回只读响应中明确同时出现账户ID和账户名称的候选账户。"""
-        result: Dict[str, Dict[str, str]] = {}
+        result: Dict[str, Dict[str, Any]] = {}
         for item in list(self._apis.values()) + list(self._requests.values()):
             for account in item.get("account_candidates") or []:
                 aid = str((account or {}).get("aavid") or "").strip()
                 name = str((account or {}).get("account_name") or "").strip()
-                if aid.isdigit() and name:
+                priority = int((account or {}).get("name_priority") or 0)
+                current = result.get(aid)
+                if (
+                    aid.isdigit()
+                    and name
+                    and (
+                        current is None
+                        or priority >= int(current.get("name_priority") or 0)
+                    )
+                ):
                     result[aid] = {
                         "aavid": aid,
                         "account_name": name[:256],
+                        "name_priority": priority,
                     }
-        return list(result.values())
+        return [
+            {
+                "aavid": str(item["aavid"]),
+                "account_name": str(item["account_name"]),
+            }
+            for item in result.values()
+        ]
+
+    async def wait_for_product_pagination(self, timeout: float = 5.0) -> None:
+        """等待已发现的商品计划列表分页只读请求完成。"""
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        while self._pagination_inflight and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        # page.evaluate 返回后，Playwright 的 response 回调可能仍在解析最后一页。
+        await asyncio.sleep(0.1)
 
     def confirmed_product_target(self) -> Optional[Dict[str, Any]]:
         """返回当前商品全域页已由主计划接口确认的目标。"""
@@ -385,7 +442,12 @@ class PromotionReadOnlyProbe:
             for field in item.get("fields") or []:
                 if str(field.get("key") or "") not in {
                     "aavid",
+                    "advId",
+                    "adv_id",
                     "advertiserId",
+                    "advertiser_id",
+                    "accountId",
+                    "account_id",
                 }:
                     continue
                 value = str(field.get("value") or "").strip()
@@ -438,7 +500,8 @@ class PromotionReadOnlyProbe:
                     summary = summarize_json(json.loads(post_data), max_nodes=120)
                 except (TypeError, ValueError, json.JSONDecodeError):
                     pass
-            self._requests[path] = {
+            request_key = self._observation_key(path, post_data)
+            self._requests[request_key] = {
                 "path": path,
                 "method": str(request.method or ""),
                 "observed_at": self._now(),
@@ -480,10 +543,136 @@ class PromotionReadOnlyProbe:
             if (
                 product_snapshot.get("plan")
                 or product_snapshot.get("products")
+                or product_snapshot.get("ad_rows")
                 or product_snapshot.get("materials")
             ):
                 item["product_snapshot"] = product_snapshot
-            self._apis[path] = item
+            post_data = getattr(response.request, "post_data", None)
+            response_key = self._observation_key(path, post_data)
+            self._apis[response_key] = item
             self._flush()
+            if path in PRODUCT_AD_LIST_API_PATHS:
+                await self._replay_remaining_product_pages(
+                    response,
+                    payload,
+                    post_data=post_data,
+                )
         except Exception:
             return
+
+    @staticmethod
+    def _observation_key(path: str, post_data: Any) -> str:
+        """区分同一路径的筛选条件和分页，不保留原始请求体。"""
+        raw = str(post_data or "")
+        if not raw:
+            return str(path)
+        digest = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+        return f"{path}|{digest[:20]}"
+
+    @staticmethod
+    def _request_page_params(body: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(body, dict):
+            return None
+        params = body.get("Params")
+        if not isinstance(params, dict):
+            params = body.get("params")
+        if not isinstance(params, dict):
+            return None
+        page_params = params.get("PageParams")
+        if not isinstance(page_params, dict):
+            page_params = params.get("pageParams")
+        return page_params if isinstance(page_params, dict) else None
+
+    @staticmethod
+    def _response_total_pages(payload: Any) -> int:
+        queue = [payload]
+        seen = 0
+        while queue and seen < 80:
+            value = queue.pop(0)
+            seen += 1
+            if isinstance(value, dict):
+                for key, one in value.items():
+                    if str(key).casefold() == "totalpage":
+                        try:
+                            return max(1, min(50, int(one)))
+                        except (TypeError, ValueError):
+                            return 1
+                    if isinstance(one, (dict, list)):
+                        queue.append(one)
+            elif isinstance(value, list):
+                queue.extend(value[:20])
+        return 1
+
+    async def _replay_remaining_product_pages(
+        self,
+        response: Any,
+        payload: Any,
+        *,
+        post_data: Any,
+    ) -> None:
+        """沿用当前只读列表请求，补读剩余分页；不保存请求体或响应原文。"""
+        if not post_data:
+            return
+        try:
+            body = json.loads(post_data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        page_params = self._request_page_params(body)
+        if not page_params:
+            return
+        page_key = "Page" if "Page" in page_params else "page"
+        try:
+            current_page = int(page_params.get(page_key) or 1)
+        except (TypeError, ValueError):
+            current_page = 1
+        total_pages = self._response_total_pages(payload)
+        if total_pages <= current_page:
+            return
+        variant_body = deepcopy(body)
+        variant_params = self._request_page_params(variant_body)
+        if not variant_params:
+            return
+        base_body = deepcopy(variant_body)
+        base_params = self._request_page_params(base_body)
+        if not base_params:
+            return
+        base_params[page_key] = 1
+        variant_hash = hashlib.sha256(
+            json.dumps(
+                base_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        marker = (str(urlparse(str(response.url or "")).path), variant_hash)
+        if marker in self._pagination_replays:
+            return
+        self._pagination_replays.add(marker)
+        self._pagination_inflight.add(marker)
+        try:
+            frame = getattr(response.request, "frame", None)
+            page = getattr(frame, "page", None)
+            if page is None:
+                return
+            for page_number in range(current_page + 1, total_pages + 1):
+                replay_body = deepcopy(body)
+                replay_params = self._request_page_params(replay_body)
+                if not replay_params:
+                    break
+                replay_params[page_key] = page_number
+                await page.evaluate(
+                    """async ({url, body}) => {
+                        const result = await fetch(url, {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {'content-type': 'application/json;charset=UTF-8'},
+                            body: JSON.stringify(body)
+                        });
+                        await result.text();
+                        return result.status;
+                    }""",
+                    {"url": str(response.url or ""), "body": replay_body},
+                )
+        finally:
+            self._pagination_inflight.discard(marker)

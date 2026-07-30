@@ -210,6 +210,7 @@ def extract_product_scene_snapshot(payload: Any) -> Dict[str, Any]:
             {
                 "ad_id": parsed_plan["ad_id"],
                 "ad_name": parsed_plan.get("plan_name") or "",
+                "plan_system": parsed_plan.get("plan_system") or "unknown",
                 "product_ids": list(ad_product_map.get(parsed_plan["ad_id"], [])),
             }
         )

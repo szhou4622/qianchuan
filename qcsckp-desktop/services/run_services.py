@@ -148,6 +148,69 @@ def _persist_product_snapshot(
         )
 
 
+def _sync_discovered_product_targets(
+    db: SQLiteStore,
+    *,
+    aavid: str,
+    snapshot: Optional[Dict[str, Any]],
+    owner_username: str,
+    page_url: str,
+) -> Dict[str, int]:
+    """登记商品列表中的全部计划候选；新计划默认关闭自动监控。"""
+    if not isinstance(snapshot, dict):
+        return {"discovered": 0, "created": 0}
+    aid = str(aavid or "").strip()
+    if not aid.isdigit():
+        return {"discovered": 0, "created": 0}
+    existing_rows = {
+        str(item.get("ad_id") or ""): item
+        for item in list_promotion_targets(
+            owner_username=owner_username,
+            db=db,
+        )
+        if str(item.get("aadvid") or "") == aid
+    }
+    discovered = 0
+    created = 0
+    seen = set()
+    for row in snapshot.get("ad_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        ad_id = str(row.get("ad_id") or "").strip()
+        if not ad_id.isdigit() or ad_id in seen:
+            continue
+        seen.add(ad_id)
+        discovered += 1
+        existing = existing_rows.get(ad_id)
+        if existing is None:
+            created += 1
+        target = upsert_promotion_target(
+            {
+                "aavid": aid,
+                "ad_id": ad_id,
+                "plan_name": str(row.get("ad_name") or "").strip()[:256],
+                "promotion_scene": "product",
+                "plan_system": str(row.get("plan_system") or "unknown"),
+                "page_url": page_url,
+                "enabled": bool(existing.get("enabled")) if existing else False,
+                "last_status": (
+                    str(existing.get("last_status") or "pending")
+                    if existing
+                    else "pending"
+                ),
+                "last_error": (
+                    str(existing.get("last_error") or "")
+                    if existing
+                    else ""
+                ),
+            },
+            owner_username=owner_username,
+            db=db,
+        )
+        _persist_product_snapshot(db, target["target_uid"], snapshot)
+    return {"discovered": discovered, "created": created}
+
+
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -913,22 +976,8 @@ class ServiceController:
                             str(product_target["ad_id"]),
                             "product",
                         )
-                        candidate_key = _promotion_target_key(
-                            candidate[0],
-                            candidate[1],
-                        )
-                        if candidate_key in known_target_keys:
-                            stable_candidate = None
-                            stable_count = 0
-                            if candidate_key != last_ignored_existing:
-                                last_ignored_existing = candidate_key
-                                with self._lock:
-                                    self._target_discovery_status["message"] = (
-                                        "当前计划已在监控列表中，请在新浏览器中"
-                                        "打开另一条计划详情"
-                                    )
-                            await asyncio.sleep(0.5)
-                            continue
+                        # 商品列表接口会一次返回账户下的计划候选。即使当前主计划
+                        # 已登记，也要继续完成分页同步，而不是要求用户逐条打开。
                         last_ignored_existing = None
                         if candidate == stable_candidate:
                             stable_count += 1
@@ -1025,6 +1074,8 @@ class ServiceController:
                 ad_id=ad_id,
             )
             if target_scene == "product":
+                await probe.wait_for_product_pagination()
+                product_snapshot = probe.latest_product_snapshot()
                 plan = product_snapshot.get("plan") or {}
                 plan_name = str(plan.get("plan_name") or plan_name).strip()[:256]
             _require_session_owner(session_owner)
@@ -1049,6 +1100,15 @@ class ServiceController:
             )
             if target_scene == "product":
                 _persist_product_snapshot(db, target["target_uid"], product_snapshot)
+                synced = _sync_discovered_product_targets(
+                    db,
+                    aavid=aavid,
+                    snapshot=product_snapshot,
+                    owner_username=session_owner,
+                    page_url=target_url,
+                )
+            else:
+                synced = {"discovered": 0, "created": 0}
             if fetcher.context:
                 _require_session_owner(session_owner)
                 await save_context_storage_state(
@@ -1061,7 +1121,13 @@ class ServiceController:
             with self._lock:
                 self._target_discovery_status = {
                     "running": False,
-                    "message": "监控计划已添加",
+                    "message": (
+                        "监控计划已添加；"
+                        f"同步发现 {synced['discovered']} 条商品计划，"
+                        f"新增 {synced['created']} 条候选（默认未启用）"
+                        if target_scene == "product"
+                        else "监控计划已添加"
+                    ),
                     "target": target,
                 }
         finally:
@@ -1287,10 +1353,21 @@ class ServiceController:
             db=db,
         )
         if promotion_scene == "product":
+            await probe.wait_for_product_pagination()
+            complete_snapshot = probe.latest_product_snapshot()
+            if complete_snapshot.get("ad_rows"):
+                discovered["snapshot"] = complete_snapshot
             _persist_product_snapshot(
                 db,
                 target["target_uid"],
                 discovered.get("snapshot"),
+            )
+            _sync_discovered_product_targets(
+                db,
+                aavid=aavid,
+                snapshot=discovered.get("snapshot"),
+                owner_username=session_owner,
+                page_url=target_url,
             )
         _save_last_target(
             aavid,
