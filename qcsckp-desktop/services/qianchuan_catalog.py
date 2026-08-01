@@ -108,6 +108,17 @@ def clear_catalog_login_failure(
 ) -> Dict[str, Any]:
     """可见 Chrome 重新登录成功后清除旧目录任务留下的登录失败状态。"""
     owner = _owner_key(owner_username)
+    # A catalog scan saves the refreshed browser storage state before it
+    # persists the final catalog result.  That save must not expose a
+    # transient ``running=False/not_synced`` state to the UI: the polling UI
+    # would otherwise stop immediately and leave the account looking as if
+    # refresh never completed.  Only a standalone visible-login flow may
+    # clear the old failure state.
+    with _LOCK:
+        if bool(_STATE.get("running")) and str(
+            _STATE.get("owner_username") or ""
+        ) == owner:
+            return dict(_STATE)
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
     store.update(

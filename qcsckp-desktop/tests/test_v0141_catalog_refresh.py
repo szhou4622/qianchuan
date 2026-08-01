@@ -14,11 +14,48 @@ from unittest.mock import Mock, patch
 from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.qianchuan_accounts import ensure_qianchuan_account
 from services.qianchuan_catalog import finalize_catalog_sync
+from services.qianchuan_catalog import (
+    clear_catalog_login_failure,
+    mark_catalog_sync_started,
+)
 from services.run_services import ServiceController
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class CatalogRefreshV0141Tests(unittest.TestCase):
+    def test_session_save_does_not_interrupt_running_catalog_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "catalog.db")
+            init_sqlite_schema(database=db_path)
+            db = SQLiteStore(database=db_path)
+            owner = "catalog-refresh-session-user"
+            account = ensure_qianchuan_account(
+                "10001", owner_username=owner, account_name="账户一", db=db
+            )
+            db.update(
+                "qianchuan_account",
+                {"catalog_status": "partial", "catalog_error": "旧错误"},
+                where={"account_uid": account["account_uid"]},
+            )
+
+            mark_catalog_sync_started(
+                owner_username=owner,
+                account_uid=account["account_uid"],
+            )
+            state = clear_catalog_login_failure(
+                owner_username=owner,
+                db=db,
+            )
+
+            persisted = db.select_one(
+                "qianchuan_account",
+                where={"account_uid": account["account_uid"]},
+            )
+            self.assertTrue(state["running"])
+            self.assertEqual("syncing", state["status"])
+            self.assertEqual("partial", persisted["catalog_status"])
+            self.assertEqual("旧错误", persisted["catalog_error"])
+
     def test_probe_instances_can_write_same_file_concurrently(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "promotion_readonly_probe.json")

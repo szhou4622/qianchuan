@@ -2052,14 +2052,6 @@ class ServiceController:
                     owner_username=owner,
                 )
                 mark_qianchuan_session_available(owner_username=owner)
-                from services.qianchuan_catalog import (
-                    clear_catalog_login_failure,
-                )
-
-                clear_catalog_login_failure(
-                    owner_username=owner,
-                    db=db,
-                )
             finally:
                 await fetcher.close()
         finalize_catalog_sync(
