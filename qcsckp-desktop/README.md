@@ -147,7 +147,7 @@ uv run python tools/restore_rc23_snapshot.py
 - 使用仓库内的 `packaging/windows/build_windows.ps1` 生成 Windows x64 目录式发布包：
 
   ```powershell
-  .\packaging\windows\build_windows.ps1 -Version 0.1.38
+  .\packaging\windows\build_windows.ps1 -Version 0.1.39
   ```
 
 - 输出位于 `output/windows/v<版本>/dist/`，结构为根目录 `QCSCKP.exe` + `bin/` 依赖。发送给用户时必须整个目录一起压缩，不得只发 EXE。

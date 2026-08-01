@@ -510,10 +510,6 @@
                 <i data-lucide="logs"></i>
                 <span>账户操作流水</span>
             </div>
-            <div class="menu-item" data-page="tutorial" data-title="使用教程">
-                <i data-lucide="book-open"></i>
-                <span>使用教程</span>
-            </div>
         </nav>
         <div class="sidebar-footer">
             <button type="button" class="sidebar-user-btn" id="sidebarUserBtn">
@@ -621,7 +617,7 @@
         </div>
     </div>
 
-    <!-- 右侧主体（使用教程为独立 tutorial.html 占位页，见 static/tutorial.html） -->
+    <!-- 右侧主体 -->
     <main class="main">
         <div class="test-env-banner" id="testEnvironmentBanner" role="status"></div>
         <div class="iframe-container">
@@ -634,7 +630,7 @@
             <div class="iframe-stack">
                 <!-- 数据大屏：独立 iframe，与规则化追投同理保活，轮询不中断 -->
                 <iframe id="frameDashboard" class="main-frame-page is-active" src="dashboard.html" title="数据大屏" onload="try{this.dataset.loaded='1'}catch(e){}"></iframe>
-                <!-- 服务控制 / 使用教程：共用 #contentFrame，切换菜单即改 src 重新加载 -->
+                <!-- 普通功能页：共用 #contentFrame，切换菜单即改 src 重新加载 -->
                 <iframe id="contentFrame" class="main-frame-page" src="about:blank" title="主内容"></iframe>
                 <!-- 规则化追投：单独 iframe，首次进入后保活，避免未保存配置因切页丢失；页内「重新加载」可刷新 -->
                 <iframe id="frameRuleRetargeting" class="main-frame-page" title="规则化追投"></iframe>
@@ -707,8 +703,7 @@
             'feishu-binding': 'feishu_binding.html',
             'rule-retargeting': 'rule_retargeting.html',
             'rule-regulation': 'rule_regulation.html',
-            'operation-events': 'operation_events.html',
-            'tutorial': 'tutorial.html'
+            'operation-events': 'operation_events.html'
         };
 
         let iframeNavToken = 0;
@@ -735,7 +730,7 @@
 
         /**
          * 数据大屏：#frameDashboard，仅首次设置 src，之后只显示/隐藏（保活轮询）。
-         * 服务控制 / 使用教程：共用 #contentFrame，每次切换改 src → 重新加载。
+         * 普通功能页：共用 #contentFrame，每次切换改 src → 重新加载。
          * 规则化追投 / 规则化停投：独立 iframe，仅首次设置 src，之后只显示/隐藏；刷新用页内「重新加载」。
          */
         function setMainFramePage(page) {

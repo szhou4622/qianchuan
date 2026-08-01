@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.38"
+    [string]$Version = "0.1.39"
 )
 
 $ErrorActionPreference = "Stop"
@@ -107,4 +107,3 @@ if (-not (Test-Path -LiteralPath $exePath)) {
 
 Write-Output "RELEASE_DIR=$releaseDir"
 Write-Output "EXE_PATH=$exePath"
-
