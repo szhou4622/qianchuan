@@ -1,10 +1,12 @@
-"""
-远程账号登录校验（POST /api/account.php）
-桌面端版本检测（GET/POST /api/version.php）
-文档：dev_files/api文档.md、dev_files/版本更新api文档.md
+"""工具账号校验与版本信息。
+
+正式分发版默认使用内置本地账号，不访问中心服务器。仅在开发者显式启用
+``QCSCKP_AUTH_MODE=remote`` 并配置 API 基址时保留旧接口兼容能力。
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sys
 from datetime import datetime
@@ -13,7 +15,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from config import API_BASE_URL
+from config import (
+    API_BASE_URL,
+    AUTH_MODE,
+    LOCAL_AUTH_PASSWORD_HASH,
+    LOCAL_AUTH_PASSWORD_SALT,
+    LOCAL_AUTH_PBKDF2_ITERATIONS,
+    LOCAL_AUTH_USERNAME,
+    REMOTE_SERVICES_ENABLED,
+)
 
 
 def _decode_http_body(raw: bytes) -> str:
@@ -34,11 +44,28 @@ def _remote_url(path: str) -> str:
     return API_BASE_URL.rstrip("/") + p
 
 
+def _local_password_matches(password: str) -> bool:
+    try:
+        salt = bytes.fromhex(LOCAL_AUTH_PASSWORD_SALT)
+        expected = bytes.fromhex(LOCAL_AUTH_PASSWORD_HASH)
+    except ValueError:
+        return False
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        LOCAL_AUTH_PBKDF2_ITERATIONS,
+    )
+    return hmac.compare_digest(actual, expected)
+
+
 class AccountAuthApi:
-    """调用服务端账号校验、版本检测等远程接口。"""
+    """默认执行本地账号校验，按显式配置兼容旧远程接口。"""
 
     def _request_json(self, req: Request) -> Dict[str, Any]:
         """执行 HTTP 请求并解析 JSON，错误时返回 success=False。"""
+        if not REMOTE_SERVICES_ENABLED:
+            return {"success": False, "message": "本地独立版已禁用中心服务器访问"}
         try:
             with urlopen(req, timeout=30) as resp:
                 body = _decode_http_body(resp.read())
@@ -84,6 +111,40 @@ class AccountAuthApi:
         p = password if password is not None else ""
         if not u or not p:
             return {"success": False, "message": "请提供账号和密码"}
+
+        if AUTH_MODE == "local":
+            if u.casefold() != LOCAL_AUTH_USERNAME.casefold() or not _local_password_matches(p):
+                return {"success": False, "message": "账号或密码错误"}
+            data: Dict[str, Any] = {
+                "id": 1,
+                "username": LOCAL_AUTH_USERNAME,
+                "role": "user",
+                "valid_from": "2026-08-01 00:00:00",
+                "valid_until": "2099-12-31 23:59:59",
+                "is_disabled": 0,
+                "agent_disabled": 0,
+                "auth_mode": "local",
+                "device_session_ready": True,
+            }
+            try:
+                from services.cloud_retarget_client import register_device_session
+
+                device = register_device_session(LOCAL_AUTH_USERNAME, p)
+                data["device_session_ready"] = bool(device.get("success"))
+                if not device.get("success"):
+                    data["device_session_message"] = str(
+                        device.get("message") or "本地账号状态保存失败"
+                    )
+            except Exception as exc:
+                data["device_session_ready"] = False
+                data["device_session_message"] = str(exc)
+            return {"success": True, "message": "登录成功", "data": data, "http_status": 200}
+
+        if not REMOTE_SERVICES_ENABLED:
+            return {
+                "success": False,
+                "message": "远程账号模式未配置 API 地址，已拒绝联网校验",
+            }
 
         payload = json.dumps({"username": u, "password": p}, ensure_ascii=False).encode("utf-8")
         req = Request(_remote_url("/api/account.php"), data=payload)
@@ -158,6 +219,22 @@ class AccountAuthApi:
             服务端 JSON（success + data.latest_version / has_update / download_url 等）。
         """
         cv = (current_version or "").strip()
+        if AUTH_MODE == "local":
+            return {
+                "success": True,
+                "message": "本地独立版不连接中心服务器检查更新",
+                "data": {
+                    "latest_version": cv or "本地版",
+                    "has_update": False,
+                    "download_url": "",
+                    "auth_mode": "local",
+                },
+            }
+        if not REMOTE_SERVICES_ENABLED:
+            return {
+                "success": False,
+                "message": "远程版本检查未配置 API 地址",
+            }
         update_url = "/api/version_mac.php" if sys.platform == "darwin" else "/api/version.php"
         url = _remote_url(update_url)
         if cv:

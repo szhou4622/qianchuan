@@ -12,7 +12,7 @@
 |------|------|
 | 数据采集 | 有头浏览器登录千川 → 进入投放详情页（识别 `aavid` / `adId`）→ 按间隔轮询拦截 `uni-promotion/material/list-required` 接口并写入 SQLite |
 | 本地看盘 | 表格、Top 消耗、素材历史折线等（`static/` + `api/dashboard.py`） |
-| 账号校验 | 启动采集前经远程服务校验账号（`config.API_BASE_URL`，见 `api/account_auth.py`） |
+| 账号校验 | 默认使用本地账号哈希校验，不依赖开发者服务器（见 `api/account_auth.py`） |
 | 飞书确认追投 | `lark-oapi 1.7.1` 本地长连接接收消息和卡片按钮，App Secret 使用 Windows DPAPI 加密 |
 | 飞书多维表 | 配置 `app_token` / `personal_base_token` / `table_id`，在抓取入库后同步（见 `services/feishu_bitable/`） |
 | 飞书 Webhook | 可配置整点推送大屏表格摘要（`services/feishu_webhook_push.py`） |
@@ -37,7 +37,7 @@
 
 1. **操作系统**：**Windows 10/11**，已安装 **Google Chrome**。
 2. **Python**：3.12+。
-3. **网络**：首次启动采集、账号登录、版本检查等需能访问配置的远程 API（`API_BASE_URL`）及千川站点。
+3. **网络**：工具账号登录和版本信息不联网；千川采集及飞书长连接需要访问各自官方站点。
 
 ---
 
@@ -62,7 +62,7 @@ uv sync
 uv run python gui_app.py
 ```
 
-启动后主窗口加载 `static/index.html`。请在界面内按提示完成**远程账号登录**，再**启动采集服务**。
+启动后主窗口加载 `static/index.html`。请在界面内按提示完成**本地工具账号登录**，再**启动采集服务**。
 
 ### 采集流程简述
 
@@ -87,15 +87,9 @@ uv run python gui_app.py
 
 ## 配置说明
 
-### 远程 API 基址
+### 本地账号与可选远程兼容模式
 
-`config.py` 中：
-
-```python
-API_BASE_URL = "https://qcscjk.shanghaijiyue.com"
-```
-
-账号校验、版本检测等 HTTP 接口均在此基址下拼接路径（详见 `api/account_auth.py` 内注释及仓库内 API 文档，若存在 `dev_files/`）。
+正式分发版默认 `QCSCKP_AUTH_MODE=local`：工具账号、版本信息和数据都在本机处理，不访问开发者服务器，也不执行素材云端备份。只有开发调试时显式设置 `QCSCKP_AUTH_MODE=remote` 和 `QCSCKP_API_BASE_URL` 才会启用旧远程兼容接口。
 
 ### 飞书本地长连接
 
@@ -179,7 +173,7 @@ qcsckp/
    在 Windows 上安装 Google Chrome 至默认路径，或在“服务控制”的高级设置中选择 `chrome.exe`。
 
 2. **无法启动采集**  
-   需同时填写账号密码并通过远程校验；请确认网络可达 `API_BASE_URL` 且账号有效。
+   请确认输入了随安装包交付的本地工具账号与密码；本步骤不依赖公网服务器。
 
 3. **数据库越来越大**  
    确认已开启 SQLite 裁剪环境变量，并按业务量调整 `SQLITE_PRUNE_MAX_ROWS`。

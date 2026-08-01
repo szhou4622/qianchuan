@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from config import API_BASE_URL, DATA_DIR
+from config import API_BASE_URL, AUTH_MODE, DATA_DIR, REMOTE_SERVICES_ENABLED
 
 
 SESSION_FILE = os.path.join(DATA_DIR, "device_session.json")
@@ -32,6 +32,8 @@ def _request(
     token: str = "",
     timeout: int = 30,
 ) -> Dict[str, Any]:
+    if not REMOTE_SERVICES_ENABLED:
+        return {"success": False, "message": "本地独立版已禁用中心服务器访问"}
     body = None
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -86,7 +88,11 @@ def load_device_session() -> Dict[str, Any]:
 
 def clear_device_session() -> Dict[str, Any]:
     token = str(load_device_session().get("token") or "").strip()
-    result = _request("/api/device/session.php", method="DELETE", token=token) if token else {"success": True}
+    result = (
+        _request("/api/device/session.php", method="DELETE", token=token)
+        if token and REMOTE_SERVICES_ENABLED
+        else {"success": True}
+    )
     try:
         os.remove(SESSION_FILE)
     except FileNotFoundError:
@@ -95,6 +101,20 @@ def clear_device_session() -> Dict[str, Any]:
 
 
 def register_device_session(username: str, password: str) -> Dict[str, Any]:
+    if AUTH_MODE == "local":
+        _atomic_save(
+            {
+                "username": str(username or "").strip(),
+                "token": "local-only",
+                "device_name": device_name(),
+                "auth_mode": "local",
+            }
+        )
+        return {
+            "success": True,
+            "message": "本地账号状态已保存",
+            "data": {"username": str(username or "").strip(), "auth_mode": "local"},
+        }
     res = _request(
         "/api/device/session.php",
         method="POST",

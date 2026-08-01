@@ -67,7 +67,7 @@ from services.control_panel_config import (
     save_feishu_bitable_panel_config,
     load_feishu_bitable_panel_config,
 )
-from config import PROJECT_ROOT, DATA_DIR, LOGS_DIR, DB_FILE
+from config import PROJECT_ROOT, DATA_DIR, LOGS_DIR, DB_FILE, REMOTE_SERVICES_ENABLED
 from utils.common import browser_runtime_info, require_executable_path
 from utils.log import logger
 
@@ -810,6 +810,10 @@ class ServiceController:
 
     def set_cloud_backup_credentials(self, username: str, password: str) -> None:
         """由 Api.startService 在校验通过后调用，供每轮 fetch 同步云端。"""
+        if not REMOTE_SERVICES_ENABLED:
+            self._cloud_backup_username = None
+            self._cloud_backup_password = ""
+            return
         u = (username or "").strip()
         self._cloud_backup_username = u if u else None
         self._cloud_backup_password = password if password is not None else ""

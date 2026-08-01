@@ -652,7 +652,7 @@ class Api:
 
     def startService(self, interval: int = None, headful: bool = True, username: str = None, password: str = None):
         """
-        启动服务（必须传入账号密码，由服务端远程校验通过后才真正启动，防止前端被篡改绕过）。
+        启动服务（必须传入账号密码，并由当前认证模式校验通过后才真正启动）。
 
         Args:
             interval: 轮询间隔（秒）
@@ -663,7 +663,7 @@ class Api:
         u = (username or "").strip()
         p = password if password is not None else ""
         if not u or not p:
-            return self._start_denied_response("启动采集须传入账号与密码，并由服务端校验通过")
+            return self._start_denied_response("启动采集须传入账号与密码并通过本机校验")
         from services.cloud_retarget_client import load_device_session
 
         old_owner = str(
@@ -821,11 +821,11 @@ class Api:
         from services.dingtalk_webhook_push import run_dingtalk_webhook_push_once
         return run_dingtalk_webhook_push_once(self.dashboard, ignore_enabled=True)
 
-    # ========== 账号登录校验（远程）==========
+    # ========== 工具账号登录校验 ==========
 
     def verify_account_login(self, username: str, password: str):
         """
-        远程校验普通用户账号与密码，并返回有效期、禁用状态（见 dev_files/api文档.md）。
+        校验普通用户账号与密码；本地独立版不访问中心服务器。
         """
         from services.cloud_retarget_client import load_device_session
 

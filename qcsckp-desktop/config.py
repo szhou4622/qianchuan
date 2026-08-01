@@ -53,7 +53,7 @@ def _get_project_root() -> str:
 PROJECT_ROOT = _get_project_root()
 
 
-CURRENT_VERSION = "0.1.39"
+CURRENT_VERSION = "0.1.40"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -144,10 +144,23 @@ SQLITE_BUSY_TIMEOUT_SEC = 30.0
 # 是否使用 WAL 日志模式（利于同库多读与并发）。
 SQLITE_JOURNAL_MODE_WAL = True
 
-# 远程服务端基址（账号 / 版本等接口路径在 api/account_auth.py 拼接，见 dev_files 下 API 文档）
-API_BASE_URL = (
-    _env_text("QCSCKP_API_BASE_URL") or "https://qcscjk.shanghaijiyue.com"
-).rstrip("/")
+# 工具账号默认在本机校验。只有开发者显式设置 QCSCKP_AUTH_MODE=remote
+# 且提供 QCSCKP_API_BASE_URL 时，才允许访问旧的远程账号、版本及备份接口。
+AUTH_MODE = (_env_text("QCSCKP_AUTH_MODE") or "local").lower()
+if AUTH_MODE not in {"local", "remote"}:
+    AUTH_MODE = "local"
+API_BASE_URL = _env_text("QCSCKP_API_BASE_URL").rstrip("/")
+REMOTE_SERVICES_ENABLED = AUTH_MODE == "remote" and bool(API_BASE_URL)
+
+# 随安装包交付的本地工具账号。密码只保存 PBKDF2-HMAC-SHA256 结果，
+# 不在源码、日志和本地数据文件中保存明文。
+LOCAL_AUTH_USERNAME = _env_text("QCSCKP_LOCAL_AUTH_USERNAME") or "qcsckp_local"
+LOCAL_AUTH_PASSWORD_SALT = "5c8a04f47e6d2ab047f3a9cc05cd9e6c"
+LOCAL_AUTH_PASSWORD_HASH = (
+    _env_text("QCSCKP_LOCAL_AUTH_PASSWORD_HASH")
+    or "a679744f824f1aab1012e99f5279def6d80cc5a8d943ff613dabde41abe9d2a4"
+)
+LOCAL_AUTH_PBKDF2_ITERATIONS = 240_000
 
 # 千川素材云端备份
 PMC_CLOUD_BACKUP_PATH = "/api/pmc_promotion_backup.php"

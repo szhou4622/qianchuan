@@ -21,6 +21,7 @@ from config import (
     PMC_AD_DETAIL_BASIC_PATH,
     PMC_CLOUD_BACKUP_MAX_ROWS,
     PMC_CLOUD_BACKUP_PATH,
+    REMOTE_SERVICES_ENABLED,
 )
 from utils.clean_promotion import clean_pmc_promotion_data, clean_pmc_roi2_assist_task_data
 from utils.common import require_executable_path, build_qianchuan_url
@@ -1693,7 +1694,7 @@ class QianChuanFetcher:
         self, username: str, password: str, rows: List[Dict[str, Any]]
     ) -> None:
         """广告基础信息云端同步 POST，按 PMC_AD_DETAIL_BASIC_MAX_ROWS 分批。"""
-        if not rows:
+        if not REMOTE_SERVICES_ENABLED or not rows:
             return
         url = API_BASE_URL.rstrip("/") + PMC_AD_DETAIL_BASIC_PATH
         batches = (len(rows) + PMC_AD_DETAIL_BASIC_MAX_ROWS - 1) // PMC_AD_DETAIL_BASIC_MAX_ROWS
@@ -1792,7 +1793,7 @@ class QianChuanFetcher:
 
     def _upload_cloud_backup_batches(self, username: str, password: str, rows: List[Dict[str, Any]]) -> None:
         """同步 HTTP POST，按 PMC_CLOUD_BACKUP_MAX_ROWS 分批。"""
-        if not rows:
+        if not REMOTE_SERVICES_ENABLED or not rows:
             return
         url = API_BASE_URL.rstrip("/") + PMC_CLOUD_BACKUP_PATH
         batches = (len(rows) + PMC_CLOUD_BACKUP_MAX_ROWS - 1) // PMC_CLOUD_BACKUP_MAX_ROWS
@@ -1858,7 +1859,7 @@ class QianChuanFetcher:
         """SQLite 与飞书之后，将同一批数据 POST 到服务端 MySQL；失败仅打日志。"""
         u = self._cloud_backup_username
         p = self._cloud_backup_password
-        if not rows or not u or not p:
+        if not REMOTE_SERVICES_ENABLED or not rows or not u or not p:
             return
 
         def _run() -> None:
@@ -1875,7 +1876,12 @@ class QianChuanFetcher:
         """本轮抓取结束前再尝试一次待同步的基础信息（弥补中途仅素材失败等情形）。"""
         u = self._cloud_backup_username
         p = self._cloud_backup_password
-        if not self._pending_ad_detail_basic_cloud_row or not u or not p:
+        if (
+            not REMOTE_SERVICES_ENABLED
+            or not self._pending_ad_detail_basic_cloud_row
+            or not u
+            or not p
+        ):
             return
 
         def _run() -> None:
