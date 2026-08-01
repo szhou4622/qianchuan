@@ -83,7 +83,7 @@
   const catalogStatus=x=>({complete:'完整',partial:'不完整',not_synced:'未同步',syncing:'同步中',login_required:'需要重新登录',error:'同步失败'}[x]||x||'未同步');
   const logStatus=x=>({ok:'同步正常',partial:'部分完成',empty:'暂无记录',login_required:'需要重新登录',not_configured:'尚未配置',error:'同步失败'}[x]||x||'尚未配置');
   const groupDefs=[['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['unknown','all','待确认/其他']];
-  let latest=null,dirty=false;
+  let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false;
 
   function filteredPlans(plans){
     const query=($('planSearch')?.value||'').trim().toLowerCase();
@@ -241,6 +241,67 @@
     const a=await waitApi();if(!a){message('工具接口尚未就绪',true);return}
     const r=await a.getQianchuanAccountOverview();if(!r?.success){message(r?.message||'读取账户失败',true);return}render(r);
   }
+
+  function stopCatalogWatch(){
+    if(catalogWatchTimer){clearTimeout(catalogWatchTimer);catalogWatchTimer=null}
+    catalogWatchBusy=false;
+  }
+
+  async function watchCatalogSync({accountUid='',startedAt='',announce=true}={}){
+    if(catalogWatchBusy)return;
+    catalogWatchBusy=true;
+    const a=await waitApi();
+    if(!a){stopCatalogWatch();message('工具接口尚未就绪',true);return}
+    const button=$('discover');const statusBox=$('catalogActionStatus');
+    const showStatus=(text,type='')=>{statusBox.textContent=text||'';statusBox.className=`head-action-status ${text?'show':''} ${type}`.trim()};
+    const tick=async()=>{
+      let s,overview;
+      try{
+        s=await a.getQianchuanCatalogSyncStatus();
+        overview=await a.getQianchuanAccountOverview();
+      }catch(e){
+        s={success:false,running:false,status:'error',message:String(e?.message||e)};
+      }
+      const queue=overview?.browser_queue||{};
+      const processed=Number(s?.processed_accounts||0),total=Number(s?.total_accounts||0);
+      const progress=total?`${processed}/${total}${s.current_account?' · '+s.current_account:''}`:'准备中';
+      const queued=!!s?.running&&processed===0&&!!queue.active&&Number(queue.waiting_count||0)>0;
+      if(s?.running){
+        button.disabled=true;
+        if(queued){
+          button.textContent='已排队，等待采集结束';
+          showStatus(`刷新任务已进入共享浏览器队列（前方 ${queue.waiting_count||1} 项）；当前采集结束后会自动继续。`);
+        }else{
+          button.textContent=total?`正在刷新 ${processed}/${total}`:'正在监听网页数据…';
+          showStatus(`${s?.message||'正在直接监听千川网页接口和计划详情'}（${progress}）`);
+        }
+        catalogWatchTimer=setTimeout(tick,1200);
+        return;
+      }
+      stopCatalogWatch();button.disabled=false;button.textContent='刷新账户计划';
+      if(overview?.success)render(overview);else await load();
+      const failed=!s?.success||['error','login_required'].includes(String(s?.status||''));
+      const finalText=s?.message||(failed?'账户计划刷新失败':'账户计划刷新完成');
+      showStatus(finalText,failed?'bad':'ok');
+      if(announce)message(finalText,failed);
+    };
+    await tick();
+  }
+
+  async function resumeCatalogWatch(){
+    if(catalogWatchBusy)return;
+    const a=await waitApi();if(!a)return;
+    let s;
+    try{s=await a.getQianchuanCatalogSyncStatus()}catch(_){return}
+    if(s?.running){
+      await watchCatalogSync({accountUid:String(s.requested_account_uid||''),startedAt:String(s.started_at||''),announce:true});
+    }else if(s?.finished_at){
+      const failed=!s?.success||['error','login_required'].includes(String(s?.status||''));
+      const box=$('catalogActionStatus');
+      box.textContent=s?.message||(failed?'账户计划刷新失败':'账户计划刷新完成');
+      box.className=`head-action-status show ${failed?'bad':'ok'}`;
+    }
+  }
   async function saveAccount(card){
     const a=await waitApi();const uid=card.dataset.account;
     const settings={
@@ -269,32 +330,12 @@
     button.disabled=true;button.textContent='正在提交刷新…';showStatus('正在创建只读刷新任务，不会提交任何千川操作。');
     try{r=await a.startQianchuanCatalogSync(accountUid||null)}catch(e){r={success:false,message:String(e?.message||e)}}
     if(!r?.success){button.disabled=false;button.textContent='刷新账户计划';showStatus(r?.message||'刷新任务启动失败','bad');message(r?.message||'刷新任务启动失败',true);return}
-    const paint=async s=>{
-      const overview=await a.getQianchuanAccountOverview();
-      const queue=overview?.browser_queue||{};
-      const processed=Number(s?.processed_accounts||0),total=Number(s?.total_accounts||0);
-      const progress=total?`${processed}/${total}${s.current_account?' · '+s.current_account:''}`:'准备中';
-      const queued=!!s?.running&&processed===0&&!!queue.active&&Number(queue.waiting_count||0)>0;
-      if(queued){
-        button.textContent='已排队，等待采集结束';
-        showStatus(`刷新任务已进入共享浏览器队列（前方 ${queue.waiting_count||1} 项）；当前采集结束后会自动继续。`);
-      }else if(s?.running){
-        button.textContent=total?`正在刷新 ${processed}/${total}`:'正在启动同步…';
-        showStatus(`${s?.message||'正在同步已添加账户和计划目录'}（${progress}）`);
-      }
-    };
-    await paint(r);
-    const timer=setInterval(async()=>{
-      let s;
-      try{s=await a.getQianchuanCatalogSyncStatus()}catch(e){s={success:false,running:false,message:String(e?.message||e)}}
-      if(s?.running){await paint(s);return}
-      clearInterval(timer);button.disabled=false;button.textContent='刷新账户计划';
-      await load();
-      const failed=!s?.success||['error','login_required'].includes(String(s?.status||''));
-      const finalText=s?.message||(failed?'账户计划刷新失败':'账户计划刷新完成');
-      showStatus(finalText,failed?'bad':'ok');
-      message(finalText,failed);
-    },1200);
+    stopCatalogWatch();
+    await watchCatalogSync({
+      accountUid:String(accountUid||''),
+      startedAt:String(r.started_at||''),
+      announce:true
+    });
   }
   async function addAccount(){
     $('addAccount').disabled=true;
@@ -364,7 +405,9 @@
   $('planSearch').oninput=rerenderCatalogFilter;
   $('planStatus').onchange=rerenderCatalogFilter;
   $('autostart').onchange=async()=>{const a=await waitApi();const r=await a.setWindowsAutostart($('autostart').checked);message(r?.message||($('autostart').checked?'开机自启已开启':'开机自启已关闭'),!r?.success);if(!r?.success)$('autostart').checked=!$('autostart').checked};
-  load();setInterval(()=>{if(!dirty)load()},15000);
+  window.addEventListener('focus',async()=>{if(!dirty)await load();await resumeCatalogWatch()});
+  document.addEventListener('visibilitychange',async()=>{if(!document.hidden){if(!dirty)await load();await resumeCatalogWatch()}});
+  load().then(resumeCatalogWatch);setInterval(()=>{if(!dirty)load()},15000);
 </script>
 </body>
 </html>

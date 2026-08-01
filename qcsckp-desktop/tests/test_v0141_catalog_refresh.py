@@ -15,6 +15,7 @@ from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.qianchuan_accounts import ensure_qianchuan_account
 from services.qianchuan_catalog import finalize_catalog_sync
 from services.qianchuan_catalog import (
+    catalog_sync_status,
     clear_catalog_login_failure,
     mark_catalog_sync_started,
 )
@@ -23,6 +24,37 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class CatalogRefreshV0141Tests(unittest.TestCase):
+    def test_status_reconciles_persisted_result_after_running_flag_stalls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "catalog.db")
+            init_sqlite_schema(database=db_path)
+            db = SQLiteStore(database=db_path)
+            owner = "catalog-persisted-finish-user"
+            account = ensure_qianchuan_account(
+                "10003", owner_username=owner, account_name="账户三", db=db
+            )
+            started = mark_catalog_sync_started(
+                owner_username=owner,
+                account_uid=account["account_uid"],
+            )
+            db.update(
+                "qianchuan_account",
+                {
+                    "catalog_status": "complete",
+                    "catalog_error": "",
+                    "catalog_last_sync_at": started["started_at"],
+                },
+                where={"account_uid": account["account_uid"]},
+            )
+
+            result = catalog_sync_status(owner_username=owner, db=db)
+
+            self.assertFalse(result["running"])
+            self.assertTrue(result["success"])
+            self.assertTrue(result["complete"])
+            self.assertEqual("complete", result["status"])
+            self.assertEqual("账户计划目录同步完成", result["message"])
+
     def test_session_save_does_not_interrupt_running_catalog_refresh(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = os.path.join(directory, "catalog.db")

@@ -349,6 +349,57 @@ def catalog_sync_status(
         }
         for item in accounts
     ]
+    # Reconcile a stale in-memory ``running`` flag from the durable account
+    # result.  A WebView can be suspended while visible Chrome or a system
+    # dialog is in front, and an exception after the final database commit
+    # must not leave the UI waiting forever even though the catalog finished.
+    if state.get("running") and account_states:
+        started_at = str(state.get("started_at") or "")
+        requested_uid = str(state.get("requested_account_uid") or "").strip()
+        scoped_states = [
+            item
+            for item in account_states
+            if not requested_uid
+            or str(item.get("account_uid") or "") == requested_uid
+        ]
+        persisted_finished = bool(scoped_states) and all(
+            str(item.get("status") or "") in {"complete", "partial"}
+            and bool(str(item.get("last_sync_at") or ""))
+            and (
+                not started_at
+                or str(item.get("last_sync_at") or "") >= started_at
+            )
+            for item in scoped_states
+        )
+        if persisted_finished:
+            all_complete = all(
+                str(item.get("status") or "") == "complete"
+                for item in scoped_states
+            )
+            finished_at = max(
+                str(item.get("last_sync_at") or "") for item in scoped_states
+            )
+            with _LOCK:
+                _STATE.update(
+                    {
+                        "owner_username": owner,
+                        "running": False,
+                        "finished_at": finished_at,
+                        "message": (
+                            "账户计划目录同步完成"
+                            if all_complete
+                            else "目录已更新，但部分分类或分页尚未取得完整证据"
+                        ),
+                        "status": "complete" if all_complete else "partial",
+                        "error": "",
+                        "failure_kind": "",
+                        "recovery_action": "",
+                        "processed_accounts": len(scoped_states),
+                        "total_accounts": len(scoped_states),
+                        "current_account": "",
+                    }
+                )
+                state = dict(_STATE)
     persisted_errors = [
         str(item.get("error") or "").strip()
         for item in account_states
