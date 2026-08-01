@@ -354,8 +354,20 @@ class PromotionReadOnlyProbe:
         self._pagination_inflight = set()
         self._all_status_replays = set()
         self._full_catalog_request_variants = set()
+        self._catalog_replay_templates: Dict[
+            tuple[str, str, str, str], Dict[str, Any]
+        ] = {}
         self._attached_page_ids = set()
         self._catalog_context: Dict[str, str] = {}
+        # 千川把一份计划目录拆成 required + optional 两段。optional 请求
+        # 只携带短期 SessionID，不重复携带推广方式；仅在本次进程内关联，
+        # 绝不写入 probe 文件。
+        self._catalog_session_context: Dict[
+            str, tuple[str, str, str]
+        ] = {}
+        self._catalog_pending_session_payloads: Dict[
+            str, List[Dict[str, Any]]
+        ] = {}
         self._catalog_rows: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
         self._catalog_variants: Dict[
             tuple[str, str, str, str], Dict[str, Any]
@@ -510,6 +522,62 @@ class PromotionReadOnlyProbe:
         ).strip()
         return value if value.isdigit() else ""
 
+    @staticmethod
+    def _request_catalog_session_id(body: Any) -> str:
+        if not isinstance(body, Mapping):
+            return ""
+        return str(
+            body.get("SessionID")
+            or body.get("sessionId")
+            or body.get("session_id")
+            or ""
+        ).strip()[:256]
+
+    @staticmethod
+    def _response_catalog_session_id(payload: Any) -> str:
+        if not isinstance(payload, Mapping):
+            return ""
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return ""
+        return str(
+            data.get("sessionId")
+            or data.get("SessionID")
+            or data.get("session_id")
+            or ""
+        ).strip()[:256]
+
+    def _catalog_response_context(
+        self,
+        body: Any,
+        payload: Any,
+        *,
+        fallback_aavid: Any = "",
+    ) -> tuple[str, str, str]:
+        """Resolve required/optional list segments without current-tab guessing."""
+        aid = self._request_catalog_aavid(body) or str(fallback_aavid or "").strip()
+        scene = self._request_catalog_scene(body)
+        system = str(self._catalog_context.get("plan_system") or "unknown")
+        request_session = self._request_catalog_session_id(body)
+        if not scene and request_session:
+            linked = self._catalog_session_context.get(request_session)
+            if linked and (not aid or aid == linked[0]):
+                return linked
+        if (
+            aid.isdigit()
+            and scene in {"live", "product"}
+            and system in {"global", "chengfang"}
+        ):
+            response_session = self._response_catalog_session_id(payload)
+            if response_session:
+                self._catalog_session_context[response_session] = (
+                    aid,
+                    scene,
+                    system,
+                )
+            return aid, scene, system
+        return "", "", "unknown"
+
     @classmethod
     def _request_page_number(cls, body: Any) -> int:
         page_params = cls._request_page_params(body)
@@ -560,6 +628,157 @@ class PromotionReadOnlyProbe:
             ).encode("utf-8")
         ).hexdigest()[:20]
         return f"{path}|{digest}"
+
+    def _record_catalog_payload(
+        self,
+        *,
+        path: str,
+        body: Any,
+        http_status: int,
+        payload: Any,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+        full_catalog: bool = False,
+    ) -> None:
+        """Record one catalog response against an immutable scan context.
+
+        Responses issued by ``page.evaluate(fetch(...))`` can reach the normal
+        Playwright response callback after the scanner has already switched to
+        another tab.  Recording the replay result directly prevents those
+        all-status rows from being attributed to the next catalog class.
+        """
+        aid = str(aavid or "").strip()
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        if (
+            not aid.isdigit()
+            or scene not in {"live", "product"}
+            or system not in {"global", "chengfang"}
+            or not isinstance(body, Mapping)
+        ):
+            return
+        variant = self._catalog_variant_key(path, body)
+        variant_key = (aid, scene, system, variant)
+        page_number = self._request_page_number(body)
+        current = dict(self._catalog_variants.get(variant_key) or {})
+        pages = {
+            int(value)
+            for value in current.get("seen_pages") or []
+            if str(value).isdigit()
+        }
+        pages.add(page_number)
+        business_error = (
+            str(payload.get("message") or "")
+            if isinstance(payload, Mapping)
+            and payload.get("status_code") not in (None, 0)
+            else ""
+        )
+        current.update(
+            {
+                "path": str(path or ""),
+                "status": int(http_status or 0),
+                "total_pages": self._response_total_pages(payload),
+                "seen_pages": sorted(pages),
+                "full_catalog": bool(full_catalog),
+                "error": (
+                    ""
+                    if int(http_status or 0) == 200 and not business_error
+                    else (business_error or f"HTTP {http_status}")[:500]
+                ),
+            }
+        )
+        self._catalog_variants[variant_key] = current
+        snapshot = extract_product_scene_snapshot(payload)
+        for row in snapshot.get("ad_rows") or []:
+            if not isinstance(row, Mapping):
+                continue
+            ad_id = str(row.get("ad_id") or "").strip()
+            if not ad_id.isdigit():
+                continue
+            self._catalog_rows[(aid, scene, system, ad_id)] = {
+                "aavid": aid,
+                "ad_id": ad_id,
+                "plan_name": str(row.get("ad_name") or "").strip()[:256],
+                "promotion_scene": scene,
+                "plan_system": system,
+                "platform_status": row.get("platform_status") or "unknown",
+                "product_ids": list(row.get("product_ids") or []),
+            }
+
+    def _record_catalog_response_segment(
+        self,
+        *,
+        path: str,
+        body: Any,
+        http_status: int,
+        payload: Any,
+        fallback_aavid: Any = "",
+    ) -> None:
+        """Join required/optional response segments regardless of arrival order."""
+        aid, scene, system = self._catalog_response_context(
+            body,
+            payload,
+            fallback_aavid=fallback_aavid,
+        )
+        request_session = self._request_catalog_session_id(body)
+        if not (
+            aid.isdigit()
+            and scene in {"live", "product"}
+            and system in {"global", "chengfang"}
+        ):
+            if request_session:
+                pending = self._catalog_pending_session_payloads.setdefault(
+                    request_session,
+                    [],
+                )
+                pending.append(
+                    {
+                        "path": str(path or ""),
+                        "body": deepcopy(body) if isinstance(body, Mapping) else {},
+                        "http_status": int(http_status or 0),
+                        "payload": payload,
+                    }
+                )
+                del pending[:-4]
+                if len(self._catalog_pending_session_payloads) > 20:
+                    oldest = next(iter(self._catalog_pending_session_payloads))
+                    self._catalog_pending_session_payloads.pop(oldest, None)
+            return
+        variant = self._catalog_variant_key(path, body)
+        self._record_catalog_payload(
+            path=path,
+            body=body,
+            http_status=http_status,
+            payload=payload,
+            aavid=aid,
+            promotion_scene=scene,
+            plan_system=system,
+            full_catalog=(
+                self._is_full_catalog_request(body)
+                or variant in self._full_catalog_request_variants
+            ),
+        )
+        response_session = self._response_catalog_session_id(payload)
+        if not response_session:
+            return
+        for segment in self._catalog_pending_session_payloads.pop(
+            response_session,
+            [],
+        ):
+            segment_body = segment.get("body")
+            if not isinstance(segment_body, Mapping):
+                continue
+            self._record_catalog_payload(
+                path=str(segment.get("path") or ""),
+                body=segment_body,
+                http_status=int(segment.get("http_status") or 0),
+                payload=segment.get("payload"),
+                aavid=aid,
+                promotion_scene=scene,
+                plan_system=system,
+                full_catalog=False,
+            )
 
     def catalog_rows(
         self,
@@ -1227,90 +1446,16 @@ class PromotionReadOnlyProbe:
                     request_body = json.loads(post_data or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     request_body = {}
-                request_aavid = (
-                    self._request_catalog_aavid(request_body)
-                    or str(item.get("identifiers", {}).get("aavid") or "")
-                    or str(self._catalog_context.get("aavid") or "")
+                self._record_catalog_response_segment(
+                    path=path,
+                    body=request_body,
+                    http_status=int(response.status),
+                    payload=payload,
+                    fallback_aavid=(
+                        str(item.get("identifiers", {}).get("aavid") or "")
+                        or str(self._catalog_context.get("aavid") or "")
+                    ),
                 )
-                request_scene = (
-                    self._request_catalog_scene(request_body)
-                    or str(self._catalog_context.get("promotion_scene") or "")
-                )
-                request_system = str(
-                    self._catalog_context.get("plan_system") or "unknown"
-                )
-                if (
-                    request_aavid.isdigit()
-                    and request_scene in {"live", "product"}
-                    and request_system in {"global", "chengfang"}
-                ):
-                    variant = self._catalog_variant_key(path, request_body)
-                    variant_key = (
-                        request_aavid,
-                        request_scene,
-                        request_system,
-                        variant,
-                    )
-                    page_number = self._request_page_number(request_body)
-                    current = dict(self._catalog_variants.get(variant_key) or {})
-                    pages = {
-                        int(value)
-                        for value in current.get("seen_pages") or []
-                        if str(value).isdigit()
-                    }
-                    pages.add(page_number)
-                    current.update(
-                        {
-                            "path": path,
-                            "status": int(response.status),
-                            "total_pages": self._response_total_pages(payload),
-                            "seen_pages": sorted(pages),
-                            "full_catalog": self._is_full_catalog_request(
-                                request_body
-                            )
-                            or variant
-                            in self._full_catalog_request_variants,
-                            "error": (
-                                ""
-                                if int(response.status) == 200
-                                and (
-                                    not isinstance(payload, Mapping)
-                                    or payload.get("status_code") in (None, 0)
-                                )
-                                else str(
-                                    (payload or {}).get("message")
-                                    if isinstance(payload, Mapping)
-                                    else f"HTTP {response.status}"
-                                )[:500]
-                            ),
-                        }
-                    )
-                    self._catalog_variants[variant_key] = current
-                    for row in product_snapshot.get("ad_rows") or []:
-                        if not isinstance(row, Mapping):
-                            continue
-                        ad_id = str(row.get("ad_id") or "").strip()
-                        if not ad_id.isdigit():
-                            continue
-                        self._catalog_rows[
-                            (
-                                request_aavid,
-                                request_scene,
-                                request_system,
-                                ad_id,
-                            )
-                        ] = {
-                            "aavid": request_aavid,
-                            "ad_id": ad_id,
-                            "plan_name": str(
-                                row.get("ad_name") or ""
-                            ).strip()[:256],
-                            "promotion_scene": request_scene,
-                            "plan_system": request_system,
-                            "platform_status": row.get("platform_status")
-                            or "unknown",
-                            "product_ids": list(row.get("product_ids") or []),
-                        }
             self._flush()
             if path in PRODUCT_AD_LIST_API_PATHS:
                 await self._replay_all_status_variant(
@@ -1368,9 +1513,34 @@ class PromotionReadOnlyProbe:
             return False
         ad_filter = cls._catalog_ad_filter(body)
         if ad_filter is None:
-            # 仅对已观察并清理过的嵌套请求宣称“全目录”；
-            # 老的平铺报表请求带日期窗口，不能作为完整目录证据。
-            return bool(body.get("__qcsckp_full_catalog__"))
+            if bool(body.get("__qcsckp_full_catalog__")):
+                return True
+            # 千川商品目录目前还会发出平铺分页请求。start/end_time
+            # 只控制指标窗口，不会排除计划；只要账户、推广方式和分页均
+            # 明确，且不存在任何状态筛选字段，就可以作为完整目录证据。
+            normalized_keys = {
+                re.sub(r"[^a-z0-9]", "", str(key).lower())
+                for key in body
+            }
+            restrictive = {
+                "notinecpadstatuses",
+                "ecpadstatuses",
+                "adstatuses",
+                "havingfilter",
+            }
+            has_pagination = (
+                ("page" in body or "Page" in body)
+                and any(
+                    key in body
+                    for key in ("page_size", "pageSize", "PageSize", "limit")
+                )
+            )
+            return bool(
+                has_pagination
+                and cls._request_catalog_aavid(body)
+                and cls._request_catalog_scene(body)
+                and not (normalized_keys & restrictive)
+            )
         restrictive_keys = {
             "NotInEcpAdStatuses",
             "notInEcpAdStatuses",
@@ -1454,18 +1624,128 @@ class PromotionReadOnlyProbe:
             send_body,
         )
         self._full_catalog_request_variants.add(full_variant)
-        await page.evaluate(
-            """async ({url, body}) => {
+        replay_url = str(response.url or "")
+        self._catalog_replay_templates[marker] = {
+            "url": replay_url,
+            "body": deepcopy(send_body),
+        }
+        await self._execute_full_catalog_replay(
+            page=page,
+            url=replay_url,
+            send_body=send_body,
+            marker=marker,
+        )
+
+    async def _execute_full_catalog_replay(
+        self,
+        *,
+        page: Any,
+        url: str,
+        send_body: Dict[str, Any],
+        marker: tuple[str, str, str, str],
+    ) -> None:
+        """Run a stored all-status request after the catalog page is stable."""
+        async def fetch_and_record(body_to_send: Dict[str, Any]) -> Dict[str, Any]:
+            result = await page.evaluate(
+                """async ({url, body}) => {
                 const result = await fetch(url, {
                     method: 'POST',
                     credentials: 'include',
                     headers: {'content-type': 'application/json;charset=UTF-8'},
                     body: JSON.stringify(body)
                 });
-                await result.text();
-                return result.status;
+                let payload = null;
+                try { payload = await result.json(); } catch (_) {}
+                return {status: result.status, payload};
             }""",
-            {"url": str(response.url or ""), "body": send_body},
+                {"url": str(url or ""), "body": body_to_send},
+            )
+            result = result if isinstance(result, Mapping) else {}
+            payload = result.get("payload")
+            self._record_catalog_payload(
+                path=marker[0],
+                body=body_to_send,
+                http_status=int(result.get("status") or 0),
+                payload=payload,
+                aavid=marker[1],
+                promotion_scene=marker[2],
+                plan_system=marker[3],
+                full_catalog=True,
+            )
+            return {"status": int(result.get("status") or 0), "payload": payload}
+
+        first = await fetch_and_record(send_body)
+        first_payload = first.get("payload")
+        if (
+            int(first.get("status") or 0) != 200
+            or (
+                isinstance(first_payload, Mapping)
+                and first_payload.get("status_code") not in (None, 0)
+            )
+        ):
+            return
+        total_pages = self._response_total_pages(first_payload)
+        for page_number in range(2, total_pages + 1):
+            next_body = deepcopy(send_body)
+            if not self._set_request_page(next_body, page_number):
+                break
+            page_result = await fetch_and_record(next_body)
+            page_payload = page_result.get("payload")
+            if (
+                int(page_result.get("status") or 0) != 200
+                or (
+                    isinstance(page_payload, Mapping)
+                    and page_payload.get("status_code") not in (None, 0)
+                )
+            ):
+                break
+        self._flush()
+
+    async def replay_full_catalog(
+        self,
+        page: Any,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> bool:
+        """Retry captured read-only templates outside the response callback.
+
+        The first attempt happens while the page is still navigating and can
+        be cancelled by the browser.  The scanner calls this method after the
+        list tab settles so that filtered default requests are reliably
+        expanded to all statuses.
+        """
+        prefix = (
+            str(aavid or "").strip(),
+            str(promotion_scene or "").strip().lower(),
+            str(plan_system or "").strip().lower(),
+        )
+        templates = [
+            (marker, dict(template))
+            for marker, template in self._catalog_replay_templates.items()
+            if marker[1:] == prefix
+        ]
+        for marker, template in templates:
+            body = template.get("body")
+            url = str(template.get("url") or "")
+            if not isinstance(body, dict) or not url:
+                continue
+            try:
+                await self._execute_full_catalog_replay(
+                    page=page,
+                    url=url,
+                    send_body=deepcopy(body),
+                    marker=marker,
+                )
+            except Exception:
+                continue
+        return bool(
+            self.catalog_class_status(
+                aavid=prefix[0],
+                promotion_scene=prefix[1],
+                plan_system=prefix[2],
+            ).get("complete")
         )
 
     @classmethod

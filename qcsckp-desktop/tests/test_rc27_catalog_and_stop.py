@@ -132,6 +132,157 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
                 candidate["target_uid"], True, db=self.db
             )
 
+    def test_click_visible_exact_skips_hidden_duplicate_text_node(self):
+        clicked = []
+
+        class Candidate:
+            def __init__(self, index):
+                self.index = index
+
+            async def is_visible(self):
+                return self.index == 0
+
+            async def click(self, timeout=None):
+                clicked.append(self.index)
+
+        class Locator:
+            async def count(self):
+                return 2
+
+            def nth(self, index):
+                return Candidate(index)
+
+        class Page:
+            def get_by_text(self, _text, exact=None):
+                return Locator()
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        self.assertTrue(
+            asyncio.run(
+                ServiceController._click_visible_exact(
+                    Page(), ["推商品"], timeout_ms=100
+                )
+            )
+        )
+        self.assertEqual([0], clicked)
+
+    def test_click_visible_exact_retries_after_stale_visible_node(self):
+        attempts = []
+
+        class Candidate:
+            def __init__(self, index):
+                self.index = index
+
+            async def is_visible(self):
+                return True
+
+            async def click(self, timeout=None):
+                attempts.append((self.index, timeout))
+                if self.index == 1:
+                    raise RuntimeError("detached during redraw")
+
+            async def evaluate(self, _script):
+                raise RuntimeError("stale node is detached")
+
+        class Locator:
+            async def count(self):
+                return 2
+
+            def nth(self, index):
+                return Candidate(index)
+
+        class Page:
+            def get_by_text(self, _text, exact=None):
+                return Locator()
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        self.assertTrue(
+            asyncio.run(
+                ServiceController._click_visible_exact(
+                    Page(), ["推直播间"], timeout_ms=2_000
+                )
+            )
+        )
+        self.assertEqual([1, 0], [item[0] for item in attempts])
+        self.assertTrue(all(0 < int(item[1]) <= 1_500 for item in attempts))
+
+    def test_product_catalog_visits_self_selected_and_managed_subtabs(self):
+        clicked = []
+
+        class Candidate:
+            async def is_visible(self):
+                return True
+
+            async def click(self, timeout=None):
+                clicked.append(page.current_label)
+
+        class Locator:
+            async def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Candidate()
+
+        class Page:
+            current_label = ""
+
+            def get_by_text(self, text, exact=None):
+                self.current_label = text
+                return Locator()
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        page = Page()
+        opened = asyncio.run(
+            ServiceController._open_all_product_subcatalogs(page)
+        )
+        self.assertEqual(2, opened)
+        self.assertEqual(["商品自选", "全店托管"], clicked)
+
+    def test_chengfang_promotional_copy_is_not_treated_as_catalog_entry(self):
+        class EmptyLocator:
+            async def count(self):
+                return 0
+
+        class VisibleCopyLocator:
+            async def count(self):
+                return 1
+
+            def nth(self, _index):
+                return self
+
+            async def is_visible(self):
+                return True
+
+        class Page:
+            def get_by_role(self, _role, name=None, exact=None):
+                return EmptyLocator()
+
+            def get_by_text(self, _text, exact=None):
+                return VisibleCopyLocator()
+
+        page = Page()
+        self.assertFalse(
+            asyncio.run(
+                ServiceController._has_visible_action_exact(
+                    page, ["千川乘方"]
+                )
+            )
+        )
+        self.assertFalse(
+            asyncio.run(
+                ServiceController._open_explicit_chengfang_catalog(
+                    page,
+                    aavid="10001",
+                )
+            )
+        )
+
     def test_new_account_and_new_plan_are_disabled_until_user_saves_setup(self):
         account = ensure_qianchuan_account(
             "10001",
@@ -390,6 +541,117 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             )["complete"]
         )
 
+    def test_direct_all_status_replay_keeps_its_original_catalog_context(self):
+        path = os.path.join(self.temp.name, "direct-replay-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        request_path = "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+        body = {
+            "Params": {
+                "AdFilter": {"MarGoal": 1},
+                "PageParams": {"Page": 1, "PageSize": 100},
+            }
+        }
+        probe._record_catalog_payload(
+            path=request_path,
+            body=body,
+            http_status=200,
+            payload={
+                "status_code": 0,
+                "data": {
+                    "adInfos": [
+                        {
+                            "id": "20001",
+                            "name": "商品计划一",
+                            "adDeliveryName": "投放中",
+                        },
+                        {
+                            "id": "20002",
+                            "name": "商品计划二",
+                            "adDeliveryName": "已暂停",
+                        },
+                    ]
+                },
+            },
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+            full_catalog=True,
+        )
+
+        self.assertTrue(
+            probe.catalog_class_status(
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )["complete"]
+        )
+        self.assertEqual(
+            {"20001", "20002"},
+            {
+                row["ad_id"]
+                for row in probe.catalog_rows(
+                    aavid="10001",
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            },
+        )
+
+    def test_deferred_all_status_replay_runs_after_navigation_settles(self):
+        path = os.path.join(self.temp.name, "deferred-replay-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        request_path = "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+        body = {
+            "Params": {
+                "AdFilter": {"MarGoal": 1},
+                "PageParams": {"Page": 1, "PageSize": 100},
+            }
+        }
+        marker = (request_path, "10001", "product", "global")
+        probe._catalog_replay_templates[marker] = {
+            "url": "https://qianchuan.test" + request_path,
+            "body": body,
+        }
+
+        class StablePage:
+            async def evaluate(self, _script, _arguments):
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "adInfos": [
+                                {
+                                    "id": "20003",
+                                    "name": "稳定后取得的商品计划",
+                                    "adDeliveryName": "投放中",
+                                }
+                            ]
+                        },
+                    },
+                }
+
+        complete = asyncio.run(
+            probe.replay_full_catalog(
+                StablePage(),
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertTrue(complete)
+        self.assertEqual(
+            ["20003"],
+            [
+                row["ad_id"]
+                for row in probe.catalog_rows(
+                    aavid="10001",
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            ],
+        )
+
     def test_flat_and_nested_catalog_pagination_are_supported(self):
         flat = {"page": 1, "page_size": 10}
         nested = {"Params": {"PageParams": {"Page": 1, "PageSize": 10}}}
@@ -402,6 +664,104 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             PromotionReadOnlyProbe._response_total_pages(
                 {"data": {"pagination": {"totalPages": 3}}}
             ),
+        )
+
+    def test_unfiltered_flat_plan_list_is_full_catalog_evidence(self):
+        flat = {
+            "aavid": "10001",
+            "mar_goal": 1,
+            "page": 1,
+            "page_size": 100,
+            "start_time": "2026-08-01",
+            "end_time": "2026-08-02",
+        }
+        self.assertTrue(PromotionReadOnlyProbe._is_full_catalog_request(flat))
+        flat["not_in_ecp_ad_statuses"] = ["PAUSED"]
+        self.assertFalse(PromotionReadOnlyProbe._is_full_catalog_request(flat))
+
+    def test_optional_catalog_segment_uses_required_response_session_context(self):
+        path = os.path.join(self.temp.name, "session-context-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe.set_catalog_context(
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+        )
+        primary = probe._catalog_response_context(
+            {
+                "aavid": "10001",
+                "mar_goal": 1,
+                "page": 1,
+                "page_size": 100,
+            },
+            {"data": {"sessionId": "transient-session"}},
+        )
+        probe.set_catalog_context(
+            aavid="10001",
+            promotion_scene="live",
+            plan_system="global",
+        )
+        optional = probe._catalog_response_context(
+            {"aavid": "10001", "SessionID": "transient-session"},
+            {"data": {}},
+        )
+
+        self.assertEqual(("10001", "product", "global"), primary)
+        self.assertEqual(primary, optional)
+
+    def test_optional_segment_arriving_first_is_replayed_after_required_response(self):
+        path = os.path.join(self.temp.name, "pending-session-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe.set_catalog_context(
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+        )
+        request_path = "/ad/api/pmc/v1/uni-promotion/ad/list-optional"
+        probe._record_catalog_response_segment(
+            path=request_path,
+            body={"aavid": "10001", "SessionID": "late-primary"},
+            http_status=200,
+            payload={
+                "status_code": 0,
+                "data": {
+                    "adInfos": [
+                        {"id": "20002", "name": "后到上下文计划二"},
+                        {"id": "20003", "name": "后到上下文计划三"},
+                    ]
+                },
+            },
+        )
+        self.assertEqual([], probe.catalog_rows(
+            aavid="10001", promotion_scene="product", plan_system="global"
+        ))
+        probe._record_catalog_response_segment(
+            path="/ad/api/pmc/v1/uni-promotion/ad/list-required",
+            body={
+                "aavid": "10001",
+                "mar_goal": 1,
+                "page": 1,
+                "page_size": 100,
+            },
+            http_status=200,
+            payload={
+                "status_code": 0,
+                "data": {
+                    "sessionId": "late-primary",
+                    "adInfos": [{"id": "20001", "name": "主段计划一"}],
+                },
+            },
+        )
+        self.assertEqual(
+            {"20001", "20002", "20003"},
+            {
+                row["ad_id"]
+                for row in probe.catalog_rows(
+                    aavid="10001",
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            },
         )
         self.assertEqual(
             3,

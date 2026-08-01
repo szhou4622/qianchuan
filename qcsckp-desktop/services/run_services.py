@@ -1410,17 +1410,45 @@ class ServiceController:
         *,
         timeout_ms: int = 8_000,
     ) -> bool:
-        for text in texts:
-            locator = page.get_by_text(text, exact=True)
+        deadline = time.monotonic() + max(0.5, float(timeout_ms) / 1000.0)
+        while time.monotonic() < deadline:
+            for text in texts:
+                locator = page.get_by_text(text, exact=True)
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+                for index in range(count - 1, -1, -1):
+                    candidate = locator.nth(index)
+                    try:
+                        if not await candidate.is_visible():
+                            continue
+                        remaining_ms = max(
+                            250,
+                            int((deadline - time.monotonic()) * 1000),
+                        )
+                        # A tab can be detached or briefly covered while the
+                        # Qianchuan SPA redraws.  Playwright's default 30s
+                        # click timeout would consume this helper's entire
+                        # retry window on that stale node.
+                        await candidate.click(timeout=min(1_500, remaining_ms))
+                        return True
+                    except Exception:
+                        # Read-only catalog tabs are sometimes covered by a
+                        # transient guide/popover.  If the exact node is still
+                        # attached and visible, dispatch its own DOM click;
+                        # the following API-response checks remain the source
+                        # of truth for whether navigation actually succeeded.
+                        try:
+                            if await candidate.is_visible():
+                                await candidate.evaluate("node => node.click()")
+                                return True
+                        except Exception:
+                            continue
             try:
-                await locator.last.wait_for(
-                    state="visible",
-                    timeout=timeout_ms,
-                )
-                await locator.last.click()
-                return True
+                await page.wait_for_timeout(200)
             except Exception:
-                continue
+                await asyncio.sleep(0.2)
         return False
 
     @staticmethod
@@ -1438,6 +1466,46 @@ class ServiceController:
                 except Exception:
                     continue
         return False
+
+    @staticmethod
+    async def _has_visible_action_exact(page: Any, texts: List[str]) -> bool:
+        """Return whether an exact label is an interactive navigation control.
+
+        The global catalog can briefly render promotional copy containing
+        ``千川乘方`` while tabs are switching.  Plain visible text is not
+        evidence that this account exposes the Chengfang catalog.
+        """
+        for text in texts:
+            for role in ("tab", "link", "button", "menuitem"):
+                locator = page.get_by_role(role, name=text, exact=True)
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+                for index in range(count - 1, -1, -1):
+                    try:
+                        if await locator.nth(index).is_visible():
+                            return True
+                    except Exception:
+                        continue
+        return False
+
+    @classmethod
+    async def _open_all_product_subcatalogs(cls, page: Any) -> int:
+        """Visit 商品自选 and 全店托管 so one product class contains both."""
+        opened = 0
+        for label in ("商品自选", "全店托管"):
+            if await cls._click_visible_exact(
+                page,
+                [label],
+                timeout_ms=2_000,
+            ):
+                opened += 1
+                try:
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    await asyncio.sleep(1.5)
+        return opened
 
     @staticmethod
     async def _active_catalog_plan_system(page: Any) -> str:
@@ -1501,10 +1569,6 @@ class ServiceController:
                     !["乘方", "千川乘方", "乘方投放", "乘方计划"]
                       .some((label) => visibleLabels.has(label))
                   ) return "global";
-                  if (
-                    window.location.pathname.includes("/uni-prom/overall") &&
-                    visibleLabels.has("千川乘方")
-                  ) return "chengfang";
                   return "unknown";
                 }
                 """
@@ -1537,7 +1601,7 @@ class ServiceController:
         *,
         aavid: str,
     ) -> bool:
-        """Open Chengfang only from an explicit clickable platform label."""
+        """Open Chengfang only from an explicit interactive navigation label."""
         entry_texts = ["乘方", "千川乘方", "乘方投放", "乘方计划"]
         roles = ["tab", "link", "button", "menuitem"]
         for text in entry_texts:
@@ -1545,7 +1609,6 @@ class ServiceController:
                 page.get_by_role(role, name=text, exact=True)
                 for role in roles
             ]
-            locators.append(page.get_by_text(text, exact=True))
             for locator in locators:
                 try:
                     count = await locator.count()
@@ -1599,7 +1662,33 @@ class ServiceController:
             promotion_scene=promotion_scene,
             plan_system=plan_system,
         )
+        if not status.get("complete"):
+            replay = getattr(probe, "replay_full_catalog", None)
+            if callable(replay):
+                try:
+                    await replay(
+                        fetcher.page,
+                        aavid=aavid,
+                        promotion_scene=promotion_scene,
+                        plan_system=plan_system,
+                    )
+                except Exception:
+                    pass
+                status = await self._wait_catalog_class(
+                    probe,
+                    aavid=aavid,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
+                    timeout_seconds=8.0,
+                )
         _require_catalog_login(fetcher.page)
+        # list-optional follows list-required and carries the remaining rows by
+        # an in-memory session id.  Give that companion response a bounded
+        # settling window before freezing candidates for detail verification.
+        try:
+            await fetcher.page.wait_for_timeout(1_000)
+        except (AttributeError, TypeError):
+            await asyncio.sleep(1.0)
         candidates = probe.catalog_rows(
             aavid=aavid,
             promotion_scene=promotion_scene,
@@ -1666,21 +1755,29 @@ class ServiceController:
             fetcher.page,
             aavid=aavid,
         )
-        await self._click_visible_exact(
+        opened_product = await self._click_visible_exact(
             fetcher.page,
             ["推商品"],
-            timeout_ms=3_000,
+            timeout_ms=12_000,
         )
-        classes["global_product"] = await self._scan_catalog_class(
-            fetcher=fetcher,
-            probe=probe,
-            db=db,
-            owner_username=owner_username,
-            account=account,
-            promotion_scene="product",
-            plan_system="global",
-            page_url=page_url,
-        )
+        if opened_product:
+            await fetcher.page.wait_for_timeout(1_000)
+            await self._open_all_product_subcatalogs(fetcher.page)
+            classes["global_product"] = await self._scan_catalog_class(
+                fetcher=fetcher,
+                probe=probe,
+                db=db,
+                owner_username=owner_username,
+                account=account,
+                promotion_scene="product",
+                plan_system="global",
+                page_url=page_url,
+            )
+        else:
+            classes["global_product"] = {
+                "complete": False,
+                "message": "未找到可点击的推商品计划目录入口",
+            }
 
         probe.reset_catalog_class(
             aavid=aavid,
@@ -1709,6 +1806,7 @@ class ServiceController:
         opened_live = await self._click_visible_exact(
             fetcher.page,
             ["推直播间", "推直播"],
+            timeout_ms=12_000,
         )
         _require_catalog_login(fetcher.page)
         if opened_live:
@@ -1757,7 +1855,7 @@ class ServiceController:
             promotion_scene="product",
             plan_system="chengfang",
         )
-        has_chengfang_entry = await self._has_visible_exact(
+        has_chengfang_entry = await self._has_visible_action_exact(
             fetcher.page,
             ["乘方", "千川乘方", "乘方投放", "乘方计划"],
         )
