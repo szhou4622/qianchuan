@@ -1158,7 +1158,7 @@
                 loggedPanel.style.display = 'none';
                 document.getElementById('loginModalTitle').textContent = '登录账号';
                 document.getElementById('loginModalSub').style.display = 'block';
-                document.getElementById('loginUser').value = '';
+                document.getElementById('loginUser').value = window.qcLocalAuthUsername || '';
                 document.getElementById('loginPass').value = '';
             }
             loginModal.classList.add('show');
@@ -1478,6 +1478,15 @@
             }
             if (!credentials || !credentials.success || !credentials.username || !credentials.password) {
                 updateSidebarUserUI();
+                try {
+                    const info = await api.getEnvironmentInfo();
+                    window.qcLocalAuthUsername = (
+                        info && info.auth_mode === 'local'
+                            ? String(info.local_auth_username || '')
+                            : ''
+                    );
+                } catch (_) {}
+                openLoginModal();
                 return;
             }
             try {

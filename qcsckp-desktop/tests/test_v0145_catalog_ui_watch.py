@@ -29,6 +29,18 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("document.addEventListener('visibilitychange'", self.html)
         self.assertIn("load().then(resumeCatalogWatch)", self.html)
 
+    def test_clean_install_opens_login_and_prefills_local_username(self):
+        index_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "static",
+            "index.html",
+        )
+        with open(index_path, "r", encoding="utf-8") as handle:
+            index_html = handle.read()
+        self.assertIn("window.qcLocalAuthUsername", index_html)
+        self.assertIn("await api.getEnvironmentInfo()", index_html)
+        self.assertIn("openLoginModal();", index_html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,8 @@ from config import (
     TEST_AAVID,
     TEST_MATERIAL_ID,
     ALLOW_LIVE_RETARGET,
+    AUTH_MODE,
+    LOCAL_AUTH_USERNAME,
 )
 from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread
 from services.webhook_push_runtime import start_webhook_push_background_threads
@@ -771,6 +773,10 @@ class JSApi:
             "live_retarget_armed": bool(ALLOW_LIVE_RETARGET),
             "live_retarget_consumed": os.path.isfile(
                 os.path.join(DATA_DIR, "live_retarget_consumed.json")
+            ),
+            "auth_mode": str(AUTH_MODE or "local"),
+            "local_auth_username": (
+                str(LOCAL_AUTH_USERNAME or "") if AUTH_MODE == "local" else ""
             ),
         }
 
