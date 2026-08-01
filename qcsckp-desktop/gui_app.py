@@ -157,6 +157,7 @@ class SingleInstanceChecker:
         except (OSError, IOError):
             handle.close()
             self._write_show_window_command()
+            self.activate_existing_instance()
             return False
         self._lease_handle = handle
         return True
@@ -180,6 +181,84 @@ class SingleInstanceChecker:
             pass
         finally:
             handle.close()
+
+    @staticmethod
+    def _activate_windows_process(pid: int) -> bool:
+        """恢复指定进程的主窗口；用于托盘隐藏后重复双击程序的兜底唤醒。"""
+        if sys.platform != "win32" or not pid:
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            found = []
+            enum_proc = ctypes.WINFUNCTYPE(
+                ctypes.c_bool,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+
+            @enum_proc
+            def callback(hwnd, _lparam):
+                window_pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(
+                    hwnd,
+                    ctypes.byref(window_pid),
+                )
+                if int(window_pid.value) != int(pid):
+                    return True
+                title_length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+                if title_length <= 0:
+                    return True
+                title = ctypes.create_unicode_buffer(title_length + 1)
+                user32.GetWindowTextW(hwnd, title, title_length + 1)
+                if "千川素材看盘工具" not in str(title.value or ""):
+                    return True
+                # SW_RESTORE 处理最小化，SW_SHOW 处理托盘隐藏。重复启动是由
+                # 用户双击触发，新进程此时有权把既有窗口带到前台。
+                user32.ShowWindowAsync(hwnd, 9)
+                user32.ShowWindowAsync(hwnd, 5)
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                found.append(int(hwnd))
+                return False
+
+            user32.EnumWindows(callback, 0)
+            return bool(found)
+        except Exception as exc:
+            print(f"[单实例检查] Windows窗口恢复失败: {exc}")
+            return False
+
+    def activate_existing_instance(self) -> bool:
+        """按规范化可执行路径查找并恢复已经运行的同一工具。"""
+        if not PSUTIL_AVAILABLE:
+            return False
+        current_pid = os.getpid()
+        current_key = _canonical_exe_path(sys.executable)
+        if not current_key:
+            return False
+        try:
+            for proc in psutil.process_iter(["pid", "exe"]):
+                try:
+                    pid = int(proc.info.get("pid") or 0)
+                    if not pid or pid == current_pid:
+                        continue
+                    proc_exe = _psutil_resolve_exe(proc)
+                    if (
+                        proc_exe
+                        and _canonical_exe_path(proc_exe) == current_key
+                        and self._activate_windows_process(pid)
+                    ):
+                        print(f"[单实例检查] 已恢复现有窗口: PID={pid}")
+                        return True
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    psutil.ZombieProcess,
+                    ValueError,
+                ):
+                    continue
+        except Exception as exc:
+            print(f"[单实例检查] 恢复现有实例失败: {exc}")
+        return False
 
     def check_single_instance(self):
         """
@@ -208,6 +287,7 @@ class SingleInstanceChecker:
                             f"[单实例检查] 已有同路径实例: PID={proc.info['pid']}, exe={proc_exe}"
                         )
                         self._write_show_window_command()
+                        self._activate_windows_process(proc.info["pid"])
                         return True
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
@@ -248,6 +328,7 @@ class SingleInstanceChecker:
                     w = webview.windows[0]
                     w.show()
                     w.restore()
+                    self._activate_windows_process(os.getpid())
                     # 清除命令
                     with open(self.command_file, 'w', encoding='utf-8') as f:
                         json.dump({"show_window": False}, f)
