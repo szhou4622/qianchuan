@@ -46,9 +46,14 @@ def _text(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def mark_catalog_sync_started(*, owner_username: Any = None) -> Dict[str, Any]:
+def mark_catalog_sync_started(
+    *,
+    owner_username: Any = None,
+    account_uid: Any = "",
+) -> Dict[str, Any]:
     now = _now()
     owner = _owner_key(owner_username)
+    requested_account_uid = str(account_uid or "").strip()
     with _LOCK:
         _STATE.update(
             {
@@ -56,15 +61,20 @@ def mark_catalog_sync_started(*, owner_username: Any = None) -> Dict[str, Any]:
                 "running": True,
                 "started_at": _text(now),
                 "finished_at": "",
-                "message": "正在只读同步已添加账户和计划目录",
+                "message": (
+                    "正在只读刷新新添加账户的计划目录"
+                    if requested_account_uid
+                    else "正在只读同步已添加账户和计划目录"
+                ),
                 "status": "syncing",
                 "error": "",
                 "failure_kind": "",
                 "recovery_action": "",
                 "next_due_at": _text(now + timedelta(minutes=CATALOG_INTERVAL_MINUTES)),
                 "processed_accounts": 0,
-                "total_accounts": 0,
+                "total_accounts": 1 if requested_account_uid else 0,
                 "current_account": "",
+                "requested_account_uid": requested_account_uid,
             }
         )
         return dict(_STATE)
@@ -159,6 +169,7 @@ def finalize_catalog_sync(
     owner_username: Any = None,
     complete_account_uids: Optional[List[str]] = None,
     account_results: Optional[Dict[str, Dict[str, Any]]] = None,
+    refreshed_account_uids: Optional[List[str]] = None,
     error: Any = "",
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
@@ -169,6 +180,15 @@ def finalize_catalog_sync(
     accounts = list_qianchuan_accounts(owner_username=owner, db=store)
     targets = list_promotion_targets(owner_username=owner, db=store)
     complete = {str(item or "") for item in complete_account_uids or []}
+    refresh_scope = (
+        {
+            str(item or "").strip()
+            for item in refreshed_account_uids
+            if str(item or "").strip()
+        }
+        if refreshed_account_uids is not None
+        else {str(item.get("account_uid") or "") for item in accounts}
+    )
     result_map = (
         {
             str(key): dict(value)
@@ -186,6 +206,8 @@ def finalize_catalog_sync(
     now = _text(_now())
     for account in accounts:
         uid = str(account.get("account_uid") or "")
+        if uid not in refresh_scope:
+            continue
         scoped = [
             item for item in targets if str(item.get("account_uid") or "") == uid
         ]
@@ -220,10 +242,18 @@ def finalize_catalog_sync(
             },
             where={"account_uid": uid, "owner_username": owner},
         )
+    refreshed_accounts = [
+        item
+        for item in list_qianchuan_accounts(owner_username=owner, db=store)
+        if str(item.get("account_uid") or "") in refresh_scope
+    ]
     state_status = (
         "complete"
-        if accounts
-        and all(str(item.get("account_uid") or "") in complete for item in accounts)
+        if refreshed_accounts
+        and all(
+            str(item.get("catalog_status") or "") == "complete"
+            for item in refreshed_accounts
+        )
         and not error
         else "partial"
     )
@@ -261,9 +291,12 @@ def finalize_catalog_sync(
                 "next_due_at": _text(
                     _now() + timedelta(minutes=CATALOG_INTERVAL_MINUTES)
                 ),
-                "processed_accounts": len(accounts),
-                "total_accounts": len(accounts),
+                "processed_accounts": len(refreshed_accounts),
+                "total_accounts": len(refreshed_accounts),
                 "current_account": "",
+                "requested_account_uid": (
+                    next(iter(refresh_scope)) if len(refresh_scope) == 1 else ""
+                ),
             }
         )
         return catalog_sync_status(owner_username=owner, db=store)

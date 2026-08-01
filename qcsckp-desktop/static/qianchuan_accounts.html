@@ -262,12 +262,12 @@
     if(!r?.success){message(r?.message||'删除账户失败',true);return}
     dirty=false;await load();message(r?.message||'账户已删除');
   }
-  async function discover(){
+  async function discover(accountUid=''){
     const a=await waitApi();const statusBox=$('catalogActionStatus');const button=$('discover');
     const showStatus=(text,type='')=>{statusBox.textContent=text||'';statusBox.className=`head-action-status ${text?'show':''} ${type}`.trim()};
     let r;
     button.disabled=true;button.textContent='正在提交刷新…';showStatus('正在创建只读刷新任务，不会提交任何千川操作。');
-    try{r=await a.startQianchuanCatalogSync()}catch(e){r={success:false,message:String(e?.message||e)}}
+    try{r=await a.startQianchuanCatalogSync(accountUid||null)}catch(e){r={success:false,message:String(e?.message||e)}}
     if(!r?.success){button.disabled=false;button.textContent='刷新账户计划';showStatus(r?.message||'刷新任务启动失败','bad');message(r?.message||'刷新任务启动失败',true);return}
     const paint=async s=>{
       const overview=await a.getQianchuanAccountOverview();
@@ -309,9 +309,9 @@
         clearInterval(timer);$('addAccount').disabled=false;
         await load();
         if(s?.success&&s?.account){
-          message('当前千川账户已添加，正在刷新这个账户及其他已添加账户的计划。');
+          message('当前千川账户已添加，正在只读刷新这个账户的计划。识别出的计划默认不监控，请刷新完成后自行勾选并保存。');
           await new Promise(resolve=>setTimeout(resolve,1200));
-          await discover();
+          await discover(String(s.account.account_uid||s.account.aavid||''));
         }else{
           message(s?.message||'未完成账户添加，请重试。',true);
         }

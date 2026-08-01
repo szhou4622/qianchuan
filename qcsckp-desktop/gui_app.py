@@ -628,8 +628,8 @@ class JSApi:
     def removeQianchuanAccount(self, accountUid=None):
         return self.api.removeQianchuanAccount(accountUid)
 
-    def startQianchuanCatalogSync(self):
-        return self.api.startQianchuanCatalogSync()
+    def startQianchuanCatalogSync(self, accountUid=None):
+        return self.api.startQianchuanCatalogSync(accountUid)
 
     def getQianchuanCatalogSyncStatus(self):
         return self.api.getQianchuanCatalogSyncStatus()

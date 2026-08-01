@@ -1064,6 +1064,16 @@ class ServiceController:
             if self._thread is not None and self._thread.is_alive():
                 self._message = "服务已在运行"
                 return self.status()
+            if (
+                self._catalog_sync_thread is not None
+                and self._catalog_sync_thread.is_alive()
+            ):
+                return {
+                    "success": False,
+                    "running": False,
+                    "phase": "waiting_catalog_sync",
+                    "message": "账户计划正在刷新，完成后再启动自动监控",
+                }
 
             self._stop_event.clear()
             self._fetch_ready = False
@@ -1169,7 +1179,7 @@ class ServiceController:
         with self._lock:
             return dict(self._target_discovery_status)
 
-    def start_catalog_sync(self) -> dict:
+    def start_catalog_sync(self, account_uid: Any = "") -> dict:
         """Start the independent read-only all-account catalog scanner."""
         from services.qianchuan_catalog import (
             catalog_sync_status,
@@ -1224,24 +1234,48 @@ class ServiceController:
                     "failure_kind": "login_required",
                     "recovery_action": "open_visible_chrome",
                 }
+        requested_account_uid = str(account_uid or "").strip()
         cfg = ServiceConfig().normalize_paths()
-        if not list_qianchuan_accounts(
+        selected_accounts = list_qianchuan_accounts(
             owner_username=owner,
             db=SQLiteStore(database=cfg.db_path),
-        ):
+        )
+        if not selected_accounts:
             return {
                 "success": False,
                 "running": False,
                 "message": "尚未添加千川账户，请先选择并添加当前账户",
                 "failure_kind": "account_required",
             }
+        if requested_account_uid:
+            matched_account = next(
+                (
+                    item
+                    for item in selected_accounts
+                    if requested_account_uid
+                    in {
+                        str(item.get("account_uid") or ""),
+                        str(item.get("aavid") or ""),
+                    }
+                ),
+                None,
+            )
+            if matched_account is None:
+                return {
+                    "success": False,
+                    "running": False,
+                    "message": "要刷新的千川账户不存在或已被删除",
+                    "failure_kind": "account_not_found",
+                }
+            requested_account_uid = str(matched_account.get("account_uid") or "")
         mark_catalog_sync_started(
-            owner_username=owner
+            owner_username=owner,
+            account_uid=requested_account_uid,
         )
         with self._lock:
             self._catalog_sync_thread = threading.Thread(
                 target=self._catalog_sync_entry,
-                args=(owner,),
+                args=(owner, requested_account_uid),
                 name="qianchuan-catalog-sync",
                 daemon=True,
             )
@@ -1288,10 +1322,18 @@ class ServiceController:
                 pass
             time.sleep(60)
 
-    def _catalog_sync_entry(self, owner_username: str) -> None:
+    def _catalog_sync_entry(
+        self,
+        owner_username: str,
+        account_uid: str = "",
+    ) -> None:
+        refresh_scope = [str(account_uid or "").strip()] if account_uid else None
         try:
             asyncio.run(
-                self._catalog_sync_async(owner_username=owner_username)
+                self._catalog_sync_async(
+                    owner_username=owner_username,
+                    account_uid=account_uid,
+                )
             )
         except CatalogLoginRequired as exc:
             from services.qianchuan_catalog import finalize_catalog_sync
@@ -1305,6 +1347,7 @@ class ServiceController:
             if visible_login_running:
                 finalize_catalog_sync(
                     owner_username=owner_username,
+                    refreshed_account_uids=refresh_scope,
                     error=(
                         "旧目录同步检测到登录异常，但可见Chrome正在重新登录；"
                         "已忽略旧会话结果"
@@ -1321,6 +1364,7 @@ class ServiceController:
             )
             finalize_catalog_sync(
                 owner_username=owner_username,
+                refreshed_account_uids=refresh_scope,
                 error=str(exc),
             )
         except Exception as exc:
@@ -1328,6 +1372,7 @@ class ServiceController:
 
             finalize_catalog_sync(
                 owner_username=owner_username,
+                refreshed_account_uids=refresh_scope,
                 error=f"账户计划目录同步失败：{exc}",
             )
 
@@ -1874,7 +1919,12 @@ class ServiceController:
             )[:2000],
         }
 
-    async def _catalog_sync_async(self, *, owner_username: str) -> None:
+    async def _catalog_sync_async(
+        self,
+        *,
+        owner_username: str,
+        account_uid: str = "",
+    ) -> None:
         from services.qianchuan_catalog import (
             finalize_catalog_sync,
             mark_catalog_sync_progress,
@@ -1889,15 +1939,36 @@ class ServiceController:
             raise RuntimeError("千川登录状态不存在")
         cfg = ServiceConfig().normalize_paths()
         db = SQLiteStore(database=cfg.db_path)
-        accounts = list_qianchuan_accounts(
+        all_accounts = list_qianchuan_accounts(
             owner_username=owner,
             db=db,
+        )
+        requested_account_uid = str(account_uid or "").strip()
+        accounts = (
+            [
+                item
+                for item in all_accounts
+                if requested_account_uid
+                in {
+                    str(item.get("account_uid") or ""),
+                    str(item.get("aavid") or ""),
+                }
+            ]
+            if requested_account_uid
+            else all_accounts
         )
         if not accounts:
             finalize_catalog_sync(
                 owner_username=owner,
                 account_results={},
-                error="尚未添加千川账户；请先选择当前账户并添加",
+                refreshed_account_uids=(
+                    [requested_account_uid] if requested_account_uid else None
+                ),
+                error=(
+                    "要刷新的千川账户不存在或已被删除"
+                    if requested_account_uid
+                    else "尚未添加千川账户；请先选择当前账户并添加"
+                ),
                 db=db,
             )
             return
@@ -1917,7 +1988,7 @@ class ServiceController:
                 migrate_existing_qianchuan_accounts(
                     owner_username=owner,
                     authorized_aavids={
-                        str(item.get("aavid") or "") for item in accounts
+                        str(item.get("aavid") or "") for item in all_accounts
                     },
                     db=db,
                 )
@@ -1941,13 +2012,25 @@ class ServiceController:
                         db=db,
                     )
                     try:
-                        result = await self._scan_global_account_catalog(
-                            fetcher=fetcher,
-                            probe=probe,
-                            db=db,
-                            owner_username=owner,
-                            account=account,
+                        result = await asyncio.wait_for(
+                            self._scan_global_account_catalog(
+                                fetcher=fetcher,
+                                probe=probe,
+                                db=db,
+                                owner_username=owner,
+                                account=account,
+                            ),
+                            timeout=300.0,
                         )
+                    except asyncio.TimeoutError:
+                        result = {
+                            "complete": False,
+                            "classes": {},
+                            "error": (
+                                "该账户计划目录刷新超过5分钟，已安全结束；"
+                                "已识别到的计划仍会展示，可重新刷新补全"
+                            ),
+                        }
                     except CatalogLoginRequired:
                         raise
                     except Exception as exc:
@@ -1982,6 +2065,9 @@ class ServiceController:
         finalize_catalog_sync(
             owner_username=owner,
             account_results=account_results,
+            refreshed_account_uids=[
+                str(item.get("account_uid") or "") for item in accounts
+            ],
             error="",
             db=db,
         )

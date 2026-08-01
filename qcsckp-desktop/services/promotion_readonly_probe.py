@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from copy import deepcopy
@@ -111,6 +112,21 @@ ACCOUNT_NAME_KEYS = (
     ("user_info_name", 10),
 )
 ACCOUNT_LIST_PATH = "/ad/api/v1/account/user-list"
+
+
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _path_write_lock(path: str) -> threading.RLock:
+    """同一进程内所有探针实例共享目标文件锁。"""
+    key = os.path.normcase(os.path.abspath(path))
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 def _safe_text(value: Any, limit: int = 160) -> str:
@@ -328,7 +344,9 @@ def summarize_page(url: str, page_text: str) -> Dict[str, Any]:
 class PromotionReadOnlyProbe:
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
-        self._lock = threading.Lock()
+        # 目录刷新、可见登录和采集服务可能各自创建探针。实例锁无法阻止
+        # 它们同时写同一个 .tmp；必须按绝对路径共享锁。
+        self._lock = _path_write_lock(self.path)
         self._pages: Dict[str, Dict[str, Any]] = {}
         self._apis: Dict[str, Dict[str, Any]] = {}
         self._requests: Dict[str, Dict[str, Any]] = {}
@@ -363,11 +381,39 @@ class PromotionReadOnlyProbe:
     def _write(self, data: Dict[str, Any]) -> None:
         parent = os.path.dirname(self.path)
         os.makedirs(parent, exist_ok=True)
-        tmp = self.path + ".tmp"
         with self._lock:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+            tmp = ""
+            try:
+                # 临时文件必须与目标文件处于同一目录，保证 os.replace
+                # 仍是原子替换；唯一文件名避免旧版遗留的固定 .tmp 冲突。
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=parent,
+                    prefix=f".{os.path.basename(self.path)}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    tmp = handle.name
+                    json.dump(data, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path)
+                tmp = ""
+                # v0.1.40 使用的固定临时文件可能在异常退出后留下；它
+                # 不再参与写入，仅在未被占用时尽力清理。
+                legacy_tmp = self.path + ".tmp"
+                try:
+                    if os.path.isfile(legacy_tmp):
+                        os.remove(legacy_tmp)
+                except OSError:
+                    pass
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
     def _flush(self) -> None:
         self._write(
@@ -888,25 +934,35 @@ class PromotionReadOnlyProbe:
         for row in rows:
             ad_id = str(row.get("ad_id") or "").strip()
             try:
-                response = await page.evaluate(
-                    """async ({endpoint, aavid, adId}) => {
+                response = await asyncio.wait_for(
+                    page.evaluate(
+                    """async ({endpoint, aavid, adId, timeoutMs}) => {
                         const query = new URLSearchParams({
                             aavid,
                             adid: adId
                         });
-                        const result = await fetch(
-                            `${endpoint}?${query.toString()}`,
-                            {credentials: 'include'}
-                        );
-                        let payload = null;
-                        try { payload = await result.json(); } catch (_) {}
-                        return {status: result.status, payload};
+                        const controller = new AbortController();
+                        const timer = setTimeout(() => controller.abort(), timeoutMs);
+                        try {
+                            const result = await fetch(
+                                `${endpoint}?${query.toString()}`,
+                                {credentials: 'include', signal: controller.signal}
+                            );
+                            let payload = null;
+                            try { payload = await result.json(); } catch (_) {}
+                            return {status: result.status, payload};
+                        } finally {
+                            clearTimeout(timer);
+                        }
                     }""",
                     {
                         "endpoint": endpoint,
                         "aavid": aid,
                         "adId": ad_id,
+                        "timeoutMs": 8_000,
                     },
+                    ),
+                    timeout=12.0,
                 )
                 payload = (
                     response.get("payload")

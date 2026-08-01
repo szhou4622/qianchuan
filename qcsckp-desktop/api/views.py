@@ -220,9 +220,9 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
-    def startQianchuanCatalogSync(self):
+    def startQianchuanCatalogSync(self, account_uid=None):
         try:
-            return self.service.start_catalog_sync()
+            return self.service.start_catalog_sync(account_uid)
         except Exception as e:
             return {"success": False, "message": str(e)}
 
