@@ -144,7 +144,15 @@ uv run python tools/restore_rc23_snapshot.py
 
 ## 打包与更新（Windows）
 
-- 依赖中包含 `auto-py-to-exe`，可按需将 `gui_app.py` 打成独立可执行文件；打包后静态资源需与 `config` 中约定的目录结构一致（如 `bin/static` 或 `static`）。
+- 使用仓库内的 `packaging/windows/build_windows.ps1` 生成 Windows x64 目录式发布包：
+
+  ```powershell
+  .\packaging\windows\build_windows.ps1 -Version 0.1.38
+  ```
+
+- 输出位于 `output/windows/v<版本>/dist/`，结构为根目录 `QCSCKP.exe` + `bin/` 依赖。发送给用户时必须整个目录一起压缩，不得只发 EXE。
+- 打包脚本包含静态页面、Playwright 驱动、WebView、飞书长连接和托盘依赖，但不包含 Chromium；目标电脑仍需安装 Google Chrome。
+- 发布目录不得带入开发环境的 `data/`、`logs/`、Cookie、SQLite 数据库、飞书密钥或 `.env`。
 - `services/update_service_win.py` 提供 **ZIP 覆盖更新**流程（下载 → 解压 → 校验含根级 `.exe` 与 `bin` 目录 → 批处理替换），**仅建议在 PyInstaller 冻结后的正式包上使用**；开发模式会直接拒绝以免破坏本地 Python 环境。
 
 ---
