@@ -22,6 +22,8 @@ qcsckp-desktop/dev_files/
 # Build output
 **/build/
 **/dist/
+!qcsckp-desktop/production_v1a_frontend/dist/
+!qcsckp-desktop/production_v1a_frontend/dist/**
 **/wheels/
+**/node_modules/
 *.egg-info/
-

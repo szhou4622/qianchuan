@@ -3,8 +3,11 @@ __pycache__/
 *.py[oc]
 build/
 dist/
+!production_v1a_frontend/dist/
+!production_v1a_frontend/dist/**
 wheels/
 *.egg-info
+*.tsbuildinfo
 
 # Virtual environments
 .venv

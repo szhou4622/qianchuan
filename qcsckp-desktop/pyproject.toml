@@ -1,7 +1,7 @@
 [project]
 name = "qianchuan-promotion-crawl"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0a1"
+description = "千川工具生产版 V1A 可信只读采集与规则模拟"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,6 +18,9 @@ dependencies = [
     "pywin32>=311",
     "screeninfo>=0.8.1",
 ]
+
+[project.scripts]
+qcsckp-v1a = "desktop_v1a:main"
 
 [tool.uv.sources]
 baseopensdk = { url = "https://lf3-static.bytednsdoc.com/obj/eden-cn/lmeh7phbozvhoz/base-open-sdk/baseopensdk-0.0.13-py3-none-any.whl" }
