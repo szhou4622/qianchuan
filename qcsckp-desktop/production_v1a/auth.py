@@ -28,7 +28,7 @@ from .storage import RuntimeDatabase, StorageWriter, short_transaction
 from .timeutils import utc_iso, utc_now
 
 PBKDF2_ITERATIONS = 600_000
-USERNAME_RE = re.compile(r"^[^\s]{3,32}$")
+USERNAME_RE = re.compile(r"^[^\s]{2,32}$")
 
 
 class AdminValidationError(ValueError):
@@ -189,13 +189,9 @@ class LocalAdminService:
     @staticmethod
     def _validate(username: str, password: str) -> None:
         if not USERNAME_RE.fullmatch(username):
-            raise AdminValidationError("账号需为3至32个非空白字符")
-        if len(password) < 10:
-            raise AdminValidationError("密码至少10位")
-        if password.lower() == password or password.upper() == password:
-            raise AdminValidationError("密码需同时包含大小写字母")
-        if not any(char.isdigit() for char in password):
-            raise AdminValidationError("密码需包含数字")
+            raise AdminValidationError("账号需为2至32个非空白字符")
+        if len(password) < 6:
+            raise AdminValidationError("密码至少6个字符")
 
 
 class AdminSessionStore:

@@ -408,7 +408,7 @@ function AdminGate({
           label={recoveryMode ? "新密码" : "密码"}
           hint={
             mode === "create" || recoveryMode
-              ? "至少10位，包含大小写字母和数字"
+              ? "至少6个字符，不限制字母或数字组合"
               : undefined
           }
         >

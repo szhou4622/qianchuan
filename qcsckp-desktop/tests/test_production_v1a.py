@@ -17,7 +17,7 @@ from production_v1a.adapters.models import (
     PageResult,
     PaginatedResult,
 )
-from production_v1a.auth import LocalAdminService
+from production_v1a.auth import AdminValidationError, LocalAdminService
 from production_v1a.browser_worker import LoginRequired, PlaywrightBrowserWorker
 from production_v1a.candidates import CandidateBlocked, CandidateService
 from production_v1a.collections import CollectionService, _classify_operation, material_uid
@@ -909,6 +909,24 @@ class ProductionV1AAdminAndApiTests(unittest.TestCase):
                 self.assertTrue(auth.verify_password("admin_local", "NewStrongPass456"))
             finally:
                 writer.close()
+
+    def test_local_admin_accepts_two_character_username_and_simple_six_character_password(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-v1a-admin-short-credentials-") as root:
+            database = RuntimeDatabase(RuntimePaths.from_root(root).ensure())
+            writer = StorageWriter(database).start()
+            try:
+                auth = LocalAdminService(database, writer)
+                auth.create_initial_admin("小倩", "123456")
+                self.assertTrue(auth.verify_password("小倩", "123456"))
+            finally:
+                writer.close()
+
+    def test_local_admin_rejects_username_or_password_below_new_minimum(self):
+        with self.assertRaisesRegex(AdminValidationError, "账号需为2至32个非空白字符"):
+            LocalAdminService._validate("千", "123456")
+        with self.assertRaisesRegex(AdminValidationError, "密码至少6个字符"):
+            LocalAdminService._validate("千七", "12345")
+        LocalAdminService._validate("千七", "abcdef")
 
     def test_local_api_requires_launch_token_and_reports_zero_writes(self):
         with tempfile.TemporaryDirectory(prefix="qcsckp-v1a-api-") as root:
