@@ -353,6 +353,21 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                 int(query.get("page") or 1),
                 int(query.get("page_size") or 20),
             )
+            data["groups"] = runtime.database.query_all(
+                """
+                SELECT group_uid, sequence, group_mode, material_ids_json,
+                       material_count, status, created_by_open_id, created_at, updated_at
+                FROM retarget_group
+                WHERE candidate_batch_id=?
+                ORDER BY sequence
+                """,
+                (batch_id,),
+            )
+            for group in data["groups"]:
+                group["material_ids"] = json.loads(
+                    str(group.get("material_ids_json") or "[]")
+                )
+            data["group_count"] = len(data["groups"])
         elif path == "/api/v1/feishu/status":
             data = runtime.feishu.status(tool_user_id)
         elif path == "/api/v1/feishu/routes":
@@ -386,7 +401,8 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/v1/migrations":
             data = {
                 "sources": runtime.database.query_all(
-                    "SELECT * FROM migration_source ORDER BY modified_at DESC"
+                    "SELECT * FROM migration_source WHERE tool_user_id=? ORDER BY modified_at DESC",
+                    (tool_user_id,),
                 ),
                 "runs": runtime.database.query_all(
                     "SELECT * FROM migration_run WHERE tool_user_id=? ORDER BY started_at DESC",

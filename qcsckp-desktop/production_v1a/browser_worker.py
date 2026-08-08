@@ -345,8 +345,8 @@ class PlaywrightBrowserWorker(ReadTransport):
             for marker in ("验证码", "安全验证", "访问过于频繁", "risk verification")
         )
 
-    @staticmethod
-    def _fetch_account_info_in_page(page, aavid: str) -> dict[str, Any] | None:
+    def _fetch_account_info_in_page(self, page, aavid: str) -> dict[str, Any] | None:
+        self.guard.assert_allowed("GET", "/ad/api/v1/account/user/info")
         result = page.evaluate(
             """
             async ({aavid}) => {

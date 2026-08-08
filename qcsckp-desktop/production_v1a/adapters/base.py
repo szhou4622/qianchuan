@@ -54,6 +54,23 @@ def _dig(payload: Any, paths: tuple[tuple[str, ...], ...]) -> Any:
     return None
 
 
+def _platform_bool(value: Any) -> bool:
+    """Parse platform boolean fields without treating the string ``false`` as true."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError("schema_changed: pagination boolean is not 0/1")
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    raise ValueError("schema_changed: pagination boolean is invalid")
+
+
 def response_schema_hash(payload: Any) -> str:
     def shape(value: Any, depth: int = 0) -> Any:
         if depth > 8:
@@ -190,6 +207,26 @@ class PlatformAdapter(ABC):
     ) -> PaginatedResult:
         if assist_task_scene not in (1, 2, 3):
             raise ValueError("assist_task_scene must be 1, 2 or 3")
+        dataset = self.control_dataset(assist_task_scene)
+        if not dataset:
+            # 未取证的数据集不能用空键发请求并把偶然返回当作可信任务。
+            return PaginatedResult(
+                rows=(),
+                platform_total_count=None,
+                expected_pages=None,
+                successful_pages=0,
+                failed_pages=(1,),
+                raw_count=0,
+                unique_count=0,
+                duplicate_count=0,
+                status="failed",
+                platform_server_time=None,
+                error_code="control_dataset_unobserved",
+                error_message=(
+                    f"{self.plan_system}/{self.promotion_scene}/scene_{assist_task_scene} "
+                    "control dataset has no verified contract"
+                ),
+            )
 
         def fetch(page: int) -> PageResult:
             body = {
@@ -199,7 +236,7 @@ class PlatformAdapter(ABC):
                 "PrimaryAID": ad_id,
                 "AssistTaskScene": assist_task_scene,
                 "MarGoal": self.mar_goal,
-                "SophonxDataSetKey": self.control_dataset(assist_task_scene),
+                "SophonxDataSetKey": dataset,
             }
             payload = self.request("POST", self.CONTROL_ENDPOINT, body=body)
             return self.extract_page(payload, page, page_size)
@@ -302,7 +339,17 @@ class PlatformAdapter(ABC):
             plan_system=system,
             promotion_scene=scene,
             platform_status=str(
-                _first(row, ("platform_status", "status", "deliveryStatus", "adDeliveryType"), "unknown")
+                _first(
+                    row,
+                    (
+                        "platform_status",
+                        "status",
+                        "deliveryStatus",
+                        "adDeliveryName",
+                        "adDeliveryType",
+                    ),
+                    "unknown",
+                )
             ),
             verification_state=verification,
             adapter_version=self.adapter_version,
@@ -310,6 +357,8 @@ class PlatformAdapter(ABC):
                 "MarGoal": goal,
                 "AdlabScene": row.get("AdlabScene"),
                 "IsOverallRoi": row.get("IsOverallRoi"),
+                "adDeliveryName": row.get("adDeliveryName"),
+                "adDeliveryType": row.get("adDeliveryType"),
                 "explicit_system": explicit_system or None,
             },
         )
@@ -519,7 +568,7 @@ class PlatformAdapter(ABC):
                 or len(rows) >= page_size
             )
         else:
-            has_more = bool(has_more_value)
+            has_more = _platform_bool(has_more_value)
         platform_time = _dig(
             payload,
             (("serverTime",), ("data", "serverTime"), ("meta", "server_time")),
@@ -548,9 +597,12 @@ class PlatformAdapter(ABC):
         error_code: str | None = None
         error_message: str | None = None
         schema_hashes: set[str] = set()
+        reached_terminal_page = False
         while page <= 10_000:
             try:
                 result = fetch_page(page)
+                if result.page_number != page or result.page_size <= 0:
+                    raise ValueError("schema_changed: pagination context mismatch")
                 schema_hashes.add(result.response_schema_hash)
                 successful_pages += 1
                 raw_count += len(result.rows)
@@ -558,6 +610,14 @@ class PlatformAdapter(ABC):
                 if total is None and result.total_count is not None:
                     total = result.total_count
                     expected_pages = math.ceil(total / result.page_size) if total else 0
+                elif (
+                    total is not None
+                    and result.total_count is not None
+                    and result.total_count != total
+                ):
+                    raise ValueError("schema_changed: pagination total changed")
+                if result.has_more and not result.rows:
+                    raise ValueError("schema_changed: empty page declares hasMore")
                 for raw in result.rows:
                     value = normalize(raw, str(raw.get("aavid") or ""))
                     if value is None and drop_none:
@@ -569,6 +629,7 @@ class PlatformAdapter(ABC):
                     seen.add(key)
                     normalized_rows.append(value)
                 if not result.has_more:
+                    reached_terminal_page = True
                     break
                 page += 1
             except Exception as exc:
@@ -576,8 +637,25 @@ class PlatformAdapter(ABC):
                 error_message = str(exc)
                 error_code = "schema_changed" if "schema_changed" in str(exc) else type(exc).__name__
                 break
+        pagination_incomplete = bool(
+            not failed_pages
+            and (
+                not reached_terminal_page
+                or (expected_pages is not None and successful_pages < expected_pages)
+                or (total is not None and raw_count != total)
+            )
+        )
+        if pagination_incomplete:
+            error_code = "pagination_incomplete"
+            error_message = (
+                "pagination evidence mismatch: "
+                f"total={total}, raw_count={raw_count}, "
+                f"expected_pages={expected_pages}, successful_pages={successful_pages}"
+            )
         if failed_pages:
             status = "schema_changed" if error_code == "schema_changed" else "partial"
+        elif pagination_incomplete:
+            status = "partial"
         elif total not in (None, 0) and not normalized_rows:
             status = "suspicious_empty"
         elif total == 0 and successful_pages:

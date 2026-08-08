@@ -50,13 +50,115 @@ class CandidateService:
         self.database = database
         self.writer = writer
 
+    def expire_due_candidates(self, tool_user_id: str | None = None) -> dict[str, int]:
+        """持久化所有已到期候选，并取消尚未发送的旧预览。"""
+
+        now = utc_iso()
+
+        def op(conn):
+            with short_transaction(conn):
+                user_clause = " AND tool_user_id=?" if tool_user_id else ""
+                params: list[Any] = [now]
+                if tool_user_id:
+                    params.append(tool_user_id)
+                batch_rows = conn.execute(
+                    """
+                    SELECT candidate_batch_id FROM candidate_batch
+                    WHERE expires_at<=?
+                      AND status IN ('frozen','grouped','pending_approval')
+                    """
+                    + user_clause,
+                    params,
+                ).fetchall()
+                batch_ids = [str(row["candidate_batch_id"]) for row in batch_rows]
+                if batch_ids:
+                    placeholders = ",".join("?" for _ in batch_ids)
+                    conn.execute(
+                        f"UPDATE candidate_batch SET status='expired', terminal_at=?, updated_at=? WHERE candidate_batch_id IN ({placeholders})",
+                        [now, now, *batch_ids],
+                    )
+                    conn.execute(
+                        f"UPDATE retarget_group SET status='expired', updated_at=? WHERE candidate_batch_id IN ({placeholders}) AND status='frozen'",
+                        [now, *batch_ids],
+                    )
+                    conn.execute(
+                        f"UPDATE feishu_outbox SET status='cancelled', updated_at=? WHERE task_uid IN ({placeholders}) AND status IN ('queued','retry')",
+                        [now, *batch_ids],
+                    )
+
+                adjustment_params: list[Any] = [now]
+                if tool_user_id:
+                    adjustment_params.append(tool_user_id)
+                adjustment_rows = conn.execute(
+                    """
+                    SELECT adjustment_candidate_id FROM adjustment_candidate
+                    WHERE expires_at<=? AND status IN ('frozen','preview_queued')
+                    """
+                    + user_clause,
+                    adjustment_params,
+                ).fetchall()
+                adjustment_ids = [
+                    str(row["adjustment_candidate_id"]) for row in adjustment_rows
+                ]
+                if adjustment_ids:
+                    placeholders = ",".join("?" for _ in adjustment_ids)
+                    conn.execute(
+                        f"UPDATE adjustment_candidate SET status='expired', updated_at=? WHERE adjustment_candidate_id IN ({placeholders})",
+                        [now, *adjustment_ids],
+                    )
+                    conn.execute(
+                        f"UPDATE feishu_outbox SET status='cancelled', updated_at=? WHERE task_uid IN ({placeholders}) AND status IN ('queued','retry')",
+                        [now, *adjustment_ids],
+                    )
+                return {
+                    "candidate_batches": len(batch_ids),
+                    "adjustment_candidates": len(adjustment_ids),
+                }
+
+        return self.writer.submit(op)
+
+    def _require_trusted_catalog(
+        self,
+        tool_user_id: str,
+        target: dict[str, Any],
+        *,
+        max_catalog_age_seconds: int,
+    ) -> None:
+        account = self.database.query_one(
+            """
+            SELECT enabled, catalog_status, catalog_completed_at, removed_at
+            FROM advertiser_account
+            WHERE tool_user_id=? AND aavid=?
+            """,
+            (tool_user_id, str(target["aavid"])),
+        )
+        if not account or account.get("removed_at"):
+            raise CandidateBlocked("account_not_active")
+        if int(account.get("enabled") or 0) != 1:
+            raise CandidateBlocked("account_disabled")
+        if str(account.get("catalog_status") or "") != "complete":
+            raise CandidateBlocked("account_catalog_not_complete")
+        completed_at = account.get("catalog_completed_at")
+        if not completed_at:
+            raise CandidateBlocked("account_catalog_not_complete")
+        try:
+            completed = __import__("datetime").datetime.fromisoformat(
+                str(completed_at).replace("Z", "+00:00")
+            )
+        except Exception as exc:
+            raise CandidateBlocked("account_catalog_time_invalid") from exc
+        if (utc_now() - completed).total_seconds() > max_catalog_age_seconds:
+            raise CandidateBlocked("account_catalog_stale")
+
     def generate_for_target(
         self,
         tool_user_id: str,
         target_uid: str,
         *,
         max_data_age_seconds: int = 600,
+        max_catalog_age_seconds: int = 3600,
     ) -> list[str]:
+        self.expire_due_candidates(tool_user_id)
         target = self.database.query_one(
             "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
             (tool_user_id, target_uid),
@@ -65,6 +167,11 @@ class CandidateService:
             raise CandidateBlocked("target_not_found")
         if int(target["monitor_enabled"]) != 1 or int(target["monitor_eligible"]) != 1:
             raise CandidateBlocked("target_not_monitorable")
+        self._require_trusted_catalog(
+            tool_user_id,
+            target,
+            max_catalog_age_seconds=max_catalog_age_seconds,
+        )
         latest_run = self.database.query_one(
             """
             SELECT * FROM collection_run
@@ -182,44 +289,73 @@ class CandidateService:
         target_uid: str,
         *,
         max_data_age_seconds: int = 600,
+        max_catalog_age_seconds: int = 3600,
     ) -> list[str]:
         """Freeze Scene 2 pause/adjustment simulations; never create a real execution."""
+        self.expire_due_candidates(tool_user_id)
         target = self.database.query_one(
             "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
             (tool_user_id, target_uid),
         )
         if not target or int(target["monitor_enabled"]) != 1 or int(target["monitor_eligible"]) != 1:
             raise CandidateBlocked("target_not_monitorable")
+        self._require_trusted_catalog(
+            tool_user_id,
+            target,
+            max_catalog_age_seconds=max_catalog_age_seconds,
+        )
         latest_run = self.database.query_one(
             """
             SELECT * FROM collection_run
             WHERE tool_user_id=? AND target_uid=? AND object_type='video_material'
-              AND business_date=? AND status='complete'
+              AND business_date=?
             ORDER BY started_at DESC, rowid DESC LIMIT 1
             """,
             (tool_user_id, target_uid, business_date()),
         )
-        if not latest_run:
+        if not latest_run or latest_run["status"] != "complete":
             raise CandidateBlocked("latest_material_batch_not_complete")
         observed = __import__("datetime").datetime.fromisoformat(
             str(latest_run["completed_at"]).replace("Z", "+00:00")
         )
         if (utc_now() - observed).total_seconds() > max_data_age_seconds:
             raise CandidateBlocked("latest_material_batch_stale")
+        latest_control_run = self.database.query_one(
+            """
+            SELECT * FROM collection_run
+            WHERE tool_user_id=? AND aavid=? AND target_uid=?
+              AND object_type='control_task:scene_2'
+            ORDER BY started_at DESC, rowid DESC LIMIT 1
+            """,
+            (tool_user_id, target["aavid"], target_uid),
+        )
+        if not latest_control_run or latest_control_run["status"] != "complete":
+            raise CandidateBlocked("latest_scene2_batch_not_complete")
+        control_observed = __import__("datetime").datetime.fromisoformat(
+            str(latest_control_run["completed_at"]).replace("Z", "+00:00")
+        )
+        if (utc_now() - control_observed).total_seconds() > max_data_age_seconds:
+            raise CandidateBlocked("latest_scene2_batch_stale")
         tasks = self.database.query_all(
             """
             SELECT * FROM platform_control_task
             WHERE tool_user_id=? AND aavid=? AND source_plan_id=?
               AND assist_task_scene=2
+              AND last_collection_run_id=?
             ORDER BY created_at_platform, control_task_id
             """,
-            (tool_user_id, target["aavid"], target_uid),
+            (
+                tool_user_id,
+                target["aavid"],
+                target_uid,
+                latest_control_run["collection_run_id"],
+            ),
         )
         strategies = self.database.query_all(
             """
             SELECT * FROM strategy
             WHERE tool_user_id=? AND target_uid=? AND enabled=1
-              AND strategy_type IN ('retarget_pause','retarget_adjust')
+              AND strategy_type='retarget_pause'
               AND action_mode='dry_run'
             ORDER BY priority ASC, created_at ASC
             """,
@@ -524,7 +660,7 @@ class CandidateService:
         )
         if not batch:
             raise KeyError(batch_id)
-        if batch["status"] in {"expired", "cancelled", "rejected"}:
+        if batch["status"] not in {"frozen", "grouped"}:
             raise CandidateBlocked(f"batch_{batch['status']}")
         allowed = {
             str(row["material_id"])
@@ -557,11 +693,21 @@ class CandidateService:
 
         def op(conn):
             with short_transaction(conn):
-                sequence_row = conn.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) AS seq FROM retarget_group WHERE candidate_batch_id=?",
-                    (batch_id,),
+                current = conn.execute(
+                    "SELECT status FROM candidate_batch WHERE tool_user_id=? AND candidate_batch_id=?",
+                    (tool_user_id, batch_id),
                 ).fetchone()
-                sequence = int(sequence_row["seq"])
+                if not current:
+                    raise KeyError(batch_id)
+                if current["status"] not in {"frozen", "grouped"}:
+                    raise CandidateBlocked(f"batch_{current['status']}")
+                # 桌面端每次提交的是完整分组草稿。候选尚未发卡时原子替换，
+                # 使删除/重排后的页面状态与数据库冻结快照完全一致。
+                conn.execute(
+                    "DELETE FROM retarget_group WHERE candidate_batch_id=? AND status='frozen'",
+                    (batch_id,),
+                )
+                sequence = 0
                 for mode, ids in expanded:
                     sequence += 1
                     fingerprint = stable_json_hash(
@@ -582,7 +728,7 @@ class CandidateService:
                             group_uid, candidate_batch_id, sequence, group_mode,
                             material_ids_json, material_count, group_fingerprint,
                             status, created_by_open_id, created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'dry_run_completed', ?, ?, ?)
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'frozen', ?, ?, ?)
                         """,
                         (
                             group_uid,
@@ -597,7 +743,76 @@ class CandidateService:
                             now,
                         ),
                     )
-                    execution_uid = f"execution_{uuid.uuid4().hex}"
+                conn.execute(
+                    "UPDATE candidate_batch SET status='grouped', terminal_at=NULL, updated_at=? WHERE candidate_batch_id=?",
+                    (now, batch_id),
+                )
+
+        self.writer.submit(op)
+        return group_ids
+
+    def confirm_groups(
+        self,
+        tool_user_id: str,
+        batch_id: str,
+        *,
+        authorized_by_open_id: str,
+    ) -> list[str]:
+        """确认冻结分组并生成纯 dry-run 结果；绝不调用任何平台适配器。"""
+
+        now_dt = utc_now()
+        now = utc_iso(now_dt)
+
+        def op(conn):
+            with short_transaction(conn):
+                batch = conn.execute(
+                    "SELECT * FROM candidate_batch WHERE tool_user_id=? AND candidate_batch_id=?",
+                    (tool_user_id, batch_id),
+                ).fetchone()
+                if not batch:
+                    raise KeyError(batch_id)
+                if batch["status"] == "completed":
+                    return [
+                        str(row["group_uid"])
+                        for row in conn.execute(
+                            "SELECT group_uid FROM retarget_group WHERE candidate_batch_id=? ORDER BY sequence",
+                            (batch_id,),
+                        ).fetchall()
+                    ]
+                if batch["status"] != "pending_approval":
+                    raise CandidateBlocked(f"batch_{batch['status']}")
+                expires_at = __import__("datetime").datetime.fromisoformat(
+                    str(batch["expires_at"]).replace("Z", "+00:00")
+                )
+                if expires_at <= now_dt:
+                    conn.execute(
+                        "UPDATE candidate_batch SET status='expired', terminal_at=?, updated_at=? WHERE candidate_batch_id=?",
+                        (now, now, batch_id),
+                    )
+                    conn.execute(
+                        "UPDATE retarget_group SET status='expired', updated_at=? WHERE candidate_batch_id=? AND status='frozen'",
+                        (now, batch_id),
+                    )
+                    return []
+                groups = conn.execute(
+                    "SELECT * FROM retarget_group WHERE candidate_batch_id=? ORDER BY sequence",
+                    (batch_id,),
+                ).fetchall()
+                if not groups:
+                    raise CandidateBlocked("candidate_groups_missing")
+                account = conn.execute(
+                    "SELECT account_name FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
+                    (tool_user_id, batch["aavid"]),
+                ).fetchone()
+                plan = conn.execute(
+                    "SELECT plan_name FROM source_plan WHERE tool_user_id=? AND target_uid=?",
+                    (tool_user_id, batch["target_uid"]),
+                ).fetchone()
+                confirmed: list[str] = []
+                for group in groups:
+                    group_uid = str(group["group_uid"])
+                    confirmed.append(group_uid)
+                    ids = [str(value) for value in json.loads(str(group["material_ids_json"]))]
                     idempotency_key = stable_json_hash(
                         [
                             tool_user_id,
@@ -610,15 +825,17 @@ class CandidateService:
                             "retarget_create_dry_run",
                         ]
                     )
-                    conn.execute(
+                    execution_uid = f"execution_{uuid.uuid4().hex}"
+                    inserted = conn.execute(
                         """
-                        INSERT INTO execution_task(
+                        INSERT OR IGNORE INTO execution_task(
                             execution_uid, tool_user_id, aavid, target_uid,
                             candidate_batch_id, group_uid, operation_type,
                             idempotency_key, strategy_id, strategy_version,
-                            status, request_snapshot_json, result_snapshot_json,
+                            authorized_by_open_id, authorized_at, status,
+                            request_snapshot_json, result_snapshot_json,
                             created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, 'retarget_create_dry_run', ?, ?, ?,
+                        ) VALUES(?, ?, ?, ?, ?, ?, 'retarget_create_dry_run', ?, ?, ?, ?, ?,
                                  'dry_run_succeeded', ?, ?, ?, ?)
                         """,
                         (
@@ -631,8 +848,14 @@ class CandidateService:
                             idempotency_key,
                             batch["strategy_id"],
                             batch["strategy_version"],
+                            authorized_by_open_id,
+                            now,
                             json.dumps(
-                                {"material_ids": ids, "mode": mode, "v1a": "simulation"},
+                                {
+                                    "material_ids": ids,
+                                    "mode": group["group_mode"],
+                                    "v1a": "simulation",
+                                },
                                 ensure_ascii=False,
                                 sort_keys=True,
                             ),
@@ -644,47 +867,78 @@ class CandidateService:
                             now,
                             now,
                         ),
-                    )
-                    event_uid = f"operation_{uuid.uuid4().hex}"
-                    account = conn.execute(
-                        "SELECT account_name FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
-                        (tool_user_id, batch["aavid"]),
-                    ).fetchone()
-                    plan = conn.execute(
-                        "SELECT plan_name FROM source_plan WHERE target_uid=?",
-                        (batch["target_uid"],),
-                    ).fetchone()
-                    conn.execute(
-                        """
-                        INSERT INTO operation_event(
-                            event_uid, tool_user_id, aavid, account_name,
-                            source_plan_id, source_plan_name, event_time_utc,
-                            event_time_beijing, source, action_type, result_status,
-                            request_result_json, created_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'simulation',
-                                 'retarget_create_dry_run', 'simulated', ?, ?)
-                        """,
-                        (
-                            event_uid,
-                            tool_user_id,
-                            batch["aavid"],
-                            account["account_name"] if account else batch["aavid"],
-                            batch["target_uid"],
-                            plan["plan_name"] if plan else None,
-                            now,
-                            utc_now().astimezone(BEIJING).isoformat(timespec="seconds"),
-                            json.dumps(
-                                {"execution_uid": execution_uid, "material_ids": ids},
-                                ensure_ascii=False,
-                                sort_keys=True,
+                    ).rowcount
+                    if inserted:
+                        conn.execute(
+                            """
+                            INSERT INTO operation_event(
+                                event_uid, tool_user_id, aavid, account_name,
+                                source_plan_id, source_plan_name, event_time_utc,
+                                event_time_beijing, operator_type, operator_id,
+                                source, action_type, result_status,
+                                request_result_json, created_at
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'feishu_user', ?,
+                                     'simulation', 'retarget_create_dry_run',
+                                     'simulated', ?, ?)
+                            """,
+                            (
+                                f"operation_{uuid.uuid4().hex}",
+                                tool_user_id,
+                                batch["aavid"],
+                                account["account_name"] if account else batch["aavid"],
+                                batch["target_uid"],
+                                plan["plan_name"] if plan else None,
+                                now,
+                                now_dt.astimezone(BEIJING).isoformat(timespec="seconds"),
+                                authorized_by_open_id,
+                                json.dumps(
+                                    {"execution_uid": execution_uid, "material_ids": ids},
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                ),
+                                now,
                             ),
-                            now,
-                        ),
+                        )
+                    conn.execute(
+                        "UPDATE retarget_group SET status='dry_run_completed', updated_at=? WHERE group_uid=?",
+                        (now, group_uid),
                     )
                 conn.execute(
                     "UPDATE candidate_batch SET status='completed', terminal_at=?, updated_at=? WHERE candidate_batch_id=?",
                     (now, now, batch_id),
                 )
+                return confirmed
 
-        self.writer.submit(op)
-        return group_ids
+        confirmed = self.writer.submit(op)
+        if not confirmed:
+            raise CandidateBlocked("batch_expired")
+        return confirmed
+
+    def reject_groups(
+        self, tool_user_id: str, batch_id: str, *, rejected_by_open_id: str
+    ) -> bool:
+        now = utc_iso()
+
+        def op(conn):
+            with short_transaction(conn):
+                batch = conn.execute(
+                    "SELECT status FROM candidate_batch WHERE tool_user_id=? AND candidate_batch_id=?",
+                    (tool_user_id, batch_id),
+                ).fetchone()
+                if not batch:
+                    raise KeyError(batch_id)
+                if batch["status"] == "rejected":
+                    return False
+                if batch["status"] != "pending_approval":
+                    raise CandidateBlocked(f"batch_{batch['status']}")
+                conn.execute(
+                    "UPDATE candidate_batch SET status='rejected', terminal_at=?, updated_at=? WHERE candidate_batch_id=?",
+                    (now, now, batch_id),
+                )
+                conn.execute(
+                    "UPDATE retarget_group SET status='rejected', created_by_open_id=COALESCE(created_by_open_id, ?), updated_at=? WHERE candidate_batch_id=?",
+                    (rejected_by_open_id, now, batch_id),
+                )
+                return True
+
+        return bool(self.writer.submit(op))

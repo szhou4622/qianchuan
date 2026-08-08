@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -86,6 +86,7 @@ def control_task_uid(
 
 
 ACTIVE_PLATFORM_STATUSES = {
+    "0",
     "1",
     "active",
     "running",
@@ -141,10 +142,11 @@ class CollectionService:
             (tool_user_id, str(aavid)),
         )
         if not account:
-            account = self.add_or_refresh_account(tool_user_id, str(aavid))
-        else:
-            # 每次目录刷新都重新读取权威 advName，禁止使用店铺名或缓存名称。
-            account = {**account, **self.add_or_refresh_account(tool_user_id, str(aavid))}
+            # 目录刷新只能作用于用户主动添加的账户，不能由后台任务静默恢复
+            # 已删除账户，也不能自动导入登录身份下的其他授权账户。
+            raise KeyError(f"account_not_added:{aavid}")
+        # 每次目录刷新都重新读取权威 advName，禁止使用店铺名或缓存名称。
+        account = {**account, **self.add_or_refresh_account(tool_user_id, str(aavid))}
 
         results: list[tuple[Any, PaginatedResult, str]] = []
         adapters = self.adapters.all()
@@ -181,6 +183,36 @@ class CollectionService:
                     error_code=type(exc).__name__,
                     error_message=str(exc),
                 )
+            previous_class_count = self.database.query_one(
+                """
+                SELECT COUNT(*) AS c FROM source_plan
+                WHERE tool_user_id=? AND aavid=?
+                  AND plan_system=? AND promotion_scene=?
+                  AND platform_status!='not_seen'
+                """,
+                (
+                    tool_user_id,
+                    str(aavid),
+                    adapter.plan_system,
+                    adapter.promotion_scene,
+                ),
+            )
+            # 异常空必须按四类目录分别判断。只检查整账户会在“某一类空、
+            # 其他类非空”时误删该类上次完整目录。
+            if (
+                result.status == "complete"
+                and result.unique_count == 0
+                and int((previous_class_count or {}).get("c") or 0) > 0
+            ):
+                result = replace(
+                    result,
+                    status="suspicious_empty",
+                    error_code="unexpected_empty_catalog_class",
+                    error_message=(
+                        f"{adapter.plan_system}/{adapter.promotion_scene} "
+                        "returned empty after a non-empty complete catalog"
+                    ),
+                )
             self._finish_run(run_id, result)
             self._record_adapter_evidence(
                 adapter,
@@ -193,6 +225,7 @@ class CollectionService:
 
         statuses = [result.status for _, result, _ in results]
         complete = all(status == "complete" for status in statuses)
+        has_suspicious_class = any(status == "suspicious_empty" for status in statuses)
         all_plans: dict[str, list[NormalizedPlan]] = {}
         for _adapter, result, _run_id in results:
             for plan in result.rows:
@@ -231,7 +264,7 @@ class CollectionService:
         )
         catalog_status = (
             "suspicious_empty"
-            if suspicious_empty
+            if suspicious_empty or has_suspicious_class
             else "complete"
             if complete
             else "partial"
@@ -288,6 +321,19 @@ class CollectionService:
             adapter.adapter_version,
         )
         result = adapter.fetch_materials(str(target["aavid"]), str(target["ad_id"]))
+        if any(
+            str(material.aavid) != str(target["aavid"])
+            or str(material.ad_id) != str(target["ad_id"])
+            for material in result.rows
+        ):
+            result = replace(
+                result,
+                rows=(),
+                unique_count=0,
+                status="schema_changed",
+                error_code="material_context_conflict",
+                error_message="material response crossed account or plan context",
+            )
         self._finish_run(run_id, result)
         self._record_adapter_evidence(
             adapter,
@@ -324,6 +370,20 @@ class CollectionService:
             result = adapter.fetch_control_tasks(
                 str(target["aavid"]), str(target["ad_id"]), scene
             )
+            if any(
+                str(task.aavid) != str(target["aavid"])
+                or str(task.source_plan_id) != str(target["ad_id"])
+                or int(task.assist_task_scene) != scene
+                for task in result.rows
+            ):
+                result = replace(
+                    result,
+                    rows=(),
+                    unique_count=0,
+                    status="schema_changed",
+                    error_code="control_task_context_conflict",
+                    error_message="control task response crossed account, plan or scene context",
+                )
             self._finish_run(run_id, result)
             self._record_adapter_evidence(
                 adapter,
@@ -772,6 +832,15 @@ class CollectionService:
 
         def op(conn):
             with short_transaction(conn):
+                # 商品—素材关系表达“最新完整批次”的当前关系，而不是历史并集。
+                # 先清空当前目标旧关系，再写入本批次，避免商品级规则召回已移除关联。
+                conn.execute(
+                    """
+                    DELETE FROM product_material_relation
+                    WHERE tool_user_id=? AND aavid=? AND ad_id=?
+                    """,
+                    (tool_user_id, target["aavid"], target["ad_id"]),
+                )
                 for material in materials:
                     uid = material_uid(
                         tool_user_id, material.aavid, material.ad_id, material.material_id

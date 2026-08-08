@@ -106,13 +106,26 @@ class OperationReportService:
         return b"\xef\xbb\xbf" + output.getvalue().encode("utf-8")
 
     def daily_summary(
-        self, tool_user_id: str, business_date: str, aavid: str | None = None
+        self,
+        tool_user_id: str,
+        business_date: str,
+        aavid: str | None = None,
+        *,
+        aavids: list[str] | None = None,
     ) -> dict[str, Any]:
+        if aavid and aavids is not None:
+            raise ValueError("aavid 与 aavids 不能同时提供")
         where = ["tool_user_id=?", "substr(event_time_beijing,1,10)=?"]
         params: list[Any] = [tool_user_id, business_date]
         if aavid:
             where.append("aavid=?")
             params.append(aavid)
+        elif aavids is not None:
+            if not aavids:
+                where.append("1=0")
+            else:
+                where.append("aavid IN (" + ",".join("?" for _ in aavids) + ")")
+                params.extend(aavids)
         rows = self.database.query_all(
             "SELECT * FROM operation_event WHERE " + " AND ".join(where), params
         )
@@ -129,6 +142,19 @@ class OperationReportService:
                     failures += 1
             return {"total": len(items), "actions": actions, "failures": failures}
 
+        completeness_clauses = ["r.tool_user_id=?", "r.object_type='operation_log'"]
+        completeness_params: list[Any] = [tool_user_id]
+        if aavid:
+            completeness_clauses.append("r.aavid=?")
+            completeness_params.append(aavid)
+        elif aavids is not None:
+            if not aavids:
+                completeness_clauses.append("1=0")
+            else:
+                completeness_clauses.append(
+                    "r.aavid IN (" + ",".join("?" for _ in aavids) + ")"
+                )
+                completeness_params.extend(aavids)
         completeness_rows = self.database.query_all(
             """
             SELECT aavid,
@@ -136,7 +162,9 @@ class OperationReportService:
                         THEN 'complete' ELSE 'partial' END AS status,
                    MAX(completed_at) AS completed_at
             FROM collection_run r
-            WHERE tool_user_id=? AND object_type='operation_log'
+            WHERE """
+            + " AND ".join(completeness_clauses)
+            + """
               AND started_at=(
                   SELECT MAX(r2.started_at) FROM collection_run r2
                   WHERE r2.tool_user_id=r.tool_user_id AND r2.aavid=r.aavid
@@ -144,7 +172,7 @@ class OperationReportService:
               )
             GROUP BY aavid
             """,
-            (tool_user_id,),
+            completeness_params,
         )
         completeness = {
             str(row["aavid"]): str(row["status"]) for row in completeness_rows
@@ -154,6 +182,14 @@ class OperationReportService:
         if aavid:
             candidate_where.append("aavid=?")
             candidate_params.append(aavid)
+        elif aavids is not None:
+            if not aavids:
+                candidate_where.append("1=0")
+            else:
+                candidate_where.append(
+                    "aavid IN (" + ",".join("?" for _ in aavids) + ")"
+                )
+                candidate_params.extend(aavids)
         retarget_candidates = self.database.query_all(
             "SELECT material_snapshot_json FROM candidate_batch WHERE "
             + " AND ".join(candidate_where),
@@ -215,7 +251,7 @@ class OperationReportService:
                 real_summary_json, simulation_summary_json,
                 platform_log_completeness, status, created_at, updated_at
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tool_user_id, aavid, business_date, route_id) DO NOTHING
+            ON CONFLICT DO NOTHING
             """,
             (
                 report_uid,

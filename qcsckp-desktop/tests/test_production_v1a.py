@@ -6,6 +6,8 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from production_v1a.adapters import AdapterRegistry
 from production_v1a.adapters.models import (
@@ -17,7 +19,7 @@ from production_v1a.adapters.models import (
 )
 from production_v1a.auth import LocalAdminService
 from production_v1a.browser_worker import LoginRequired, PlaywrightBrowserWorker
-from production_v1a.candidates import CandidateService
+from production_v1a.candidates import CandidateBlocked, CandidateService
 from production_v1a.collections import CollectionService, _classify_operation, material_uid
 from production_v1a.feishu import (
     FeishuError,
@@ -30,10 +32,14 @@ from production_v1a.jobs import EventBus, JobService
 from production_v1a.migration import LegacyMigrationService
 from production_v1a.reports import OperationReportService
 from production_v1a.runtime_paths import RuntimePaths
-from production_v1a.security import PlatformNetworkGuard, PlatformWriteBlocked
+from production_v1a.security import (
+    PlatformNetworkGuard,
+    PlatformWriteBlocked,
+    sanitize_exception_text,
+)
 from production_v1a.service_main import start_service
 from production_v1a.single_instance import mutex_name
-from production_v1a.runtime import collection_interval_for_relation_count
+from production_v1a.runtime import V1AScheduler, collection_interval_for_relation_count
 from production_v1a.storage import RuntimeDatabase, StorageWriter
 from production_v1a.strategies import StrategyService
 from production_v1a.timeutils import beijing_iso, business_date, utc_iso
@@ -69,18 +75,18 @@ class TestDatabase:
         now = utc_iso()
         target = f"target_{aavid}_{ad_id}"
         self.writer.execute(
-            "INSERT OR IGNORE INTO advertiser_account(account_uid, tool_user_id, aavid, account_name, catalog_status, created_at, updated_at) VALUES(?, ?, ?, ?, 'complete', ?, ?)",
-            (f"account_{aavid}", self.user, aavid, f"账户{aavid}", now, now),
+            "INSERT OR IGNORE INTO advertiser_account(account_uid, tool_user_id, aavid, account_name, enabled, catalog_status, catalog_completed_at, created_at, updated_at) VALUES(?, ?, ?, ?, 1, 'complete', ?, ?, ?)",
+            (f"account_{aavid}", self.user, aavid, f"账户{aavid}", now, now, now),
         )
         self.writer.execute(
             """
             INSERT INTO source_plan(target_uid, tool_user_id, aavid, ad_id, plan_name,
                 plan_system, promotion_scene, platform_status, verification_state,
-                monitor_enabled, monitor_eligible, retarget_eligible, pause_eligible,
+                catalog_seen_at, monitor_enabled, monitor_eligible, retarget_eligible, pause_eligible,
                 adjust_eligible, adapter_version, created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, 'active', 'verified', 1, 1, 0, 0, 0, 'test-v1', ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'active', 'verified', ?, 1, 1, 0, 0, 0, 'test-v1', ?, ?)
             """,
-            (target, self.user, aavid, ad_id, f"计划{ad_id}", system, scene, now, now),
+            (target, self.user, aavid, ad_id, f"计划{ad_id}", system, scene, now, now, now),
         )
         return target
 
@@ -113,6 +119,15 @@ class ProductionV1ASafetyTests(unittest.TestCase):
 
     def tearDown(self):
         self.fx.close()
+
+    def test_exception_text_is_redacted_before_persistence(self):
+        message = sanitize_exception_text(
+            "Authorization: Bearer top-secret app_secret=hidden access_token=token123"
+        )
+        self.assertNotIn("top-secret", message)
+        self.assertNotIn("hidden", message)
+        self.assertNotIn("token123", message)
+        self.assertGreaterEqual(message.count("[REDACTED]"), 3)
 
     def test_sqlite_guards_wal_foreign_keys_and_real_execution(self):
         conn = self.fx.database.connect()
@@ -355,11 +370,25 @@ class ProductionV1ASafetyTests(unittest.TestCase):
             "SELECT * FROM adjustment_candidate WHERE adjustment_candidate_id=?",
             (candidates[0],),
         )
-        self.assertEqual(winning, row["strategy_id"])
-        self.assertEqual("retarget_adjust", row["action_type"])
-        self.assertEqual(11000, row["budget_expected_after_cent"])
-        self.assertEqual("25.5", row["duration_expected_after_hours_decimal"])
+        self.assertNotEqual(winning, row["strategy_id"])
+        self.assertEqual("retarget_pause", row["action_type"])
+        self.assertEqual(0, row["budget_delta_cent"])
+        self.assertEqual("0", row["duration_delta_hours_decimal"])
         self.assertEqual(0, self.fx.database.query_one("SELECT COUNT(*) AS c FROM execution_task")["c"])
+        self.fx.writer.execute(
+            """
+            INSERT INTO collection_run(collection_run_id, tool_user_id, aavid, target_uid,
+                object_type, business_date, filters_hash, started_at, completed_at,
+                adapter_version, status)
+            VALUES('control_scene2_partial', ?, '1001', ?, 'control_task:scene_2', ?,
+                   'newer', ?, ?, 'test-v1', 'partial')
+            """,
+            (self.fx.user, target, business_date(), now, now),
+        )
+        with self.assertRaisesRegex(CandidateBlocked, "latest_scene2_batch_not_complete"):
+            CandidateService(self.fx.database, self.fx.writer).generate_adjustments_for_target(
+                self.fx.user, target
+            )
 
     def test_multiple_overlapping_groups_remain_dry_run(self):
         target = self.fx.seed_target()
@@ -369,12 +398,129 @@ class ProductionV1ASafetyTests(unittest.TestCase):
         strategies.save(tool_user_id=self.fx.user, target_uid=target, title="全部", priority=1, trigger_level="material", trigger={"conditions": [{"metric": "spend_cent", "operator": "gte", "value": 1}]}, enabled=True)
         service = CandidateService(self.fx.database, self.fx.writer)
         batch = service.generate_for_target(self.fx.user, target)[0]
-        first = service.save_groups(self.fx.user, batch, [{"mode": "selected_group", "material_ids": ["m1", "m2"]}])
-        second = service.save_groups(self.fx.user, batch, [{"mode": "selected_group", "material_ids": ["m2", "m3"]}, {"mode": "all_group", "material_ids": ["m1", "m2", "m3", "m4"]}])
-        self.assertEqual(3, len(first + second))
+        saved = service.save_groups(
+            self.fx.user,
+            batch,
+            [
+                {"mode": "selected_group", "material_ids": ["m1", "m2"]},
+                {"mode": "selected_group", "material_ids": ["m2", "m3"]},
+                {"mode": "all_group", "material_ids": ["m1", "m2", "m3", "m4"]},
+            ],
+        )
+        self.assertEqual(3, len(saved))
+        self.assertEqual(0, self.fx.database.query_one("SELECT COUNT(*) c FROM execution_task")["c"])
+        self.assertEqual(
+            {"frozen"},
+            {row["status"] for row in self.fx.database.query_all("SELECT status FROM retarget_group")},
+        )
+        self.assertEqual(
+            "grouped",
+            self.fx.database.query_one(
+                "SELECT status FROM candidate_batch WHERE candidate_batch_id=?", (batch,)
+            )["status"],
+        )
+        self.fx.writer.execute(
+            "UPDATE candidate_batch SET status='pending_approval' WHERE candidate_batch_id=?",
+            (batch,),
+        )
+        confirmed = service.confirm_groups(
+            self.fx.user, batch, authorized_by_open_id="ou_admin"
+        )
+        self.assertEqual(3, len(confirmed))
         statuses = {row["status"] for row in self.fx.database.query_all("SELECT status FROM execution_task")}
         self.assertEqual({"dry_run_succeeded"}, statuses)
         self.assertEqual(3, self.fx.database.query_one("SELECT COUNT(*) c FROM operation_event WHERE source='simulation'")["c"])
+        self.assertEqual(
+            confirmed,
+            service.confirm_groups(
+                self.fx.user, batch, authorized_by_open_id="ou_admin"
+            ),
+        )
+        self.assertEqual(3, self.fx.database.query_one("SELECT COUNT(*) c FROM execution_task")["c"])
+
+    def test_desktop_group_resave_atomically_replaces_frozen_snapshot(self):
+        target = self.fx.seed_target()
+        materials = [
+            NormalizedMaterial("1001", "2001", f"m{i}", f"视频{i}", None, "1", "1", None, "1", "0", True, True, (), 100, 1, 100, "1", {})
+            for i in range(1, 4)
+        ]
+        self.fx.seed_material_batch(target, materials)
+        StrategyService(self.fx.database, self.fx.writer).save(
+            tool_user_id=self.fx.user,
+            target_uid=target,
+            title="全部",
+            priority=1,
+            trigger_level="material",
+            trigger={"conditions": [{"metric": "spend_cent", "operator": "gte", "value": 1}]},
+            enabled=True,
+        )
+        service = CandidateService(self.fx.database, self.fx.writer)
+        batch = service.generate_for_target(self.fx.user, target)[0]
+        service.save_groups(
+            self.fx.user,
+            batch,
+            [
+                {"mode": "selected_group", "material_ids": ["m1"]},
+                {"mode": "selected_group", "material_ids": ["m2"]},
+            ],
+        )
+        service.save_groups(
+            self.fx.user,
+            batch,
+            [{"mode": "selected_group", "material_ids": ["m3"]}],
+        )
+        rows = self.fx.database.query_all(
+            "SELECT sequence, material_ids_json FROM retarget_group WHERE candidate_batch_id=?",
+            (batch,),
+        )
+        self.assertEqual(1, len(rows))
+        self.assertEqual(["m3"], json.loads(rows[0]["material_ids_json"]))
+
+    def test_expired_candidates_and_unsent_cards_are_closed_persistently(self):
+        target = self.fx.seed_target()
+        materials = [NormalizedMaterial("1001", "2001", "m1", "视频1", None, "1", "1", None, "1", "0", True, True, (), 100, 1, 100, "1", {})]
+        self.fx.seed_material_batch(target, materials)
+        StrategyService(self.fx.database, self.fx.writer).save(
+            tool_user_id=self.fx.user,
+            target_uid=target,
+            title="全部",
+            priority=1,
+            trigger_level="material",
+            trigger={"conditions": [{"metric": "spend_cent", "operator": "gte", "value": 1}]},
+            enabled=True,
+        )
+        service = CandidateService(self.fx.database, self.fx.writer)
+        batch = service.generate_for_target(self.fx.user, target)[0]
+        service.save_groups(
+            self.fx.user,
+            batch,
+            [{"mode": "selected_group", "material_ids": ["m1"]}],
+        )
+        past = "2000-01-01T00:00:00+00:00"
+        self.fx.writer.execute(
+            "UPDATE candidate_batch SET status='pending_approval', expires_at=? WHERE candidate_batch_id=?",
+            (past, batch),
+        )
+        self.fx.writer.execute(
+            "INSERT INTO feishu_outbox(outbox_id, tool_user_id, route_id, task_uid, payload_json, status, created_at, updated_at) VALUES('outbox_expired', ?, 'open_id:ou', ?, '{}', 'queued', ?, ?)",
+            (self.fx.user, batch, utc_iso(), utc_iso()),
+        )
+        self.assertEqual(
+            {"candidate_batches": 1, "adjustment_candidates": 0},
+            service.expire_due_candidates(self.fx.user),
+        )
+        self.assertEqual(
+            "expired",
+            self.fx.database.query_one(
+                "SELECT status FROM candidate_batch WHERE candidate_batch_id=?", (batch,)
+            )["status"],
+        )
+        self.assertEqual(
+            "cancelled",
+            self.fx.database.query_one(
+                "SELECT status FROM feishu_outbox WHERE outbox_id='outbox_expired'"
+            )["status"],
+        )
 
     def test_feishu_inbox_deduplicates_and_rejects_other_user(self):
         service = FeishuService(self.fx.database, self.fx.writer, CandidateService(self.fx.database, self.fx.writer))
@@ -423,19 +569,181 @@ class ProductionV1ASafetyTests(unittest.TestCase):
         self.assertEqual(0, report["simulation_candidates"]["total"])
         self.assertEqual(1, report["simulation_candidates"]["dry_run_audits"]["total"])
 
-    def test_card_is_explicitly_dry_run_and_offers_multi_select(self):
+    def test_daily_report_overview_accepts_only_enabled_account_scope(self):
+        now = beijing_iso()
+        for aavid in ("1001", "1002"):
+            self.fx.writer.execute(
+                "INSERT INTO operation_event(event_uid, tool_user_id, aavid, account_name, event_time_utc, event_time_beijing, source, action_type, result_status, created_at) VALUES(?, ?, ?, ?, ?, ?, 'platform_log', 'plan_pause', 'succeeded', ?)",
+                (f"event_scope_{aavid}", self.fx.user, aavid, f"账户{aavid}", utc_iso(), now, utc_iso()),
+            )
+        report = OperationReportService(self.fx.database, self.fx.writer).daily_summary(
+            self.fx.user, business_date(), aavids=["1001"]
+        )
+        self.assertEqual(1, report["real_platform_operations"]["total"])
+
+    def test_daily_report_completeness_is_isolated_by_account_and_delivery_is_idempotent(self):
+        first = self.fx.seed_target(aavid="1001", ad_id="2001")
+        second = self.fx.seed_target(aavid="1002", ad_id="2002")
+        now = utc_iso()
+        for index, (aavid, target, status) in enumerate(
+            (("1001", first, "complete"), ("1002", second, "partial")), start=1
+        ):
+            self.fx.writer.execute(
+                """
+                INSERT INTO collection_run(
+                    collection_run_id, tool_user_id, aavid, target_uid,
+                    object_type, business_date, filters_hash, started_at,
+                    completed_at, adapter_version, status
+                ) VALUES(?, ?, ?, ?, 'operation_log', ?, 'filters', ?, ?, 'test', ?)
+                """,
+                (f"op_run_{index}", self.fx.user, aavid, target, business_date(), now, now, status),
+            )
+        service = OperationReportService(self.fx.database, self.fx.writer)
+        summary = service.daily_summary(self.fx.user, business_date(), "1001")
+        self.assertEqual({"1001": "complete"}, summary["platform_log_completeness"])
+        self.fx.writer.execute(
+            "INSERT INTO feishu_route(route_id, tool_user_id, route_name, created_at, updated_at) VALUES('route_report', ?, '日报', ?, ?)",
+            (self.fx.user, now, now),
+        )
+        first_uid = service.record_delivery(
+            self.fx.user, business_date(), "route_report", summary
+        )
+        second_uid = service.record_delivery(
+            self.fx.user, business_date(), "route_report", summary
+        )
+        self.assertEqual(first_uid, second_uid)
+        self.assertEqual(
+            1,
+            self.fx.database.query_one(
+                "SELECT COUNT(*) c FROM daily_report_delivery WHERE report_uid=?",
+                (first_uid,),
+            )["c"],
+        )
+
+    def test_feishu_inbox_payload_is_encrypted_and_recoverable(self):
+        service = FeishuService(
+            self.fx.database,
+            self.fx.writer,
+            CandidateService(self.fx.database, self.fx.writer),
+        )
+        payload = {
+            "sender_open_id": "ou_admin",
+            "chat_id": "chat1",
+            "chat_type": "p2p",
+            "text": "普通消息",
+            "message_id": "message1",
+        }
+        self.assertTrue(
+            service.ingest_event(
+                tool_user_id=self.fx.user,
+                event_id="evt_recover",
+                event_type="im.message.receive_v1",
+                sender_open_id="ou_admin",
+                message_id="message1",
+                payload=payload,
+            )
+        )
+        stored = self.fx.database.query_one(
+            "SELECT payload_json, status FROM feishu_inbox WHERE tool_user_id=? AND event_id='evt_recover'",
+            (self.fx.user,),
+        )
+        self.assertNotIn("普通消息", stored["payload_json"])
+        self.assertEqual({"processed": 1, "failed": 0, "unrecoverable": 0}, service.recover_inbox(self.fx.user))
+        self.assertEqual(
+            "processed",
+            self.fx.database.query_one(
+                "SELECT status FROM feishu_inbox WHERE tool_user_id=? AND event_id='evt_recover'",
+                (self.fx.user,),
+            )["status"],
+        )
+
+    def test_feishu_outbox_partial_failure_does_not_report_ready(self):
+        service = FeishuService(
+            self.fx.database,
+            self.fx.writer,
+            CandidateService(self.fx.database, self.fx.writer),
+        )
+        service.save_credentials(self.fx.user, "cli_test_app", "secret-value")
+        now = utc_iso()
+        for index in (1, 2):
+            self.fx.writer.execute(
+                """
+                INSERT INTO feishu_outbox(
+                    outbox_id, tool_user_id, route_id, task_uid,
+                    payload_json, status, next_attempt_at, created_at, updated_at
+                ) VALUES(?, ?, ?, 'task_partial', ?, 'queued', ?, ?, ?)
+                """,
+                (
+                    f"outbox_partial_{index}",
+                    self.fx.user,
+                    f"open_id:ou_{index}",
+                    json.dumps(
+                        {
+                            "receive_type": "open_id",
+                            "receive_id": f"ou_{index}",
+                            "card": {"elements": []},
+                        }
+                    ),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        with patch(
+            "production_v1a.feishu.FeishuApiClient.send_card",
+            side_effect=["message_ok", FeishuError("temporary")],
+        ):
+            self.assertEqual(1, service.deliver_outbox_once(self.fx.user))
+        self.assertEqual(
+            {"sent", "retry"},
+            {
+                row["status"]
+                for row in self.fx.database.query_all(
+                    "SELECT status FROM feishu_outbox WHERE task_uid='task_partial'"
+                )
+            },
+        )
+        self.assertEqual(
+            "error",
+            self.fx.database.query_one(
+                "SELECT send_status FROM feishu_profile WHERE tool_user_id=?",
+                (self.fx.user,),
+            )["send_status"],
+        )
+
+    def test_scheduler_active_job_deduplication_is_scoped_to_tool_user(self):
+        now = utc_iso()
+        self.fx.writer.execute(
+            "INSERT INTO tool_user(tool_user_id, username, password_salt, password_hash, password_iterations, recovery_code_hash, status, created_at, updated_at) VALUES('user_two', 'two', '00', '00', 1, '00', 'active', ?, ?)",
+            (now, now),
+        )
+        self.fx.writer.execute(
+            "INSERT INTO background_job(job_uid, tool_user_id, job_type, priority, payload_json, status, created_at, updated_at) VALUES('job_other', 'user_two', 'catalog_refresh', 1, '{\"aavid\":\"same\"}', 'queued', ?, ?)",
+            (now, now),
+        )
+        scheduler = object.__new__(V1AScheduler)
+        scheduler.runtime = SimpleNamespace(database=self.fx.database)
+        self.assertFalse(
+            scheduler._job_active(self.fx.user, "catalog_refresh", "aavid", "same")
+        )
+        self.assertTrue(
+            scheduler._job_active("user_two", "catalog_refresh", "aavid", "same")
+        )
+
+    def test_card_only_previews_desktop_frozen_groups(self):
         batch = {"aavid": "1001", "candidate_batch_id": "b1", "expires_at": utc_iso(), "material_snapshot_json": json.dumps([{"sequence": 1, "material_id": "m1", "material_name": "视频1"}])}
-        card = build_candidate_preview_card(batch, account_name="账户", plan_name="计划", plan_system="global", promotion_scene="product")
+        groups = [{"sequence": 1, "material_ids_json": json.dumps(["m1"])}]
+        card = build_candidate_preview_card(batch, account_name="账户", plan_name="计划", plan_system="global", promotion_scene="product", groups=groups)
         text = json.dumps(card, ensure_ascii=False)
         self.assertIn("V1A 模拟，不执行任何千川操作", text)
-        self.assertIn("multi_select_static", text)
-        self.assertIn("v1a_selected_group", text)
+        self.assertNotIn("multi_select_static", text)
+        self.assertNotIn("v1a_selected_group", text)
+        self.assertIn("v1a_confirm_groups", text)
+        self.assertIn("v1a_reject_groups", text)
 
     def test_large_feishu_candidate_card_has_page_navigation(self):
-        materials = [
-            {"sequence": index, "material_id": f"m{index}", "material_name": f"视频{index}"}
-            for index in range(1, 22)
-        ]
+        materials = [{"sequence": index, "material_id": f"m{index}", "material_name": f"视频{index}"} for index in range(1, 7)]
+        groups = [{"sequence": index, "material_ids_json": json.dumps([f"m{index}"])} for index in range(1, 7)]
         batch = {
             "aavid": "1001",
             "candidate_batch_id": "b21",
@@ -449,6 +757,7 @@ class ProductionV1ASafetyTests(unittest.TestCase):
                 plan_name="计划",
                 plan_system="global",
                 promotion_scene="product",
+                groups=groups,
                 page=1,
             ),
             ensure_ascii=False,
@@ -460,6 +769,7 @@ class ProductionV1ASafetyTests(unittest.TestCase):
                 plan_name="计划",
                 plan_system="global",
                 promotion_scene="product",
+                groups=groups,
                 page=2,
             ),
             ensure_ascii=False,

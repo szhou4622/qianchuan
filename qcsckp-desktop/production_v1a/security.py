@@ -76,6 +76,21 @@ SENSITIVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+SENSITIVE_TEXT_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+"),
+    re.compile(r"(?i)((?:app_?secret|access_?token|refresh_?token|csrf|cookie|password)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)([?&](?:token|secret|signature|authorization|password)=)[^&\s]+"),
+)
+
+
+def sanitize_exception_text(value: Any, limit: int = 1000) -> str:
+    """持久化或返回异常前统一去除常见凭据文本。"""
+
+    text = str(value)
+    for pattern in SENSITIVE_TEXT_PATTERNS:
+        text = pattern.sub(r"\1[REDACTED]", text)
+    return text[:limit]
+
 
 def redact_mapping(value: Any) -> Any:
     """递归删除诊断快照中的凭据和签名资源参数。"""

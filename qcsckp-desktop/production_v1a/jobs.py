@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .leases import Lease, LeaseManager
-from .security import redact_mapping
+from .security import redact_mapping, sanitize_exception_text
 from .storage import RuntimeDatabase, StorageWriter, short_transaction
 from .timeutils import utc_iso
 
@@ -200,6 +200,19 @@ class JobService:
             """,
             (current, total, message, utc_iso(), job_uid, lease.fencing_token),
         )
+
+    def _heartbeat_claim(self, job_uid: str, lease: Lease) -> Lease:
+        renewed = self.leases.heartbeat(lease, ttl_seconds=45)
+        changed = self.writer.execute(
+            """
+            UPDATE background_job SET lease_expires_at=?, updated_at=?
+            WHERE job_uid=? AND fencing_token=? AND status='running'
+            """,
+            (renewed.expires_at, utc_iso(), job_uid, lease.fencing_token),
+        )
+        if changed != 1:
+            raise RuntimeError("background_job_lease_lost")
+        return renewed
         self.events.publish(
             {
                 "type": "job.progress",
@@ -214,18 +227,38 @@ class JobService:
         job_uid = str(job["job_uid"])
         handler = self.handlers[str(job["job_type"])]
         payload = json.loads(str(job["payload_json"] or "{}"))
+        lease_ref = [lease]
+        heartbeat_stop = threading.Event()
+        heartbeat_error: list[BaseException] = []
+
+        def heartbeat_loop() -> None:
+            while not heartbeat_stop.wait(15):
+                try:
+                    lease_ref[0] = self._heartbeat_claim(job_uid, lease_ref[0])
+                except BaseException as exc:
+                    heartbeat_error.append(exc)
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"qcsckp-v1a-job-heartbeat-{job_uid[-8:]}",
+            daemon=True,
+        )
         context = JobContext(
             job_uid=job_uid,
             tool_user_id=job.get("tool_user_id"),
             payload=payload,
-            lease=lease,
+            lease=lease_ref[0],
             update_progress=lambda current, total, message: self._progress(
-                job_uid, lease, current, total, message
+                job_uid, lease_ref[0], current, total, message
             ),
         )
+        heartbeat_thread.start()
         try:
             result = handler(context) or {}
-            self.leases.assert_current(lease)
+            if heartbeat_error:
+                raise heartbeat_error[0]
+            self.leases.assert_current(lease_ref[0])
             self.writer.execute(
                 """
                 UPDATE background_job
@@ -256,9 +289,9 @@ class JobService:
                     (
                         terminal_status,
                         type(exc).__name__,
-                        str(exc)[:1000],
+                        sanitize_exception_text(exc),
                         json.dumps(
-                            {"traceback": traceback.format_exc(limit=8)},
+                            {"traceback": sanitize_exception_text(traceback.format_exc(limit=8), 4000)},
                             ensure_ascii=False,
                         ),
                         utc_iso(),
@@ -276,7 +309,9 @@ class JobService:
                     }
                 )
         finally:
-            self.leases.release(lease)
+            heartbeat_stop.set()
+            heartbeat_thread.join(2)
+            self.leases.release(lease_ref[0])
 
 
 class JobWorker:
@@ -306,10 +341,14 @@ class JobWorker:
         self._thread.join(timeout)
 
     def _run(self) -> None:
+        last_recovery = 0.0
         try:
             while not self._stop.is_set():
                 claimed = self.service.claim_next()
                 if not claimed:
+                    if time.monotonic() - last_recovery >= 10:
+                        self.service.recover_expired()
+                        last_recovery = time.monotonic()
                     self._stop.wait(self.idle_seconds)
                     continue
                 self.service.execute_claimed(*claimed)

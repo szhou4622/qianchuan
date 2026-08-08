@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Checkbox,
@@ -78,6 +78,20 @@ const sceneName: Record<string, string> = {
   live: "推直播",
   unknown: "待确认",
 };
+type StrategyCondition = {
+  id: string;
+  metric: string;
+  operator: string;
+  value: string;
+  maxValue: string;
+};
+const createCondition = (index = 0): StrategyCondition => ({
+  id: `condition_${Date.now()}_${index}`,
+  metric: "spend_cent",
+  operator: "gte",
+  value: "10000",
+  maxValue: "20000",
+});
 
 function App() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -98,6 +112,11 @@ function App() {
   useEffect(() => {
     void refreshHealth();
   }, [refreshHealth, refreshKey]);
+  useEffect(() => {
+    if (!authenticated) return;
+    const timer = window.setInterval(() => void refreshHealth(), 10000);
+    return () => window.clearInterval(timer);
+  }, [authenticated, refreshHealth]);
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
@@ -146,7 +165,7 @@ function App() {
         return job;
       } catch (error) {
         setNotice({ tone: "danger", message: errorMessage(error) });
-        throw error;
+        return null;
       }
     },
     [],
@@ -250,7 +269,11 @@ function App() {
         )}
         <section className="page-content">
           {page === "health" && (
-            <HealthPage health={health} setPage={setPage} />
+            <HealthPage
+              health={health}
+              setPage={setPage}
+              refreshKey={refreshKey}
+            />
           )}
           {page === "accounts" && (
             <AccountsPage refreshKey={refreshKey} run={run} />
@@ -431,9 +454,11 @@ function AdminGate({
 function HealthPage({
   health,
   setPage,
+  refreshKey,
 }: {
   health: Health;
   setPage: (page: PageKey) => void;
+  refreshKey: number;
 }) {
   return (
     <>
@@ -531,6 +556,7 @@ function HealthPage({
           ))}
         </div>
       </Panel>
+      <JobStatusPanel refreshKey={refreshKey} />
     </>
   );
 }
@@ -550,8 +576,12 @@ function AccountsPage({
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("all");
   const [loading, setLoading] = useState(true);
+  const [plansLoading, setPlansLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const planRequestRef = useRef(0);
   const load = useCallback(async () => {
     setLoading(true);
+    setLoadError("");
     try {
       const list = await api<Account[]>("/api/v1/accounts");
       setAccounts(list);
@@ -559,6 +589,8 @@ function AccountsPage({
         (current) =>
           list.find((item) => item.aavid === current?.aavid) ?? list[0] ?? null,
       );
+    } catch (error) {
+      setLoadError(errorMessage(error));
     } finally {
       setLoading(false);
     }
@@ -567,24 +599,35 @@ function AccountsPage({
     void load();
   }, [load, refreshKey]);
   useEffect(() => {
-    void api<any[]>("/api/v1/feishu/routes").then(setRoutes);
+    void api<any[]>("/api/v1/feishu/routes")
+      .then(setRoutes)
+      .catch((error) => setLoadError(errorMessage(error)));
   }, [refreshKey]);
   useEffect(() => {
     if (!selected) {
       setPlans([]);
       return;
     }
+    setPlansLoading(true);
+    setLoadError("");
+    const requestId = ++planRequestRef.current;
+    const requestedAavid = selected.aavid;
     void api<Plan[]>(
-      `/api/v1/plans?aavid=${encodeURIComponent(selected.aavid)}`,
+      `/api/v1/plans?aavid=${encodeURIComponent(requestedAavid)}`,
     ).then((list) => {
+      if (requestId !== planRequestRef.current) return;
       setPlans(list);
       setChecked(
         new Set(
           list
-            .filter((item) => item.monitor_enabled)
+            .filter((item) => item.monitor_enabled && item.monitor_eligible)
             .map((item) => item.target_uid),
         ),
       );
+    }).catch((error) => {
+      if (requestId === planRequestRef.current) setLoadError(errorMessage(error));
+    }).finally(() => {
+      if (requestId === planRequestRef.current) setPlansLoading(false);
     });
   }, [selected, refreshKey]);
   const filtered = plans.filter(
@@ -597,13 +640,7 @@ function AccountsPage({
   );
   const groups = useMemo(
     () =>
-      [
-        "global:product",
-        "global:live",
-        "chengfang:product",
-        "chengfang:live",
-        "unknown:unknown",
-      ]
+      ["global:product", "global:live", "chengfang:product", "chengfang:live"]
         .map((key) => {
           const [system, scene] = key.split(":");
           return {
@@ -614,6 +651,15 @@ function AccountsPage({
                 plan.plan_system === system && plan.promotion_scene === scene,
             ),
           };
+        })
+        .concat({
+          key: "unknown",
+          label: "待确认类型",
+          plans: filtered.filter(
+            (plan) =>
+              plan.plan_system === "unknown" ||
+              plan.promotion_scene === "unknown",
+          ),
         })
         .filter((group) => group.plans.length),
     [filtered],
@@ -654,8 +700,9 @@ function AccountsPage({
           </Button>
         }
       >
+        {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
         {loading ? (
-          <Spinner />
+          <LoadingState label="正在读取已添加账户" />
         ) : accounts.length === 0 ? (
           <Empty
             title="还没有账户"
@@ -747,7 +794,9 @@ function AccountsPage({
           <span className="selection-count">已选 {checked.size}/10</span>
         </div>
         <div className="scroll-catalog">
-          {!selected ? (
+          {plansLoading ? (
+            <LoadingState label="正在读取该账户的计划目录" />
+          ) : !selected ? (
             <Empty
               title="未选择账户"
               description="从左侧选择账户查看四类计划。"
@@ -772,7 +821,7 @@ function AccountsPage({
                     <Checkbox
                       checked={checked.has(plan.target_uid)}
                       disabled={
-                        !plan.monitor_eligible ||
+                        (!plan.monitor_eligible && !checked.has(plan.target_uid)) ||
                         (!checked.has(plan.target_uid) && checked.size >= 10)
                       }
                       onChange={(_, data) =>
@@ -796,7 +845,13 @@ function AccountsPage({
                       )}
                     </div>
                     <div className="plan-actions">
-                      <span>{plan.monitor_enabled ? "监控中" : "未监控"}</span>
+                      <span>
+                        {plan.monitor_enabled && !plan.monitor_eligible
+                          ? "原监控已安全暂停"
+                          : plan.monitor_enabled
+                            ? "监控中"
+                            : "未监控"}
+                      </span>
                       {plan.monitor_enabled && plan.monitor_eligible && (
                         <Button
                           size="small"
@@ -994,27 +1049,43 @@ function StrategyPage({
   run: RunCommand;
 }) {
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [target, setTarget] = useState("");
   const [items, setItems] = useState<any[]>([]);
   const [title, setTitle] = useState(
     mode === "retarget" ? "高质量视频追投候选" : "低效追投任务停投候选",
   );
   const [level, setLevel] = useState("material");
-  const [metric, setMetric] = useState("spend_cent");
-  const [operator, setOperator] = useState("gte");
-  const [value, setValue] = useState("10000");
-  const [maxValue, setMaxValue] = useState("20000");
+  const [conditions, setConditions] = useState<StrategyCondition[]>([
+    createCondition(),
+  ]);
   const [priority, setPriority] = useState("10");
   const [enableNow, setEnableNow] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const strategyRequestRef = useRef(0);
   const strategyType = mode === "retarget" ? "retarget_create" : "retarget_pause";
   useEffect(() => {
-    void api<Plan[]>("/api/v1/plans").then((rows) => {
-      const eligible = rows.filter(
-        (row) => row.monitor_enabled && row.monitor_eligible,
-      );
-      setPlans(eligible);
-      setTarget((current) => current || eligible[0]?.target_uid || "");
-    });
+    setLoading(true);
+    setLoadError("");
+    void Promise.all([
+      api<Plan[]>("/api/v1/plans"),
+      api<Account[]>("/api/v1/accounts"),
+    ])
+      .then(([rows, accountRows]) => {
+        const eligible = rows.filter(
+          (row) => row.monitor_enabled && row.monitor_eligible,
+        );
+        setPlans(eligible);
+        setAccounts(accountRows);
+        setTarget((current) =>
+          eligible.some((plan) => plan.target_uid === current)
+            ? current
+            : eligible[0]?.target_uid || "",
+        );
+      })
+      .catch((error) => setLoadError(errorMessage(error)))
+      .finally(() => setLoading(false));
   }, [refreshKey]);
   useEffect(() => {
     setTitle(
@@ -1023,13 +1094,22 @@ function StrategyPage({
     if (mode === "stop") setLevel("material");
   }, [mode]);
   useEffect(() => {
-    if (target)
+    if (target) {
+      setLoadError("");
+      const requestId = ++strategyRequestRef.current;
+      const requestedTarget = target;
       void api<any[]>(
-        `/api/v1/strategies?target_uid=${encodeURIComponent(target)}`,
+        `/api/v1/strategies?target_uid=${encodeURIComponent(requestedTarget)}`,
       ).then((rows) =>
+        requestId === strategyRequestRef.current &&
         setItems(rows.filter((item) => item.strategy_type === strategyType)),
-      );
-    else setItems([]);
+      ).catch((error) => {
+        if (requestId === strategyRequestRef.current) setLoadError(errorMessage(error));
+      });
+    } else {
+      strategyRequestRef.current += 1;
+      setItems([]);
+    }
   }, [target, refreshKey, strategyType]);
   const selectedPlan = plans.find((plan) => plan.target_uid === target);
   useEffect(() => {
@@ -1047,11 +1127,20 @@ function StrategyPage({
         strategy_type: strategyType,
         trigger_level: level,
         trigger: {
-          conditions: [
-            operator === "between"
-              ? { metric, operator, min: value, max: maxValue }
-              : { metric, operator, value },
-          ],
+          conditions: conditions.map((condition) =>
+            condition.operator === "between"
+              ? {
+                  metric: condition.metric,
+                  operator: condition.operator,
+                  min: condition.value,
+                  max: condition.maxValue,
+                }
+              : {
+                  metric: condition.metric,
+                  operator: condition.operator,
+                  value: condition.value,
+                },
+          ),
         },
         action_params: {},
         enabled: enableNow,
@@ -1064,18 +1153,34 @@ function StrategyPage({
     mode === "retarget"
       ? "商品计划支持素材级和商品汇总级；直播计划只支持素材级。"
       : "仅判断 Scene 2 素材追投调控任务；不会删除任务，也不会影响源计划。";
+  const accountNames = new Map(accounts.map((account) => [account.aavid, account.account_name]));
+  const conditionsValid = conditions.every((condition) => {
+    const value = Number(condition.value);
+    if (!condition.value.trim() || !Number.isFinite(value)) return false;
+    if (condition.operator !== "between") return true;
+    const max = Number(condition.maxValue);
+    return condition.maxValue.trim() !== "" && Number.isFinite(max) && max >= value;
+  });
+  const formValid =
+    Boolean(target) &&
+    Boolean(title.trim()) &&
+    Number(priority) >= 1 &&
+    conditionsValid;
   return (
     <div className="two-columns strategy-layout">
       <Panel
         title={`新建${pageTitle}`}
         description={`${pageDescription} V1A只评估今日累计，同一策略内所有条件使用 AND。`}
       >
+        {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
+        {loading && <LoadingState label="正在读取可配置的监控计划" />}
         <Field label="监控计划">
           <Select value={target} onChange={(_, data) => setTarget(data.value)}>
             <option value="">请选择</option>
             {plans.map((plan) => (
               <option key={plan.target_uid} value={plan.target_uid}>
-                {plan.plan_name}
+                {accountNames.get(plan.aavid) || plan.aavid} · {plan.plan_name} ·{" "}
+                {planSystemName[plan.plan_system]} · {sceneName[plan.promotion_scene]}
               </option>
             ))}
           </Select>
@@ -1083,7 +1188,7 @@ function StrategyPage({
         <Field label="策略名称">
           <Input value={title} onChange={(_, data) => setTitle(data.value)} />
         </Field>
-        <div className="form-grid">
+        <div className="form-grid compact-fields">
           <Field label="触发层级">
             <Select
               value={level}
@@ -1105,44 +1210,109 @@ function StrategyPage({
               onChange={(_, data) => setPriority(data.value)}
             />
           </Field>
-          <Field label="指标">
-            <Select
-              value={metric}
-              onChange={(_, data) => setMetric(data.value)}
-            >
-              <option value="spend_cent">消耗（分）</option>
-              <option value="order_count">成交订单数</option>
-              <option value="gmv_cent">成交金额（分）</option>
-              <option value="roi_decimal">ROI</option>
-            </Select>
-          </Field>
-          <Field label="比较">
-            <Select
-              value={operator}
-              onChange={(_, data) => setOperator(data.value)}
-            >
-              <option value="gt">大于</option>
-              <option value="gte">大于等于</option>
-              <option value="lt">小于</option>
-              <option value="lte">小于等于</option>
-              <option value="between">区间（含边界）</option>
-            </Select>
-          </Field>
         </div>
-        {operator === "between" ? (
-          <div className="form-grid">
-            <Field label="区间下限">
-              <Input value={value} onChange={(_, data) => setValue(data.value)} />
-            </Field>
-            <Field label="区间上限">
-              <Input value={maxValue} onChange={(_, data) => setMaxValue(data.value)} />
-            </Field>
+        <div className="condition-editor">
+          <div className="section-heading-row">
+            <div>
+              <strong>触发条件</strong>
+              <small>以下 {conditions.length} 个条件必须同时满足（AND）</small>
+            </div>
+            <Button
+              size="small"
+              disabled={conditions.length >= 8}
+              onClick={() =>
+                setConditions((current) => [
+                  ...current,
+                  createCondition(current.length),
+                ])
+              }
+            >
+              添加条件
+            </Button>
           </div>
-        ) : (
-          <Field label="阈值">
-            <Input value={value} onChange={(_, data) => setValue(data.value)} />
-          </Field>
-        )}
+          {conditions.map((condition, index) => (
+            <div className="condition-row" key={condition.id}>
+              <span className="condition-number">{index + 1}</span>
+              <Select
+                aria-label={`条件${index + 1}指标`}
+                value={condition.metric}
+                onChange={(_, data) =>
+                  setConditions((current) =>
+                    current.map((item) =>
+                      item.id === condition.id
+                        ? { ...item, metric: data.value }
+                        : item,
+                    ),
+                  )
+                }
+              >
+                <option value="spend_cent">消耗（分）</option>
+                <option value="order_count">成交订单数</option>
+                <option value="gmv_cent">成交金额（分）</option>
+                <option value="roi_decimal">ROI</option>
+              </Select>
+              <Select
+                aria-label={`条件${index + 1}比较方式`}
+                value={condition.operator}
+                onChange={(_, data) =>
+                  setConditions((current) =>
+                    current.map((item) =>
+                      item.id === condition.id
+                        ? { ...item, operator: data.value }
+                        : item,
+                    ),
+                  )
+                }
+              >
+                <option value="gt">大于</option>
+                <option value="gte">大于等于</option>
+                <option value="lt">小于</option>
+                <option value="lte">小于等于</option>
+                <option value="between">区间（含边界）</option>
+              </Select>
+              <Input
+                aria-label={condition.operator === "between" ? "区间下限" : "阈值"}
+                value={condition.value}
+                onChange={(_, data) =>
+                  setConditions((current) =>
+                    current.map((item) =>
+                      item.id === condition.id
+                        ? { ...item, value: data.value }
+                        : item,
+                    ),
+                  )
+                }
+              />
+              {condition.operator === "between" && (
+                <Input
+                  aria-label="区间上限"
+                  value={condition.maxValue}
+                  onChange={(_, data) =>
+                    setConditions((current) =>
+                      current.map((item) =>
+                        item.id === condition.id
+                          ? { ...item, maxValue: data.value }
+                          : item,
+                      ),
+                    )
+                  }
+                />
+              )}
+              <Button
+                size="small"
+                appearance="subtle"
+                icon={<DeleteRegular />}
+                aria-label={`删除条件${index + 1}`}
+                disabled={conditions.length === 1}
+                onClick={() =>
+                  setConditions((current) =>
+                    current.filter((item) => item.id !== condition.id),
+                  )
+                }
+              />
+            </div>
+          ))}
+        </div>
         <div className="strategy-enable-row">
           <Switch
             checked={enableNow}
@@ -1161,9 +1331,14 @@ function StrategyPage({
             ? "命中后只冻结追投候选并发送模拟预览，不会创建真实追投。"
             : "命中后只冻结停投候选并发送模拟预览，不会暂停任何调控任务。"}
         </div>
+        {!conditionsValid && (
+          <InlineStatus tone="warning">
+            条件阈值必须是有效数字；区间上限不能小于下限。
+          </InlineStatus>
+        )}
         <Button
           appearance="primary"
-          disabled={!target}
+          disabled={!formValid}
           onClick={() => void save()}
         >
           {enableNow ? "保存并启用模拟策略" : "保存策略草稿"}
@@ -1180,10 +1355,11 @@ function StrategyPage({
                 <div>
                   <strong>{item.title}</strong>
                   <small>
-                    优先级 {item.priority} · {item.strategy_type} ·{" "}
+                    优先级 {item.priority} · {mode === "retarget" ? "追投候选" : "停投候选"} ·{" "}
                     {item.trigger_level === "product" ? "商品级" : "素材级"} ·
                     版本 {item.version}
                   </small>
+                  <small>{strategyTriggerSummary(item.trigger_json)}</small>
                 </div>
                 <Switch
                   checked={Boolean(item.enabled)}
@@ -1224,29 +1400,65 @@ function CandidatePage({
   const [groups, setGroups] = useState<
     Array<{ name: string; mode: string; material_ids: string[] }>
   >([]);
+  const [savedGroupCount, setSavedGroupCount] = useState(0);
+  const [groupsDirty, setGroupsDirty] = useState(false);
+  const groupsDirtyRef = useRef(false);
+  const markGroupsDirty = (value: boolean) => {
+    groupsDirtyRef.current = value;
+    setGroupsDirty(value);
+  };
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   useEffect(() => {
-    void api<any[]>("/api/v1/candidates").then((rows) => {
-      setBatches(rows);
-      setActive(
-        (current: any | null) =>
-          rows.find(
-            (row) => row.candidate_batch_id === current?.candidate_batch_id,
-          ) ??
-          rows[0] ??
-          null,
-      );
-    });
+    setLoading(true);
+    setLoadError("");
+    void api<any[]>("/api/v1/candidates")
+      .then((rows) => {
+        setBatches(rows);
+        setActive(
+          (current: any | null) =>
+            rows.find(
+              (row) => row.candidate_batch_id === current?.candidate_batch_id,
+            ) ??
+            rows[0] ??
+            null,
+        );
+      })
+      .catch((error) => setLoadError(errorMessage(error)))
+      .finally(() => setLoading(false));
   }, [refreshKey]);
   useEffect(() => {
     setPageNumber(1);
     setSelected(new Set());
     setGroups([]);
+    setSavedGroupCount(0);
+    markGroupsDirty(false);
   }, [active?.candidate_batch_id]);
   useEffect(() => {
     if (!active) return;
+    setLoadError("");
     void api<any>(
       `/api/v1/candidates/${active.candidate_batch_id}?page=${pageNumber}&page_size=20`,
-    ).then(setPage);
+    )
+      .then((value) => {
+        setPage(value);
+        const persisted = Array.isArray(value.groups) ? value.groups : [];
+        if (persisted.length && !groupsDirtyRef.current) {
+          setGroups(
+            persisted.map((group: any, index: number) => ({
+              name: group.group_name || `已保存分组${index + 1}`,
+              mode: group.group_mode || "selected_group",
+              material_ids: group.material_ids || [],
+            })),
+          );
+          setSavedGroupCount(persisted.length);
+          markGroupsDirty(false);
+        } else if (Number(value.group_count || 0) > 0 && !groupsDirtyRef.current) {
+          setSavedGroupCount(Number(value.group_count));
+          markGroupsDirty(false);
+        }
+      })
+      .catch((error) => setLoadError(errorMessage(error)));
   }, [active, pageNumber, refreshKey]);
   const addSelectedGroup = () => {
     if (!selected.size || selected.size > 20) return;
@@ -1258,6 +1470,7 @@ function CandidatePage({
         material_ids: [...selected],
       },
     ]);
+    markGroupsDirty(true);
   };
   const makeSingleGroups = async () => {
     if (!active || !page) return;
@@ -1271,6 +1484,7 @@ function CandidatePage({
     setGroups([
       { name: "全部逐条分别成组", mode: "single_each", material_ids: all },
     ]);
+    markGroupsDirty(true);
   };
   const materials = page?.items ?? [];
   return (
@@ -1280,7 +1494,10 @@ function CandidatePage({
         title="冻结候选批次"
         description="同一候选内容只保留一张活动卡；素材、指标或策略变化才生成新批次。"
       >
-        {batches.length ? (
+        {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
+        {loading ? (
+          <LoadingState label="正在读取冻结候选批次" />
+        ) : batches.length ? (
           <div className="account-list">
             {batches.map((batch) => (
               <button
@@ -1295,7 +1512,7 @@ function CandidatePage({
                 <div>
                   <strong>{batch.account_name} · {batch.plan_name}</strong>
                   <small>
-                    {batch.material_count} 条视频 · {batch.created_at} · {batch.status}
+                    {batch.material_count} 条视频 · {batch.created_at} · {candidateStatusLabel(batch.status)}
                   </small>
                 </div>
                 <i>
@@ -1318,17 +1535,33 @@ function CandidatePage({
         description="单组最多20条；不同分组允许重复选择同一素材。"
         actions={
           active && (
-            <Button
-              onClick={() =>
-                void run(
-                  "/api/v1/candidates/send-preview",
-                  { candidate_batch_id: active.candidate_batch_id },
-                  "飞书V1A模拟预览已加入发送队列",
-                )
+            <Tooltip
+              content={
+                groupsDirty || savedGroupCount === 0
+                  ? "请先保存当前分组，飞书卡只展示已冻结分组"
+                  : "发送已冻结分组的V1A模拟确认卡"
               }
+              relationship="label"
             >
-              发送模拟卡
-            </Button>
+              <Button
+                disabled={
+                  groupsDirty ||
+                  savedGroupCount === 0 ||
+                  !["frozen", "grouped", "pending_approval"].includes(
+                    String(active.status),
+                  )
+                }
+                onClick={() =>
+                  void run(
+                    "/api/v1/candidates/send-preview",
+                    { candidate_batch_id: active.candidate_batch_id },
+                    "飞书V1A模拟确认卡已加入发送队列",
+                  )
+                }
+              >
+                发送冻结分组预览
+              </Button>
+            </Tooltip>
           )
         }
       >
@@ -1403,7 +1636,7 @@ function CandidatePage({
                 relationship="label"
               >
                 <Button
-                  onClick={() =>
+                  onClick={() => {
                     setGroups([
                       {
                         name: "全部为一组",
@@ -1412,8 +1645,9 @@ function CandidatePage({
                           (item: any) => item.material_id,
                         ),
                       },
-                    ])
-                  }
+                    ]);
+                    markGroupsDirty(true);
+                  }}
                   disabled={!materials.length || page?.total > 20}
                 >
                   全部为一组
@@ -1433,30 +1667,54 @@ function CandidatePage({
                   <span>{group.material_ids.length} 条</span>
                   <button
                     aria-label={`删除${group.name}`}
-                    onClick={() =>
+                    onClick={() => {
                       setGroups((current) =>
                         current.filter((_, itemIndex) => itemIndex !== index),
-                      )
-                    }
+                      );
+                      markGroupsDirty(true);
+                    }}
                   >
                     ×
                   </button>
                 </div>
               ))}
             </div>
-            <Button
-              appearance="primary"
-              disabled={!groups.length}
-              onClick={() =>
-                void run(
-                  "/api/v1/candidates/groups",
-                  { candidate_batch_id: active.candidate_batch_id, groups },
-                  "模拟分组已保存，未执行任何千川操作",
-                )
-              }
-            >
-              保存 Dry-run 分组
-            </Button>
+            <div className="button-row align-center">
+              <Button
+                appearance="primary"
+                disabled={!groups.length || !groupsDirty}
+                onClick={async () => {
+                  const result = await run(
+                    "/api/v1/candidates/groups",
+                    { candidate_batch_id: active.candidate_batch_id, groups },
+                    "模拟分组已冻结保存，未执行任何千川操作",
+                  );
+                  if (!result) return;
+                  const payload = jobResult(result);
+                  const count = Array.isArray(payload?.group_uids)
+                    ? payload.group_uids.length
+                    : groups.reduce(
+                        (total, group) =>
+                          total +
+                          (group.mode === "single_each"
+                            ? group.material_ids.length
+                            : 1),
+                        0,
+                      );
+                  setSavedGroupCount(count);
+                  markGroupsDirty(false);
+                }}
+              >
+                保存并冻结分组
+              </Button>
+              <span className={groupsDirty ? "warning-text" : "good-text"}>
+                {groupsDirty
+                  ? "当前分组尚未保存"
+                  : savedGroupCount > 0
+                    ? `已冻结 ${savedGroupCount} 个分组，可发送飞书预览`
+                    : "尚未冻结分组"}
+              </span>
+            </div>
           </>
         )}
       </Panel>
@@ -1477,7 +1735,11 @@ function AdjustmentCandidatePanel({ refreshKey }: { refreshKey: number }) {
       description="仅展示素材追投任务的冻结停投候选；V1A不会创建或推进任何真实执行任务。"
     >
       <DataTable
-        rows={items}
+        rows={items.map((item) => ({
+          ...item,
+          action_type: "停投模拟",
+          status: candidateStatusLabel(item.status),
+        }))}
         columns={[
           "created_at",
           "account_name",
@@ -1487,6 +1749,15 @@ function AdjustmentCandidatePanel({ refreshKey }: { refreshKey: number }) {
           "action_type",
           "status",
         ]}
+        headerLabels={{
+          created_at: "创建时间",
+          account_name: "千川账户",
+          plan_name: "源计划",
+          task_name: "调控任务",
+          control_task_id: "调控任务ID",
+          action_type: "动作",
+          status: "状态",
+        }}
         empty="暂无 Scene 2 停投候选"
       />
     </Panel>
@@ -1504,7 +1775,15 @@ function ExecutionTaskPanel({ refreshKey }: { refreshKey: number }) {
       description="这里只记录飞书模拟确认、拒绝、过期、取消和只读归档结果；V1A 数据库不接受真实执行状态。"
     >
       <DataTable
-        rows={items}
+        rows={items.map((item) => ({
+          ...item,
+          plan_system: planSystemName[item.plan_system] || item.plan_system,
+          promotion_scene: sceneName[item.promotion_scene] || item.promotion_scene,
+          operation_type: operationActionLabel(
+            String(item.operation_type || "").replace(/_dry_run$/, ""),
+          ),
+          status: candidateStatusLabel(item.status),
+        }))}
         columns={[
           "created_at",
           "account_name",
@@ -1519,6 +1798,20 @@ function ExecutionTaskPanel({ refreshKey }: { refreshKey: number }) {
           "authorized_at",
           "error_message",
         ]}
+        headerLabels={{
+          created_at: "创建时间",
+          account_name: "千川账户",
+          plan_name: "源计划",
+          plan_system: "计划体系",
+          promotion_scene: "推广方式",
+          operation_type: "模拟动作",
+          status: "状态",
+          candidate_batch_id: "追投候选批次",
+          group_uid: "素材分组",
+          adjustment_candidate_id: "停投候选",
+          authorized_at: "确认时间",
+          error_message: "失败原因",
+        }}
         empty="暂无模拟任务记录"
       />
     </Panel>
@@ -1536,14 +1829,36 @@ function FeishuPage({
   const [appId, setAppId] = useState("");
   const [appSecret, setAppSecret] = useState("");
   const [code, setCode] = useState("");
+  const [codePurpose, setCodePurpose] = useState<"personal" | "group">("personal");
+  const [routes, setRoutes] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ tone: "success" | "danger" | "info"; message: string } | null>(null);
   const load = useCallback(
-    () => api<any>("/api/v1/feishu/status").then(setStatus),
+    () =>
+      Promise.all([
+        api<any>("/api/v1/feishu/status"),
+        api<any[]>("/api/v1/feishu/routes"),
+      ])
+        .then(([connectionStatus, routeRows]) => {
+          setStatus(connectionStatus);
+          setRoutes(routeRows);
+        })
+        .catch((error) =>
+          setFeedback({ tone: "danger", message: errorMessage(error) }),
+        ),
     [],
   );
   useEffect(() => {
     void load();
   }, [load, refreshKey]);
+  useEffect(() => {
+    if (!code || status.binding === "bound") return;
+    const timer = window.setInterval(() => void load(), 2000);
+    return () => window.clearInterval(timer);
+  }, [code, status.binding, load]);
   const save = async () => {
+    setBusy(true);
+    setFeedback({ tone: "info", message: "正在验证飞书应用凭据…" });
     try {
       const queued = await command("/api/v1/feishu/config", {
         app_id: appId,
@@ -1559,9 +1874,12 @@ function FeishuPage({
       if (!payload?.valid)
         throw new Error(payload?.error || "飞书凭据验证失败");
       setAppSecret("");
+      setFeedback({ tone: "success", message: "凭据有效并已加密保存" });
       await load();
     } catch (error) {
-      alert(errorMessage(error));
+      setFeedback({ tone: "danger", message: errorMessage(error) });
+    } finally {
+      setBusy(false);
     }
   };
   const issue = async (purpose: string) => {
@@ -1570,9 +1888,9 @@ function FeishuPage({
       { purpose },
       "一次性绑定码已生成",
     );
-    const payload = result.result_json
-      ? JSON.parse(result.result_json)
-      : result.result;
+    if (!result) return;
+    const payload = jobResult(result);
+    setCodePurpose(purpose === "group" ? "group" : "personal");
     setCode(payload?.code || "请在任务结果中查看");
   };
   const states = [
@@ -1586,8 +1904,9 @@ function FeishuPage({
     <div className="two-columns">
       <Panel
         title="飞书长连接"
-        description="无需公网IP、域名或Cloudflare。App Secret经Windows DPAPI加密，仅保存在本机。"
+        description="无需公网IP、域名或Cloudflare。App ID与App Secret均经Windows DPAPI加密，仅保存在本机。"
       >
+        {feedback && <InlineStatus tone={feedback.tone}>{feedback.message}</InlineStatus>}
         <div className="connection-grid">
           {states.map(([label, value]) => (
             <div key={label}>
@@ -1603,7 +1922,7 @@ function FeishuPage({
                     : "warning-text"
                 }
               >
-                {value || "unknown"}
+                {feishuStateLabel(value)}
               </strong>
             </div>
           ))}
@@ -1619,10 +1938,15 @@ function FeishuPage({
           />
         </Field>
         <div className="button-row">
-          <Button appearance="primary" onClick={() => void save()}>
-            保存并验证凭据
+          <Button
+            appearance="primary"
+            disabled={busy || !appId.trim() || !appSecret.trim()}
+            onClick={() => void save()}
+          >
+            {busy ? "正在验证…" : "保存并验证凭据"}
           </Button>
           <Button
+            disabled={status.credential !== "valid"}
             onClick={() =>
               void run("/api/v1/feishu/reconnect", {}, "长连接启动请求已完成")
             }
@@ -1645,8 +1969,14 @@ function FeishuPage({
       >
         <div className="button-row">
           <Button onClick={() => void issue("personal")}>生成个人绑定码</Button>
-          <Button onClick={() => void issue("group")}>生成群绑定码</Button>
           <Button
+            disabled={status.binding !== "bound"}
+            onClick={() => void issue("group")}
+          >
+            生成群绑定码
+          </Button>
+          <Button
+            disabled={status.sending !== "ready"}
             onClick={() =>
               void run("/api/v1/feishu/test-card", {}, "测试卡已发送")
             }
@@ -1656,8 +1986,15 @@ function FeishuPage({
         </div>
         {code && (
           <div className="binding-code">
-            <span>请私聊机器人发送</span>
-            <strong>绑定 {code}</strong>
+            <span>
+              {codePurpose === "personal"
+                ? "请私聊机器人发送"
+                : "请由已绑定授权人在目标群内@机器人发送"}
+            </span>
+            <strong>
+              {codePurpose === "personal" ? `绑定 ${code}` : `绑定群 ${code}`}
+            </strong>
+            <small>10分钟有效，仅可使用一次</small>
           </div>
         )}
         <ol className="guide-list">
@@ -1666,6 +2003,30 @@ function FeishuPage({
           <li>个人绑定：私聊机器人发送“绑定 123456”。</li>
           <li>群绑定：群内 @机器人发送“绑定群 123456”。</li>
         </ol>
+        {status.last_error_message && (
+          <InlineStatus tone="danger">
+            最近错误 {status.last_error_code || "unknown"}：{status.last_error_message}
+          </InlineStatus>
+        )}
+        <div className="route-list">
+          <strong>已绑定接收位置</strong>
+          {routes.length ? (
+            routes.map((route) => (
+              <div key={route.route_id}>
+                <span>{route.route_name}</span>
+                <small>
+                  {route.personal_open_id ? "个人" : ""}
+                  {route.personal_open_id && routeGroupCount(route) ? " + " : ""}
+                  {routeGroupCount(route)
+                    ? `${routeGroupCount(route)}个群`
+                    : ""}
+                </small>
+              </div>
+            ))
+          ) : (
+            <span className="warning-text">尚未绑定个人或群</span>
+          )}
+        </div>
       </Panel>
     </div>
   );
@@ -1680,9 +2041,8 @@ function OperationsPage({
 }) {
   const today = new Date();
   const seven = new Date(Date.now() - 6 * 86400000);
-  const iso = (date: Date) => date.toISOString().slice(0, 10);
-  const [from, setFrom] = useState(iso(seven));
-  const [to, setTo] = useState(iso(today));
+  const [from, setFrom] = useState(localDateKey(seven));
+  const [to, setTo] = useState(localDateKey(today));
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [aavid, setAavid] = useState("");
   const [source, setSource] = useState("platform_log");
@@ -1692,7 +2052,17 @@ function OperationsPage({
   const [keyword, setKeyword] = useState("");
   const [rows, setRows] = useState<any[]>([]);
   const [report, setReport] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const operationRequestRef = useRef(0);
   const load = useCallback(async () => {
+    if (from > to) {
+      setLoadError("开始日期不能晚于结束日期");
+      return;
+    }
+    setLoading(true);
+    setLoadError("");
+    const requestId = ++operationRequestRef.current;
     const query = new URLSearchParams({
       date_from: from,
       date_to: to,
@@ -1702,15 +2072,41 @@ function OperationsPage({
       ...(resultStatus ? { result_status: resultStatus } : {}),
       ...(operatorName ? { operator: operatorName } : {}),
       ...(keyword ? { keyword } : {}),
+      limit: "500",
     });
-    setRows(await api<any[]>(`/api/v1/operation-events?${query}`));
+    try {
+      const nextRows = await api<any[]>(`/api/v1/operation-events?${query}`);
+      if (requestId === operationRequestRef.current) setRows(nextRows);
+    } catch (error) {
+      if (requestId === operationRequestRef.current) setLoadError(errorMessage(error));
+    } finally {
+      if (requestId === operationRequestRef.current) setLoading(false);
+    }
   }, [from, to, source, aavid, actionType, resultStatus, operatorName, keyword]);
   useEffect(() => {
-    void api<Account[]>("/api/v1/accounts").then(setAccounts);
+    void api<Account[]>("/api/v1/accounts")
+      .then(setAccounts)
+      .catch((error) => setLoadError(errorMessage(error)));
   }, [refreshKey]);
   useEffect(() => {
     void load();
   }, [load, refreshKey]);
+  const accountNames = useMemo(
+    () => new Map(accounts.map((account) => [account.aavid, account.account_name])),
+    [accounts],
+  );
+  const normalizedRows = useMemo(
+    () =>
+      rows.map((row) => ({
+        ...row,
+        account_name:
+          accountNames.get(String(row.aavid)) || row.account_name || row.aavid,
+        action_type: operationActionLabel(row.action_type),
+        source: operationSourceLabel(row.source),
+        result_status: operationResultLabel(row.result_status),
+      })),
+    [rows, accountNames],
+  );
   const exportCsv = () => {
     const columns: Array<[string, string]> = [
       ["event_time_beijing", "北京时间"],
@@ -1731,14 +2127,8 @@ function OperationsPage({
       "\ufeff" +
       [
         columns.map(([, label]) => label).join(","),
-        ...rows.map((row) => {
-          const exported = {
-            ...row,
-            action_type: operationActionLabel(row.action_type),
-            source: operationSourceLabel(row.source),
-            result_status: operationResultLabel(row.result_status),
-          };
-          return columns.map(([column]) => escape(exported[column])).join(",");
+        ...normalizedRows.map((row) => {
+          return columns.map(([column]) => escape(row[column])).join(",");
         }),
       ].join("\r\n");
     const link = document.createElement("a");
@@ -1747,14 +2137,19 @@ function OperationsPage({
     );
     link.download = `千川账户操作流水_${from}_${to}.csv`;
     link.click();
-    URL.revokeObjectURL(link.href);
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   };
   const preview = async () => {
     const query = new URLSearchParams({
       business_date: to,
       ...(aavid ? { aavid } : {}),
     });
-    setReport(await api<any>(`/api/v1/daily-report?${query}`));
+    setLoadError("");
+    try {
+      setReport(await api<any>(`/api/v1/daily-report?${query}`));
+    } catch (error) {
+      setLoadError(errorMessage(error));
+    }
   };
   return (
     <>
@@ -1780,11 +2175,16 @@ function OperationsPage({
                 同步平台日志
               </Button>
             </Tooltip>
-            <Button onClick={() => void load()}>查询</Button>
-            <Button onClick={exportCsv}>导出当前结果</Button>
+            <Button disabled={loading} onClick={() => void load()}>
+              {loading ? "正在查询…" : "查询"}
+            </Button>
+            <Button disabled={!normalizedRows.length} onClick={exportCsv}>
+              导出当前结果
+            </Button>
           </>
         }
       >
+        {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
         <div className="toolbar">
           <Field label="千川账户">
             <Select value={aavid} onChange={(_, data) => setAavid(data.value)}>
@@ -1866,39 +2266,53 @@ function OperationsPage({
               onChange={(_, data) => setKeyword(data.value)}
             />
           </Field>
-          <Button onClick={() => void preview()}>预览日报</Button>
+          <Button onClick={() => void preview()}>预览结束日期日报</Button>
+          <Button
+            onClick={() =>
+              confirm(`确认发送 ${to} 的全账户总览和账户明细日报？`) &&
+              void run(
+                "/api/v1/daily-report/send",
+                { business_date: to },
+                `${to} 日报已加入飞书发送队列`,
+              )
+            }
+          >
+            发送飞书日报
+          </Button>
         </div>
-        <DataTable
-          rows={rows.map((row) => ({
-            ...row,
-            action_type: operationActionLabel(row.action_type),
-            source: operationSourceLabel(row.source),
-            result_status: operationResultLabel(row.result_status),
-          }))}
-          columns={[
-            "event_time_beijing",
-            "account_name",
-            "source_plan_name",
-            "action_type",
-            "operator_id",
-            "source",
-            "result_status",
-          ]}
-          headerLabels={{
-            event_time_beijing: "北京时间",
-            account_name: "千川账户",
-            source_plan_name: "计划名称",
-            action_type: "操作类型",
-            operator_id: "操作人",
-            source: "来源",
-            result_status: "结果",
-          }}
-          empty="当前筛选范围无操作流水"
-        />
+        <InlineStatus tone="info">
+          当前显示 {normalizedRows.length} 条，最多返回500条；导出内容与当前筛选结果一致。
+        </InlineStatus>
+        {loading ? (
+          <LoadingState label="正在查询平台操作流水" />
+        ) : (
+          <DataTable
+            rows={normalizedRows}
+            columns={[
+              "event_time_beijing",
+              "account_name",
+              "source_plan_name",
+              "action_type",
+              "operator_id",
+              "source",
+              "result_status",
+            ]}
+            headerLabels={{
+              event_time_beijing: "北京时间",
+              account_name: "千川账户",
+              source_plan_name: "计划名称",
+              action_type: "操作类型",
+              operator_id: "操作人",
+              source: "来源",
+              result_status: "结果",
+            }}
+            empty="当前筛选范围无操作流水"
+          />
+        )}
       </Panel>
       {report && (
-        <Panel title="日报双段预览">
-          <pre className="json-preview">{JSON.stringify(report, null, 2)}</pre>
+        <Panel title={`日报双段预览 · ${report.business_date}`}>
+          <DailyReportPreview report={report} accounts={accounts} />
         </Panel>
       )}
     </>
@@ -1994,17 +2408,27 @@ function RecoveryPage({
   const [data, setData] = useState<any>({ sources: [], runs: [] });
   const [caps, setCaps] = useState<any[]>([]);
   const [evidence, setEvidence] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const load = useCallback(
-    () =>
-      Promise.all([
-        api<any>("/api/v1/migrations"),
-        api<any[]>("/api/v1/capabilities"),
-        api<any[]>("/api/v1/adapter-evidence"),
-      ]).then(([migrations, capabilities, adapterEvidence]) => {
+    async () => {
+      setLoading(true);
+      setLoadError("");
+      try {
+        const [migrations, capabilities, adapterEvidence] = await Promise.all([
+          api<any>("/api/v1/migrations"),
+          api<any[]>("/api/v1/capabilities"),
+          api<any[]>("/api/v1/adapter-evidence"),
+        ]);
         setData(migrations);
         setCaps(capabilities);
         setEvidence(adapterEvidence);
-      }),
+      } catch (error) {
+        setLoadError(errorMessage(error));
+      } finally {
+        setLoading(false);
+      }
+    },
     [],
   );
   useEffect(() => {
@@ -2012,6 +2436,8 @@ function RecoveryPage({
   }, [load, refreshKey]);
   return (
     <>
+      {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
+      {loading && <LoadingState label="正在读取诊断与迁移状态" />}
       <div className="two-columns">
         <Panel
           title="旧版数据迁移"
@@ -2063,6 +2489,9 @@ function RecoveryPage({
           )}
         </Panel>
         <Panel title="运行诊断">
+          <div className="button-row diagnostic-actions">
+            <Button onClick={() => void load()}>刷新诊断</Button>
+          </div>
           <DataTable
             rows={[
               { item: "SQLite完整性", status: health.database.integrity },
@@ -2174,6 +2603,155 @@ function RecoveryPage({
   );
 }
 
+function JobStatusPanel({ refreshKey }: { refreshKey: number }) {
+  const [rows, setRows] = useState<any[]>([]);
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    try {
+      const jobs = await api<any[]>("/api/v1/jobs");
+      setRows(
+        jobs.slice(0, 50).map((job) => ({
+          ...job,
+          job_type: jobTypeLabel(job.job_type),
+          status: jobStatusLabel(job.status),
+          progress:
+            Number(job.progress_total || 0) > 0
+              ? `${job.progress_current}/${job.progress_total}`
+              : job.progress_message || "—",
+        })),
+      );
+      setError("");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }, []);
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => window.clearInterval(timer);
+  }, [load, refreshKey]);
+  return (
+    <Panel
+      title="后台任务状态"
+      description="长任务离开当前页面仍会继续执行。这里保留最近50条任务及失败原因。"
+      actions={<Button onClick={() => void load()}>刷新任务状态</Button>}
+    >
+      {error && <InlineStatus tone="danger">{error}</InlineStatus>}
+      <DataTable
+        rows={rows}
+        columns={[
+          "created_at",
+          "job_type",
+          "status",
+          "progress",
+          "error_message",
+        ]}
+        headerLabels={{
+          created_at: "创建时间",
+          job_type: "任务",
+          status: "状态",
+          progress: "进度",
+          error_message: "失败原因",
+        }}
+        empty="暂无后台任务"
+      />
+    </Panel>
+  );
+}
+
+function DailyReportPreview({ report, accounts }: { report: any; accounts: Account[] }) {
+  const real = report.real_platform_operations || {};
+  const simulation = report.simulation_candidates || {};
+  const accountNames = new Map(accounts.map((account) => [account.aavid, account.account_name]));
+  const actionRows = (actions: Record<string, number> = {}, simulationMode = false) =>
+    Object.entries(actions).map(([action, count]) => ({
+      action: simulationMode ? simulationActionLabel(action) : operationActionLabel(action),
+      count,
+    }));
+  const completenessRows = Object.entries(report.platform_log_completeness || {}).map(
+    ([aavid, status]) => ({
+      account_name: accountNames.get(aavid) || aavid,
+      aavid,
+      status: status === "complete" ? "完整" : "不完整",
+    }),
+  );
+  return (
+    <div className="daily-report-preview">
+      <section>
+        <div className="section-heading-row">
+          <div>
+            <strong>真实平台操作</strong>
+            <small>只统计千川后台投放日志</small>
+          </div>
+          <b>{real.total || 0} 条</b>
+        </div>
+        <div className="report-metrics">
+          <span>操作总数 <strong>{real.total || 0}</strong></span>
+          <span>失败/部分完成 <strong>{real.failures || 0}</strong></span>
+        </div>
+        <DataTable
+          rows={actionRows(real.actions)}
+          columns={["action", "count"]}
+          headerLabels={{ action: "动作", count: "数量" }}
+          empty="当天没有真实平台操作"
+        />
+      </section>
+      <section>
+        <div className="section-heading-row">
+          <div>
+            <strong>V1A模拟候选</strong>
+            <small>不计入真实追投、停投或调整数量</small>
+          </div>
+          <b>{simulation.total || 0} 批</b>
+        </div>
+        <DataTable
+          rows={actionRows(simulation.actions, true)}
+          columns={["action", "count"]}
+          headerLabels={{ action: "模拟内容", count: "数量" }}
+          empty="当天没有模拟候选"
+        />
+      </section>
+      <section className="report-completeness">
+        <div className="section-heading-row">
+          <div>
+            <strong>平台日志完整性</strong>
+            <small>不完整账户不会被标记为完整日报</small>
+          </div>
+        </div>
+        <DataTable
+          rows={completenessRows}
+          columns={["account_name", "aavid", "status"]}
+          headerLabels={{ account_name: "千川账户", aavid: "账户ID", status: "覆盖状态" }}
+          empty="尚无平台日志同步证据"
+        />
+      </section>
+    </div>
+  );
+}
+
+function InlineStatus({
+  tone,
+  children,
+}: {
+  tone: "info" | "success" | "danger" | "warning";
+  children: any;
+}) {
+  return (
+    <div className={`inline-status ${tone}`} role={tone === "danger" ? "alert" : "status"}>
+      {children}
+    </div>
+  );
+}
+
+function LoadingState({ label }: { label: string }) {
+  return (
+    <div className="loading-state" role="status">
+      <Spinner size="small" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 function Panel({
   title,
   description,
@@ -2256,7 +2834,9 @@ function DataTable({
               key={row.event_uid || row.run_uid || row.control_task_id || index}
             >
               {columns.map((column) => (
-                <td key={column}>{formatCell(row[column])}</td>
+                <td key={column} title={formatCell(row[column])}>
+                  {formatCell(row[column])}
+                </td>
               ))}
             </tr>
           ))}
@@ -2276,8 +2856,8 @@ function JobRail({ jobs }: { jobs: Job[] }) {
         <div key={job.job_uid}>
           <Spinner size="tiny" />
           <span>
-            <strong>{job.job_type}</strong>
-            <small>{job.progress_message || job.status}</small>
+            <strong>{jobTypeLabel(job.job_type)}</strong>
+            <small>{job.progress_message || jobStatusLabel(job.status)}</small>
           </span>
           {job.progress_total > 0 && (
             <b>
@@ -2296,7 +2876,150 @@ type RunCommand = (
   successMessage: string,
 ) => Promise<any>;
 function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  if (!(error instanceof Error)) return String(error);
+  const details = error as Error & { code?: string; requestId?: string };
+  const suffix = [details.code, details.requestId].filter(Boolean).join(" · ");
+  return suffix ? `${error.message}（${suffix}）` : error.message;
+}
+function jobResult(job: any) {
+  if (!job) return null;
+  if (job.result && typeof job.result === "object") return job.result;
+  if (job.result_json) {
+    try {
+      return JSON.parse(job.result_json);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+function localDateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+function routeGroupCount(route: any) {
+  try {
+    const groups = JSON.parse(String(route.group_chat_ids_json || "[]"));
+    return Array.isArray(groups) ? groups.length : 0;
+  } catch {
+    return 0;
+  }
+}
+function strategyTriggerSummary(value: unknown) {
+  try {
+    const trigger = typeof value === "string" ? JSON.parse(value) : value;
+    const conditions = Array.isArray(trigger?.conditions) ? trigger.conditions : [];
+    if (!conditions.length) return "未配置触发条件";
+    return conditions
+      .map((condition: any) => {
+        const metric =
+          ({
+            spend_cent: "消耗",
+            order_count: "订单数",
+            gmv_cent: "成交金额",
+            roi_decimal: "ROI",
+          } as Record<string, string>)[condition.metric] || condition.metric;
+        const operator =
+          ({ gt: ">", gte: "≥", lt: "<", lte: "≤" } as Record<string, string>)[
+            condition.operator
+          ];
+        return condition.operator === "between"
+          ? `${metric} ${condition.min}~${condition.max}`
+          : `${metric} ${operator || condition.operator} ${condition.value}`;
+      })
+      .join(" 且 ");
+  } catch {
+    return "触发条件无法解析";
+  }
+}
+function feishuStateLabel(value: unknown) {
+  const key = String(value || "unknown");
+  return (
+    ({
+      valid: "有效",
+      invalid: "无效",
+      not_configured: "未配置",
+      connected: "已连接",
+      connecting: "连接中",
+      disconnected: "未连接",
+      reconnecting: "正在重连",
+      receiving: "已收到事件",
+      not_received: "尚未收到事件",
+      bound: "已绑定",
+      unbound: "未绑定",
+      ready: "可发送",
+      unavailable: "不可发送",
+      permission_missing: "权限不足",
+    } as Record<string, string>)[key] || key
+  );
+}
+function jobStatusLabel(value: unknown) {
+  const key = String(value || "");
+  return (
+    ({
+      queued: "等待中",
+      running: "执行中",
+      succeeded: "成功",
+      failed: "失败",
+      cancelled: "已取消",
+      blocked_user_action: "等待用户处理",
+    } as Record<string, string>)[key] || key
+  );
+}
+function jobTypeLabel(value: unknown) {
+  const key = String(value || "");
+  return (
+    ({
+      qianchuan_add_account: "添加千川账户",
+      qianchuan_delete_account: "移除千川账户",
+      catalog_refresh: "刷新账户计划目录",
+      monitor_setup_save: "保存账户与监控计划",
+      target_collect: "采集计划数据",
+      strategy_save: "保存模拟策略",
+      strategy_toggle: "启停模拟策略",
+      candidate_generate: "生成冻结候选",
+      candidate_group_save: "保存候选分组",
+      candidate_preview_send: "发送飞书模拟卡",
+      feishu_reconnect: "连接飞书长连接",
+      feishu_binding_code: "生成飞书绑定码",
+      feishu_test_send: "发送飞书测试卡",
+      operation_log_sync: "同步平台操作日志",
+      daily_report_send: "发送平台日报",
+      migration_scan: "扫描旧版数据",
+      migration_execute: "迁移旧版数据",
+      migration_restore: "恢复迁移快照",
+    } as Record<string, string>)[key] || key
+  );
+}
+function simulationActionLabel(value: unknown) {
+  return (
+    ({
+      retarget_candidate_batch: "追投候选批次",
+      retarget_candidate_material: "追投候选素材",
+      retarget_pause_candidate: "停投候选",
+    } as Record<string, string>)[String(value ?? "")] || String(value ?? "")
+  );
+}
+function candidateStatusLabel(value: unknown) {
+  const key = String(value ?? "");
+  return (
+    ({
+      frozen: "已冻结",
+      grouped: "分组已冻结",
+      frozen_groups: "分组已冻结",
+      pending_approval: "等待飞书模拟确认",
+      preview_queued: "预览待发送",
+      completed: "模拟已完成",
+      dry_run_succeeded: "模拟成功",
+      dry_run_rejected: "已拒绝模拟",
+      rejected: "已拒绝",
+      expired: "已过期",
+      cancelled: "已取消",
+      archived_readonly: "只读归档",
+    } as Record<string, string>)[key] || key
+  );
 }
 function formatCell(value: unknown) {
   if (typeof value === "boolean") return value ? "是" : "否";

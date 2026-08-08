@@ -45,37 +45,48 @@ export function command(path: string, body: Record<string, unknown> = {}) {
 }
 
 export async function waitJob(jobUid: string, onProgress?: (job: any) => void) {
-  for (let attempt = 0; attempt < 600; attempt += 1) {
+  for (let attempt = 0; attempt < 1800; attempt += 1) {
     const job = await api<any>(`/api/v1/jobs/${encodeURIComponent(jobUid)}`);
     onProgress?.(job);
     if (["succeeded", "failed", "cancelled", "blocked_user_action"].includes(job.status)) return job;
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
-  throw new Error("后台任务等待超时");
+  throw new Error("后台任务等待超过30分钟，请到运行健康页查看任务状态");
 }
 
 export async function subscribeEvents(onEvent: (event: any) => void, signal: AbortSignal) {
-  if (!adminSession) return;
-  const response = await fetch("/api/v1/events", {
-    headers: {
-      Authorization: `Bearer ${launchToken}`,
-      "X-QCSCKP-Session": adminSession,
-    },
-    signal,
-  });
-  if (!response.ok || !response.body) return;
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (!signal.aborted) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() ?? "";
-    for (const chunk of chunks) {
-      const line = chunk.split("\n").find((value) => value.startsWith("data: "));
-      if (line) onEvent(JSON.parse(line.slice(6)));
+  while (!signal.aborted && adminSession) {
+    try {
+      const response = await fetch("/api/v1/events", {
+        headers: {
+          Authorization: `Bearer ${launchToken}`,
+          "X-QCSCKP-Session": adminSession,
+        },
+        signal,
+      });
+      if (!response.ok || !response.body) throw new Error(`SSE HTTP ${response.status}`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() ?? "";
+        for (const chunk of chunks) {
+          const line = chunk.split("\n").find((value) => value.startsWith("data: "));
+          if (!line) continue;
+          try {
+            onEvent(JSON.parse(line.slice(6)));
+          } catch {
+            // 单条损坏事件不能中断后续任务进度。
+          }
+        }
+      }
+    } catch {
+      if (signal.aborted) return;
     }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   }
 }

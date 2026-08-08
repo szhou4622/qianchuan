@@ -60,11 +60,19 @@ class LegacyMigrationService:
         self.database = database
         self.writer = writer
 
-    def scan(self, extra_roots: Iterable[str | Path] = ()) -> list[dict[str, Any]]:
+    def scan(
+        self,
+        tool_user_id: str | Iterable[str | Path],
+        extra_roots: Iterable[str | Path] = (),
+    ) -> list[dict[str, Any]]:
+        # 兼容内部旧调用；生产 API 始终显式传入当前 tool_user_id。
+        if not isinstance(tool_user_id, str):
+            extra_roots = tool_user_id
+            tool_user_id = "legacy-local-admin"
         candidates = self._candidate_databases(extra_roots)
         inspected = []
         for path in sorted(candidates, key=lambda item: str(item).lower()):
-            inspected.append(self._inspect(path))
+            inspected.append(self._inspect(tool_user_id, path))
         return inspected
 
     def _candidate_databases(self, extra_roots: Iterable[str | Path]) -> set[Path]:
@@ -102,9 +110,9 @@ class LegacyMigrationService:
                         candidates.add(path.resolve())
         return candidates
 
-    def _inspect(self, path: Path) -> dict[str, Any]:
+    def _inspect(self, tool_user_id: str, path: Path) -> dict[str, Any]:
         stat = path.stat()
-        source_uid = "legacy_" + stable_json_hash(str(path).lower())[:24]
+        source_uid = "legacy_" + stable_json_hash([tool_user_id, str(path).lower()])[:24]
         result = {
             "source_uid": source_uid,
             "database_path": str(path),
@@ -139,11 +147,11 @@ class LegacyMigrationService:
         self.writer.execute(
             """
             INSERT INTO migration_source(
-                source_uid, database_path, source_version, modified_at,
+                source_uid, tool_user_id, database_path, source_version, modified_at,
                 size_bytes, account_count, plan_count, operation_count,
                 status, inspection_error, inspected_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(database_path) DO UPDATE SET
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tool_user_id, database_path) DO UPDATE SET
                 source_version=excluded.source_version,
                 modified_at=excluded.modified_at,
                 size_bytes=excluded.size_bytes,
@@ -154,17 +162,18 @@ class LegacyMigrationService:
                 inspection_error=excluded.inspection_error,
                 inspected_at=excluded.inspected_at
             """,
-            tuple(result[key] for key in (
+            (result["source_uid"], tool_user_id) + tuple(result[key] for key in (
                 "source_uid", "database_path", "source_version", "modified_at",
                 "size_bytes", "account_count", "plan_count", "operation_count",
                 "status", "inspection_error", "inspected_at"
-            )),
+            ) if key != "source_uid"),
         )
         return result
 
     def migrate(self, tool_user_id: str, source_uid: str) -> dict[str, Any]:
         source = self.database.query_one(
-            "SELECT * FROM migration_source WHERE source_uid=?", (source_uid,)
+            "SELECT * FROM migration_source WHERE tool_user_id=? AND source_uid=?",
+            (tool_user_id, source_uid),
         )
         if not source or source["status"] != "available":
             raise ValueError("迁移源不存在或不可用")
@@ -493,9 +502,12 @@ class LegacyMigrationService:
                 inserted += 1
         return inserted
 
-    def restore_pre_migration_snapshot(self, migration_uid: str) -> dict[str, Any]:
+    def restore_pre_migration_snapshot(
+        self, tool_user_id: str, migration_uid: str
+    ) -> dict[str, Any]:
         row = self.database.query_one(
-            "SELECT * FROM migration_run WHERE migration_uid=?", (migration_uid,)
+            "SELECT * FROM migration_run WHERE tool_user_id=? AND migration_uid=?",
+            (tool_user_id, migration_uid),
         )
         if not row:
             raise KeyError(migration_uid)

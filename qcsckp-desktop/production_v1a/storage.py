@@ -556,6 +556,7 @@ CREATE TABLE IF NOT EXISTS feishu_inbox (
     processed_at TEXT,
     status TEXT NOT NULL,
     payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(tool_user_id, event_id)
 );
 
@@ -570,6 +571,8 @@ CREATE TABLE IF NOT EXISTS feishu_outbox (
     status TEXT NOT NULL,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT,
+    claim_owner TEXT,
+    claim_expires_at TEXT,
     sent_at TEXT,
     updated_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -625,7 +628,8 @@ CREATE TABLE IF NOT EXISTS daily_report_delivery (
 
 CREATE TABLE IF NOT EXISTS migration_source (
     source_uid TEXT PRIMARY KEY,
-    database_path TEXT NOT NULL UNIQUE,
+    tool_user_id TEXT NOT NULL,
+    database_path TEXT NOT NULL,
     source_version TEXT,
     modified_at TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
@@ -634,7 +638,8 @@ CREATE TABLE IF NOT EXISTS migration_source (
     operation_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     inspection_error TEXT,
-    inspected_at TEXT NOT NULL
+    inspected_at TEXT NOT NULL,
+    UNIQUE(tool_user_id, database_path)
 );
 
 CREATE TABLE IF NOT EXISTS migration_run (
@@ -758,6 +763,31 @@ class RuntimeDatabase:
         }
         if "encrypted_app_id" not in feishu_columns:
             conn.execute("ALTER TABLE feishu_profile ADD COLUMN encrypted_app_id TEXT")
+
+        inbox_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(feishu_inbox)")
+        }
+        if "payload_json" not in inbox_columns:
+            conn.execute(
+                "ALTER TABLE feishu_inbox ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+        outbox_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(feishu_outbox)")
+        }
+        if "claim_owner" not in outbox_columns:
+            conn.execute("ALTER TABLE feishu_outbox ADD COLUMN claim_owner TEXT")
+        if "claim_expires_at" not in outbox_columns:
+            conn.execute("ALTER TABLE feishu_outbox ADD COLUMN claim_expires_at TEXT")
+
+        migration_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(migration_source)")
+        }
+        if "tool_user_id" not in migration_columns:
+            conn.execute("ALTER TABLE migration_source ADD COLUMN tool_user_id TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_migration_source_owner_path ON migration_source(tool_user_id, database_path)"
+        )
 
     def initialize_history(self, business_month: str) -> Path:
         path = self.paths.history_db_for_month(business_month)

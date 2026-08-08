@@ -353,7 +353,7 @@ class RuntimeContext:
         promotion_scene: str | None = None,
         keyword: str | None = None,
     ) -> list[dict[str, Any]]:
-        clauses = ["tool_user_id=?"]
+        clauses = ["p.tool_user_id=?", "a.removed_at IS NULL"]
         params: list[Any] = [tool_user_id]
         for column, value in (
             ("aavid", aavid),
@@ -361,15 +361,15 @@ class RuntimeContext:
             ("promotion_scene", promotion_scene),
         ):
             if value:
-                clauses.append(f"{column}=?")
+                clauses.append(f"p.{column}=?")
                 params.append(value)
         if keyword:
-            clauses.append("(plan_name LIKE ? OR ad_id LIKE ?)")
+            clauses.append("(p.plan_name LIKE ? OR p.ad_id LIKE ?)")
             params.extend([f"%{keyword}%", f"%{keyword}%"])
         return self.database.query_all(
-            "SELECT p.*, (SELECT MAX(completed_at) FROM collection_run c WHERE c.tool_user_id=p.tool_user_id AND c.target_uid=p.target_uid AND c.object_type='video_material' AND c.status='complete') AS last_successful_collection_at FROM source_plan p WHERE "
+            "SELECT p.*, (SELECT MAX(completed_at) FROM collection_run c WHERE c.tool_user_id=p.tool_user_id AND c.target_uid=p.target_uid AND c.object_type='video_material' AND c.status='complete') AS last_successful_collection_at FROM source_plan p JOIN advertiser_account a ON a.tool_user_id=p.tool_user_id AND a.aavid=p.aavid WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY aavid, plan_system, promotion_scene, plan_name",
+            + " ORDER BY p.aavid, p.plan_system, p.promotion_scene, p.plan_name",
             params,
         )
 
@@ -402,11 +402,13 @@ class RuntimeContext:
         if not existing and int((account_count or {}).get("c") or 0) >= MAX_ACCOUNTS:
             raise ValueError(f"V1A最多主动添加{MAX_ACCOUNTS}个千川账户")
         self._require_collection_storage()
+        # 可见 Chrome 已保存最新 storage_state；先恢复唯一无头 Worker，
+        # 后续权威 advName 和四类目录请求才能使用同一份已登录会话。
+        self.browser.prepare_headless(context.tool_user_id)
         saved = self.collections.add_or_refresh_account(
             context.tool_user_id, str(account["aavid"])
         )
         # 账户添加完成后立即进行该账户目录刷新，不扫描全部授权账户。
-        self.browser.prepare_headless(context.tool_user_id)
         catalog = self.collections.refresh_catalog(
             context.tool_user_id,
             str(account["aavid"]),
@@ -436,7 +438,31 @@ class RuntimeContext:
                     (now, context.tool_user_id, aavid),
                 )
                 conn.execute(
-                    "UPDATE candidate_batch SET status='cancelled', terminal_at=?, updated_at=? WHERE tool_user_id=? AND aavid=? AND status IN ('draft','frozen','pending_approval','partially_approved')",
+                    "UPDATE candidate_batch SET status='cancelled', terminal_at=?, updated_at=? WHERE tool_user_id=? AND aavid=? AND status IN ('draft','frozen','grouped','pending_approval','partially_approved')",
+                    (now, now, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE retarget_group SET status='cancelled', updated_at=? WHERE candidate_batch_id IN (SELECT candidate_batch_id FROM candidate_batch WHERE tool_user_id=? AND aavid=? AND status='cancelled') AND status='frozen'",
+                    (now, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE adjustment_candidate SET status='cancelled', updated_at=? WHERE tool_user_id=? AND aavid=? AND status IN ('frozen','preview_queued')",
+                    (now, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE feishu_outbox SET status='cancelled', updated_at=? WHERE tool_user_id=? AND task_uid IN (SELECT candidate_batch_id FROM candidate_batch WHERE tool_user_id=? AND aavid=? AND status='cancelled') AND status IN ('queued','retry')",
+                    (now, context.tool_user_id, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE feishu_outbox SET status='cancelled', updated_at=? WHERE tool_user_id=? AND task_uid IN (SELECT adjustment_candidate_id FROM adjustment_candidate WHERE tool_user_id=? AND aavid=? AND status='cancelled') AND status IN ('queued','retry','sending')",
+                    (now, context.tool_user_id, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE feishu_outbox SET status='cancelled', updated_at=? WHERE tool_user_id=? AND task_uid IN (SELECT report_uid FROM daily_report_delivery WHERE tool_user_id=? AND aavid=?) AND status IN ('queued','retry','sending')",
+                    (now, context.tool_user_id, context.tool_user_id, aavid),
+                )
+                conn.execute(
+                    "UPDATE background_job SET status='cancelled', completed_at=?, updated_at=?, error_code='account_removed', error_message='账户已删除，任务已取消' WHERE tool_user_id=? AND status='queued' AND json_extract(payload_json, '$.aavid')=?",
                     (now, now, context.tool_user_id, aavid),
                 )
 
@@ -459,12 +485,8 @@ class RuntimeContext:
         target_uids = [str(value) for value in context.payload.get("target_uids") or []]
         if len(set(target_uids)) > MAX_MONITORED_PLANS_PER_ACCOUNT:
             raise ValueError("每个账户最多监控10条计划")
-        feishu_status = self.feishu.status(context.tool_user_id)
-        enabling = bool(context.payload.get("enabled")) or bool(target_uids)
-        if enabling and not (
-            feishu_status["credential"] == "valid" and feishu_status["binding"] == "bound"
-        ):
-            raise ValueError("请先完成飞书凭据验证和授权人绑定")
+        # 账户与监听计划是只读采集配置，不依赖飞书。飞书未就绪时仅阻止
+        # 启用需要发卡的策略，不能反向阻塞用户选择监控计划。
         now = utc_iso()
 
         def op(conn):
@@ -540,18 +562,22 @@ class RuntimeContext:
         context.update_progress(2, 3, "运行规则模拟并冻结候选")
         candidate_ids: list[str] = []
         adjustment_candidate_ids: list[str] = []
+        candidate_blocked_reasons: list[str] = []
         if materials.get("status") == "complete":
-            candidate_ids = self.candidates.generate_for_target(
-                context.tool_user_id, str(target["target_uid"])
-            )
-            adjustment_candidate_ids = self.candidates.generate_adjustments_for_target(
-                context.tool_user_id, str(target["target_uid"])
-            )
+            try:
+                candidate_ids = self.candidates.generate_for_target(
+                    context.tool_user_id, str(target["target_uid"])
+                )
+            except CandidateBlocked as exc:
+                candidate_blocked_reasons.append(str(exc))
+            try:
+                adjustment_candidate_ids = self.candidates.generate_adjustments_for_target(
+                    context.tool_user_id, str(target["target_uid"])
+                )
+            except CandidateBlocked as exc:
+                if str(exc) not in candidate_blocked_reasons:
+                    candidate_blocked_reasons.append(str(exc))
             if self.feishu.status(context.tool_user_id)["sending"] == "ready":
-                for candidate_id in candidate_ids:
-                    self.feishu.enqueue_candidate_preview(
-                        context.tool_user_id, candidate_id
-                    )
                 for adjustment_candidate_id in adjustment_candidate_ids:
                     self.feishu.enqueue_adjustment_preview(
                         context.tool_user_id, adjustment_candidate_id
@@ -562,6 +588,7 @@ class RuntimeContext:
             "control_tasks": control_tasks,
             "candidate_batch_ids": candidate_ids,
             "adjustment_candidate_ids": adjustment_candidate_ids,
+            "candidate_blocked_reasons": candidate_blocked_reasons,
         }
 
     def _job_strategy_save(self, context: JobContext) -> dict[str, Any]:
@@ -689,8 +716,9 @@ class RuntimeContext:
         return {"message_id": message_id}
 
     def _job_migration_scan(self, context: JobContext) -> dict[str, Any]:
+        assert context.tool_user_id
         roots = [str(value) for value in context.payload.get("roots") or []]
-        return {"sources": self.migrations.scan(roots)}
+        return {"sources": self.migrations.scan(context.tool_user_id, roots)}
 
     def _job_migration_execute(self, context: JobContext) -> dict[str, Any]:
         assert context.tool_user_id
@@ -699,8 +727,9 @@ class RuntimeContext:
         )
 
     def _job_migration_restore(self, context: JobContext) -> dict[str, Any]:
+        assert context.tool_user_id
         return self.migrations.restore_pre_migration_snapshot(
-            str(context.payload["migration_uid"])
+            context.tool_user_id, str(context.payload["migration_uid"])
         )
 
     def _job_operation_log_sync(self, context: JobContext) -> dict[str, Any]:
@@ -732,8 +761,16 @@ class RuntimeContext:
         )
         if not default_route:
             raise ValueError("未配置管理员默认接收位置")
+        accounts = self.database.query_all(
+            "SELECT * FROM advertiser_account WHERE tool_user_id=? AND daily_report_enabled=1 AND removed_at IS NULL",
+            (context.tool_user_id,),
+        )
         outbox_ids: list[str] = []
-        overview = self.reports.daily_summary(context.tool_user_id, report_date)
+        overview = self.reports.daily_summary(
+            context.tool_user_id,
+            report_date,
+            aavids=[str(account["aavid"]) for account in accounts],
+        )
         overview_uid = self.reports.record_delivery(
             context.tool_user_id, report_date, str(default_route["route_id"]), overview
         )
@@ -741,10 +778,6 @@ class RuntimeContext:
             self.feishu.enqueue_daily_report(
                 context.tool_user_id, overview_uid, overview, default_route
             )
-        )
-        accounts = self.database.query_all(
-            "SELECT * FROM advertiser_account WHERE tool_user_id=? AND daily_report_enabled=1 AND removed_at IS NULL",
-            (context.tool_user_id,),
         )
         for account in accounts:
             summary = self.reports.daily_summary(
@@ -816,6 +849,7 @@ class V1AScheduler:
         while not self._stop.wait(30):
             try:
                 self._handle_resume(time.monotonic())
+                self.runtime.candidates.expire_due_candidates()
                 self._enqueue_due_catalogs()
                 self._enqueue_due_targets()
                 self._enqueue_operation_logs()
@@ -853,6 +887,7 @@ class V1AScheduler:
             JOIN advertiser_account a ON a.tool_user_id=p.tool_user_id AND a.aavid=p.aavid
             WHERE p.monitor_enabled=1 AND p.monitor_eligible=1
               AND a.enabled=1 AND a.removed_at IS NULL
+              AND a.catalog_status='complete' AND a.catalog_completed_at IS NOT NULL
             """
         )
         for target in targets:
@@ -861,11 +896,12 @@ class V1AScheduler:
             active = self.runtime.database.query_one(
                 """
                 SELECT 1 FROM background_job
-                WHERE job_type='target_collect' AND status IN ('queued','running')
+                WHERE tool_user_id=? AND job_type='target_collect'
+                  AND status IN ('queued','running')
                   AND json_extract(payload_json, '$.target_uid')=?
                 LIMIT 1
                 """,
-                (target["target_uid"],),
+                (target["tool_user_id"], target["target_uid"]),
             )
             if active:
                 continue
@@ -902,14 +938,16 @@ class V1AScheduler:
         )
         return bool(row and row["login_status"] == "authenticated")
 
-    def _job_active(self, job_type: str, field: str, value: str) -> bool:
+    def _job_active(
+        self, tool_user_id: str, job_type: str, field: str, value: str
+    ) -> bool:
         row = self.runtime.database.query_one(
             f"""
             SELECT 1 FROM background_job
-            WHERE job_type=? AND status IN ('queued','running')
+            WHERE tool_user_id=? AND job_type=? AND status IN ('queued','running')
               AND json_extract(payload_json, '$.{field}')=? LIMIT 1
             """,
-            (job_type, value),
+            (tool_user_id, job_type, value),
         )
         return bool(row)
 
@@ -920,7 +958,9 @@ class V1AScheduler:
         now = utc_now()
         for account in accounts:
             user_id = str(account["tool_user_id"])
-            if not self._authenticated(user_id) or self._job_active("catalog_refresh", "aavid", str(account["aavid"])):
+            if not self._authenticated(user_id) or self._job_active(
+                user_id, "catalog_refresh", "aavid", str(account["aavid"])
+            ):
                 continue
             completed = account.get("catalog_completed_at")
             if completed:
@@ -941,7 +981,9 @@ class V1AScheduler:
         for account in accounts:
             user_id = str(account["tool_user_id"])
             aavid = str(account["aavid"])
-            if not self._authenticated(user_id) or self._job_active("operation_log_sync", "aavid", aavid):
+            if not self._authenticated(user_id) or self._job_active(
+                user_id, "operation_log_sync", "aavid", aavid
+            ):
                 continue
             last = self.runtime.database.query_one(
                 "SELECT completed_at FROM collection_run WHERE tool_user_id=? AND aavid=? AND object_type='operation_log' ORDER BY started_at DESC, rowid DESC LIMIT 1",
@@ -968,11 +1010,15 @@ class V1AScheduler:
             user_id = str(user["tool_user_id"])
             if not self.runtime.is_tool_user_authorized(user_id):
                 continue
+            if self.runtime.feishu.status(user_id)["sending"] != "ready":
+                continue
             existing = self.runtime.database.query_one(
                 "SELECT 1 FROM daily_report_delivery WHERE tool_user_id=? AND aavid IS NULL AND business_date=? LIMIT 1",
                 (user_id, report_date),
             )
-            if existing or self._job_active("daily_report_send", "business_date", report_date):
+            if existing or self._job_active(
+                user_id, "daily_report_send", "business_date", report_date
+            ):
                 continue
             self.runtime.jobs.create(
                 "daily_report_send",

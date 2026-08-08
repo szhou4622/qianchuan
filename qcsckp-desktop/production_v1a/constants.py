@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 PRODUCT_VERSION = "1A.0.2-dev"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 RUNTIME_NAME = "production-v1a"
 AUTH_OFFLINE_GRACE_HOURS = 72
 AUTH_ACCESS_TOKEN_HOURS = 12

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import queue
 import re
 import secrets
@@ -21,6 +22,7 @@ from typing import Any, Callable
 from .candidates import CandidateService
 from .security import (
     protect_for_current_windows_user,
+    sanitize_exception_text,
     stable_json_hash,
     unprotect_for_current_windows_user,
 )
@@ -149,14 +151,19 @@ def build_candidate_preview_card(
     plan_name: str,
     plan_system: str,
     promotion_scene: str,
+    groups: list[dict[str, Any]] | None = None,
     page: int = 1,
-    page_size: int = 20,
+    page_size: int = 5,
 ) -> dict[str, Any]:
     materials = json.loads(str(batch["material_snapshot_json"]))
-    total_pages = max(1, (len(materials) + page_size - 1) // page_size)
+    frozen_groups = list(groups or [])
+    total_pages = max(1, (len(frozen_groups) + page_size - 1) // page_size)
     page = min(max(page, 1), total_pages)
     start = (page - 1) * page_size
-    visible = materials[start : start + page_size]
+    visible_groups = frozen_groups[start : start + page_size]
+    materials_by_id = {
+        str(material["material_id"]): material for material in materials
+    }
     system_label = {"global": "全域", "chengfang": "乘方"}.get(plan_system, "待确认")
     scene_label = {"product": "推商品", "live": "推直播"}.get(
         promotion_scene, "待确认"
@@ -166,14 +173,24 @@ def build_candidate_preview_card(
         f"**账户 ID：** {batch['aavid']}",
         f"**计划：** {plan_name}",
         f"**计划类型：** {system_label} · {scene_label}",
-        f"**候选素材：** {len(materials)} 条，当前第 {page} 页",
+        f"**候选素材：** {len(materials)} 条",
+        f"**冻结分组：** {len(frozen_groups)} 组，当前第 {page}/{total_pages} 页",
         f"**有效期：** {batch['expires_at']}",
     ]
-    material_lines = []
-    for material in visible:
-        material_id = str(material["material_id"])
-        material_lines.append(
-            f"{material['sequence']}. {material['material_name']}\n素材 ID：{material_id}"
+    group_lines: list[str] = []
+    for group in visible_groups:
+        material_ids = [
+            str(value) for value in json.loads(str(group.get("material_ids_json") or "[]"))
+        ]
+        material_lines = []
+        for material_id in material_ids:
+            material = materials_by_id.get(material_id) or {}
+            material_lines.append(
+                f"- {material.get('material_name') or material_id}（素材 ID：{material_id}）"
+            )
+        group_lines.append(
+            f"**第 {group.get('sequence')} 组 · {len(material_ids)} 条**\n"
+            + "\n".join(material_lines)
         )
     return {
         "config": {"wide_screen_mode": True},
@@ -189,68 +206,15 @@ def build_candidate_preview_card(
             {"tag": "hr"},
             {
                 "tag": "markdown",
-                "content": "\n\n".join(material_lines) or "当前页没有素材",
+                "content": "\n\n".join(group_lines) or "尚未在桌面任务中心保存冻结分组",
             },
             {
                 "tag": "note",
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": "分组保存后只生成 dry-run 结果和模拟审计，不会提交千川。",
+                        "content": "确认后只生成 dry-run 结果和模拟审计，不会提交千川。分组只能在桌面任务中心修改。",
                     }
-                ],
-            },
-            {
-                "tag": "form",
-                "name": "candidate_group_form",
-                "elements": [
-                    {
-                        "tag": "multi_select_static",
-                        "name": "material_ids",
-                        "placeholder": {
-                            "tag": "plain_text",
-                            "content": "选择本页素材，可重复提交形成多个组",
-                        },
-                        "options": [
-                            {
-                                "text": {
-                                    "tag": "plain_text",
-                                    "content": f"{item['sequence']}. {str(item['material_name'])[:32]}",
-                                },
-                                "value": str(item["material_id"]),
-                            }
-                            for item in visible
-                        ],
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "所选素材为一组"},
-                        "type": "primary",
-                        "action_type": "form_submit",
-                        "value": {
-                            "action": "v1a_selected_group",
-                            "candidate_batch_id": batch["candidate_batch_id"],
-                            "page": page,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "全部一组（总数≤20）"},
-                        "value": {
-                            "action": "v1a_all_group",
-                            "candidate_batch_id": batch["candidate_batch_id"],
-                            "page": page,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "逐条分别模拟"},
-                        "value": {
-                            "action": "v1a_single_each",
-                            "candidate_batch_id": batch["candidate_batch_id"],
-                            "page": page,
-                        },
-                    },
                 ],
             },
             *(
@@ -262,7 +226,7 @@ def build_candidate_preview_card(
                                 [
                                     {
                                         "tag": "button",
-                                        "text": {"tag": "plain_text", "content": "上一页"},
+                                        "text": {"tag": "plain_text", "content": "上一页分组"},
                                         "value": {
                                             "action": "v1a_previous_page",
                                             "candidate_batch_id": batch["candidate_batch_id"],
@@ -277,7 +241,7 @@ def build_candidate_preview_card(
                                 [
                                     {
                                         "tag": "button",
-                                        "text": {"tag": "plain_text", "content": "下一页"},
+                                        "text": {"tag": "plain_text", "content": "下一页分组"},
                                         "value": {
                                             "action": "v1a_next_page",
                                             "candidate_batch_id": batch["candidate_batch_id"],
@@ -299,7 +263,24 @@ def build_candidate_preview_card(
                 "actions": [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": "查看任务中心 / 继续多组"},
+                        "text": {"tag": "plain_text", "content": "确认模拟"},
+                        "type": "primary",
+                        "value": {
+                            "action": "v1a_confirm_groups",
+                            "candidate_batch_id": batch["candidate_batch_id"],
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "拒绝模拟"},
+                        "value": {
+                            "action": "v1a_reject_groups",
+                            "candidate_batch_id": batch["candidate_batch_id"],
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "查看任务中心"},
                         "value": {
                             "action": "v1a_view_task_center",
                             "candidate_batch_id": batch["candidate_batch_id"],
@@ -356,6 +337,45 @@ def build_adjustment_preview_card(
                     }
                 ],
             },
+        ],
+    }
+
+
+def build_candidate_result_card(
+    batch: dict[str, Any],
+    *,
+    account_name: str,
+    plan_name: str,
+    plan_system: str,
+    promotion_scene: str,
+    group_count: int,
+    result: str,
+) -> dict[str, Any]:
+    system_label = {"global": "全域", "chengfang": "乘方"}.get(plan_system, "待确认")
+    scene_label = {"product": "推商品", "live": "推直播"}.get(
+        promotion_scene, "待确认"
+    )
+    succeeded = result == "confirmed"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green" if succeeded else "grey",
+            "title": {
+                "tag": "plain_text",
+                "content": "V1A 模拟确认完成" if succeeded else "V1A 模拟已拒绝",
+            },
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": (
+                    "**未执行任何千川操作**\n\n"
+                    f"**账户：** {account_name}\n**账户 ID：** {batch['aavid']}\n"
+                    f"**计划：** {plan_name}\n**计划类型：** {system_label} · {scene_label}\n"
+                    f"**冻结分组：** {group_count} 组\n"
+                    f"**处理结果：** {'已生成 dry-run 结果与模拟审计' if succeeded else '已拒绝，本批次不会生成模拟执行结果'}"
+                ),
+            }
         ],
     }
 
@@ -426,9 +446,9 @@ class FeishuService:
         except Exception as exc:
             self.writer.execute(
                 "UPDATE feishu_profile SET credential_status='invalid', send_status='unavailable', last_error_code=?, last_error_message=?, updated_at=? WHERE tool_user_id=?",
-                (type(exc).__name__, str(exc)[:500], utc_iso(), tool_user_id),
+                (type(exc).__name__, sanitize_exception_text(exc, 500), utc_iso(), tool_user_id),
             )
-            return {"valid": False, "error": str(exc)}
+            return {"valid": False, "error": sanitize_exception_text(exc, 500)}
 
     def issue_binding_code(self, tool_user_id: str, purpose: str) -> str:
         if purpose not in {"personal", "group"}:
@@ -466,6 +486,8 @@ class FeishuService:
         """持久化事件；重复 event_id 返回 False 且绝不再次处理。"""
 
         now = utc_iso()
+        serialized_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        protected_payload = protect_for_current_windows_user(serialized_payload)
 
         def op(conn):
             with short_transaction(conn):
@@ -474,8 +496,9 @@ class FeishuService:
                         """
                         INSERT INTO feishu_inbox(
                             event_id, tool_user_id, event_type, sender_open_id,
-                            message_id, received_at, status, payload_hash
-                        ) VALUES(?, ?, ?, ?, ?, ?, 'received', ?)
+                            message_id, received_at, status, payload_hash,
+                            payload_json
+                        ) VALUES(?, ?, ?, ?, ?, ?, 'received', ?, ?)
                         """,
                         (
                             event_id,
@@ -485,6 +508,7 @@ class FeishuService:
                             message_id,
                             now,
                             stable_json_hash(payload),
+                            protected_payload,
                         ),
                     )
                 except __import__("sqlite3").IntegrityError:
@@ -513,9 +537,11 @@ class FeishuService:
         message_id: str = "",
     ) -> dict[str, Any]:
         payload = {
+            "sender_open_id": sender_open_id,
             "chat_id": chat_id,
             "chat_type": chat_type,
-            "text_hash": stable_json_hash(text),
+            "text": text,
+            "message_id": message_id,
         }
         if not self.ingest_event(
             tool_user_id=tool_user_id,
@@ -526,6 +552,15 @@ class FeishuService:
             payload=payload,
         ):
             return {"processed": False, "reason": "duplicate_event"}
+        return self._process_message_received(tool_user_id, event_id, payload)
+
+    def _process_message_received(
+        self, tool_user_id: str, event_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        sender_open_id = str(payload.get("sender_open_id") or "")
+        chat_id = str(payload.get("chat_id") or "")
+        chat_type = str(payload.get("chat_type") or "")
+        text = str(payload.get("text") or "")
         personal = re.search(r"(?:^|\s)绑定\s+(\d{6})(?:\s|$)", text)
         group = re.search(r"绑定群\s+(\d{6})(?:\s|$)", text)
         try:
@@ -667,15 +702,30 @@ class FeishuService:
         message_id: str,
         value: dict[str, Any],
     ) -> dict[str, Any]:
+        payload = {
+            "operator_open_id": operator_open_id,
+            "message_id": message_id,
+            "value": value,
+        }
         if not self.ingest_event(
             tool_user_id=tool_user_id,
             event_id=event_id,
             event_type="card.action.trigger",
             sender_open_id=operator_open_id,
             message_id=message_id,
-            payload=value,
+            payload=payload,
         ):
             return {"processed": False, "reason": "duplicate_event"}
+        return self._process_card_received(tool_user_id, event_id, payload)
+
+    def _process_card_received(
+        self, tool_user_id: str, event_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        operator_open_id = str(payload.get("operator_open_id") or "")
+        message_id = str(payload.get("message_id") or "")
+        value = payload.get("value")
+        if not isinstance(value, dict):
+            value = {}
         profile = self.database.query_one(
             "SELECT authorized_open_id FROM feishu_profile WHERE tool_user_id=?",
             (tool_user_id,),
@@ -687,70 +737,83 @@ class FeishuService:
         batch_id = str(value.get("candidate_batch_id") or "")
         page = max(1, int(value.get("page") or 1))
         page_data = self.candidates.page(tool_user_id, batch_id, page)
-        visible_ids = [str(row["material_id"]) for row in page_data["materials"]]
+        frozen_groups = self.database.query_all(
+            "SELECT * FROM retarget_group WHERE candidate_batch_id=? ORDER BY sequence",
+            (batch_id,),
+        )
         updated_card = None
+        target = self.database.query_one(
+            "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
+            (tool_user_id, page_data["batch"]["target_uid"]),
+        )
+        account = self.database.query_one(
+            "SELECT * FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
+            (tool_user_id, page_data["batch"]["aavid"]),
+        )
+        if not target or not account:
+            raise FeishuError("候选关联的账户或计划不存在")
         if action in {"v1a_previous_page", "v1a_next_page"}:
-            target = self.database.query_one(
-                "SELECT * FROM source_plan WHERE target_uid=?",
-                (page_data["batch"]["target_uid"],),
-            )
-            account = self.database.query_one(
-                "SELECT * FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
-                (tool_user_id, page_data["batch"]["aavid"]),
-            )
-            if not target or not account:
-                raise FeishuError("候选关联的账户或计划不存在")
             destination = page - 1 if action == "v1a_previous_page" else page + 1
-            destination = min(max(destination, 1), int(page_data["total_pages"]))
+            group_pages = max(1, math.ceil(len(frozen_groups) / 5))
+            destination = min(max(destination, 1), group_pages)
             updated_card = build_candidate_preview_card(
                 page_data["batch"],
                 account_name=str(account["account_name"]),
                 plan_name=str(target["plan_name"]),
                 plan_system=str(target["plan_system"]),
                 promotion_scene=str(target["promotion_scene"]),
+                groups=frozen_groups,
                 page=destination,
             )
             groups = []
-        elif action == "v1a_selected_group":
-            form = value.get("form_value") if isinstance(value.get("form_value"), dict) else {}
-            selected = value.get("material_ids") or form.get("material_ids") or []
-            if isinstance(selected, str):
-                selected = [selected]
-            selected_ids = [str(item) for item in selected]
-            if not selected_ids or len(selected_ids) > 20 or any(
-                item not in visible_ids for item in selected_ids
-            ):
-                raise FeishuError("请选择当前页中的1至20条素材")
-            groups = self.candidates.save_groups(
+        elif action == "v1a_confirm_groups":
+            groups = self.candidates.confirm_groups(
                 tool_user_id,
                 batch_id,
-                [{"mode": "selected_group", "material_ids": selected_ids}],
-                created_by_open_id=operator_open_id,
+                authorized_by_open_id=operator_open_id,
             )
-        elif action == "v1a_all_group":
-            all_ids = [
-                str(row["material_id"])
-                for row in json.loads(str(page_data["batch"]["material_snapshot_json"]))
-            ]
-            if len(all_ids) > 20:
-                raise FeishuError("候选超过20条，请在任务中心按页选择分组")
-            groups = self.candidates.save_groups(
-                tool_user_id,
-                batch_id,
-                [{"mode": "all_group", "material_ids": all_ids}],
-                created_by_open_id=operator_open_id,
+            updated_card = build_candidate_result_card(
+                page_data["batch"],
+                account_name=str(account["account_name"]),
+                plan_name=str(target["plan_name"]),
+                plan_system=str(target["plan_system"]),
+                promotion_scene=str(target["promotion_scene"]),
+                group_count=len(groups),
+                result="confirmed",
             )
-        elif action == "v1a_single_each":
-            groups = self.candidates.save_groups(
-                tool_user_id,
-                batch_id,
-                [{"mode": "single_each", "material_ids": visible_ids}],
-                created_by_open_id=operator_open_id,
+        elif action == "v1a_reject_groups":
+            self.candidates.reject_groups(
+                tool_user_id, batch_id, rejected_by_open_id=operator_open_id
+            )
+            groups = []
+            updated_card = build_candidate_result_card(
+                page_data["batch"],
+                account_name=str(account["account_name"]),
+                plan_name=str(target["plan_name"]),
+                plan_system=str(target["plan_system"]),
+                promotion_scene=str(target["promotion_scene"]),
+                group_count=len(frozen_groups),
+                result="rejected",
             )
         elif action == "v1a_view_task_center":
             groups = []
         else:
             raise FeishuError("未知的 V1A 模拟动作")
+        if updated_card:
+            if action in {"v1a_confirm_groups", "v1a_reject_groups"}:
+                self._enqueue_task_card_updates(
+                    tool_user_id,
+                    event_id=event_id,
+                    task_uid=batch_id,
+                    card=updated_card,
+                )
+            elif message_id:
+                self._enqueue_card_update(
+                    tool_user_id,
+                    event_id=event_id,
+                    message_id=message_id,
+                    card=updated_card,
+                )
         self._mark_inbox(tool_user_id, event_id, "processed")
         return {
             "processed": True,
@@ -760,88 +823,211 @@ class FeishuService:
             "updated_card": updated_card,
         }
 
-    def enqueue_candidate_preview(self, tool_user_id: str, batch_id: str) -> list[str]:
-        batch = self.database.query_one(
-            "SELECT * FROM candidate_batch WHERE tool_user_id=? AND candidate_batch_id=?",
-            (tool_user_id, batch_id),
-        )
-        if not batch:
-            raise KeyError(batch_id)
-        target = self.database.query_one(
-            "SELECT * FROM source_plan WHERE target_uid=?", (batch["target_uid"],)
-        )
-        account = self.database.query_one(
-            "SELECT * FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
-            (tool_user_id, batch["aavid"]),
-        )
-        if not target or not account:
-            raise FeishuError("候选账户或计划不存在")
-        route_id = account.get("feishu_route_id")
-        if not route_id:
-            route = self.database.query_one(
-                "SELECT * FROM feishu_route WHERE tool_user_id=? AND route_name='管理员默认位置' AND enabled=1",
-                (tool_user_id,),
-            )
-        else:
-            route = self.database.query_one(
-                "SELECT * FROM feishu_route WHERE tool_user_id=? AND route_id=? AND enabled=1",
-                (tool_user_id, route_id),
-            )
-        if not route:
-            raise FeishuError("该账户尚未配置飞书接收位置")
-        card = build_candidate_preview_card(
-            batch,
-            account_name=str(account["account_name"]),
-            plan_name=str(target["plan_name"]),
-            plan_system=str(target["plan_system"]),
-            promotion_scene=str(target["promotion_scene"]),
-        )
-        targets: list[tuple[str, str]] = []
-        if route.get("personal_open_id"):
-            targets.append(("open_id", str(route["personal_open_id"])))
-        for chat_id in json.loads(str(route.get("group_chat_ids_json") or "[]")):
-            targets.append(("chat_id", str(chat_id)))
+    def _enqueue_card_update(
+        self,
+        tool_user_id: str,
+        *,
+        event_id: str,
+        message_id: str,
+        card: dict[str, Any],
+    ) -> str:
+        outbox_id = "outbox_update_" + stable_json_hash(
+            [tool_user_id, event_id, message_id]
+        )[:40]
         now = utc_iso()
-        outbox_ids = []
-        for receive_type, receive_id in targets:
-            outbox_id = f"outbox_{uuid.uuid4().hex}"
-            delivery_route = f"{receive_type}:{receive_id}"
-            self.writer.execute(
-                """
-                INSERT INTO feishu_outbox(
-                    outbox_id, tool_user_id, route_id, task_uid,
-                    card_version, payload_json, status, attempt_count,
-                    next_attempt_at, updated_at, created_at
-                ) VALUES(?, ?, ?, ?, 1, ?, 'queued', 0, ?, ?, ?)
-                ON CONFLICT(tool_user_id, route_id, task_uid, card_version) DO NOTHING
-                """,
-                (
-                    outbox_id,
-                    tool_user_id,
-                    delivery_route,
-                    batch_id,
-                    json.dumps(
-                        {
-                            "receive_type": receive_type,
-                            "receive_id": receive_id,
-                            "card": card,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    now,
-                    now,
-                    now,
-                ),
-            )
-            outbox_ids.append(outbox_id)
-        if not targets:
-            raise FeishuError("飞书接收位置为空")
         self.writer.execute(
-            "UPDATE candidate_batch SET status='pending_approval', updated_at=? WHERE candidate_batch_id=? AND status='frozen'",
-            (now, batch_id),
+            """
+            INSERT INTO feishu_outbox(
+                outbox_id, tool_user_id, route_id, task_uid,
+                card_version, payload_json, status, attempt_count,
+                next_attempt_at, updated_at, created_at
+            ) VALUES(?, ?, ?, ?, 1, ?, 'queued', 0, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                outbox_id,
+                tool_user_id,
+                f"message:{message_id}",
+                f"card_event:{event_id}",
+                json.dumps(
+                    {
+                        "operation": "update_card",
+                        "message_id": message_id,
+                        "card": card,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+                now,
+                now,
+            ),
         )
-        return outbox_ids
+        return outbox_id
+
+    def _enqueue_task_card_updates(
+        self,
+        tool_user_id: str,
+        *,
+        event_id: str,
+        task_uid: str,
+        card: dict[str, Any],
+    ) -> list[str]:
+        message_ids = {
+            str(row["message_id"])
+            for row in self.database.query_all(
+                "SELECT message_id FROM feishu_outbox WHERE tool_user_id=? AND task_uid=? AND status='sent' AND message_id IS NOT NULL",
+                (tool_user_id, task_uid),
+            )
+        }
+        return [
+            self._enqueue_card_update(
+                tool_user_id,
+                event_id=event_id,
+                message_id=message_id,
+                card=card,
+            )
+            for message_id in sorted(message_ids)
+        ]
+
+    def recover_inbox(self, tool_user_id: str, limit: int = 100) -> dict[str, int]:
+        """重放已落库但尚未完成的事件；所有业务写入仍保持幂等。"""
+
+        rows = self.database.query_all(
+            """
+            SELECT * FROM feishu_inbox
+            WHERE tool_user_id=? AND status='received'
+            ORDER BY received_at ASC LIMIT ?
+            """,
+            (tool_user_id, max(1, min(int(limit), 500))),
+        )
+        processed = failed = unrecoverable = 0
+        for row in rows:
+            event_id = str(row["event_id"])
+            try:
+                protected = str(row.get("payload_json") or "")
+                if not protected:
+                    raise FeishuError("历史Inbox事件不含可恢复载荷")
+                payload = json.loads(unprotect_for_current_windows_user(protected))
+                if row["event_type"] == "im.message.receive_v1":
+                    self._process_message_received(tool_user_id, event_id, payload)
+                elif row["event_type"] == "card.action.trigger":
+                    self._process_card_received(tool_user_id, event_id, payload)
+                else:
+                    raise FeishuError("不支持的Inbox事件类型")
+                processed += 1
+            except Exception:
+                current = self.database.query_one(
+                    "SELECT status FROM feishu_inbox WHERE tool_user_id=? AND event_id=?",
+                    (tool_user_id, event_id),
+                )
+                if current and current.get("status") == "received":
+                    self._mark_inbox(tool_user_id, event_id, "failed_unrecoverable")
+                    unrecoverable += 1
+                else:
+                    failed += 1
+        return {
+            "processed": processed,
+            "failed": failed,
+            "unrecoverable": unrecoverable,
+        }
+
+    def enqueue_candidate_preview(self, tool_user_id: str, batch_id: str) -> list[str]:
+        now = utc_iso()
+
+        def op(conn):
+            with short_transaction(conn):
+                batch = conn.execute(
+                    "SELECT * FROM candidate_batch WHERE tool_user_id=? AND candidate_batch_id=?",
+                    (tool_user_id, batch_id),
+                ).fetchone()
+                if not batch:
+                    raise KeyError(batch_id)
+                if batch["status"] == "pending_approval":
+                    return [
+                        str(row["outbox_id"])
+                        for row in conn.execute(
+                            "SELECT outbox_id FROM feishu_outbox WHERE tool_user_id=? AND task_uid=? AND card_version=1 ORDER BY created_at",
+                            (tool_user_id, batch_id),
+                        ).fetchall()
+                    ]
+                if batch["status"] != "grouped":
+                    raise FeishuError("请先在桌面任务中心保存至少一个冻结分组")
+                target = conn.execute(
+                    "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
+                    (tool_user_id, batch["target_uid"]),
+                ).fetchone()
+                account = conn.execute(
+                    "SELECT * FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
+                    (tool_user_id, batch["aavid"]),
+                ).fetchone()
+                if not target or not account:
+                    raise FeishuError("候选账户或计划不存在")
+                route_id = account["feishu_route_id"]
+                if route_id:
+                    route = conn.execute(
+                        "SELECT * FROM feishu_route WHERE tool_user_id=? AND route_id=? AND enabled=1",
+                        (tool_user_id, route_id),
+                    ).fetchone()
+                else:
+                    route = conn.execute(
+                        "SELECT * FROM feishu_route WHERE tool_user_id=? AND route_name='管理员默认位置' AND enabled=1",
+                        (tool_user_id,),
+                    ).fetchone()
+                if not route:
+                    raise FeishuError("该账户尚未配置飞书接收位置")
+                groups = conn.execute(
+                    "SELECT * FROM retarget_group WHERE candidate_batch_id=? AND status='frozen' ORDER BY sequence",
+                    (batch_id,),
+                ).fetchall()
+                if not groups:
+                    raise FeishuError("请先在桌面任务中心保存至少一个冻结分组")
+                card = build_candidate_preview_card(
+                    dict(batch),
+                    account_name=str(account["account_name"]),
+                    plan_name=str(target["plan_name"]),
+                    plan_system=str(target["plan_system"]),
+                    promotion_scene=str(target["promotion_scene"]),
+                    groups=[dict(group) for group in groups],
+                )
+                targets: list[tuple[str, str]] = []
+                if route["personal_open_id"]:
+                    targets.append(("open_id", str(route["personal_open_id"])))
+                for chat_id in json.loads(str(route["group_chat_ids_json"] or "[]")):
+                    targets.append(("chat_id", str(chat_id)))
+                if not targets:
+                    raise FeishuError("飞书接收位置为空")
+                outbox_ids: list[str] = []
+                for receive_type, receive_id in targets:
+                    outbox_id = f"outbox_{uuid.uuid4().hex}"
+                    delivery_route = f"{receive_type}:{receive_id}"
+                    conn.execute(
+                        """
+                        INSERT INTO feishu_outbox(
+                            outbox_id, tool_user_id, route_id, task_uid,
+                            card_version, payload_json, status, attempt_count,
+                            next_attempt_at, updated_at, created_at
+                        ) VALUES(?, ?, ?, ?, 1, ?, 'queued', 0, ?, ?, ?)
+                        """,
+                        (
+                            outbox_id, tool_user_id, delivery_route, batch_id,
+                            json.dumps(
+                                {"receive_type": receive_type, "receive_id": receive_id, "card": card},
+                                ensure_ascii=False, sort_keys=True,
+                            ),
+                            now, now, now,
+                        ),
+                    )
+                    outbox_ids.append(outbox_id)
+                updated = conn.execute(
+                    "UPDATE candidate_batch SET status='pending_approval', updated_at=? WHERE tool_user_id=? AND candidate_batch_id=? AND status='grouped'",
+                    (now, tool_user_id, batch_id),
+                ).rowcount
+                if updated != 1:
+                    raise FeishuError("候选分组状态已变化，请刷新后重试")
+                return outbox_ids
+
+        return list(self.writer.submit(op))
 
     def enqueue_adjustment_preview(
         self, tool_user_id: str, adjustment_candidate_id: str
@@ -853,15 +1039,16 @@ class FeishuService:
         if not candidate:
             raise KeyError(adjustment_candidate_id)
         target = self.database.query_one(
-            "SELECT * FROM source_plan WHERE target_uid=?", (candidate["target_uid"],)
+            "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
+            (tool_user_id, candidate["target_uid"]),
         )
         account = self.database.query_one(
             "SELECT * FROM advertiser_account WHERE tool_user_id=? AND aavid=?",
             (tool_user_id, candidate["aavid"]),
         )
         task = self.database.query_one(
-            "SELECT * FROM platform_control_task WHERE control_task_uid=?",
-            (candidate["control_task_uid"],),
+            "SELECT * FROM platform_control_task WHERE tool_user_id=? AND control_task_uid=?",
+            (tool_user_id, candidate["control_task_uid"]),
         )
         if not target or not account or not task:
             raise FeishuError("暂停或调整候选关联对象不存在")
@@ -898,7 +1085,8 @@ class FeishuService:
         outbox_ids: list[str] = []
         for receive_type, receive_id in targets:
             outbox_id = f"outbox_{uuid.uuid4().hex}"
-            self.writer.execute(
+            delivery_route = f"{receive_type}:{receive_id}"
+            inserted = self.writer.execute(
                 """
                 INSERT INTO feishu_outbox(
                     outbox_id, tool_user_id, route_id, task_uid,
@@ -910,7 +1098,7 @@ class FeishuService:
                 (
                     outbox_id,
                     tool_user_id,
-                    f"{receive_type}:{receive_id}",
+                    delivery_route,
                     adjustment_candidate_id,
                     json.dumps(
                         {"receive_type": receive_type, "receive_id": receive_id, "card": card},
@@ -922,7 +1110,15 @@ class FeishuService:
                     now,
                 ),
             )
-            outbox_ids.append(outbox_id)
+            if inserted:
+                outbox_ids.append(outbox_id)
+            else:
+                existing = self.database.query_one(
+                    "SELECT outbox_id FROM feishu_outbox WHERE tool_user_id=? AND route_id=? AND task_uid=? AND card_version=1",
+                    (tool_user_id, delivery_route, adjustment_candidate_id),
+                )
+                if existing:
+                    outbox_ids.append(str(existing["outbox_id"]))
         self.writer.execute(
             "UPDATE adjustment_candidate SET status='preview_queued', updated_at=? WHERE adjustment_candidate_id=? AND status='frozen'",
             (now, adjustment_candidate_id),
@@ -995,7 +1191,7 @@ class FeishuService:
         for receive_type, receive_id in targets:
             outbox_id = f"outbox_{uuid.uuid4().hex}"
             delivery_route = f"{receive_type}:{receive_id}"
-            self.writer.execute(
+            inserted = self.writer.execute(
                 """
                 INSERT INTO feishu_outbox(
                     outbox_id, tool_user_id, route_id, task_uid,
@@ -1019,72 +1215,119 @@ class FeishuService:
                     now,
                 ),
             )
-            outbox_ids.append(outbox_id)
+            if inserted:
+                outbox_ids.append(outbox_id)
+            else:
+                existing = self.database.query_one(
+                    "SELECT outbox_id FROM feishu_outbox WHERE tool_user_id=? AND route_id=? AND task_uid=? AND card_version=1",
+                    (tool_user_id, delivery_route, report_uid),
+                )
+                if existing:
+                    outbox_ids.append(str(existing["outbox_id"]))
         return outbox_ids
 
     def deliver_outbox_once(self, tool_user_id: str, limit: int = 20) -> int:
-        rows = self.database.query_all(
-            """
-            SELECT * FROM feishu_outbox
-            WHERE tool_user_id=? AND status IN ('queued', 'retry')
-              AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-            ORDER BY created_at ASC LIMIT ?
-            """,
-            (tool_user_id, utc_iso(), limit),
-        )
+        now = utc_iso()
+        claim_owner = f"outbox-worker-{uuid.uuid4().hex}"
+        claim_expires_at = utc_iso(utc_now() + timedelta(minutes=2))
+
+        def claim(conn):
+            with short_transaction(conn):
+                candidates = conn.execute(
+                    """
+                    SELECT outbox_id FROM feishu_outbox
+                    WHERE tool_user_id=?
+                      AND (
+                        (status IN ('queued','retry') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+                        OR (status='sending' AND claim_expires_at<=?)
+                      )
+                    ORDER BY created_at ASC LIMIT ?
+                    """,
+                    (tool_user_id, now, now, limit),
+                ).fetchall()
+                ids = [str(row["outbox_id"]) for row in candidates]
+                if not ids:
+                    return []
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"UPDATE feishu_outbox SET status='sending', claim_owner=?, claim_expires_at=?, updated_at=? WHERE outbox_id IN ({placeholders})",
+                    (claim_owner, claim_expires_at, now, *ids),
+                )
+                return [
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT * FROM feishu_outbox WHERE claim_owner=? AND outbox_id IN ({placeholders}) ORDER BY created_at",
+                        (claim_owner, *ids),
+                    ).fetchall()
+                ]
+
+        rows = list(self.writer.submit(claim))
         if not rows:
             return 0
         profile, secret = self._profile_with_secret(tool_user_id)
         client = FeishuApiClient(str(profile["app_id"]), secret)
         sent = 0
+        failures = 0
         for row in rows:
             payload = json.loads(str(row["payload_json"]))
             try:
-                message_id = client.send_card(
-                    payload["receive_type"], payload["receive_id"], payload["card"]
-                )
+                if payload.get("operation") == "update_card":
+                    message_id = str(payload["message_id"])
+                    client.update_card(message_id, payload["card"])
+                else:
+                    message_id = client.send_card(
+                        payload["receive_type"], payload["receive_id"], payload["card"]
+                    )
                 self.writer.execute(
-                    "UPDATE feishu_outbox SET status='sent', message_id=?, attempt_count=attempt_count+1, sent_at=?, updated_at=? WHERE outbox_id=?",
-                    (message_id, utc_iso(), utc_iso(), row["outbox_id"]),
+                    "UPDATE feishu_outbox SET status='sent', message_id=?, attempt_count=attempt_count+1, sent_at=?, updated_at=?, claim_owner=NULL, claim_expires_at=NULL WHERE outbox_id=? AND status='sending' AND claim_owner=?",
+                    (message_id, utc_iso(), utc_iso(), row["outbox_id"], claim_owner),
                 )
                 sent += 1
             except Exception as exc:
+                failures += 1
                 attempts = int(row["attempt_count"] or 0) + 1
                 status = "failed" if attempts >= 6 else "retry"
                 delay = min(300, 2**attempts)
                 self.writer.execute(
-                    "UPDATE feishu_outbox SET status=?, attempt_count=?, next_attempt_at=?, updated_at=? WHERE outbox_id=?",
+                    "UPDATE feishu_outbox SET status=?, attempt_count=?, next_attempt_at=?, updated_at=?, claim_owner=NULL, claim_expires_at=NULL WHERE outbox_id=? AND status='sending' AND claim_owner=?",
                     (
                         status,
                         attempts,
                         utc_iso(utc_now() + timedelta(seconds=delay)),
                         utc_iso(),
                         row["outbox_id"],
+                        claim_owner,
                     ),
                 )
                 self.writer.execute(
                     "UPDATE feishu_profile SET send_status='error', last_error_code=?, last_error_message=?, updated_at=? WHERE tool_user_id=?",
-                    (type(exc).__name__, str(exc)[:500], utc_iso(), tool_user_id),
+                    (type(exc).__name__, sanitize_exception_text(exc, 500), utc_iso(), tool_user_id),
                 )
-        if sent:
+        if sent and not failures:
             self.writer.execute(
-                "UPDATE feishu_profile SET send_status='ready', updated_at=? WHERE tool_user_id=?",
+                "UPDATE feishu_profile SET send_status='ready', last_error_code=NULL, last_error_message=NULL, updated_at=? WHERE tool_user_id=?",
                 (utc_iso(), tool_user_id),
             )
-            for task_uid in {
-                str(row.get("task_uid") or "")
-                for row in rows
-                if str(row.get("task_uid") or "").startswith("report_")
-            }:
-                pending = self.database.query_one(
-                    "SELECT 1 FROM feishu_outbox WHERE tool_user_id=? AND task_uid=? AND status!='sent' LIMIT 1",
-                    (tool_user_id, task_uid),
+        for task_uid in {
+            str(row.get("task_uid") or "")
+            for row in rows
+            if str(row.get("task_uid") or "").startswith("report_")
+        }:
+            states = self.database.query_all(
+                "SELECT status FROM feishu_outbox WHERE tool_user_id=? AND task_uid=?",
+                (tool_user_id, task_uid),
+            )
+            statuses = {str(item["status"]) for item in states}
+            if statuses and statuses <= {"sent"}:
+                self.writer.execute(
+                    "UPDATE daily_report_delivery SET status='sent', sent_at=?, updated_at=? WHERE report_uid=?",
+                    (utc_iso(), utc_iso(), task_uid),
                 )
-                if not pending:
-                    self.writer.execute(
-                        "UPDATE daily_report_delivery SET status='sent', sent_at=?, updated_at=? WHERE report_uid=?",
-                        (utc_iso(), utc_iso(), task_uid),
-                    )
+            elif "failed" in statuses and not statuses.intersection({"queued", "retry"}):
+                self.writer.execute(
+                    "UPDATE daily_report_delivery SET status='failed', updated_at=? WHERE report_uid=?",
+                    (utc_iso(), task_uid),
+                )
         return sent
 
     def status(self, tool_user_id: str) -> dict[str, Any]:
@@ -1113,6 +1356,7 @@ class FeishuService:
     def start_long_connection(self, tool_user_id: str) -> None:
         self.stop_long_connection()
         profile, secret = self._profile_with_secret(tool_user_id)
+        self.recover_inbox(tool_user_id)
         self._connection = FeishuLongConnection(
             service=self,
             tool_user_id=tool_user_id,
@@ -1236,7 +1480,7 @@ class FeishuLongConnection:
             except Exception as exc:
                 self.service.writer.execute(
                     "UPDATE feishu_profile SET transport_status='error', last_error_code=?, last_error_message=?, updated_at=? WHERE tool_user_id=?",
-                    (type(exc).__name__, str(exc)[:500], utc_iso(), self.tool_user_id),
+                    (type(exc).__name__, sanitize_exception_text(exc, 500), utc_iso(), self.tool_user_id),
                 )
 
         self._thread = threading.Thread(
@@ -1289,13 +1533,8 @@ class FeishuLongConnection:
     def _process_card_safely(self, **kwargs) -> None:
         try:
             result = self.service.process_card_action(self.tool_user_id, **kwargs)
-            updated_card = result.get("updated_card")
-            message_id = str(kwargs.get("message_id") or "")
-            if updated_card and message_id:
-                profile, secret = self.service._profile_with_secret(self.tool_user_id)
-                FeishuApiClient(str(profile["app_id"]), secret).update_card(
-                    message_id, updated_card
-                )
+            if result.get("updated_card"):
+                self.service.deliver_outbox_once(self.tool_user_id)
         except Exception:
             event_id = str(kwargs.get("event_id") or "")
             row = self.service.database.query_one(
