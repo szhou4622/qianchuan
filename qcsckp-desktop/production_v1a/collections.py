@@ -56,16 +56,20 @@ def _normalize_platform_time(value: Any) -> tuple[str, str]:
 
 def _classify_operation(content: str) -> str:
     normalized = content.lower()
+    is_retarget = any(token in normalized for token in ("追投", "加热", "retarget"))
+    if is_retarget and any(token in normalized for token in ("停投", "暂停", "pause")):
+        return "retarget_pause"
     rules = (
-        (("追投", "加热", "retarget"), "retarget_create"),
-        (("停投", "暂停", "pause"), "retarget_pause"),
-        (("预算", "budget"), "retarget_adjust_budget"),
-        (("时长", "延长", "duration"), "retarget_extend_duration"),
-        (("roi", "出价", "bid"), "retarget_adjust_roi_or_bid"),
+        (("预算", "budget"), "budget_update"),
+        (("延长", "时长", "duration"), "duration_update"),
+        (("roi",), "roi_update"),
+        (("出价", "bid"), "bid_update"),
         (("新建", "create"), "plan_create"),
         (("复制", "copy"), "plan_copy"),
         (("删除", "delete"), "plan_delete"),
         (("启用", "开启", "enable"), "plan_enable"),
+        (("暂停", "pause"), "plan_pause"),
+        (("追投", "加热", "retarget"), "retarget_create"),
     )
     for tokens, action in rules:
         if any(token in normalized for token in tokens):

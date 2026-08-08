@@ -32,6 +32,7 @@ class OperationReportService:
         source: str | None = None,
         action_type: str | None = None,
         result_status: str | None = None,
+        operator: str | None = None,
         keyword: str | None = None,
         limit: int = 500,
         offset: int = 0,
@@ -53,6 +54,10 @@ class OperationReportService:
         if date_to:
             clauses.append("substr(event_time_beijing,1,10)<=?")
             params.append(date_to)
+        if operator:
+            clauses.append("(operator_id LIKE ? OR operator_type LIKE ?)")
+            token = f"%{operator}%"
+            params.extend([token, token])
         if keyword:
             clauses.append(
                 "(account_name LIKE ? OR source_plan_name LIKE ? OR control_task_id LIKE ? OR action_type LIKE ?)"

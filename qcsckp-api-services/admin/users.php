@@ -4,10 +4,20 @@ declare(strict_types=1);
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
 require_once dirname(__DIR__) . '/includes/layout.php';
 require_once dirname(__DIR__) . '/includes/helpers.php';
+require_once dirname(__DIR__) . '/includes/desktop_auth.php';
 
 $me = require_panel_login($pdo);
 $GLOBALS['layout_user'] = $me;
 $isSuper = $me['role'] === 'super_admin';
+desktop_auth_ensure_schema($pdo);
+
+function desktop_admin_password_valid(string $password): bool
+{
+    return strlen($password) >= 10
+        && preg_match('/[a-z]/', $password)
+        && preg_match('/[A-Z]/', $password)
+        && preg_match('/\d/', $password);
+}
 
 function user_row_allowed(PDO $pdo, array $me, int $userId): ?array
 {
@@ -45,8 +55,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $vu = dt_from_input($_POST['valid_until'] ?? null);
         $agentId = $isSuper ? (int) ($_POST['parent_id'] ?? 0) : (int) $me['id'];
 
-        if ($username === '' || strlen($password) < 6) {
-            flash_set('用户名不能为空，密码至少 6 位。');
+        if ($username === '' || !desktop_admin_password_valid($password)) {
+            flash_set('用户名不能为空；临时密码至少10位，并包含大小写字母和数字。');
         } elseif ($vf === null || $vu === null) {
             flash_set('请填写有效期开始与结束时间。');
         } elseif (strtotime($vu) < strtotime($vf)) {
@@ -72,7 +82,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                      VALUES (?, ?, \'user\', ?, ?, ?, 0)'
                 );
                 $ins->execute([$username, $hash, $agentId, $vf, $vu]);
-                flash_set('已创建普通用户。');
+                desktop_auth_profile($pdo, (int) $pdo->lastInsertId(), true);
+                flash_set('已创建工具用户；首次登录必须修改临时密码。');
             }
         }
     } elseif ($action === 'update') {
@@ -92,7 +103,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->prepare(
                     'UPDATE accounts SET valid_from = ?, valid_until = ?, is_disabled = ? WHERE id = ? AND role = \'user\''
                 )->execute([$vf, $vu, $dis, $uid]);
+                if ($dis === 1) {
+                    $now = desktop_auth_now()->format('Y-m-d H:i:s');
+                    $pdo->prepare('UPDATE desktop_auth_users SET token_version=token_version+1, updated_at=? WHERE account_id=?')
+                        ->execute([$now, $uid]);
+                    $pdo->prepare('UPDATE desktop_auth_sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL')
+                        ->execute([$now, $uid]);
+                }
                 flash_set('已保存。');
+            }
+        }
+    } elseif ($action === 'reset_password') {
+        $uid = (int) ($_POST['id'] ?? 0);
+        $row = user_row_allowed($pdo, $me, $uid);
+        $temporaryPassword = (string) ($_POST['temporary_password'] ?? '');
+        if (!$row) {
+            flash_set('无权操作该用户。');
+        } elseif (!desktop_admin_password_valid($temporaryPassword)) {
+            flash_set('临时密码至少10位，并包含大小写字母和数字。');
+        } else {
+            $now = desktop_auth_now()->format('Y-m-d H:i:s');
+            $pdo->beginTransaction();
+            try {
+                desktop_auth_profile($pdo, $uid, true);
+                $pdo->prepare('UPDATE accounts SET password_hash=? WHERE id=? AND role=\'user\'')
+                    ->execute([password_hash($temporaryPassword, PASSWORD_DEFAULT), $uid]);
+                $pdo->prepare(
+                    'UPDATE desktop_auth_users SET must_change_password=1,
+                     token_version=token_version+1, updated_at=? WHERE account_id=?'
+                )->execute([$now, $uid]);
+                $pdo->prepare('UPDATE desktop_auth_sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL')
+                    ->execute([$now, $uid]);
+                $pdo->commit();
+                flash_set('临时密码已重置；用户下次登录必须修改密码。');
+            } catch (Throwable $error) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                flash_set('密码重置失败，请重试。');
+            }
+        }
+    } elseif ($action === 'unbind_device') {
+        $uid = (int) ($_POST['id'] ?? 0);
+        $row = user_row_allowed($pdo, $me, $uid);
+        if (!$row) {
+            flash_set('无权操作该用户。');
+        } else {
+            $now = desktop_auth_now()->format('Y-m-d H:i:s');
+            $pdo->beginTransaction();
+            try {
+                desktop_auth_profile($pdo, $uid, false);
+                $pdo->prepare('DELETE FROM desktop_auth_devices WHERE account_id=?')->execute([$uid]);
+                $pdo->prepare('UPDATE desktop_auth_users SET token_version=token_version+1, updated_at=? WHERE account_id=?')
+                    ->execute([$now, $uid]);
+                $pdo->prepare('UPDATE desktop_auth_sessions SET revoked_at=? WHERE account_id=? AND revoked_at IS NULL')
+                    ->execute([$now, $uid]);
+                $pdo->commit();
+                flash_set('设备已解绑，用户可在另一台电脑重新登录。');
+            } catch (Throwable $error) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                flash_set('设备解绑失败，请重试。');
             }
         }
     }
@@ -103,9 +175,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 if ($isSuper) {
     $rows = $pdo->query(
         "SELECT u.id, u.username, u.valid_from, u.valid_until, u.is_disabled, u.created_at,
-                a.username AS agent_username, u.parent_id
+                a.username AS agent_username, u.parent_id,
+                dau.must_change_password, dad.bound_at, dad.last_seen_at
          FROM accounts u
          LEFT JOIN accounts a ON u.parent_id = a.id
+         LEFT JOIN desktop_auth_users dau ON dau.account_id=u.id
+         LEFT JOIN desktop_auth_devices dad ON dad.account_id=u.id
          WHERE u.role = 'user'
          ORDER BY u.id DESC"
     )->fetchAll();
@@ -113,9 +188,12 @@ if ($isSuper) {
 } else {
     $st = $pdo->prepare(
         "SELECT u.id, u.username, u.valid_from, u.valid_until, u.is_disabled, u.created_at,
-                a.username AS agent_username, u.parent_id
+                a.username AS agent_username, u.parent_id,
+                dau.must_change_password, dad.bound_at, dad.last_seen_at
          FROM accounts u
          LEFT JOIN accounts a ON u.parent_id = a.id
+         LEFT JOIN desktop_auth_users dau ON dau.account_id=u.id
+         LEFT JOIN desktop_auth_devices dad ON dad.account_id=u.id
          WHERE u.role = 'user' AND u.parent_id = ?
          ORDER BY u.id DESC"
     );
@@ -154,7 +232,8 @@ if ($m) {
     </div>
     <div>
       <label class="block text-sm text-slate-600 mb-1">密码</label>
-      <input name="password" type="password" required minlength="6" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+      <input name="password" type="password" required minlength="10" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+      <p class="mt-1 text-xs text-slate-500">临时密码需包含大小写字母和数字；用户首次登录后必须修改。</p>
     </div>
     <div class="md:col-span-2 lg:col-span-3">
       <div class="flex flex-col xl:flex-row gap-4 xl:items-end">
@@ -238,7 +317,7 @@ if ($m) {
     <p class="px-4 py-8 text-center text-slate-500">暂无普通用户</p>
   <?php else: ?>
     <div class="overflow-x-auto">
-      <table class="w-full min-w-[56rem] text-sm border-collapse">
+      <table class="w-full min-w-[78rem] text-sm border-collapse">
         <thead>
           <tr class="bg-slate-100/90 text-slate-700 border-b border-slate-200">
             <th class="text-left font-medium px-4 py-3 w-14 align-bottom">ID</th>
@@ -250,7 +329,8 @@ if ($m) {
             <th class="text-left font-medium px-4 py-3 min-w-[11rem] align-bottom">结束时间</th>
             <th class="text-center font-medium px-3 py-3 w-20 align-bottom">禁用</th>
             <th class="text-left font-medium px-4 py-3 min-w-[5.5rem] align-bottom">状态</th>
-            <th class="text-right font-medium px-4 py-3 w-24 align-bottom">操作</th>
+            <th class="text-left font-medium px-4 py-3 min-w-[8rem] align-bottom">工具认证</th>
+            <th class="text-right font-medium px-4 py-3 min-w-[18rem] align-bottom">操作</th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-100">
@@ -290,9 +370,31 @@ if ($m) {
                   <span class="inline-flex items-center rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-800 ring-1 ring-inset ring-emerald-200">正常</span>
                 <?php endif; ?>
               </td>
+              <td class="px-4 py-4 text-xs text-slate-600">
+                <div><?= (int) ($r['must_change_password'] ?? 0) === 1 ? '等待首次改密' : '密码已激活' ?></div>
+                <div class="mt-1"><?= !empty($r['bound_at']) ? '已绑定设备' : '未绑定设备' ?></div>
+              </td>
               <td class="px-4 py-4 text-right">
-                <button type="submit" form="<?= htmlspecialchars($fid, ENT_QUOTES, 'UTF-8') ?>"
-                  class="inline-flex items-center justify-center bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium px-4 py-2 rounded-lg shadow-sm min-w-[4.5rem]">保存</button>
+                <div class="flex flex-wrap justify-end gap-2">
+                  <button type="submit" form="<?= htmlspecialchars($fid, ENT_QUOTES, 'UTF-8') ?>"
+                    class="inline-flex items-center justify-center bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium px-3 py-2 rounded-lg">保存</button>
+                  <form method="post" class="flex gap-1">
+                    <input type="hidden" name="_csrf" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') ?>">
+                    <input type="hidden" name="action" value="reset_password">
+                    <input type="hidden" name="id" value="<?= $uid ?>">
+                    <input name="temporary_password" type="password" minlength="10" required placeholder="新临时密码"
+                      class="w-32 border border-slate-300 rounded-md px-2 py-1.5 text-xs">
+                    <button class="border border-amber-400 text-amber-800 rounded-md px-2 py-1.5 text-xs">重置密码</button>
+                  </form>
+                  <?php if (!empty($r['bound_at'])): ?>
+                    <form method="post">
+                      <input type="hidden" name="_csrf" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') ?>">
+                      <input type="hidden" name="action" value="unbind_device">
+                      <input type="hidden" name="id" value="<?= $uid ?>">
+                      <button class="border border-red-300 text-red-700 rounded-md px-2 py-1.5 text-xs">解绑设备</button>
+                    </form>
+                  <?php endif; ?>
+                </div>
               </td>
             </tr>
           <?php endforeach; ?>

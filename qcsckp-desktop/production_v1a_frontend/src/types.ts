@@ -4,6 +4,8 @@ export type Health = {
   runtime_dir: string;
   database: { ok: boolean; integrity: string };
   admin_required: boolean;
+  auth_mode?: string;
+  authentication?: Record<string, unknown>;
   real_platform_writes: { registered: boolean; network_guard: string; database_guard: string; mode: string };
   collection_capacity?: {
     active_plan_material_relations: number;
@@ -13,6 +15,23 @@ export type Health = {
     disk_state: string;
   };
   setup_progress: Array<{ key: string; label: string; status: string }>;
+  browser?: {
+    chrome_state: string;
+    chrome_path: string;
+    qianchuan_login_status: string;
+    cookie_updated_at?: string;
+    last_verified_at?: string;
+    blocked_reason?: string;
+  };
+  feishu?: {
+    credential: string;
+    transport: string;
+    events: string;
+    binding: string;
+    sending: string;
+  };
+  job_queue?: { queued: number; running: number; blocked: number };
+  latest_collection_at?: string;
 };
 
 export type Account = {

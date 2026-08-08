@@ -18,7 +18,7 @@ from production_v1a.adapters.models import (
 from production_v1a.auth import LocalAdminService
 from production_v1a.browser_worker import LoginRequired, PlaywrightBrowserWorker
 from production_v1a.candidates import CandidateService
-from production_v1a.collections import CollectionService, material_uid
+from production_v1a.collections import CollectionService, _classify_operation, material_uid
 from production_v1a.feishu import (
     FeishuError,
     FeishuService,
@@ -385,6 +385,31 @@ class ProductionV1ASafetyTests(unittest.TestCase):
         self.assertEqual("duplicate_event", replay["reason"])
         with self.assertRaises(FeishuError):
             service.process_card_action(self.fx.user, event_id="evt2", operator_open_id="ou_other", message_id="m", value={"action": "v1a_view_task_center", "candidate_batch_id": "x"})
+
+    def test_feishu_app_id_and_secret_are_both_dpapi_encrypted(self):
+        service = FeishuService(
+            self.fx.database,
+            self.fx.writer,
+            CandidateService(self.fx.database, self.fx.writer),
+        )
+        service.save_credentials(self.fx.user, "cli_test_app", "secret-value")
+        row = self.fx.database.query_one(
+            "SELECT app_id, encrypted_app_id, encrypted_app_secret FROM feishu_profile WHERE tool_user_id=?",
+            (self.fx.user,),
+        )
+        self.assertIsNone(row["app_id"])
+        self.assertNotIn("cli_test_app", row["encrypted_app_id"])
+        self.assertNotIn("secret-value", row["encrypted_app_secret"])
+        profile, secret = service._profile_with_secret(self.fx.user)
+        self.assertEqual("cli_test_app", profile["app_id"])
+        self.assertEqual("secret-value", secret)
+
+    def test_platform_operation_log_classification_is_business_facing(self):
+        self.assertEqual("retarget_pause", _classify_operation("暂停素材追投任务"))
+        self.assertEqual("plan_pause", _classify_operation("暂停计划"))
+        self.assertEqual("budget_update", _classify_operation("修改预算"))
+        self.assertEqual("roi_update", _classify_operation("修改ROI目标"))
+        self.assertEqual("bid_update", _classify_operation("修改出价"))
 
     def test_daily_report_separates_real_simulation_and_browser(self):
         now = beijing_iso()

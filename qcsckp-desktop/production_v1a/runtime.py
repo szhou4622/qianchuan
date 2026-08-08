@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import AdapterRegistry
-from .auth import AdminSessionStore, LocalAdminService
-from .browser_worker import PlaywrightBrowserWorker
+from .auth import AdminSessionStore, CentralAuthService, LocalAdminService
+from .browser_worker import PlaywrightBrowserWorker, find_google_chrome
 from .candidates import CandidateBlocked, CandidateService
 from .collections import CollectionService
 from .constants import (
@@ -64,7 +64,13 @@ class RuntimeContext:
         self.writer = StorageWriter(self.database).start()
         self.events = EventBus()
         self.sessions = AdminSessionStore()
-        self.auth = LocalAdminService(self.database, self.writer)
+        # 中心认证联调按用户要求暂缓；默认保留本机门禁，显式 remote 才切换。
+        self.auth_mode = (os.getenv("QCSCKP_V1A_AUTH_MODE") or "local").strip().lower()
+        if self.auth_mode not in {"local", "remote"}:
+            self.auth_mode = "local"
+        self.local_auth = LocalAdminService(self.database, self.writer)
+        self.central_auth = CentralAuthService(self.database, self.writer, self.paths)
+        self.auth = self.central_auth if self.auth_mode == "remote" else self.local_auth
         self.guard = PlatformNetworkGuard(self._record_guard_block)
         self.browser = PlaywrightBrowserWorker(self.database, self.writer, self.guard)
         self.adapters = AdapterRegistry(self.browser, self.guard)
@@ -123,11 +129,71 @@ class RuntimeContext:
 
     def health(self) -> dict[str, Any]:
         ok, integrity = self.database.integrity_check()
-        admin_required = not self.auth.admin_exists()
-        user = self.database.query_one(
-            "SELECT tool_user_id, username FROM tool_user WHERE status='active' LIMIT 1"
+        if self.auth_mode == "remote":
+            auth_status = self.central_auth.status()
+            tool_user_id = (
+                str(auth_status.get("tool_user_id"))
+                if auth_status.get("tool_user_id") and auth_status.get("state") in {"active", "offline_grace"}
+                else None
+            )
+            admin_required = False
+            auth_required = tool_user_id is None
+        else:
+            user = self.database.query_one(
+                "SELECT tool_user_id, username FROM tool_user WHERE status='active' ORDER BY created_at LIMIT 1"
+            )
+            tool_user_id = str(user["tool_user_id"]) if user else None
+            admin_required = not self.local_auth.admin_exists()
+            auth_required = admin_required
+            auth_status = {
+                "configured": bool(user),
+                "state": "local_development" if user else "create_local_admin",
+                "username": user["username"] if user else None,
+                "tool_user_id": tool_user_id,
+            }
+        setup = self._setup_progress(tool_user_id)
+        identity = (
+            self.database.query_one(
+                "SELECT login_status, cookie_updated_at, last_verified_at, blocked_reason FROM qianchuan_identity WHERE tool_user_id=?",
+                (tool_user_id,),
+            )
+            if tool_user_id
+            else None
         )
-        setup = self._setup_progress(user["tool_user_id"] if user else None)
+        feishu_status = self.feishu.status(tool_user_id) if tool_user_id else {
+            "credential": "not_configured",
+            "transport": "disconnected",
+            "events": "not_received",
+            "binding": "unbound",
+            "sending": "unavailable",
+        }
+        queue_status = (
+            self.database.query_one(
+                """
+                SELECT SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
+                       SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running,
+                       SUM(CASE WHEN status='blocked_user_action' THEN 1 ELSE 0 END) AS blocked
+                FROM background_job WHERE tool_user_id=?
+                """,
+                (tool_user_id,),
+            )
+            if tool_user_id
+            else {}
+        ) or {}
+        latest_collection = (
+            self.database.query_one(
+                "SELECT MAX(completed_at) AS completed_at FROM collection_run WHERE tool_user_id=? AND status='complete'",
+                (tool_user_id,),
+            )
+            if tool_user_id
+            else None
+        )
+        try:
+            chrome_path = str(find_google_chrome())
+            chrome_state = "available"
+        except Exception:
+            chrome_path = ""
+            chrome_state = "missing"
         return {
             "product_version": PRODUCT_VERSION,
             "schema_version": SCHEMA_VERSION,
@@ -135,6 +201,9 @@ class RuntimeContext:
             "instance_id": self.instance_id,
             "database": {"ok": ok, "integrity": integrity},
             "admin_required": admin_required,
+            "auth_required": auth_required,
+            "auth_mode": self.auth_mode,
+            "authentication": auth_status,
             "real_platform_writes": {
                 "registered": False,
                 "network_guard": "enforced",
@@ -144,11 +213,33 @@ class RuntimeContext:
             "setup_progress": setup,
             "browser": {
                 "owner": "Browser Worker",
+                "chrome_state": chrome_state,
+                "chrome_path": chrome_path,
                 "headless_for_collection": True,
                 "visible_for_login": True,
+                "qianchuan_login_status": (identity or {}).get("login_status") or "not_configured",
+                "cookie_updated_at": (identity or {}).get("cookie_updated_at"),
+                "last_verified_at": (identity or {}).get("last_verified_at"),
+                "blocked_reason": (identity or {}).get("blocked_reason"),
             },
+            "feishu": feishu_status,
+            "job_queue": {
+                "queued": int(queue_status.get("queued") or 0),
+                "running": int(queue_status.get("running") or 0),
+                "blocked": int(queue_status.get("blocked") or 0),
+            },
+            "latest_collection_at": (latest_collection or {}).get("completed_at"),
             "collection_capacity": self.collection_capacity(),
         }
+
+    def is_tool_user_authorized(self, tool_user_id: str) -> bool:
+        if self.auth_mode == "remote":
+            return self.central_auth.is_runtime_authorized(tool_user_id)
+        row = self.database.query_one(
+            "SELECT status FROM tool_user WHERE tool_user_id=?",
+            (tool_user_id,),
+        )
+        return bool(row and row["status"] == "active")
 
     def collection_capacity(self) -> dict[str, Any]:
         row = self.database.query_one(
@@ -187,7 +278,7 @@ class RuntimeContext:
     def _setup_progress(self, tool_user_id: str | None) -> list[dict[str, Any]]:
         if not tool_user_id:
             return [
-                {"key": "local_admin", "label": "创建本机管理员", "status": "required"},
+                {"key": "tool_login", "label": "登录工具账号", "status": "required"},
                 {"key": "qianchuan", "label": "千川登录及账户目录", "status": "waiting"},
                 {"key": "feishu", "label": "飞书长连接和绑定", "status": "waiting"},
                 {"key": "monitor", "label": "监控计划", "status": "waiting"},
@@ -211,7 +302,7 @@ class RuntimeContext:
             (tool_user_id,),
         )
         return [
-            {"key": "local_admin", "label": "本机管理员", "status": "complete"},
+            {"key": "tool_login", "label": "工具账号", "status": "complete"},
             {
                 "key": "qianchuan",
                 "label": "千川登录及账户目录",
@@ -476,14 +567,36 @@ class RuntimeContext:
     def _job_strategy_save(self, context: JobContext) -> dict[str, Any]:
         assert context.tool_user_id
         payload = dict(context.payload)
+        strategy_type = str(payload.get("strategy_type") or "retarget_create")
+        if strategy_type not in {"retarget_create", "retarget_pause"}:
+            raise ValueError("V1A业务页面只开放追投和停投模拟策略")
+        target = self.database.query_one(
+            "SELECT * FROM source_plan WHERE tool_user_id=? AND target_uid=?",
+            (context.tool_user_id, str(payload["target_uid"])),
+        )
+        if not target or not int(target["monitor_enabled"]) or not int(target["monitor_eligible"]):
+            raise ValueError("请先选择一条已启用且证据完整的监听计划")
+        trigger_level = str(payload.get("trigger_level") or "material")
+        if target["promotion_scene"] == "live" and trigger_level != "material":
+            raise ValueError("推直播计划只支持素材级规则")
+        if strategy_type == "retarget_pause" and trigger_level != "material":
+            raise ValueError("停投模拟只针对Scene 2素材追投任务，必须使用素材级规则")
+        if bool(payload.get("enabled")):
+            feishu = self.feishu.status(context.tool_user_id)
+            if not (
+                feishu["credential"] == "valid"
+                and feishu["binding"] == "bound"
+                and feishu["sending"] == "ready"
+            ):
+                raise ValueError("可以保存策略草稿；启用并发卡前请完成飞书绑定与发送验证")
         strategy_id = self.strategies.save(
             tool_user_id=context.tool_user_id,
             target_uid=str(payload["target_uid"]),
             title=str(payload["title"]),
             priority=int(payload["priority"]),
-            trigger_level=str(payload.get("trigger_level") or "material"),
+            trigger_level=trigger_level,
             trigger=dict(payload["trigger"]),
-            strategy_type=str(payload.get("strategy_type") or "retarget_create"),
+            strategy_type=strategy_type,
             action_params=dict(payload.get("action_params") or {}),
             enabled=bool(payload.get("enabled")),
             cooldown_minutes=int(payload.get("cooldown_minutes") or 30),
@@ -493,6 +606,14 @@ class RuntimeContext:
 
     def _job_strategy_toggle(self, context: JobContext) -> dict[str, Any]:
         assert context.tool_user_id
+        if bool(context.payload.get("enabled")):
+            feishu = self.feishu.status(context.tool_user_id)
+            if not (
+                feishu["credential"] == "valid"
+                and feishu["binding"] == "bound"
+                and feishu["sending"] == "ready"
+            ):
+                raise ValueError("启用策略前请完成飞书绑定与发送验证")
         self.strategies.set_enabled(
             context.tool_user_id,
             str(context.payload["strategy_id"]),
@@ -773,6 +894,8 @@ class V1AScheduler:
             )
 
     def _authenticated(self, tool_user_id: str) -> bool:
+        if not self.runtime.is_tool_user_authorized(tool_user_id):
+            return False
         row = self.runtime.database.query_one(
             "SELECT login_status FROM qianchuan_identity WHERE tool_user_id=?",
             (tool_user_id,),
@@ -843,6 +966,8 @@ class V1AScheduler:
         users = self.runtime.database.query_all("SELECT tool_user_id FROM tool_user WHERE status='active'")
         for user in users:
             user_id = str(user["tool_user_id"])
+            if not self.runtime.is_tool_user_authorized(user_id):
+                continue
             existing = self.runtime.database.query_one(
                 "SELECT 1 FROM daily_report_delivery WHERE tool_user_id=? AND aavid IS NULL AND business_date=? LIMIT 1",
                 (user_id, report_date),
@@ -862,6 +987,9 @@ class V1AScheduler:
         )
         for user in users:
             try:
-                self.runtime.feishu.deliver_outbox_once(str(user["tool_user_id"]))
+                user_id = str(user["tool_user_id"])
+                if not self.runtime.is_tool_user_authorized(user_id):
+                    continue
+                self.runtime.feishu.deliver_outbox_once(user_id)
             except Exception:
                 continue

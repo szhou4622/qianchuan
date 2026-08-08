@@ -376,18 +376,19 @@ class FeishuService:
         app_id = app_id.strip()
         if not app_id.startswith("cli_") or not app_secret:
             raise ValueError("App ID 或 App Secret 格式不正确")
-        protected = protect_for_current_windows_user(app_secret)
+        protected_id = protect_for_current_windows_user(app_id)
+        protected_secret = protect_for_current_windows_user(app_secret)
         now = utc_iso()
         self.writer.execute(
             """
             UPDATE feishu_profile
-            SET app_id=?, encrypted_app_secret=?, credential_status='untested',
+            SET app_id=NULL, encrypted_app_id=?, encrypted_app_secret=?, credential_status='untested',
                 transport_status='disconnected', event_status='not_received',
                 send_status='unavailable', last_error_code=NULL,
                 last_error_message=NULL, updated_at=?
             WHERE tool_user_id=?
             """,
-            (app_id, protected, now, tool_user_id),
+            (protected_id, protected_secret, now, tool_user_id),
         )
 
     def _profile_with_secret(self, tool_user_id: str) -> tuple[dict[str, Any], str]:
@@ -396,7 +397,17 @@ class FeishuService:
         )
         if not profile or not profile.get("encrypted_app_secret"):
             raise FeishuError("飞书凭据未配置")
+        protected_id = str(profile.get("encrypted_app_id") or "")
+        if protected_id:
+            app_id = unprotect_for_current_windows_user(protected_id)
+        else:
+            # 兼容早期V1A明文App ID；首次重新保存凭据后即清空旧列。
+            app_id = str(profile.get("app_id") or "")
+        if not app_id.startswith("cli_"):
+            raise FeishuError("飞书App ID无法解密或格式无效")
         secret = unprotect_for_current_windows_user(str(profile["encrypted_app_secret"]))
+        profile = dict(profile)
+        profile["app_id"] = app_id
         return profile, secret
 
     def test_credentials(self, tool_user_id: str) -> dict[str, Any]:

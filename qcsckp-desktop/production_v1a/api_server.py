@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from .auth import CentralAuthError
 from .runtime import RuntimeContext
 from .timeutils import business_date
 
@@ -72,6 +73,20 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                     self._sse(tool_user_id)
                     return
                 tool_user_id = self._require_admin_session()
+                if parsed.path == "/api/v1/auth/me":
+                    if self.app.runtime.auth_mode == "remote":
+                        auth_data = self.app.runtime.central_auth.status(tool_user_id)
+                    else:
+                        user = self.app.runtime.database.query_one(
+                            "SELECT tool_user_id, username, status FROM tool_user WHERE tool_user_id=?",
+                            (tool_user_id,),
+                        ) or {}
+                        auth_data = {**user, "state": "local_development"}
+                    self._json_ok(
+                        request_id,
+                        auth_data,
+                    )
+                    return
                 self._handle_query(request_id, parsed, tool_user_id)
                 return
             self._serve_frontend(parsed.path)
@@ -97,8 +112,53 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                 self._json_ok(request_id, {"woken": True})
                 return
             self._assert_launch_token()
-            if parsed.path == "/api/v1/admin/create":
-                created = self.app.runtime.auth.create_initial_admin(
+            if parsed.path == "/api/v1/auth/restore" and self.app.runtime.auth_mode == "remote":
+                user = self.app.runtime.central_auth.restore()
+                if not user:
+                    raise ApiError("tool_login_required", "请登录工具账号", status=401)
+                session = self.app.runtime.sessions.issue(user.tool_user_id)
+                self._json_ok(
+                    request_id,
+                    {**user.__dict__, "session_token": session},
+                )
+                return
+            if parsed.path == "/api/v1/auth/login" and self.app.runtime.auth_mode == "remote":
+                result = self.app.runtime.central_auth.login(
+                    str(body.get("username") or ""),
+                    str(body.get("password") or ""),
+                )
+                if result.get("must_change_password"):
+                    self._json_ok(request_id, result)
+                    return
+                session = self.app.runtime.sessions.issue(str(result["tool_user_id"]))
+                self._json_ok(request_id, {**result, "session_token": session})
+                return
+            if parsed.path == "/api/v1/auth/change-password" and self.app.runtime.auth_mode == "remote":
+                user = self.app.runtime.central_auth.change_initial_password(
+                    str(body.get("change_token") or ""),
+                    str(body.get("new_password") or ""),
+                )
+                session = self.app.runtime.sessions.issue(user.tool_user_id)
+                self._json_ok(
+                    request_id,
+                    {**user.__dict__, "session_token": session},
+                )
+                return
+            if parsed.path == "/api/v1/auth/logout" and self.app.runtime.auth_mode == "remote":
+                tool_user_id = self._require_admin_session()
+                token = self.headers.get("X-QCSCKP-Session")
+                self.app.runtime.central_auth.logout(tool_user_id)
+                if token:
+                    self.app.runtime.sessions.revoke(token)
+                self.app.runtime.feishu.stop_long_connection()
+                self._json_ok(request_id, {"logged_out": True})
+                return
+            legacy_local_auth = (
+                self.app.runtime.auth_mode == "local"
+                or os.getenv("QCSCKP_ALLOW_LEGACY_LOCAL_AUTH") == "1"
+            )
+            if parsed.path == "/api/v1/admin/create" and legacy_local_auth:
+                created = self.app.runtime.local_auth.create_initial_admin(
                     str(body.get("username") or ""), str(body.get("password") or "")
                 )
                 session = self.app.runtime.sessions.issue(created.tool_user_id)
@@ -117,8 +177,8 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                     status=201,
                 )
                 return
-            if parsed.path == "/api/v1/admin/login":
-                user = self.app.runtime.auth.verify_password(
+            if parsed.path == "/api/v1/admin/login" and legacy_local_auth:
+                user = self.app.runtime.local_auth.verify_password(
                     str(body.get("username") or ""), str(body.get("password") or "")
                 )
                 if not user:
@@ -133,8 +193,8 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            if parsed.path == "/api/v1/admin/recover":
-                replacement = self.app.runtime.auth.reset_password_with_recovery_code(
+            if parsed.path == "/api/v1/admin/recover" and legacy_local_auth:
+                replacement = self.app.runtime.local_auth.reset_password_with_recovery_code(
                     str(body.get("username") or ""),
                     str(body.get("recovery_code") or ""),
                     str(body.get("new_password") or ""),
@@ -148,7 +208,7 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            if parsed.path == "/api/v1/admin/logout":
+            if parsed.path == "/api/v1/admin/logout" and legacy_local_auth:
                 token = self.headers.get("X-QCSCKP-Session")
                 if token:
                     self.app.runtime.sessions.revoke(token)
@@ -165,6 +225,16 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
             self._handle_command(request_id, parsed.path, tool_user_id, body)
         except ApiError as exc:
             self._json_error(request_id, exc)
+        except CentralAuthError as exc:
+            self._json_error(
+                request_id,
+                ApiError(
+                    exc.code,
+                    exc.message,
+                    status=exc.status,
+                    retryable=exc.retryable,
+                ),
+            )
         except Exception as exc:
             status = 409 if isinstance(exc, (ValueError, KeyError)) else 500
             self._json_error(
@@ -223,7 +293,17 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
             data = runtime.strategies.list_for_target(tool_user_id, target)
         elif path == "/api/v1/candidates":
             rows = runtime.database.query_all(
-                "SELECT * FROM candidate_batch WHERE tool_user_id=? ORDER BY created_at DESC LIMIT 500",
+                """
+                SELECT cb.*, p.plan_name, p.plan_system, p.promotion_scene,
+                       a.account_name
+                FROM candidate_batch cb
+                JOIN source_plan p ON p.tool_user_id=cb.tool_user_id
+                                  AND p.target_uid=cb.target_uid
+                JOIN advertiser_account a ON a.tool_user_id=cb.tool_user_id
+                                         AND a.aavid=cb.aavid
+                WHERE cb.tool_user_id=?
+                ORDER BY cb.created_at DESC LIMIT 500
+                """,
                 (tool_user_id,),
             )
             for row in rows:
@@ -233,16 +313,29 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
             data = rows
         elif path == "/api/v1/execution-tasks":
             data = runtime.database.query_all(
-                "SELECT * FROM execution_task WHERE tool_user_id=? ORDER BY created_at DESC LIMIT 500",
+                """
+                SELECT et.*, p.plan_name, p.plan_system, p.promotion_scene,
+                       a.account_name
+                FROM execution_task et
+                JOIN source_plan p ON p.tool_user_id=et.tool_user_id
+                                  AND p.target_uid=et.target_uid
+                JOIN advertiser_account a ON a.tool_user_id=et.tool_user_id
+                                         AND a.aavid=et.aavid
+                WHERE et.tool_user_id=?
+                ORDER BY et.created_at DESC LIMIT 500
+                """,
                 (tool_user_id,),
             )
         elif path == "/api/v1/adjustment-candidates":
             data = runtime.database.query_all(
                 """
                 SELECT ac.*, p.plan_name, p.plan_system, p.promotion_scene,
+                       a.account_name,
                        ct.control_task_id, ct.task_name, ct.assist_task_scene
                 FROM adjustment_candidate ac
                 JOIN source_plan p ON p.target_uid=ac.target_uid
+                JOIN advertiser_account a ON a.tool_user_id=ac.tool_user_id
+                                         AND a.aavid=ac.aavid
                 JOIN platform_control_task ct ON ct.control_task_uid=ac.control_task_uid
                 WHERE ac.tool_user_id=?
                 ORDER BY ac.created_at DESC LIMIT 500
@@ -268,14 +361,18 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
                 (tool_user_id,),
             )
         elif path == "/api/v1/operation-events":
+            selected_source = query.get("source") or "platform_log"
+            if selected_source == "all":
+                selected_source = None
             data = runtime.reports.query_events(
                 tool_user_id,
                 aavid=query.get("aavid"),
                 date_from=query.get("date_from"),
                 date_to=query.get("date_to"),
-                source=query.get("source"),
+                source=selected_source,
                 action_type=query.get("action_type"),
                 result_status=query.get("result_status"),
+                operator=query.get("operator"),
                 keyword=query.get("keyword"),
                 limit=int(query.get("limit") or 500),
                 offset=int(query.get("offset") or 0),
@@ -385,8 +482,8 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
         tool_user_id = self.app.runtime.sessions.resolve(
             self.headers.get("X-QCSCKP-Session")
         )
-        if not tool_user_id:
-            raise ApiError("admin_session_required", "请登录本机管理员", status=401)
+        if not tool_user_id or not self.app.runtime.is_tool_user_authorized(tool_user_id):
+            raise ApiError("tool_login_required", "请登录工具账号", status=401)
         return tool_user_id
 
     def _read_json(self) -> dict[str, Any]:

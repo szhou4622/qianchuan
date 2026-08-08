@@ -42,32 +42,30 @@ import type { Account, Health, Job, Plan } from "./types";
 type PageKey =
   | "health"
   | "accounts"
-  | "monitor"
-  | "strategies"
-  | "candidates"
   | "feishu"
+  | "retarget"
+  | "stop"
+  | "tasks"
   | "operations"
-  | "dashboard"
-  | "recovery";
+  | "settings";
 type Notice = {
   tone: "info" | "success" | "danger" | "warning";
   message: string;
 };
 
 const nav: Array<{ key: PageKey; label: string; icon: any }> = [
-  { key: "health", label: "运行健康与首次配置", icon: HeartPulseRegular },
-  { key: "accounts", label: "千川账户与计划", icon: AppsListDetailRegular },
-  { key: "monitor", label: "监控详情", icon: DataTrendingRegular },
-  { key: "strategies", label: "策略模拟", icon: BeakerRegular },
+  { key: "health", label: "运行健康", icon: HeartPulseRegular },
+  { key: "accounts", label: "千川账户", icon: AppsListDetailRegular },
+  { key: "feishu", label: "飞书绑定", icon: BotRegular },
+  { key: "retarget", label: "追投策略", icon: PlayRegular },
+  { key: "stop", label: "停投策略", icon: ShieldCheckmarkRegular },
   {
-    key: "candidates",
+    key: "tasks",
     label: "候选与任务中心",
     icon: ClipboardTaskListLtrRegular,
   },
-  { key: "feishu", label: "飞书绑定", icon: BotRegular },
-  { key: "operations", label: "操作流水与日报", icon: BookDatabaseRegular },
-  { key: "dashboard", label: "数据大屏", icon: DataTrendingRegular },
-  { key: "recovery", label: "迁移、诊断与恢复", icon: DoctorRegular },
+  { key: "operations", label: "账户操作流水", icon: BookDatabaseRegular },
+  { key: "settings", label: "诊断与恢复", icon: DoctorRegular },
 ];
 
 const planSystemName: Record<string, string> = {
@@ -225,7 +223,7 @@ function App() {
         >
           <span>·</span>
           <SignOutRegular />
-          <b>锁定本机管理台</b>
+          <b>退出工具账号</b>
         </button>
       </aside>
       <main className="workspace">
@@ -257,24 +255,26 @@ function App() {
           {page === "accounts" && (
             <AccountsPage refreshKey={refreshKey} run={run} />
           )}
-          {page === "monitor" && (
-            <MonitorPage refreshKey={refreshKey} run={run} />
-          )}
-          {page === "strategies" && (
-            <StrategyPage refreshKey={refreshKey} run={run} />
-          )}
-          {page === "candidates" && (
-            <>
-              <CandidatePage refreshKey={refreshKey} run={run} />
-              <AdjustmentCandidatePanel refreshKey={refreshKey} />
-            </>
-          )}
           {page === "feishu" && (
             <FeishuPage refreshKey={refreshKey} run={run} />
           )}
-          {page === "operations" && <OperationsPage refreshKey={refreshKey} />}
-          {page === "dashboard" && <DashboardPage refreshKey={refreshKey} />}
-          {page === "recovery" && (
+          {page === "retarget" && (
+            <StrategyPage mode="retarget" refreshKey={refreshKey} run={run} />
+          )}
+          {page === "stop" && (
+            <StrategyPage mode="stop" refreshKey={refreshKey} run={run} />
+          )}
+          {page === "tasks" && (
+            <>
+              <CandidatePage refreshKey={refreshKey} run={run} />
+              <AdjustmentCandidatePanel refreshKey={refreshKey} />
+              <ExecutionTaskPanel refreshKey={refreshKey} />
+            </>
+          )}
+          {page === "operations" && (
+            <OperationsPage refreshKey={refreshKey} run={run} />
+          )}
+          {page === "settings" && (
             <RecoveryPage refreshKey={refreshKey} run={run} health={health} />
           )}
         </section>
@@ -461,9 +461,34 @@ function HealthPage({
         />
         <Metric label="运行目录" value="已隔离" detail={health.runtime_dir} />
         <Metric
-          label="后台事件流"
-          value="持续连接"
-          detail="UI重载不影响后台任务"
+          label="Google Chrome"
+          value={health.browser?.chrome_state === "available" ? "可用" : "未找到"}
+          detail={health.browser?.chrome_path || "请安装 Chrome"}
+          tone={health.browser?.chrome_state === "available" ? "good" : "bad"}
+        />
+      </div>
+      <div className="metric-grid">
+        <Metric
+          label="千川会话"
+          value={health.browser?.qianchuan_login_status || "未配置"}
+          detail={health.browser?.cookie_updated_at || "尚未保存登录态"}
+          tone={health.browser?.qianchuan_login_status === "authenticated" ? "good" : "neutral"}
+        />
+        <Metric
+          label="飞书"
+          value={health.feishu?.sending === "ready" ? "可发卡" : "未就绪"}
+          detail={`${health.feishu?.transport || "disconnected"} · ${health.feishu?.binding || "unbound"}`}
+          tone={health.feishu?.sending === "ready" ? "good" : "neutral"}
+        />
+        <Metric
+          label="任务队列"
+          value={`${health.job_queue?.running || 0} 运行 / ${health.job_queue?.queued || 0} 等待`}
+          detail={`${health.job_queue?.blocked || 0} 个等待用户处理`}
+        />
+        <Metric
+          label="最近采集"
+          value={health.latest_collection_at ? "已有数据" : "尚无数据"}
+          detail={health.latest_collection_at || "启用计划后开始只读采集"}
         />
       </div>
       <Panel
@@ -482,7 +507,8 @@ function HealthPage({
                       qianchuan: "accounts",
                       feishu: "feishu",
                       monitor: "accounts",
-                      strategy: "strategies",
+                      strategy: "retarget",
+                      tool_login: "health",
                       local_admin: "health",
                     } as any
                   )[step.key],
@@ -517,6 +543,7 @@ function AccountsPage({
   run: RunCommand;
 }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [routes, setRoutes] = useState<any[]>([]);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [selected, setSelected] = useState<Account | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
@@ -539,6 +566,9 @@ function AccountsPage({
   useEffect(() => {
     void load();
   }, [load, refreshKey]);
+  useEffect(() => {
+    void api<any[]>("/api/v1/feishu/routes").then(setRoutes);
+  }, [refreshKey]);
   useEffect(() => {
     if (!selected) {
       setPlans([]);
@@ -594,7 +624,7 @@ function AccountsPage({
       "/api/v1/accounts/monitor-setup",
       {
         aavid: selected.aavid,
-        enabled: true,
+        enabled: Boolean(selected.enabled),
         daily_report_enabled: Boolean(selected.daily_report_enabled),
         feishu_route_id: selected.feishu_route_id || null,
         target_uids: [...checked],
@@ -765,7 +795,25 @@ function AccountsPage({
                         <em>{plan.ineligible_reason || "证据未确认"}</em>
                       )}
                     </div>
-                    <span>{plan.monitor_enabled ? "监控中" : "未监控"}</span>
+                    <div className="plan-actions">
+                      <span>{plan.monitor_enabled ? "监控中" : "未监控"}</span>
+                      {plan.monitor_enabled && plan.monitor_eligible && (
+                        <Button
+                          size="small"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void run(
+                              "/api/v1/collections/run",
+                              { target_uid: plan.target_uid },
+                              "只读采集、规则模拟和候选冻结完成",
+                            );
+                          }}
+                        >
+                          立即采集
+                        </Button>
+                      )}
+                    </div>
                   </label>
                 ))}
               </div>
@@ -791,6 +839,24 @@ function AccountsPage({
                 })
               }
             />
+            <Field label="飞书接收位置">
+              <Select
+                value={selected.feishu_route_id || ""}
+                onChange={(_, data) =>
+                  setSelected({
+                    ...selected,
+                    feishu_route_id: data.value || undefined,
+                  })
+                }
+              >
+                <option value="">管理员默认位置</option>
+                {routes.map((route) => (
+                  <option key={route.route_id} value={route.route_id}>
+                    {route.route_name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
             <Button appearance="primary" onClick={() => void save()}>
               保存账户与监控计划
             </Button>
@@ -919,25 +985,28 @@ function MonitorPage({
 }
 
 function StrategyPage({
+  mode,
   refreshKey,
   run,
 }: {
+  mode: "retarget" | "stop";
   refreshKey: number;
   run: RunCommand;
 }) {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [target, setTarget] = useState("");
   const [items, setItems] = useState<any[]>([]);
-  const [title, setTitle] = useState("高质量视频候选");
-  const [strategyType, setStrategyType] = useState("retarget_create");
+  const [title, setTitle] = useState(
+    mode === "retarget" ? "高质量视频追投候选" : "低效追投任务停投候选",
+  );
   const [level, setLevel] = useState("material");
   const [metric, setMetric] = useState("spend_cent");
   const [operator, setOperator] = useState("gte");
   const [value, setValue] = useState("10000");
   const [maxValue, setMaxValue] = useState("20000");
   const [priority, setPriority] = useState("10");
-  const [budgetDelta, setBudgetDelta] = useState("0");
-  const [durationDelta, setDurationDelta] = useState("0");
+  const [enableNow, setEnableNow] = useState(false);
+  const strategyType = mode === "retarget" ? "retarget_create" : "retarget_pause";
   useEffect(() => {
     void api<Plan[]>("/api/v1/plans").then((rows) => {
       const eligible = rows.filter(
@@ -948,12 +1017,26 @@ function StrategyPage({
     });
   }, [refreshKey]);
   useEffect(() => {
+    setTitle(
+      mode === "retarget" ? "高质量视频追投候选" : "低效追投任务停投候选",
+    );
+    if (mode === "stop") setLevel("material");
+  }, [mode]);
+  useEffect(() => {
     if (target)
       void api<any[]>(
         `/api/v1/strategies?target_uid=${encodeURIComponent(target)}`,
-      ).then(setItems);
+      ).then((rows) =>
+        setItems(rows.filter((item) => item.strategy_type === strategyType)),
+      );
     else setItems([]);
-  }, [target, refreshKey]);
+  }, [target, refreshKey, strategyType]);
+  const selectedPlan = plans.find((plan) => plan.target_uid === target);
+  useEffect(() => {
+    if (selectedPlan?.promotion_scene === "live" || mode === "stop") {
+      setLevel("material");
+    }
+  }, [selectedPlan?.promotion_scene, mode]);
   const save = () =>
     run(
       "/api/v1/strategies/save",
@@ -970,23 +1053,22 @@ function StrategyPage({
               : { metric, operator, value },
           ],
         },
-        action_params:
-          strategyType === "retarget_adjust"
-            ? {
-                budget_delta_cent: Number(budgetDelta),
-                duration_delta_hours: durationDelta,
-              }
-            : {},
-        enabled: true,
+        action_params: {},
+        enabled: enableNow,
         cooldown_minutes: 30,
       },
-      "模拟策略已保存",
+      enableNow ? "模拟策略已保存并启用" : "模拟策略草稿已保存",
     );
+  const pageTitle = mode === "retarget" ? "追投模拟策略" : "停投模拟策略";
+  const pageDescription =
+    mode === "retarget"
+      ? "商品计划支持素材级和商品汇总级；直播计划只支持素材级。"
+      : "仅判断 Scene 2 素材追投调控任务；不会删除任务，也不会影响源计划。";
   return (
     <div className="two-columns strategy-layout">
       <Panel
-        title="新建模拟策略"
-        description="V1A只评估今日累计；同一策略内所有条件使用 AND。"
+        title={`新建${pageTitle}`}
+        description={`${pageDescription} V1A只评估今日累计，同一策略内所有条件使用 AND。`}
       >
         <Field label="监控计划">
           <Select value={target} onChange={(_, data) => setTarget(data.value)}>
@@ -1002,20 +1084,17 @@ function StrategyPage({
           <Input value={title} onChange={(_, data) => setTitle(data.value)} />
         </Field>
         <div className="form-grid">
-          <Field label="模拟动作">
-            <Select
-              value={strategyType}
-              onChange={(_, data) => setStrategyType(data.value)}
-            >
-              <option value="retarget_create">新建追投候选</option>
-              <option value="retarget_pause">暂停Scene 2追投任务</option>
-              <option value="retarget_adjust">调整Scene 2追投任务</option>
-            </Select>
-          </Field>
           <Field label="触发层级">
-            <Select value={level} onChange={(_, data) => setLevel(data.value)}>
+            <Select
+              value={level}
+              disabled={mode === "stop" || selectedPlan?.promotion_scene === "live"}
+              onChange={(_, data) => setLevel(data.value)}
+            >
               <option value="material">素材级</option>
-              <option value="product">商品级</option>
+              {mode === "retarget" &&
+                selectedPlan?.promotion_scene !== "live" && (
+                  <option value="product">商品汇总级</option>
+                )}
             </Select>
           </Field>
           <Field label="优先级（越小越高）">
@@ -1064,40 +1143,34 @@ function StrategyPage({
             <Input value={value} onChange={(_, data) => setValue(data.value)} />
           </Field>
         )}
-        {strategyType === "retarget_adjust" && (
-          <div className="form-grid">
-            <Field label="预算增加（分）">
-              <Input
-                type="number"
-                min={0}
-                value={budgetDelta}
-                onChange={(_, data) => setBudgetDelta(data.value)}
-              />
-            </Field>
-            <Field label="时长增加（小时）">
-              <Input
-                type="number"
-                min={0}
-                step="0.1"
-                value={durationDelta}
-                onChange={(_, data) => setDurationDelta(data.value)}
-              />
-            </Field>
+        <div className="strategy-enable-row">
+          <Switch
+            checked={enableNow}
+            onChange={(_, data) => setEnableNow(data.checked)}
+          />
+          <div>
+            <strong>保存后立即启用</strong>
+            <small>
+              未启用时仅保存草稿；启用需要飞书凭据、绑定和测试发送均正常。
+            </small>
           </div>
-        )}
+        </div>
         <div className="dry-run-callout">
-          <BeakerRegular /> 保存后只会冻结模拟候选，不会调用千川写接口。
+          <BeakerRegular />
+          {mode === "retarget"
+            ? "命中后只冻结追投候选并发送模拟预览，不会创建真实追投。"
+            : "命中后只冻结停投候选并发送模拟预览，不会暂停任何调控任务。"}
         </div>
         <Button
           appearance="primary"
           disabled={!target}
           onClick={() => void save()}
         >
-          保存并启用模拟策略
+          {enableNow ? "保存并启用模拟策略" : "保存策略草稿"}
         </Button>
       </Panel>
       <Panel
-        title="已配置策略"
+        title={`已配置${mode === "retarget" ? "追投" : "停投"}策略`}
         description="同一对象命中多条策略时，只采用优先级数字最小的一条。"
       >
         {items.length ? (
@@ -1128,7 +1201,7 @@ function StrategyPage({
         ) : (
           <Empty
             title="暂无策略"
-            description="先选择一个已监控计划并创建模拟策略。"
+            description={`先选择一个已监控计划并创建${mode === "retarget" ? "追投" : "停投"}模拟策略。`}
           />
         )}
       </Panel>
@@ -1220,12 +1293,15 @@ function CandidatePage({
                 onClick={() => setActive(batch)}
               >
                 <div>
-                  <strong>{batch.material_count} 条视频候选</strong>
+                  <strong>{batch.account_name} · {batch.plan_name}</strong>
                   <small>
-                    {batch.created_at} · {batch.status}
+                    {batch.material_count} 条视频 · {batch.created_at} · {batch.status}
                   </small>
                 </div>
-                <i>{batch.trigger_level === "product" ? "商品级" : "素材级"}</i>
+                <i>
+                  {planSystemName[batch.plan_system]} · {sceneName[batch.promotion_scene]} ·{" "}
+                  {batch.trigger_level === "product" ? "商品级" : "素材级"}
+                </i>
               </button>
             ))}
           </div>
@@ -1391,27 +1467,59 @@ function CandidatePage({
 function AdjustmentCandidatePanel({ refreshKey }: { refreshKey: number }) {
   const [items, setItems] = useState<any[]>([]);
   useEffect(() => {
-    void api<any[]>("/api/v1/adjustment-candidates").then(setItems);
+    void api<any[]>("/api/v1/adjustment-candidates").then((rows) =>
+      setItems(rows.filter((item) => item.action_type === "retarget_pause")),
+    );
   }, [refreshKey]);
   return (
     <Panel
-      title="Scene 2 暂停与调整模拟"
-      description="仅展示素材追投任务的冻结候选；V1A不会创建或推进任何真实执行任务。"
+      title="Scene 2 停投候选"
+      description="仅展示素材追投任务的冻结停投候选；V1A不会创建或推进任何真实执行任务。"
     >
       <DataTable
         rows={items}
         columns={[
           "created_at",
+          "account_name",
           "plan_name",
           "task_name",
           "control_task_id",
           "action_type",
-          "budget_before_cent",
-          "budget_expected_after_cent",
-          "duration_expected_after_hours_decimal",
           "status",
         ]}
-        empty="暂无Scene 2暂停或调整候选"
+        empty="暂无 Scene 2 停投候选"
+      />
+    </Panel>
+  );
+}
+
+function ExecutionTaskPanel({ refreshKey }: { refreshKey: number }) {
+  const [items, setItems] = useState<any[]>([]);
+  useEffect(() => {
+    void api<any[]>("/api/v1/execution-tasks").then(setItems);
+  }, [refreshKey]);
+  return (
+    <Panel
+      title="模拟任务记录"
+      description="这里只记录飞书模拟确认、拒绝、过期、取消和只读归档结果；V1A 数据库不接受真实执行状态。"
+    >
+      <DataTable
+        rows={items}
+        columns={[
+          "created_at",
+          "account_name",
+          "plan_name",
+          "plan_system",
+          "promotion_scene",
+          "operation_type",
+          "status",
+          "candidate_batch_id",
+          "group_uid",
+          "adjustment_candidate_id",
+          "authorized_at",
+          "error_message",
+        ]}
+        empty="暂无模拟任务记录"
       />
     </Panel>
   );
@@ -1563,46 +1671,75 @@ function FeishuPage({
   );
 }
 
-function OperationsPage({ refreshKey }: { refreshKey: number }) {
+function OperationsPage({
+  refreshKey,
+  run,
+}: {
+  refreshKey: number;
+  run: RunCommand;
+}) {
   const today = new Date();
   const seven = new Date(Date.now() - 6 * 86400000);
   const iso = (date: Date) => date.toISOString().slice(0, 10);
   const [from, setFrom] = useState(iso(seven));
   const [to, setTo] = useState(iso(today));
-  const [source, setSource] = useState("");
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [aavid, setAavid] = useState("");
+  const [source, setSource] = useState("platform_log");
+  const [actionType, setActionType] = useState("");
+  const [resultStatus, setResultStatus] = useState("");
+  const [operatorName, setOperatorName] = useState("");
+  const [keyword, setKeyword] = useState("");
   const [rows, setRows] = useState<any[]>([]);
   const [report, setReport] = useState<any>(null);
   const load = useCallback(async () => {
     const query = new URLSearchParams({
       date_from: from,
       date_to: to,
-      ...(source ? { source } : {}),
+      source,
+      ...(aavid ? { aavid } : {}),
+      ...(actionType ? { action_type: actionType } : {}),
+      ...(resultStatus ? { result_status: resultStatus } : {}),
+      ...(operatorName ? { operator: operatorName } : {}),
+      ...(keyword ? { keyword } : {}),
     });
     setRows(await api<any[]>(`/api/v1/operation-events?${query}`));
-  }, [from, to, source]);
+  }, [from, to, source, aavid, actionType, resultStatus, operatorName, keyword]);
+  useEffect(() => {
+    void api<Account[]>("/api/v1/accounts").then(setAccounts);
+  }, [refreshKey]);
   useEffect(() => {
     void load();
   }, [load, refreshKey]);
   const exportCsv = () => {
-    const columns = [
-      "event_time_beijing",
-      "account_name",
-      "aavid",
-      "source_plan_name",
-      "action_type",
-      "source",
-      "result_status",
-      "error_message",
+    const columns: Array<[string, string]> = [
+      ["event_time_beijing", "北京时间"],
+      ["account_name", "千川账户"],
+      ["aavid", "账户ID"],
+      ["source_plan_name", "计划名称"],
+      ["source_plan_id", "计划ID"],
+      ["action_type", "操作类型"],
+      ["operator_id", "操作人"],
+      ["source", "来源"],
+      ["result_status", "结果"],
+      ["control_task_id", "调控任务ID"],
+      ["error_message", "失败原因"],
     ];
     const escape = (value: unknown) =>
       `"${String(value ?? "").replaceAll('"', '""')}"`;
     const text =
       "\ufeff" +
       [
-        columns.join(","),
-        ...rows.map((row) =>
-          columns.map((column) => escape(row[column])).join(","),
-        ),
+        columns.map(([, label]) => label).join(","),
+        ...rows.map((row) => {
+          const exported = {
+            ...row,
+            action_type: operationActionLabel(row.action_type),
+            source: operationSourceLabel(row.source),
+            result_status: operationResultLabel(row.result_status),
+          };
+          return columns.map(([column]) => escape(exported[column])).join(",");
+        }),
       ].join("\r\n");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(
@@ -1612,21 +1749,53 @@ function OperationsPage({ refreshKey }: { refreshKey: number }) {
     link.click();
     URL.revokeObjectURL(link.href);
   };
-  const preview = async () =>
-    setReport(await api<any>(`/api/v1/daily-report?business_date=${to}`));
+  const preview = async () => {
+    const query = new URLSearchParams({
+      business_date: to,
+      ...(aavid ? { aavid } : {}),
+    });
+    setReport(await api<any>(`/api/v1/daily-report?${query}`));
+  };
   return (
     <>
       <Panel
         title="账户操作流水"
-        description="只展示平台操作、工具只读审计和明确的模拟审计；普通浏览器轨迹不会进入日报。"
+        description="默认只查询千川后台真实投放操作。普通浏览器导航与采集轨迹不会进入流水或日报；模拟候选仅在选择相应来源时展示。"
         actions={
           <>
+            <Tooltip
+              content={aavid ? "增量同步所选账户的千川平台操作日志" : "请先选择一个千川账户"}
+              relationship="label"
+            >
+              <Button
+                disabled={!aavid}
+                onClick={() =>
+                  void run(
+                    "/api/v1/operation-logs/sync",
+                    { aavid },
+                    "所选账户的平台操作日志同步完成",
+                  )
+                }
+              >
+                同步平台日志
+              </Button>
+            </Tooltip>
             <Button onClick={() => void load()}>查询</Button>
             <Button onClick={exportCsv}>导出当前结果</Button>
           </>
         }
       >
         <div className="toolbar">
+          <Field label="千川账户">
+            <Select value={aavid} onChange={(_, data) => setAavid(data.value)}>
+              <option value="">全部已添加账户</option>
+              {accounts.map((account) => (
+                <option key={account.aavid} value={account.aavid}>
+                  {account.account_name}
+                </option>
+              ))}
+            </Select>
+          </Field>
           <Field label="开始日期">
             <Input
               type="date"
@@ -1646,24 +1815,84 @@ function OperationsPage({ refreshKey }: { refreshKey: number }) {
               value={source}
               onChange={(_, data) => setSource(data.value)}
             >
-              <option value="">全部</option>
-              <option value="platform_log">平台操作日志</option>
+              <option value="platform_log">平台操作日志（默认）</option>
               <option value="tool_direct">工具审计</option>
               <option value="simulation">V1A模拟</option>
+              <option value="all">全部来源</option>
             </Select>
+          </Field>
+          <Field label="操作类型">
+            <Select
+              value={actionType}
+              onChange={(_, data) => setActionType(data.value)}
+            >
+              <option value="">全部操作</option>
+              <option value="retarget_create">追投</option>
+              <option value="retarget_pause">停投</option>
+              <option value="plan_create">新建计划</option>
+              <option value="plan_copy">复制计划</option>
+              <option value="plan_enable">启用计划</option>
+              <option value="plan_pause">暂停计划</option>
+              <option value="plan_delete">删除计划</option>
+              <option value="budget_update">修改预算</option>
+              <option value="duration_update">延长时长</option>
+              <option value="bid_update">修改出价</option>
+              <option value="roi_update">修改ROI</option>
+              <option value="other">其他</option>
+            </Select>
+          </Field>
+          <Field label="结果">
+            <Select
+              value={resultStatus}
+              onChange={(_, data) => setResultStatus(data.value)}
+            >
+              <option value="">全部结果</option>
+              <option value="succeeded">成功</option>
+              <option value="failed">失败</option>
+              <option value="partial">部分完成</option>
+            </Select>
+          </Field>
+          <Field label="操作人">
+            <Input
+              value={operatorName}
+              placeholder="姓名或平台用户ID"
+              onChange={(_, data) => setOperatorName(data.value)}
+            />
+          </Field>
+          <Field label="关键词">
+            <Input
+              value={keyword}
+              placeholder="计划、任务或动作"
+              onChange={(_, data) => setKeyword(data.value)}
+            />
           </Field>
           <Button onClick={() => void preview()}>预览日报</Button>
         </div>
         <DataTable
-          rows={rows}
+          rows={rows.map((row) => ({
+            ...row,
+            action_type: operationActionLabel(row.action_type),
+            source: operationSourceLabel(row.source),
+            result_status: operationResultLabel(row.result_status),
+          }))}
           columns={[
             "event_time_beijing",
             "account_name",
             "source_plan_name",
             "action_type",
+            "operator_id",
             "source",
             "result_status",
           ]}
+          headerLabels={{
+            event_time_beijing: "北京时间",
+            account_name: "千川账户",
+            source_plan_name: "计划名称",
+            action_type: "操作类型",
+            operator_id: "操作人",
+            source: "来源",
+            result_status: "结果",
+          }}
           empty="当前筛选范围无操作流水"
         />
       </Panel>
@@ -2003,10 +2232,12 @@ function DataTable({
   rows,
   columns,
   empty,
+  headerLabels = {},
 }: {
   rows: any[];
   columns: string[];
   empty: string;
+  headerLabels?: Record<string, string>;
 }) {
   if (!rows.length) return <Empty title={empty} description="" />;
   return (
@@ -2015,7 +2246,7 @@ function DataTable({
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column}>{column}</th>
+              <th key={column}>{headerLabels[column] || column}</th>
             ))}
           </tr>
         </thead>
@@ -2087,6 +2318,53 @@ function catalogLabel(status: string) {
         never_synced: "待同步",
       } as Record<string, string>
     )[status] || status
+  );
+}
+
+function operationActionLabel(value: unknown) {
+  const key = String(value ?? "");
+  return (
+    (
+      {
+        retarget_create: "追投",
+        retarget_pause: "停投",
+        plan_create: "新建计划",
+        plan_copy: "复制计划",
+        plan_enable: "启用计划",
+        plan_pause: "暂停计划",
+        plan_delete: "删除计划",
+        budget_update: "修改预算",
+        duration_update: "延长时长",
+        bid_update: "修改出价",
+        roi_update: "修改ROI",
+        other: "其他",
+      } as Record<string, string>
+    )[key] || key
+  );
+}
+
+function operationSourceLabel(value: unknown) {
+  return (
+    (
+      {
+        platform_log: "千川平台日志",
+        tool_direct: "工具操作审计",
+        simulation: "V1A模拟",
+        browser_observed: "浏览器记录",
+      } as Record<string, string>
+    )[String(value ?? "")] || String(value ?? "")
+  );
+}
+
+function operationResultLabel(value: unknown) {
+  return (
+    (
+      {
+        succeeded: "成功",
+        failed: "失败",
+        partial: "部分完成",
+      } as Record<string, string>
+    )[String(value ?? "")] || String(value ?? "")
   );
 }
 

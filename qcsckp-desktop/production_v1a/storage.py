@@ -36,6 +36,23 @@ CREATE TABLE IF NOT EXISTS tool_user (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS remote_auth_cache (
+    tool_user_id TEXT PRIMARY KEY,
+    remote_account_id TEXT NOT NULL UNIQUE,
+    encrypted_access_token TEXT NOT NULL,
+    token_expires_at TEXT NOT NULL,
+    last_online_verified_at TEXT NOT NULL,
+    offline_grace_until TEXT NOT NULL,
+    auth_status TEXT NOT NULL DEFAULT 'active'
+        CHECK(auth_status IN ('active', 'offline_grace', 'expired', 'disabled', 'device_mismatch', 'logged_out')),
+    last_error_code TEXT,
+    last_error_message TEXT,
+    last_used_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(tool_user_id) REFERENCES tool_user(tool_user_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS qianchuan_identity (
     login_identity_id TEXT PRIMARY KEY,
     tool_user_id TEXT NOT NULL UNIQUE,
@@ -502,6 +519,7 @@ CREATE TABLE IF NOT EXISTS feishu_profile (
     profile_uid TEXT PRIMARY KEY,
     tool_user_id TEXT NOT NULL UNIQUE,
     app_id TEXT,
+    encrypted_app_id TEXT,
     encrypted_app_secret TEXT,
     authorized_open_id TEXT,
     credential_status TEXT NOT NULL DEFAULT 'not_configured',
@@ -721,6 +739,7 @@ class RuntimeDatabase:
         conn = self.connect()
         try:
             conn.executescript(RUNTIME_SCHEMA)
+            self._migrate_schema(conn)
             now = utc_iso()
             conn.execute(
                 "INSERT INTO schema_meta(key, value, updated_at) VALUES('schema_version', ?, ?) "
@@ -729,6 +748,16 @@ class RuntimeDatabase:
             )
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        """只做可重复、向前兼容的轻量迁移，绝不重写旧运行数据。"""
+
+        feishu_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(feishu_profile)")
+        }
+        if "encrypted_app_id" not in feishu_columns:
+            conn.execute("ALTER TABLE feishu_profile ADD COLUMN encrypted_app_id TEXT")
 
     def initialize_history(self, business_month: str) -> Path:
         path = self.paths.history_db_for_month(business_month)
