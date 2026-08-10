@@ -1165,6 +1165,159 @@ def build_stop_task_card(
     }
 
 
+def build_budget_increase_task_card(
+    task: Dict[str, Any],
+    *,
+    expanded: bool = False,
+) -> Dict[str, Any]:
+    """Build a confirmation card for adjusting one existing control task."""
+    status = str(task.get("status") or "pending")
+    status_text = {
+        "pending": "等待确认",
+        "approved_queued": "已确认，等待工具执行",
+        "claimed": "工具已领取",
+        "executing": "正在复核并追加预算",
+        "succeeded": "追加预算成功",
+        "failed": "追加预算失败",
+        "rejected": "已暂不追加",
+        "expired": "已过期",
+        "cancelled": "已取消",
+    }.get(status, status)
+    template = (
+        "green" if status == "succeeded"
+        else "red" if status in {"failed", "expired", "rejected"}
+        else "blue"
+    )
+    scene_text = (
+        "推商品"
+        if str(task.get("promotion_scene") or "live") == "product"
+        else "推直播"
+    )
+    system_text = {
+        "global": "全域",
+        "chengfang": "乘方",
+        "unknown": "待确认",
+    }.get(str(task.get("plan_system") or "unknown"), "待确认")
+    calculation = (
+        task.get("calculation_snapshot")
+        if isinstance(task.get("calculation_snapshot"), dict)
+        else {}
+    )
+    increase = (
+        task.get("budget_increase")
+        if isinstance(task.get("budget_increase"), dict)
+        else {}
+    )
+    task_kind = {
+        "volume": "放量任务",
+        "cost_control_roi": "控成本·ROI任务",
+        "cost_control_conversion": "控成本·成交任务",
+    }.get(str(calculation.get("task_kind") or ""), "任务类型待确认")
+    if str(calculation.get("mode") or "") == "spend_percentage":
+        basis_text = (
+            f"按最新消耗 ¥{calculation.get('latest_spend_yuan', 0)} 的 "
+            f"{calculation.get('spend_percentage', increase.get('spend_percentage', 0))}% 增加"
+        )
+    else:
+        basis_text = "按固定金额增加"
+    lines = [
+        f"千川账户：{task.get('account_name') or '未命名账户'}",
+        f"账户ID：{task.get('aavid') or ''}",
+        f"计划名称：{task.get('plan_name') or '未命名计划'}",
+        f"计划ID：{task.get('ad_id') or ''}",
+        f"计划类型：{system_text}·{scene_text}",
+        f"调控任务：{task.get('assist_task_name') or '未命名任务'}",
+        f"调控任务ID：{task.get('assist_task_id') or ''}",
+        f"任务类型：{task_kind}",
+        "",
+        f"当前预算：¥{calculation.get('current_budget_yuan', '')}",
+        f"计算方式：{basis_text}",
+        f"本次新增：¥{calculation.get('increment_budget_yuan', '')}",
+        f"新增后预算：¥{calculation.get('new_budget_yuan', '')}",
+    ]
+    if calculation.get("extend_hours") is not None:
+        lines.append(f"放量任务延长：{calculation.get('extend_hours')} 小时")
+    elements: List[Dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {"tag": "plain_text", "content": "\n".join(lines)},
+        },
+        {
+            "tag": "markdown",
+            "content": (
+                f"**策略：** {task.get('strategy_name') or '追加预算策略'}"
+                f"\n**命中条件：** {_trigger_summary(task.get('trigger_snapshot') or {})}"
+                f"\n**有效期至：** {task.get('expires_at') or ''}"
+                f"\n**当前状态：** {status_text}"
+            ),
+        },
+    ]
+    if task.get("result_message"):
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**执行结果：** {str(task.get('result_message'))[:500]}",
+            }
+        )
+    if expanded:
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**执行前复核说明**\n工具会重新读取该调控任务的最新预算、"
+                        "最新消耗和ROI；策略、任务或登录状态变化时不会提交。"
+                    ),
+                },
+            ]
+        )
+    if status == "pending":
+        base = {
+            "task_uid": str(task.get("task_uid") or ""),
+            "nonce": str(task.get("action_nonce") or ""),
+        }
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "primary",
+                        "text": {"tag": "plain_text", "content": "确认追加预算"},
+                        "value": {**base, "action": "approve"},
+                    },
+                    {
+                        "tag": "button",
+                        "type": "danger",
+                        "text": {"tag": "plain_text", "content": "暂不追加"},
+                        "value": {**base, "action": "reject"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "查看详情"},
+                        "value": {**base, "action": "view"},
+                    },
+                ],
+            }
+        )
+    return {
+        "config": {
+            "wide_screen_mode": True,
+            "enable_forward": False,
+            "update_multi": True,
+        },
+        "header": {
+            "template": template,
+            "title": {
+                "tag": "plain_text",
+                "content": f"千川追加预算 · {system_text} · {scene_text} · {status_text}",
+            },
+        },
+        "elements": elements,
+    }
+
+
 def build_local_task_card(
     task: Dict[str, Any],
     *,
@@ -1172,6 +1325,8 @@ def build_local_task_card(
 ) -> Dict[str, Any]:
     if str(task.get("action_type") or "retarget") == "stop":
         return build_stop_task_card(task, expanded=expanded)
+    if str(task.get("task_operation") or "") == "increase_budget":
+        return build_budget_increase_task_card(task, expanded=expanded)
     return build_task_card(task, expanded=expanded)
 
 
@@ -2081,10 +2236,18 @@ def _create_local_retarget_task_for(
     if not profile.get("authorized_open_id") and not profile.get("groups"):
         return {"success": False, "message": "请先完成飞书个人或群绑定"}
     payload = dict(payload or {})
+    task_operation = str(
+        payload.get("task_operation") or "create_retarget"
+    ).strip().lower()
+    is_budget_increase = task_operation == "increase_budget"
     raw_materials = payload.get("materials")
-    if isinstance(raw_materials, list) and len(raw_materials) > 20:
+    if (
+        not is_budget_increase
+        and isinstance(raw_materials, list)
+        and len(raw_materials) > 20
+    ):
         return {"success": False, "message": "一张追投卡片最多支持20条素材"}
-    materials = _normalize_materials(payload)
+    materials = [] if is_budget_increase else _normalize_materials(payload)
     required = {
         "aavid": str(payload.get("aavid") or "").strip(),
         "ad_id": str(payload.get("ad_id") or "").strip(),
@@ -2094,11 +2257,26 @@ def _create_local_retarget_task_for(
     }
     if (
         any(not value for value in required.values())
-        or not materials
-        or len(materials) > 20
+        or (not is_budget_increase and not materials)
+        or (not is_budget_increase and len(materials) > 20)
         or not re.fullmatch(r"[a-f0-9]{64}", required["strategy_hash"])
     ):
         return {"success": False, "message": "账户、计划、素材或策略快照不完整"}
+    if is_budget_increase:
+        assist_task_id = str(payload.get("assist_task_id") or "").strip()
+        calculation = payload.get("calculation_snapshot")
+        calculation_fingerprint = str(
+            payload.get("calculation_fingerprint") or ""
+        ).strip()
+        if (
+            not assist_task_id
+            or not isinstance(calculation, dict)
+            or not re.fullmatch(r"[a-f0-9]{64}", calculation_fingerprint)
+        ):
+            return {
+                "success": False,
+                "message": "调控任务、预算计算结果或计算快照不完整",
+            }
     from services.qianchuan_accounts import (
         bind_target_account_scope,
         ensure_qianchuan_account,
@@ -2148,14 +2326,16 @@ def _create_local_retarget_task_for(
     payload["qianchuan_session_epoch"] = int(
         session_gate.get("session_epoch") or 1
     )
+    payload["task_operation"] = task_operation
     payload["materials"] = materials
     payload["candidate_materials"] = materials
     payload["retarget_groups"] = []
     payload["selected_material_ids"] = [
         str(material["material_id"]) for material in materials
     ]
-    payload["material_id"] = materials[0]["material_id"]
-    payload["material_name"] = materials[0]["material_name"]
+    if materials:
+        payload["material_id"] = materials[0]["material_id"]
+        payload["material_name"] = materials[0]["material_name"]
     payload.setdefault("promotion_scene", "live")
     payload.setdefault("plan_system", "unknown")
     payload.setdefault("trigger_level", "material")
@@ -2165,9 +2345,21 @@ def _create_local_retarget_task_for(
             args=(task_uid,),
             daemon=True,
         ).start()
-    dedupe = hashlib.sha256(
-        f"{account}|{required['target_uid']}|{required['strategy_id']}".encode("utf-8")
-    ).hexdigest()
+    if is_budget_increase:
+        dedupe = hashlib.sha256(
+            (
+                f"{account}|{required['target_uid']}|{required['strategy_id']}|"
+                f"increase_budget|{payload.get('assist_task_id') or ''}"
+            ).encode("utf-8")
+        ).hexdigest()
+    else:
+        # Keep the historical key stable so an active card created by an older
+        # build cannot be duplicated after upgrading this feature branch.
+        dedupe = hashlib.sha256(
+            f"{account}|{required['target_uid']}|{required['strategy_id']}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
     task_uid = str(uuid.uuid4())
     nonce = secrets.token_hex(32)
     created_at = _dt(_now())
@@ -2850,6 +3042,25 @@ def handle_local_card_action(
             if not isinstance(payload, dict):
                 conn.rollback()
                 return {"success": False, "message": "任务素材快照损坏"}
+            if str(payload.get("task_operation") or "") == "increase_budget":
+                conn.execute(
+                    "UPDATE local_retarget_task SET status='approved_queued',approved_by=?,"
+                    "approved_at=?,payload_json=?,updated_at=? "
+                    "WHERE task_uid=? AND status='pending'",
+                    (
+                        operator_open_id,
+                        now_text,
+                        _json(payload),
+                        now_text,
+                        task_uid,
+                    ),
+                )
+                conn.commit()
+                return {
+                    "success": True,
+                    "message": "已确认追加预算，工具将重新复核最新预算、消耗和ROI后执行",
+                    "update": True,
+                }
             candidates = _candidate_materials(payload)
             selected_materials = _selected_materials(payload, candidates)
             groups = _retarget_groups(payload, candidates)

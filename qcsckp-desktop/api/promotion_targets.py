@@ -446,6 +446,8 @@ def sanitize_target_url(url: str) -> str:
 def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
+    if "account_enabled" in out:
+        out["account_enabled"] = bool(out.get("account_enabled"))
     for key in ("monitor_eligible", "retarget_eligible", "stop_eligible"):
         out[key] = bool(out.get(key))
     out["automation_write_blocked"] = bool(
@@ -516,7 +518,8 @@ def get_promotion_target(
 
     _initialize_directory_selection(store)
     rows = store.execute(
-        "SELECT t.* FROM promotion_target t "
+        "SELECT t.*,a.account_name AS account_name,"
+        "a.enabled AS account_enabled FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
         "WHERE t.target_uid=? AND a.owner_username=? "
         "AND a.directory_selected=1 LIMIT 1",

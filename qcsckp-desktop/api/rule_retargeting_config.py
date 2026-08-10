@@ -42,6 +42,11 @@ ALLOWED_METRICS = frozenset(
         "overallClickCount",
         "overallCtr",
         "overallConversionRate",
+        # Existing-control-task budget rules.  These two metrics are evaluated
+        # against pmc_roi2_assist_task rows, never against individual material
+        # rows.
+        "assistCost",
+        "assistRoi",
     }
 )
 ALLOWED_OPS = frozenset({"gt", "gte", "lt", "lte", "eq"})
@@ -58,6 +63,9 @@ _RATE_TRIGGER_METRICS = frozenset(
 ALLOWED_METHOD = frozenset({"volume", "cost_control"})
 ALLOWED_GOAL = frozenset({"net_roi", "live_room"})
 ALLOWED_ACTION_MODES = frozenset({"card_confirm", "auto_execute"})
+ALLOWED_TASK_ACTIONS = frozenset({"create_retarget", "increase_budget"})
+ALLOWED_BUDGET_INCREASE_MODES = frozenset({"fixed", "spend_percentage"})
+ASSIST_TASK_METRICS = frozenset({"assistCost", "assistRoi"})
 ALLOWED_TRIGGER_LEVELS = frozenset({"material", "product"})
 ALLOWED_CANDIDATE_SORTS = frozenset({"net_roi_desc"})
 MAX_CANDIDATE_LIMIT = 20
@@ -138,6 +146,12 @@ def _default_retargeting() -> Dict[str, Any]:
             "net_roi": {"daily_budget_yuan": None, "net_roi_target": None},
             "live_room": {"daily_budget_yuan": None, "bid_per_conversion_yuan": None},
         },
+        "budget_increase": {
+            "mode": "fixed",
+            "fixed_amount_yuan": None,
+            "spend_percentage": None,
+            "volume_extend_hours": 1.0,
+        },
         # 滑动窗口（秒）内允许的最大追投次数；默认 86400s = 24 小时 1 次（执行侧接入后用于限频）
         "interval": {"window_seconds": _DEFAULT_INTERVAL_WINDOW_SECONDS, "max_count": 1},
         "task_name_suffix": DEFAULT_TASK_SUFFIX,
@@ -154,6 +168,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "title": f"策略 {index + 1}",
         # 旧配置允许暂时为空。运行时仅在“唯一启用目标”时兼容绑定；
         # 新版前端保存时会显式选择监控计划。
+        "account_uid": "",
         "target_uid": "",
         "trigger_level": "material",
         "product_filter": [],
@@ -161,6 +176,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "candidate_sort": "net_roi_desc",
         "candidate_limit": 1,
         "action_mode": "card_confirm",
+        "task_action": "create_retarget",
         "trigger": _default_trigger(),
         "retargeting": _default_retargeting(),
     }
@@ -314,6 +330,46 @@ def _budget_yuan_error_msg(raw: Any) -> Optional[str]:
         return "预算需大于 0 元"
     if n < _MIN_BUDGET_YUAN:
         return "预算不能低于100元"
+    return None
+
+
+def _budget_increment_yuan_error_msg(raw: Any) -> Optional[str]:
+    """追加预算的固定增量：必须大于0，最多两位小数。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "请填写每次新增金额"
+    if isinstance(raw, bool):
+        return "请输入有效数字"
+    s = str(raw).strip()
+    if _str_has_leading_zero_bad(s):
+        return "不能以0开头，请正确输入"
+    if _str_more_than_two_decimal_places(s):
+        return "仅支持最多2位小数"
+    try:
+        value = float(s)
+    except Exception:
+        return "请输入有效数字"
+    if not math.isfinite(value) or value <= 0:
+        return "每次新增金额需大于0元"
+    return None
+
+
+def _spend_percentage_error_msg(raw: Any) -> Optional[str]:
+    """按最新调控消耗计算的预算增量百分比。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "请填写消耗金额百分比"
+    if isinstance(raw, bool):
+        return "请输入有效百分比"
+    s = str(raw).strip()
+    if _str_has_leading_zero_bad(s):
+        return "不能以0开头，请正确输入"
+    if _str_more_than_two_decimal_places(s):
+        return "百分比最多保留2位小数"
+    try:
+        value = float(s)
+    except Exception:
+        return "请输入有效百分比"
+    if not math.isfinite(value) or value <= 0 or value > 1000:
+        return "消耗金额百分比须在0到1000之间"
     return None
 
 
@@ -573,6 +629,25 @@ def _normalize_retargeting(raw: Any) -> Dict[str, Any]:
                     except Exception:
                         base["cost_control"]["live_room"][key] = None
 
+    increase = r.get("budget_increase")
+    if isinstance(increase, dict):
+        mode = str(increase.get("mode") or "fixed").strip().lower()
+        if mode not in ALLOWED_BUDGET_INCREASE_MODES:
+            mode = "fixed"
+        base["budget_increase"]["mode"] = mode
+        for key in ("fixed_amount_yuan", "spend_percentage"):
+            value = increase.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                base["budget_increase"][key] = None
+            else:
+                try:
+                    base["budget_increase"][key] = float(value)
+                except Exception:
+                    base["budget_increase"][key] = None
+        base["budget_increase"]["volume_extend_hours"] = _clamp_duration(
+            increase.get("volume_extend_hours")
+        )
+
     inv = r.get("interval")
     if isinstance(inv, dict):
         base["interval"]["window_seconds"] = _interval_window_seconds_from_inv(inv)
@@ -624,6 +699,10 @@ def _normalize_strategy_entry(
     action_mode = str(raw.get("action_mode") or "card_confirm").strip().lower()
     if action_mode not in ALLOWED_ACTION_MODES:
         action_mode = "card_confirm"
+    task_action = str(raw.get("task_action") or "create_retarget").strip().lower()
+    if task_action not in ALLOWED_TASK_ACTIONS:
+        task_action = "create_retarget"
+    account_uid = str(raw.get("account_uid") or "").strip()
     target_uid = str(raw.get("target_uid") or "").strip()
     trigger_level = str(raw.get("trigger_level") or "material").strip().lower()
     if trigger_level not in ALLOWED_TRIGGER_LEVELS:
@@ -655,6 +734,7 @@ def _normalize_strategy_entry(
     return {
         "id": sid,
         "title": title,
+        "account_uid": account_uid,
         "target_uid": target_uid,
         "trigger_level": trigger_level,
         "product_filter": product_filter,
@@ -662,6 +742,7 @@ def _normalize_strategy_entry(
         "candidate_sort": candidate_sort,
         "candidate_limit": candidate_limit,
         "action_mode": action_mode,
+        "task_action": task_action,
         "trigger": trig,
         "retargeting": ret,
     }
@@ -693,12 +774,14 @@ def _disk_needs_strategy_migration_rewrite(raw: Optional[Dict[str, Any]]) -> boo
             if any(
                 key not in strategy
                 for key in (
+                    "account_uid",
                     "target_uid",
                     "trigger_level",
                     "product_filter",
                     "candidate_trigger",
                     "candidate_sort",
                     "candidate_limit",
+                    "task_action",
                 )
             ):
                 return True
@@ -843,6 +926,40 @@ def _validate_retargeting_block(r: Dict[str, Any], *, validate_interval: bool) -
     return True, ""
 
 
+def _validate_budget_increase_block(r: Dict[str, Any]) -> Tuple[bool, str]:
+    increase = r.get("budget_increase")
+    if not isinstance(increase, dict):
+        return False, "缺少追加预算设置"
+    mode = str(increase.get("mode") or "fixed").strip().lower()
+    if mode not in ALLOWED_BUDGET_INCREASE_MODES:
+        return False, "追加预算计算方式无效"
+    if mode == "fixed":
+        error = _budget_increment_yuan_error_msg(increase.get("fixed_amount_yuan"))
+    else:
+        error = _spend_percentage_error_msg(increase.get("spend_percentage"))
+    if error:
+        return False, error
+    duration_error = _duration_hours_error_msg(increase.get("volume_extend_hours"))
+    if duration_error:
+        return False, duration_error
+    return True, ""
+
+
+def _trigger_metrics(trigger: Any) -> List[str]:
+    metrics: List[str] = []
+    if not isinstance(trigger, dict):
+        return metrics
+    for group in trigger.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for condition in group.get("conditions") or []:
+            if isinstance(condition, dict):
+                metric = str(condition.get("metric") or "").strip()
+                if metric:
+                    metrics.append(metric)
+    return metrics
+
+
 def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
     """提交前校验（normalize 前可调用；多策略时每条均校验）。"""
     if not isinstance(data, dict):
@@ -906,12 +1023,25 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
             mode = str(st.get("action_mode") or "card_confirm").strip().lower()
             if mode not in ALLOWED_ACTION_MODES:
                 return False, f"策略{i + 1} 的执行方式无效"
+            task_action = str(st.get("task_action") or "create_retarget").strip().lower()
+            if task_action not in ALLOWED_TASK_ACTIONS:
+                return False, f"策略{i + 1} 的调控动作无效"
+            metrics = _trigger_metrics(st.get("trigger"))
+            if task_action == "increase_budget":
+                if not metrics or any(metric not in ASSIST_TASK_METRICS for metric in metrics):
+                    return False, f"策略{i + 1} 追加预算时只能使用调控消耗和调控ROI"
+            elif any(metric in ASSIST_TASK_METRICS for metric in metrics):
+                return False, f"策略{i + 1} 新建追投时不能使用调控任务指标"
             r = st.get("retargeting")
             if not isinstance(r, dict):
                 return False, f"策略{i + 1} 缺少调控任务"
             ok, msg = _validate_retargeting_block(r, validate_interval=per_str)
             if not ok:
                 return False, msg
+            if task_action == "increase_budget":
+                ok, msg = _validate_budget_increase_block(r)
+                if not ok:
+                    return False, msg
         return True, ""
 
     r = data.get("retargeting")
@@ -940,12 +1070,29 @@ def validate_strategy_target_compatibility(
         if not isinstance(target, dict):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             return False, f"“{title}”选择的监控计划不存在，请重新选择"
+        account_uid = str(strategy.get("account_uid") or "").strip()
+        target_account_uid = str(target.get("account_uid") or "").strip()
+        if account_uid and account_uid != target_account_uid:
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的监控账户与计划不一致，请重新选择"
+        if "account_enabled" in target and not bool(target.get("account_enabled")):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的千川账户已停用，请先启用账户"
         if not bool(target.get("enabled")):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             return False, f"“{title}”选择的监控计划已停用，请先启用计划"
+        if "retarget_eligible" in target and not bool(target.get("retarget_eligible")):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            reason = str(target.get("ineligible_reason") or "计划尚未取得追投资格").strip()
+            return False, f"“{title}”当前不可用于追投：{reason}"
         scene = str(target.get("promotion_scene") or "live").strip().lower()
         retargeting = strategy.get("retargeting")
         if not isinstance(retargeting, dict):
+            continue
+        if str(strategy.get("task_action") or "create_retarget").strip().lower() == "increase_budget":
+            # Existing-task adjustment derives volume/ROI/conversion type from
+            # the matched control-task row; the source-plan scene does not use
+            # the create-retarget method restriction below.
             continue
         method = str(retargeting.get("method") or "volume").strip().lower()
         if scene == "product" and method == "cost_control":
@@ -964,7 +1111,11 @@ def metric_value_from_dashboard_row(metric: str, row: Dict[str, Any]) -> Optiona
     """从大屏表格行取指标数值；无键或不可转 float 则返回 None。"""
     if metric not in ALLOWED_METRICS:
         return None
-    v = row.get(metric)
+    assist_field = {
+        "assistCost": "stat_cost_for_roi2_assist",
+        "assistRoi": "total_prepay_and_pay_order_roi2_assist",
+    }.get(metric)
+    v = row.get(assist_field or metric)
     if v is None:
         return None
     try:

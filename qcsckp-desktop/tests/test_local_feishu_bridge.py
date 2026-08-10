@@ -13,6 +13,10 @@ from unittest.mock import patch
 from api.promotion_targets import upsert_promotion_target
 from services.qianchuan_accounts import ensure_qianchuan_account
 from services import local_feishu_bridge as bridge
+from services.retarget_budget_increase import (
+    budget_increase_fingerprint,
+    calculate_budget_increase,
+)
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -260,6 +264,86 @@ class LocalFeishuTaskTests(unittest.TestCase):
         final = bridge._task_row(task_uid, "tool-user-a")
         self.assertEqual("succeeded", final["status"])
         self.assertEqual("regulate-1", final["regulate_task_id"])
+
+    def test_budget_increase_card_needs_no_materials_and_queues_once(self):
+        calculation = calculate_budget_increase(
+            {
+                "assist_task_id": "assist-budget-1",
+                "budget": 400,
+                "ecp_roi2_goal": 2.8,
+                "stat_cost_for_roi2_assist": 300,
+            },
+            {
+                "mode": "spend_percentage",
+                "spend_percentage": 20,
+                "volume_extend_hours": 1,
+            },
+        )
+        payload = {
+            "task_operation": "increase_budget",
+            "aavid": "10001",
+            "ad_id": "20002",
+            "target_uid": "target-product-1",
+            "account_name": "测试千川账户",
+            "plan_name": "商品全域测试计划",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "strategy_id": "strategy-budget-1",
+            "strategy_name": "调控任务追加预算",
+            "strategy_hash": "c" * 64,
+            "rule_snapshot": {
+                "id": "strategy-budget-1",
+                "task_action": "increase_budget",
+            },
+            "trigger_snapshot": {"reason": "调控消耗大于100元"},
+            "assist_task_id": "assist-budget-1",
+            "assist_task_name": "控成本ROI任务",
+            "budget_increase": {
+                "mode": "spend_percentage",
+                "spend_percentage": 20,
+                "volume_extend_hours": 1,
+            },
+            "calculation_snapshot": calculation,
+            "calculation_fingerprint": budget_increase_fingerprint(
+                target_uid="target-product-1",
+                strategy_id="strategy-budget-1",
+                calculation=calculation,
+            ),
+        }
+
+        created = bridge.create_local_retarget_task(payload)
+        self.assertTrue(created["success"])
+        duplicate = bridge.create_local_retarget_task(payload)
+        self.assertTrue(duplicate["success"])
+        self.assertTrue(duplicate["duplicate"])
+        task_uid = created["data"]["task_uid"]
+        self.assertEqual(task_uid, duplicate["data"]["task_uid"])
+
+        row = bridge._task_row(task_uid, "tool-user-a")
+        task = bridge._task_payload(row)
+        self.assertEqual("increase_budget", task["task_operation"])
+        self.assertEqual([], task["materials"])
+        card = bridge.build_local_task_card(task)
+        actions = [
+            action
+            for element in card["elements"]
+            if element.get("tag") == "action"
+            for action in element.get("actions", [])
+        ]
+        self.assertIn("approve", [action["value"]["action"] for action in actions])
+        self.assertIn("460", json.dumps(card, ensure_ascii=False))
+
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=task_uid,
+            nonce=row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        pulled = bridge.pull_local_retarget_task()["data"]
+        self.assertEqual(task_uid, pulled["task_uid"])
+        self.assertEqual("increase_budget", pulled["task_operation"])
 
     def test_one_card_accepts_at_most_twenty_materials(self):
         accepted = bridge.create_local_retarget_task(task_payload(20))

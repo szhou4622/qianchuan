@@ -20,7 +20,10 @@ from api.operation_events import (
     update_platform_sync_state,
     upsert_operation_event,
 )
-from api.rule_retargeting_config import _normalize_full
+from api.rule_retargeting_config import (
+    _normalize_full,
+    validate_strategy_target_compatibility,
+)
 from services.cloud_retarget_client import report_retarget_task
 from services import local_test_guard
 from services import retarget_task_worker
@@ -88,6 +91,60 @@ def _retarget_capability_json(
 
 
 class RetargetConfigTests(unittest.TestCase):
+    def test_strategy_normalization_preserves_account_scope(self):
+        normalized = _normalize_full(
+            {
+                "strategies": [
+                    {
+                        "id": "strategy-account",
+                        "account_uid": "account-1",
+                        "target_uid": "target-1",
+                    }
+                ]
+            }
+        )
+        strategy = normalized["strategies"][0]
+        self.assertEqual("account-1", strategy["account_uid"])
+        self.assertEqual("target-1", strategy["target_uid"])
+
+    def test_strategy_target_compatibility_rejects_cross_account_plan(self):
+        config = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "title": "跨账户策略",
+                    "account_uid": "account-left",
+                    "target_uid": "target-right",
+                    "retargeting": {"method": "volume"},
+                }
+            ],
+        }
+        ok, message = validate_strategy_target_compatibility(
+            config,
+            {
+                "target-right": {
+                    "account_uid": "account-right",
+                    "account_enabled": True,
+                    "enabled": True,
+                    "retarget_eligible": True,
+                    "promotion_scene": "live",
+                }
+            },
+        )
+        self.assertFalse(ok)
+        self.assertIn("监控账户与计划不一致", message)
+
+    def test_strategy_hash_includes_account_scope(self):
+        base = {
+            "id": "strategy-1",
+            "target_uid": "target-1",
+            "trigger": {},
+            "retargeting": {},
+        }
+        left = _strategy_hash({**base, "account_uid": "account-left"})
+        right = _strategy_hash({**base, "account_uid": "account-right"})
+        self.assertNotEqual(left, right)
+
     def test_card_account_name_is_resolved_per_target(self):
         class FakeStore:
             def select_one(self, table, **_kwargs):
