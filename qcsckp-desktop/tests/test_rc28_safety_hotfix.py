@@ -784,10 +784,15 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
                 return "10002"
 
             async def current_account_name(self, _page):
-                return "第二个千川账户"
+                return "火"
 
             def authorized_accounts(self):
-                return []
+                return [
+                    {
+                        "aavid": "10002",
+                        "account_name": "火橙-船奇日化-千川",
+                    }
+                ]
 
         cfg = SimpleNamespace(
             db_path=self.db_path,
@@ -840,7 +845,7 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
             where={"owner_username": self.owner, "aavid": "10002"},
         )
         self.assertEqual(1, int(saved["directory_selected"]))
-        self.assertEqual("第二个千川账户", saved["account_name"])
+        self.assertEqual("火橙-船奇日化-千川", saved["account_name"])
         save_state.assert_awaited_once()
         mark_available.assert_called_once_with(owner_username=self.owner)
         self.assertTrue(fetcher.closed)

@@ -36,6 +36,15 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("刷新页面显示", self.html)
         self.assertIn("本次没有访问千川后台", self.html)
 
+    def test_plan_groups_put_chengfang_and_live_first(self):
+        expected = (
+            "const groupDefs=[['chengfang','live','乘方 · 推直播'],"
+            "['chengfang','product','乘方 · 推商品'],"
+            "['global','live','全域 · 推直播'],"
+            "['global','product','全域 · 推商品']"
+        )
+        self.assertIn(expected, self.html)
+
     def test_catalog_watch_does_not_stream_full_overview_every_tick(self):
         self.assertIn("loadInFlight", self.html)
         self.assertNotIn(

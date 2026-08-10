@@ -769,6 +769,71 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             [item["dataSetKey"] for item in page.requests],
         )
 
+    def test_backend_catalog_prefers_the_exact_scene_request_shape(self):
+        path = os.path.join(self.temp.name, "exact-template-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates[("10001", "live", "global")] = {
+            "url": "https://qianchuan.test/live",
+            "body": {
+                "aavid": "10001",
+                "mar_goal": 2,
+                "dataSetKey": "site_promotion_list",
+                "page": 1,
+                "page_size": 100,
+                "requestShape": "live",
+            },
+        }
+        probe._catalog_base_templates[("10001", "product", "global")] = {
+            "url": "https://qianchuan.test/product",
+            "body": {
+                "aavid": "10001",
+                "mar_goal": 1,
+                "dataSetKey": "overall_roi_promotion_list_for_product",
+                "page": 1,
+                "page_size": 100,
+                "requestShape": "product",
+            },
+        }
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                self.calls.append(dict(arguments["body"]))
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "totalPage": 1,
+                            "adInfos": [
+                                {
+                                    "id": "30001",
+                                    "name": "商品计划",
+                                    "adDeliveryName": "投放中",
+                                }
+                            ],
+                        },
+                    },
+                }
+
+        page = Page()
+        complete = asyncio.run(
+            probe.fetch_catalog_class_from_backend(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertTrue(complete)
+        self.assertEqual("product", page.calls[0]["requestShape"])
+        self.assertEqual(
+            "overall_roi_promotion_list_for_product",
+            page.calls[0]["dataSetKey"],
+        )
+
     def test_unfiltered_flat_plan_list_is_full_catalog_evidence(self):
         flat = {
             "aavid": "10001",

@@ -374,7 +374,7 @@ class PromotionReadOnlyProbe:
         # 只在内存中保留页面已经成功发出的目录请求模板。模板不会写入
         # probe 文件；随后只替换账户、数据集、场景和分页字段，复用同一
         # 登录会话读取四类目录，避免依赖页面导航文字和 DOM 结构。
-        self._catalog_base_templates: Dict[str, Dict[str, Any]] = {}
+        self._catalog_base_templates: Dict[Any, Dict[str, Any]] = {}
         self._attached_page_ids = set()
         self._catalog_context: Dict[str, str] = {}
         # 千川把一份计划目录拆成 required + optional 两段。optional 请求
@@ -722,19 +722,39 @@ class PromotionReadOnlyProbe:
     ) -> bool:
         """Read a complete catalog class through the observed backend API."""
         aid = str(aavid or "").strip()
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        exact_key = (aid, scene, system)
         deadline = time.monotonic() + max(0.2, float(timeout_seconds))
         while time.monotonic() < deadline:
-            if aid in self._catalog_base_templates:
+            if self.catalog_class_status(
+                aavid=aid,
+                promotion_scene=scene,
+                plan_system=system,
+            ).get("complete"):
+                return True
+            has_class_templates = any(
+                isinstance(key, tuple) and key and str(key[0]) == aid
+                for key in self._catalog_base_templates
+            )
+            if exact_key in self._catalog_base_templates or (
+                aid in self._catalog_base_templates
+                and not has_class_templates
+            ):
                 break
             await asyncio.sleep(0.1)
-        template = self._catalog_base_templates.get(aid)
+        # 优先复用页面真实发出的同类请求。商品和直播列表的
+        # 请求形状不同，不能像旧逻辑那样用“最后一条请求”同时
+        # 派生四类目录，否则会把已返回的商品计划误判为空。
+        template = self._catalog_base_templates.get(exact_key)
+        if not isinstance(template, Mapping):
+            # 兼容旧测试及旧页面仅观察到一种模板的情形。
+            template = self._catalog_base_templates.get(aid)
         if not isinstance(template, Mapping):
             return False
         source_body = template.get("body")
         if not isinstance(source_body, dict):
             return False
-        scene = str(promotion_scene or "").strip().lower()
-        system = str(plan_system or "").strip().lower()
         send_body = self._set_catalog_request_identity(
             source_body,
             aavid=aid,
@@ -757,7 +777,11 @@ class PromotionReadOnlyProbe:
         )
 
     def has_backend_catalog_template(self, aavid: Any) -> bool:
-        return str(aavid or "").strip() in self._catalog_base_templates
+        aid = str(aavid or "").strip()
+        return aid in self._catalog_base_templates or any(
+            isinstance(key, tuple) and key and str(key[0]) == aid
+            for key in self._catalog_base_templates
+        )
 
     @classmethod
     def _request_page_number(cls, body: Any) -> int:
@@ -1639,10 +1663,30 @@ class PromotionReadOnlyProbe:
                     if template_aavid.isdigit():
                         # 内存模板只用于同一登录会话内派生四类只读请求，
                         # 不写入 probe 文件，也不包含请求头或 Cookie。
-                        self._catalog_base_templates[template_aavid] = {
+                        template = {
                             "url": str(response.url or ""),
                             "body": deepcopy(request_body),
                         }
+                        template_scene, template_system = (
+                            self._request_catalog_class(request_body)
+                        )
+                        if (
+                            template_scene in {"live", "product"}
+                            and template_system in {"global", "chengfang"}
+                        ):
+                            self._catalog_base_templates[
+                                (
+                                    template_aavid,
+                                    template_scene,
+                                    template_system,
+                                )
+                            ] = template
+                        # 仅作为旧页面兼容模板，不再被后续的其他
+                        # 场景请求覆盖。
+                        self._catalog_base_templates.setdefault(
+                            template_aavid,
+                            template,
+                        )
                 self._record_catalog_response_segment(
                     path=path,
                     body=request_body,

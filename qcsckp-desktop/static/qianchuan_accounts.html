@@ -82,7 +82,7 @@
   const accountStatus=x=>({available:'可访问',pending:'待识别',authorization_missing:'授权已失效'}[x]||x||'待识别');
   const catalogStatus=x=>({complete:'完整',partial:'不完整',not_synced:'未同步',syncing:'同步中',login_required:'需要重新登录',error:'同步失败'}[x]||x||'未同步');
   const logStatus=x=>({ok:'同步正常',partial:'部分完成',empty:'暂无记录',login_required:'需要重新登录',not_configured:'尚未配置',error:'同步失败'}[x]||x||'尚未配置');
-  const groupDefs=[['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['unknown','all','待确认/其他']];
+  const groupDefs=[['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['unknown','all','待确认/其他']];
   let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null;
 
   function filteredPlans(plans){

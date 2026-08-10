@@ -1815,6 +1815,22 @@ class ServiceController:
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
         classes: Dict[str, Dict[str, Any]] = {}
+        backend_classes = (
+            ("global_product", "product", "global"),
+            ("global_live", "live", "global"),
+            ("chengfang_product", "product", "chengfang"),
+            ("chengfang_live", "live", "chengfang"),
+        )
+
+        # 必须在打开目录页之前一次性清理四类旧证据。页面加载
+        # 期间会并发返回多类目录；如果在逐类读取时再 reset，
+        # 会把已经监听到的商品/乘方计划删掉。
+        for _class_key, promotion_scene, plan_system in backend_classes:
+            probe.reset_catalog_class(
+                aavid=aavid,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
 
         # 主路径：先让千川 SPA 建立当前账户的登录上下文，再复用它真实
         # 发出的只读目录请求模板，按 dataSetKey + mar_goal 读取四类计划。
@@ -1829,18 +1845,7 @@ class ServiceController:
         )
         _require_catalog_login(fetcher.page)
         backend_template_available = False
-        backend_classes = (
-            ("global_product", "product", "global"),
-            ("global_live", "live", "global"),
-            ("chengfang_product", "product", "chengfang"),
-            ("chengfang_live", "live", "chengfang"),
-        )
         for class_key, promotion_scene, plan_system in backend_classes:
-            probe.reset_catalog_class(
-                aavid=aavid,
-                promotion_scene=promotion_scene,
-                plan_system=plan_system,
-            )
             probe.set_catalog_context(
                 aavid=aavid,
                 promotion_scene=promotion_scene,
@@ -1889,6 +1894,30 @@ class ServiceController:
             )
 
         if backend_template_available:
+            # 账户名只接受千川后台响应中与当前 aavid 同时出现
+            # 的 advName/accountName。导航栏文字可能被截断为一个字，
+            # 不能继续覆盖权威账户名。
+            identity = next(
+                (
+                    item
+                    for item in probe.authorized_accounts()
+                    if str(item.get("aavid") or "") == aavid
+                    and str(item.get("account_name") or "").strip()
+                ),
+                {},
+            )
+            authoritative_name = str(
+                identity.get("account_name") or ""
+            ).strip()
+            if authoritative_name:
+                account["account_name"] = authoritative_name
+                ensure_qianchuan_account(
+                    aavid,
+                    account_name=authoritative_name,
+                    owner_username=owner_username,
+                    seen=True,
+                    db=db,
+                )
             return self._finalize_account_catalog_classes(
                 aavid=aavid,
                 classes=classes,
@@ -2723,32 +2752,37 @@ class ServiceController:
                         await asyncio.sleep(0.25)
                         continue
 
-                    account_name = ""
-                    account_name_loader = getattr(
-                        probe,
-                        "current_account_name",
-                        None,
+                    selected_account = next(
+                        (
+                            item
+                            for item in probe.authorized_accounts()
+                            if str(item.get("aavid") or "")
+                            == latest_aavid
+                        ),
+                        {},
                     )
-                    if callable(account_name_loader):
-                        try:
-                            account_name = str(
-                                await account_name_loader(fetcher.page) or ""
-                            ).strip()
-                        except Exception:
-                            account_name = ""
+                    account_name = str(
+                        selected_account.get("account_name") or ""
+                    ).strip()
                     if not account_name:
-                        selected_account = next(
-                            (
-                                item
-                                for item in probe.authorized_accounts()
-                                if str(item.get("aavid") or "")
-                                == latest_aavid
-                            ),
-                            {},
+                        account_name_loader = getattr(
+                            probe,
+                            "current_account_name",
+                            None,
                         )
-                        account_name = str(
-                            selected_account.get("account_name") or ""
-                        ).strip()
+                        if callable(account_name_loader):
+                            try:
+                                account_name = str(
+                                    await account_name_loader(fetcher.page)
+                                    or ""
+                                ).strip()
+                            except Exception:
+                                account_name = ""
+                        # 千川导航栏在收起状态下可能只渲染名称首字。
+                        # 与其把“火”这类截断文本当成账户名，不如暂时
+                        # 显示账户 ID，并在目录后台响应到达后更新真实名称。
+                        if len(account_name) < 2:
+                            account_name = ""
                     existing_account = db.select_one(
                         "qianchuan_account",
                         where={
