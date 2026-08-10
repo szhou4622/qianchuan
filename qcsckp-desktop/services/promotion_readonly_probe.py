@@ -119,12 +119,17 @@ ACCOUNT_LIST_PATH = "/ad/api/v1/account/user-list"
 # 只负责让千川 SPA 建立登录上下文，不能作为计划分类的主证据。
 CATALOG_DATASET_CLASS = {
     "overall_roi_promotion_list_for_product": ("product", "global"),
+    "product_roi2_promotion": ("product", "global"),
+    "site_promotion_allshop_list": ("product", "global"),
     "site_promotion_list": ("live", "global"),
     "overall_roi_promotion_list_for_product_v2": ("product", "chengfang"),
     "overall_roi_promotion_list_for_live_v2": ("live", "chengfang"),
 }
 CATALOG_CLASS_DATASET = {
-    value: key for key, value in CATALOG_DATASET_CLASS.items()
+    ("product", "global"): "overall_roi_promotion_list_for_product",
+    ("live", "global"): "site_promotion_list",
+    ("product", "chengfang"): "overall_roi_promotion_list_for_product_v2",
+    ("live", "chengfang"): "overall_roi_promotion_list_for_live_v2",
 }
 CATALOG_REQUIRED_PATH = "/ad/api/pmc/v1/uni-promotion/ad/list-required"
 
@@ -390,6 +395,13 @@ class PromotionReadOnlyProbe:
         # probe 文件；随后只替换账户、数据集、场景和分页字段，复用同一
         # 登录会话读取四类目录，避免依赖页面导航文字和 DOM 结构。
         self._catalog_base_templates: Dict[Any, Dict[str, Any]] = {}
+        # A catalog class can be split into multiple native sub-catalogs.  For
+        # example, product promotion currently emits separate contracts for
+        # self-selected products and all-shop hosting.  Keeping only the last
+        # request silently drops the other sub-catalog on the next refresh.
+        self._catalog_scope_templates: Dict[
+            tuple[str, str, str], Dict[str, Dict[str, Any]]
+        ] = {}
         for item in restored_templates:
             if not isinstance(item, Mapping):
                 continue
@@ -413,9 +425,12 @@ class PromotionReadOnlyProbe:
                 # scene/system alias for backward-compatible diagnostics, but
                 # backend fetches must verify the body aavid before using it.
                 if template_aavid.isdigit():
-                    self._catalog_base_templates[
-                        (template_aavid, scene, system)
-                    ] = template
+                    self._remember_catalog_template(
+                        aavid=template_aavid,
+                        promotion_scene=scene,
+                        plan_system=system,
+                        template=template,
+                    )
                 self._catalog_base_templates[(scene, system)] = template
         self._catalog_templates_protected = self._protect_catalog_templates(
             self._serializable_catalog_templates()
@@ -542,10 +557,187 @@ class PromotionReadOnlyProbe:
         except Exception:
             return []
 
+    @classmethod
+    def _unfiltered_catalog_template_body(
+        cls,
+        body: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Turn one native list request into a reusable all-status template."""
+        result = deepcopy(dict(body))
+        ad_filter = cls._catalog_ad_filter(result)
+        if isinstance(ad_filter, dict):
+            for key in (
+                "NotInEcpAdStatuses",
+                "notInEcpAdStatuses",
+                "EcpAdStatuses",
+                "ecpAdStatuses",
+            ):
+                ad_filter.pop(key, None)
+        params = result.get("Params")
+        params = params if isinstance(params, dict) else result.get("params")
+        if isinstance(params, dict):
+            params.pop("HavingFilter", None)
+            params.pop("havingFilter", None)
+        for key in (
+            "ad_cost_status",
+            "ad_status_filter_type",
+            "not_in_ecp_ad_statuses",
+            "ecp_ad_statuses",
+            "NotInEcpAdStatuses",
+            "EcpAdStatuses",
+        ):
+            result.pop(key, None)
+        page_params = cls._request_page_params(result)
+        if isinstance(page_params, dict):
+            page_params["Page" if "Page" in page_params else "page"] = 1
+            size_key = "PageSize" if "PageSize" in page_params else "pageSize"
+            if size_key in page_params:
+                page_params[size_key] = max(100, int(page_params.get(size_key) or 0))
+        else:
+            if "Page" in result:
+                result["Page"] = 1
+            if "page" in result:
+                result["page"] = 1
+            for size_key in ("PageSize", "pageSize", "page_size"):
+                if size_key in result:
+                    result[size_key] = max(100, int(result.get(size_key) or 0))
+        result.pop("__qcsckp_full_catalog__", None)
+        return result
+
+    @classmethod
+    def _catalog_template_identity(cls, path: str, body: Any) -> str:
+        """Identify a native sub-catalog without treating UI filters as one."""
+        if isinstance(body, Mapping):
+            params = body.get("Params")
+            params = params if isinstance(params, Mapping) else body.get("params")
+            candidates = (body, params if isinstance(params, Mapping) else {})
+            for container in candidates:
+                for key in ("SophonxDataSetKey", "dataSetKey", "DataSetKey"):
+                    dataset = str(container.get(key) or "").strip().casefold()
+                    if dataset:
+                        return f"{path}|dataset:{dataset}"
+        return cls._catalog_variant_key(path, body)
+
+    @staticmethod
+    def _catalog_template_dataset(body: Any) -> str:
+        if not isinstance(body, Mapping):
+            return ""
+        params = body.get("Params")
+        params = params if isinstance(params, Mapping) else body.get("params")
+        for container in (body, params if isinstance(params, Mapping) else {}):
+            for key in ("SophonxDataSetKey", "dataSetKey", "DataSetKey"):
+                dataset = str(container.get(key) or "").strip().casefold()
+                if dataset:
+                    return dataset
+        return ""
+
+    def _remember_catalog_template(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+        template: Mapping[str, Any],
+    ) -> None:
+        aid = str(aavid or "").strip()
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        body = template.get("body") if isinstance(template, Mapping) else None
+        if (
+            not aid.isdigit()
+            or scene not in {"live", "product"}
+            or system not in {"global", "chengfang"}
+            or not isinstance(body, dict)
+            or self._request_catalog_aavid(body) != aid
+        ):
+            return
+        normalized_body = self._unfiltered_catalog_template_body(body)
+        stored = {
+            "url": str(template.get("url") or CATALOG_REQUIRED_PATH),
+            "body": normalized_body,
+        }
+        path = str(urlparse(stored["url"]).path or CATALOG_REQUIRED_PATH)
+        variant = self._catalog_template_identity(path, normalized_body)
+        scope = (aid, scene, system)
+        self._catalog_scope_templates.setdefault(scope, {})[variant] = stored
+        # Retain the previous single-template indexes for diagnostics and old
+        # callers/tests.  Backend catalog refreshes use the scope collection.
+        self._catalog_base_templates[scope] = stored
+
+    def _catalog_templates_for_scope(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> List[Dict[str, Any]]:
+        scope = (
+            str(aavid or "").strip(),
+            str(promotion_scene or "").strip().lower(),
+            str(plan_system or "").strip().lower(),
+        )
+        templates = list((self._catalog_scope_templates.get(scope) or {}).values())
+        legacy = self._catalog_base_templates.get(scope)
+        if isinstance(legacy, Mapping):
+            templates.append(dict(legacy))
+        unique: Dict[str, Dict[str, Any]] = {}
+        for template in templates:
+            body = template.get("body") if isinstance(template, Mapping) else None
+            if not isinstance(body, dict) or self._request_catalog_aavid(body) != scope[0]:
+                continue
+            path = str(
+                urlparse(str(template.get("url") or CATALOG_REQUIRED_PATH)).path
+                or CATALOG_REQUIRED_PATH
+            )
+            unique[self._catalog_template_identity(path, body)] = dict(template)
+        return [unique[key] for key in sorted(unique)]
+
+    def _preferred_catalog_templates_for_scope(
+        self,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+    ) -> List[Dict[str, Any]]:
+        templates = self._catalog_templates_for_scope(
+            aavid=aavid,
+            promotion_scene=promotion_scene,
+            plan_system=plan_system,
+        )
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        if (scene, system) != ("product", "global"):
+            return templates
+        current_datasets = {
+            "product_roi2_promotion",
+            "site_promotion_allshop_list",
+        }
+        current = [
+            template
+            for template in templates
+            if self._catalog_template_dataset(template.get("body"))
+            in current_datasets
+        ]
+        # The former overall_roi contract is retained for old Qianchuan
+        # tenants, but once the native product/all-shop datasets have been
+        # observed it must not be retried as a third mandatory sub-catalog.
+        return current or templates
+
     def _serializable_catalog_templates(self) -> List[Dict[str, Any]]:
         """Persist only request bodies; browser headers and cookies are absent."""
-        by_scope: Dict[tuple[str, str, str], Dict[str, Any]] = {}
-        for key, template in self._catalog_base_templates.items():
+        by_variant: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+        candidates: List[tuple[Any, Mapping[str, Any]]] = []
+        for scope, variants in self._catalog_scope_templates.items():
+            for template in variants.values():
+                candidates.append((scope, template))
+        # Include direct legacy assignments because older code and migration
+        # tests still populate the single-template map explicitly.
+        candidates.extend(
+            (key, template)
+            for key, template in self._catalog_base_templates.items()
+            if isinstance(template, Mapping)
+        )
+        for key, template in candidates:
             if not isinstance(key, tuple) or len(key) not in {2, 3}:
                 continue
             if len(key) == 3:
@@ -564,23 +756,31 @@ class PromotionReadOnlyProbe:
                 or not isinstance(body, dict)
             ):
                 continue
+            body = self._unfiltered_catalog_template_body(body)
             body_aavid = self._request_catalog_aavid(body)
             template_aavid = key_aavid or body_aavid
             if not template_aavid.isdigit() or body_aavid != template_aavid:
                 continue
-            by_scope[(template_aavid, scene, system)] = {
+            url = str(template.get("url") or CATALOG_REQUIRED_PATH)
+            path = str(urlparse(url).path or CATALOG_REQUIRED_PATH)
+            variant = self._catalog_template_identity(path, body)
+            by_variant[(template_aavid, scene, system, variant)] = {
                 "aavid": template_aavid,
                 "promotion_scene": scene,
                 "plan_system": system,
-                "url": str(template.get("url") or CATALOG_REQUIRED_PATH),
+                "url": url,
                 "body": deepcopy(body),
             }
-        result = list(by_scope.values())
+        result = list(by_variant.values())
         result.sort(
             key=lambda item: (
                 item["aavid"],
                 item["plan_system"],
                 item["promotion_scene"],
+                self._catalog_template_identity(
+                    str(urlparse(item["url"]).path or CATALOG_REQUIRED_PATH),
+                    item["body"],
+                ),
             )
         )
         return result
@@ -770,6 +970,7 @@ class PromotionReadOnlyProbe:
         aavid: str,
         promotion_scene: str,
         plan_system: str,
+        preserve_dataset: bool = False,
     ) -> Dict[str, Any]:
         """Derive one read-only class request from a real browser request."""
         scene = str(promotion_scene or "").strip().lower()
@@ -796,14 +997,16 @@ class PromotionReadOnlyProbe:
         dataset_written = False
         for key in ("dataSetKey", "DataSetKey", "SophonxDataSetKey"):
             if key in result:
-                result[key] = dataset
+                if not preserve_dataset:
+                    result[key] = dataset
                 dataset_written = True
         params = result.get("Params")
         params = params if isinstance(params, dict) else result.get("params")
         if isinstance(params, dict):
             for key in ("dataSetKey", "DataSetKey", "SophonxDataSetKey"):
                 if key in params:
-                    params[key] = dataset
+                    if not preserve_dataset:
+                        params[key] = dataset
                     dataset_written = True
             ad_filter = params.get("AdFilter")
             ad_filter = (
@@ -906,6 +1109,11 @@ class PromotionReadOnlyProbe:
         system = str(plan_system or "").strip().lower()
         exact_key = (aid, scene, system)
         generic_key = (scene, system)
+        sibling_scene_key = (
+            aid,
+            "live" if scene == "product" else "product",
+            system,
+        )
 
         def matching_template(value: Any) -> Optional[Dict[str, Any]]:
             if not isinstance(value, Mapping):
@@ -918,8 +1126,15 @@ class PromotionReadOnlyProbe:
                 return None
             return dict(value)
 
+        exact_templates = self._preferred_catalog_templates_for_scope(
+            aavid=aid,
+            promotion_scene=scene,
+            plan_system=system,
+        )
         deadline = time.monotonic() + max(0.2, float(timeout_seconds))
         while time.monotonic() < deadline:
+            if exact_templates:
+                break
             if self.catalog_class_status(
                 aavid=aid,
                 promotion_scene=scene,
@@ -928,16 +1143,61 @@ class PromotionReadOnlyProbe:
                 return True
             if any(
                 matching_template(self._catalog_base_templates.get(key))
-                for key in (exact_key, generic_key, aid)
+                for key in (exact_key, generic_key, sibling_scene_key, aid)
             ):
                 break
             await asyncio.sleep(0.1)
+
+        if exact_templates:
+            # Replay every native sub-catalog contract for this account/class.
+            # A successful all-shop response cannot stand in for a missing
+            # self-selected-products response (or vice versa).
+            for exact_template in exact_templates:
+                source_body = exact_template.get("body")
+                if not isinstance(source_body, dict):
+                    continue
+                send_body = self._set_catalog_request_identity(
+                    source_body,
+                    aavid=aid,
+                    promotion_scene=scene,
+                    plan_system=system,
+                    preserve_dataset=True,
+                )
+                request_url = str(
+                    exact_template.get("url") or CATALOG_REQUIRED_PATH
+                )
+                marker = (
+                    str(urlparse(request_url).path or CATALOG_REQUIRED_PATH),
+                    aid,
+                    scene,
+                    system,
+                )
+                try:
+                    await self._execute_full_catalog_replay(
+                        page=page,
+                        url=request_url,
+                        send_body=send_body,
+                        marker=marker,
+                    )
+                except Exception:
+                    continue
+            if self.catalog_class_status(
+                aavid=aid,
+                promotion_scene=scene,
+                plan_system=system,
+            ).get("complete"):
+                return True
+            # Multiple contracts are independent native sub-catalogs.  A
+            # canonical single request cannot prove all of them were read.
+            if len(exact_templates) > 1:
+                return False
+
         # 优先复用页面真实发出的同类请求。商品和直播列表的
         # 请求形状不同，不能像旧逻辑那样用“最后一条请求”同时
         # 派生四类目录，否则会把已返回的商品计划误判为空。
         template = matching_template(
-            self._catalog_base_templates.get(exact_key)
-        )
+            exact_templates[0] if exact_templates else None
+        ) or matching_template(self._catalog_base_templates.get(exact_key))
         if template is None:
             template = matching_template(
                 self._catalog_base_templates.get(generic_key)
@@ -945,7 +1205,16 @@ class PromotionReadOnlyProbe:
         if template is None:
             # 兼容旧页面只观察到当前账户一种请求形状的情形；绝不能
             # 使用另一个账户的 scene/system 通用模板。
-            template = matching_template(self._catalog_base_templates.get(aid))
+            # Prefer the other scene from this exact account and plan system.
+            # Its dataset and MarGoal are rewritten below; never cross an
+            # account boundary.
+            template = matching_template(
+                self._catalog_base_templates.get(sibling_scene_key)
+            )
+            if template is None:
+                template = matching_template(
+                    self._catalog_base_templates.get(aid)
+                )
         if template is None:
             return False
         source_body = template.get("body")
@@ -967,12 +1236,13 @@ class PromotionReadOnlyProbe:
             (transport_template or template).get("url")
             or CATALOG_REQUIRED_PATH
         )
-        await self._execute_full_catalog_replay(
-            page=page,
-            url=request_url,
-            send_body=send_body,
-            marker=marker,
-        )
+        if not exact_templates:
+            await self._execute_full_catalog_replay(
+                page=page,
+                url=request_url,
+                send_body=send_body,
+                marker=marker,
+            )
         if self.catalog_class_status(
             aavid=aid,
             promotion_scene=scene,
@@ -1052,11 +1322,18 @@ class PromotionReadOnlyProbe:
                 page_params["Page"] = 1
             if "page" in page_params:
                 page_params["page"] = 1
+            if "PageSize" in page_params:
+                page_params["PageSize"] = 0
+            if "pageSize" in page_params:
+                page_params["pageSize"] = 0
         else:
             if "page" in stable:
                 stable["page"] = 1
             if "Page" in stable:
                 stable["Page"] = 1
+            for size_key in ("page_size", "pageSize", "PageSize"):
+                if size_key in stable:
+                    stable[size_key] = 0
         # 飞书/千川会话类字段不参与筛选变体身份，也绝不落盘。
         for key in list(stable):
             if any(part in str(key).lower() for part in SENSITIVE_KEY_PARTS):
@@ -1254,23 +1531,25 @@ class PromotionReadOnlyProbe:
             str(promotion_scene or "").strip().lower(),
             str(plan_system or "").strip().lower(),
         )
-        variants = [
-            dict(item)
+        variant_records = [
+            (str(key[3]), dict(item))
             for key, item in self._catalog_variants.items()
             if key[:3] == prefix
         ]
-        if not variants:
+        if not variant_records:
             return {
                 "complete": False,
                 "variants": 0,
                 "message": "未观察到该分类的计划列表接口",
             }
         full_variants = [
-            item for item in variants if bool(item.get("full_catalog"))
+            (variant, item)
+            for variant, item in variant_records
+            if bool(item.get("full_catalog"))
         ]
         completed_variants = [
-            item
-            for item in full_variants
+            (variant, item)
+            for variant, item in full_variants
             if not item.get("error")
             and set(item.get("seen_pages") or [])
             >= set(range(1, int(item.get("total_pages") or 1) + 1))
@@ -1278,10 +1557,36 @@ class PromotionReadOnlyProbe:
         # 同一分类可能先遇到一个失效页面模板，随后由标准
         # 只读契约取得全部分页。旧的失败尝试应保留诊断，
         # 但不能永久污染后续已完整的证据。
-        complete = bool(completed_variants)
+        completed_keys = {variant for variant, _item in completed_variants}
+        expected_keys = set()
+        for template in self._preferred_catalog_templates_for_scope(
+            aavid=prefix[0],
+            promotion_scene=prefix[1],
+            plan_system=prefix[2],
+        ):
+            body = template.get("body")
+            if not isinstance(body, dict):
+                continue
+            normalized = self._set_catalog_request_identity(
+                body,
+                aavid=prefix[0],
+                promotion_scene=prefix[1],
+                plan_system=prefix[2],
+                preserve_dataset=True,
+            )
+            path = str(
+                urlparse(str(template.get("url") or CATALOG_REQUIRED_PATH)).path
+                or CATALOG_REQUIRED_PATH
+            )
+            expected_keys.add(self._catalog_variant_key(path, normalized))
+        complete = (
+            expected_keys <= completed_keys
+            if len(expected_keys) > 1
+            else bool(completed_variants)
+        )
         return {
             "complete": complete,
-            "variants": len(variants),
+            "variants": len(variant_records),
             "message": (
                 ""
                 if complete
@@ -1972,13 +2277,12 @@ class PromotionReadOnlyProbe:
                             template_scene in {"live", "product"}
                             and template_system in {"global", "chengfang"}
                         ):
-                            self._catalog_base_templates[
-                                (
-                                    template_aavid,
-                                    template_scene,
-                                    template_system,
-                                )
-                            ] = template
+                            self._remember_catalog_template(
+                                aavid=template_aavid,
+                                promotion_scene=template_scene,
+                                plan_system=template_system,
+                                template=template,
+                            )
                             if self._request_page_number(request_body) == 1:
                                 self._catalog_base_templates[
                                     (template_scene, template_system)

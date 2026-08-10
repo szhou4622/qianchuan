@@ -1850,6 +1850,109 @@ class ServiceController:
                             return True
                     except Exception:
                         continue
+
+        # Some Qianchuan revisions render the top navigation as a plain
+        # ``span``/``div`` whose click bubbles to an interactive parent.  Its
+        # accessible name can also include the ``新升级`` badge, so role-only
+        # lookup above does not see it.  Clicking an exact navigation label is
+        # only used to make the page emit its genuine signed read request; the
+        # active catalog system is still verified afterwards and no plan is
+        # classified from DOM text.
+        text_locators = []
+        for text in entry_texts:
+            try:
+                text_locators.append(page.get_by_text(text, exact=True))
+            except Exception:
+                pass
+        try:
+            text_locators.append(page.get_by_text(badge_pattern))
+        except Exception:
+            pass
+        for locator in text_locators:
+            try:
+                count = await locator.count()
+            except Exception:
+                count = 0
+            for index in range(count - 1, -1, -1):
+                candidate = locator.nth(index)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    await candidate.click(timeout=3_000)
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=15_000,
+                        )
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(1_000)
+                    if (
+                        await ServiceController._active_catalog_plan_system(
+                            page
+                        )
+                        == "chengfang"
+                    ):
+                        return True
+                except Exception:
+                    continue
+
+        # Ant Design navigation can expose the label only through nested
+        # spans.  Use the nearest interactive ancestor as a final navigation
+        # trigger.  A successful click is not catalog evidence by itself: the
+        # caller still requires a complete Chengfang API response before any
+        # plan can be persisted or enabled.
+        try:
+            clicked = await page.evaluate(
+                r"""
+                () => {
+                  const labels = new Set([
+                    "乘方", "千川乘方", "乘方投放", "乘方计划",
+                    "乘方新升级", "千川乘方新升级", "乘方投放新升级",
+                    "乘方计划新升级", "乘方新版", "千川乘方新版"
+                  ]);
+                  const canonical = (value) => String(value || "")
+                    .replace(/\s+/g, "")
+                    .replace(/[·・]/g, "");
+                  const visible = (node) => {
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      rect.width > 0 && rect.height > 0;
+                  };
+                  const nodes = Array.from(document.querySelectorAll(
+                    "a,button,[role='tab'],[role='link'],[role='button']," +
+                    "[role='menuitem'],span,div"
+                  ));
+                  for (const node of nodes) {
+                    if (!labels.has(canonical(node.textContent)) || !visible(node)) {
+                      continue;
+                    }
+                    const action = node.closest(
+                      "a,button,[role='tab'],[role='link']," +
+                      "[role='button'],[role='menuitem']"
+                    );
+                    if (!action || !visible(action)) continue;
+                    action.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        except Exception:
+            clicked = False
+        if clicked is True:
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=15_000,
+                )
+            except Exception:
+                pass
+            await page.wait_for_timeout(1_000)
+            return True
         return False
 
     async def _scan_catalog_class(
@@ -2101,15 +2204,16 @@ class ServiceController:
         # same row for a derived dataSetKey request; a previously verified
         # class is stronger evidence than whichever derived request happened
         # to finish first in the current refresh.
+        existing_targets = list_promotion_targets(
+            owner_username=owner_username,
+            db=db,
+        )
         trusted_plan_classes: Dict[str, tuple[str, str]] = {
             str(item.get("ad_id") or "").strip(): (
                 str(item.get("plan_system") or "").strip().lower(),
                 str(item.get("promotion_scene") or "").strip().lower(),
             )
-            for item in list_promotion_targets(
-                owner_username=owner_username,
-                db=db,
-            )
+            for item in existing_targets
             if str(item.get("aadvid") or "") == aavid
             and str(item.get("ad_id") or "").strip()
             and str(item.get("verification_state") or "") == "verified"
@@ -2117,6 +2221,15 @@ class ServiceController:
             in {"global", "chengfang"}
             and str(item.get("promotion_scene") or "").strip().lower()
             in {"live", "product"}
+        }
+        known_plan_classes = {
+            (
+                str(item.get("plan_system") or "").strip().lower(),
+                str(item.get("promotion_scene") or "").strip().lower(),
+            )
+            for item in existing_targets
+            if str(item.get("aadvid") or "") == aavid
+            and str(item.get("ad_id") or "").strip()
         }
         claimed_plan_classes: Dict[str, tuple[str, str]] = dict(
             trusted_plan_classes
@@ -2461,28 +2574,77 @@ class ServiceController:
                     "complete": False,
                     "message": "千川乘方页面未找到推直播计划目录入口",
                 }
+            # A live Chengfang page can yield the first exact signed contract
+            # only after the product attempt above has already timed out.
+            # Retry product once with that newly observed same-account
+            # contract so the user does not need a second manual refresh.
+            if not bool(classes.get("chengfang_product", {}).get("complete")):
+                probe.reset_catalog_class(
+                    aavid=aavid,
+                    promotion_scene="product",
+                    plan_system="chengfang",
+                )
+                probe.set_catalog_context(
+                    aavid=aavid,
+                    promotion_scene="product",
+                    plan_system="chengfang",
+                )
+                try:
+                    product_replayed = await probe.fetch_catalog_class_from_backend(
+                        fetcher.page,
+                        aavid=aavid,
+                        promotion_scene="product",
+                        plan_system="chengfang",
+                        timeout_seconds=1.0,
+                    )
+                except Exception:
+                    product_replayed = False
+                if product_replayed:
+                    classes["chengfang_product"] = await self._scan_catalog_class(
+                        fetcher=fetcher,
+                        probe=probe,
+                        db=db,
+                        owner_username=owner_username,
+                        account=account,
+                        promotion_scene="product",
+                        plan_system="chengfang",
+                        page_url=str(fetcher.page.url or ""),
+                        claimed_plan_classes=claimed_plan_classes,
+                    )
         else:
             unavailable = not has_chengfang_entry
+            known_chengfang_product = (
+                "chengfang",
+                "product",
+            ) in known_plan_classes
+            known_chengfang_live = (
+                "chengfang",
+                "live",
+            ) in known_plan_classes
             classes["chengfang_product"] = {
-                "complete": unavailable,
+                "complete": unavailable and not known_chengfang_product,
                 "seen": 0,
                 "seen_ids": [],
                 "verified": 0,
                 "candidates": 0,
                 "message": (
-                    "该账户未显示乘方入口，目录记为0条"
+                    "已登记乘方·推商品计划，但本轮未取得该分类完整接口分页"
+                    if known_chengfang_product
+                    else "该账户未显示乘方入口，目录记为0条"
                     if unavailable
                     else "未取得千川乘方·推商品目录的明确页面证据"
                 ),
             }
             classes["chengfang_live"] = {
-                "complete": unavailable,
+                "complete": unavailable and not known_chengfang_live,
                 "seen": 0,
                 "seen_ids": [],
                 "verified": 0,
                 "candidates": 0,
                 "message": (
-                    "该账户未显示乘方入口，目录记为0条"
+                    "已登记乘方·推直播计划，但本轮未取得该分类完整接口分页"
+                    if known_chengfang_live
+                    else "该账户未显示乘方入口，目录记为0条"
                     if unavailable
                     else "未取得千川乘方·推直播目录的明确页面证据"
                 ),

@@ -284,6 +284,83 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             )
         )
 
+    def test_chengfang_badged_text_navigation_can_open_catalog(self):
+        class EmptyLocator:
+            async def count(self):
+                return 0
+
+        class Candidate:
+            async def is_visible(self):
+                return True
+
+            async def click(self, timeout=None):
+                page.active = True
+
+        class TextLocator:
+            async def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Candidate()
+
+        class Page:
+            active = False
+
+            def get_by_role(self, _role, name=None, exact=None):
+                return EmptyLocator()
+
+            def get_by_text(self, _text, exact=None):
+                return TextLocator()
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+            async def evaluate(self, _script):
+                return "chengfang" if self.active else "unknown"
+
+        page = Page()
+        self.assertTrue(
+            asyncio.run(
+                ServiceController._open_explicit_chengfang_catalog(
+                    page,
+                    aavid="10001",
+                )
+            )
+        )
+
+    def test_chengfang_nested_span_navigation_uses_interactive_ancestor(self):
+        class EmptyLocator:
+            async def count(self):
+                return 0
+
+        class Page:
+            def get_by_role(self, _role, name=None, exact=None):
+                return EmptyLocator()
+
+            def get_by_text(self, _text, exact=None):
+                return EmptyLocator()
+
+            async def evaluate(self, script):
+                return "closest(" in script
+
+            async def wait_for_load_state(self, *_args, **_kwargs):
+                return None
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        self.assertTrue(
+            asyncio.run(
+                ServiceController._open_explicit_chengfang_catalog(
+                    Page(),
+                    aavid="10001",
+                )
+            )
+        )
+
     def test_new_account_and_new_plan_are_disabled_until_user_saves_setup(self):
         account = ensure_qianchuan_account(
             "10001",
@@ -835,6 +912,157 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             page.calls[0]["dataSetKey"],
         )
 
+    def test_backend_catalog_replays_every_native_subcatalog_template(self):
+        path = os.path.join(self.temp.name, "multi-template-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        datasets = {
+            "self_selected": "product_roi2_promotion",
+            "all_shop": "site_promotion_allshop_list",
+        }
+        for subcatalog, dataset in datasets.items():
+            probe._remember_catalog_template(
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+                template={
+                    "url": "https://qianchuan.test/catalog",
+                    "body": {
+                        "aavid": "10001",
+                        "mar_goal": 1,
+                        "dataSetKey": dataset,
+                        "page": 1,
+                        "page_size": 20,
+                        "subCatalog": subcatalog,
+                    },
+                },
+            )
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                body = dict(arguments["body"])
+                self.calls.append(body)
+                suffix = "1" if body["subCatalog"] == "self_selected" else "2"
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "totalPage": 1,
+                            "adInfos": [
+                                {
+                                    "id": f"3000{suffix}",
+                                    "name": body["subCatalog"],
+                                    "adDeliveryName": "投放中",
+                                }
+                            ],
+                        },
+                    },
+                }
+
+        page = Page()
+        complete = asyncio.run(
+            probe.fetch_catalog_class_from_backend(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+
+        self.assertTrue(complete)
+        self.assertEqual(
+            ["all_shop", "self_selected"],
+            sorted(body["subCatalog"] for body in page.calls),
+        )
+        self.assertEqual(
+            sorted(datasets.values()),
+            sorted(body["dataSetKey"] for body in page.calls),
+        )
+        self.assertEqual(
+            ["30001", "30002"],
+            sorted(
+                row["ad_id"]
+                for row in probe.catalog_rows(
+                    aavid="10001",
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            ),
+        )
+
+    def test_catalog_template_cache_collapses_status_filters_per_dataset(self):
+        probe = PromotionReadOnlyProbe(
+            os.path.join(self.temp.name, "filtered-template-probe.json")
+        )
+        for status_filter in ("active", "paused"):
+            probe._remember_catalog_template(
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+                template={
+                    "url": "https://qianchuan.test/catalog",
+                    "body": {
+                        "aavid": "10001",
+                        "dataSetKey": "product_roi2_promotion",
+                        "mar_goal": 1,
+                        "page": 1,
+                        "page_size": 20,
+                        "ad_status_filter_type": status_filter,
+                        "ad_cost_status": status_filter,
+                    },
+                },
+            )
+
+        templates = probe._catalog_templates_for_scope(
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+        )
+        self.assertEqual(1, len(templates))
+        self.assertNotIn("ad_status_filter_type", templates[0]["body"])
+        self.assertNotIn("ad_cost_status", templates[0]["body"])
+
+    def test_current_product_datasets_supersede_legacy_catalog_contract(self):
+        probe = PromotionReadOnlyProbe(
+            os.path.join(self.temp.name, "preferred-template-probe.json")
+        )
+        for dataset in (
+            "overall_roi_promotion_list_for_product",
+            "product_roi2_promotion",
+            "site_promotion_allshop_list",
+        ):
+            probe._remember_catalog_template(
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+                template={
+                    "url": "https://qianchuan.test/catalog",
+                    "body": {
+                        "aavid": "10001",
+                        "dataSetKey": dataset,
+                        "mar_goal": 1,
+                        "page": 1,
+                        "page_size": 100,
+                    },
+                },
+            )
+
+        preferred = probe._preferred_catalog_templates_for_scope(
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+        )
+        self.assertEqual(
+            ["product_roi2_promotion", "site_promotion_allshop_list"],
+            sorted(
+                probe._catalog_template_dataset(template["body"])
+                for template in preferred
+            ),
+        )
+
     def test_backend_catalog_never_reuses_another_accounts_generic_template(self):
         path = os.path.join(self.temp.name, "account-scoped-template.json")
         probe = PromotionReadOnlyProbe(path)
@@ -903,6 +1131,59 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             "overall_roi_promotion_list_for_product",
             page.calls[0]["body"]["dataSetKey"],
         )
+
+    def test_backend_catalog_derives_sibling_scene_only_for_same_account_system(self):
+        path = os.path.join(self.temp.name, "same-account-sibling-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates[("10001", "live", "chengfang")] = {
+            "url": "https://qianchuan.test/current-account",
+            "body": {
+                "aavid": "10001",
+                "Params": {
+                    "SophonxDataSetKey": "overall_roi_promotion_list_for_live_v2",
+                    "AdFilter": {
+                        "MarGoal": 2,
+                        "AdlabScene": 1,
+                        "IsOverallRoi": 1,
+                    },
+                    "PageParams": {"Page": 1, "PageSize": 10},
+                },
+            },
+        }
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                body = dict(arguments["body"])
+                self.calls.append(body)
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {"totalPage": 1, "adInfos": []},
+                    },
+                }
+
+        page = Page()
+        complete = asyncio.run(
+            probe.fetch_catalog_class_from_backend(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="chengfang",
+            )
+        )
+
+        self.assertTrue(complete)
+        sent = page.calls[0]
+        self.assertEqual("10001", sent["aavid"])
+        self.assertEqual(
+            "overall_roi_promotion_list_for_product_v2",
+            sent["Params"]["SophonxDataSetKey"],
+        )
+        self.assertEqual(1, sent["Params"]["AdFilter"]["MarGoal"])
 
     def test_backend_catalog_falls_back_to_canonical_read_contract(self):
         path = os.path.join(self.temp.name, "canonical-fallback-probe.json")
@@ -1064,6 +1345,89 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             scanned[-4:],
         )
 
+    def test_known_chengfang_plan_prevents_false_empty_complete_catalog(self):
+        ensure_qianchuan_account(
+            "10001",
+            account_name="测试账户",
+            owner_username=self.owner,
+            seen=True,
+            db=self.db,
+        )
+        self._target(
+            ad_id="39991",
+            scene="live",
+            system="chengfang",
+        )
+
+        class Page:
+            url = "https://qianchuan.jinritemai.com/uni-prom?aavid=10001"
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Probe:
+            def reset_catalog_class(self, **_kwargs):
+                return None
+
+            def set_catalog_context(self, **_kwargs):
+                return None
+
+            async def fetch_catalog_class_from_backend(self, _page, **kwargs):
+                return kwargs["promotion_scene"] == "live"
+
+            def has_backend_catalog_template(self, _aavid):
+                return True
+
+        controller = ServiceController.__new__(ServiceController)
+
+        async def scan_class(**_kwargs):
+            return {
+                "complete": True,
+                "seen": 0,
+                "seen_ids": [],
+                "verified": 0,
+                "candidates": 0,
+                "message": "",
+            }
+
+        controller._scan_catalog_class = scan_class
+        controller._open_explicit_global_catalog = AsyncMock(
+            return_value=Page.url
+        )
+        controller._open_all_product_subcatalogs = AsyncMock()
+        controller._click_visible_exact = AsyncMock(return_value=True)
+        controller._has_visible_action_exact = AsyncMock(return_value=False)
+        controller._open_explicit_chengfang_catalog = AsyncMock(
+            return_value=False
+        )
+
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            result = asyncio.run(
+                controller._scan_global_account_catalog(
+                    fetcher=SimpleNamespace(page=Page()),
+                    probe=Probe(),
+                    db=self.db,
+                    owner_username=self.owner,
+                    account={
+                        "aavid": "10001",
+                        "account_name": "测试账户",
+                    },
+                )
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["classes"]["chengfang_live"]["complete"])
+        self.assertIn(
+            "已登记乘方·推直播计划",
+            result["classes"]["chengfang_live"]["message"],
+        )
+
     def test_exact_detail_verification_can_limit_to_new_plan_ids(self):
         path = os.path.join(self.temp.name, "incremental-verify-probe.json")
         probe = PromotionReadOnlyProbe(path)
@@ -1194,6 +1558,47 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
         self.assertIn(
             ("10001", "product", "global"),
             restored._catalog_base_templates,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI only")
+    def test_all_catalog_subtemplates_are_dpapi_persisted(self):
+        path = os.path.join(self.temp.name, "multi-template-persisted-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        for subcatalog, dataset in {
+            "self_selected": "overall_roi_promotion_list_for_product",
+            "all_shop": "site_promotion_allshop_list",
+        }.items():
+            probe._remember_catalog_template(
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+                template={
+                    "url": "/ad/api/pmc/v1/uni-promotion/ad/list-required",
+                    "body": {
+                        "aavid": "10001",
+                        "mar_goal": 1,
+                        "dataSetKey": dataset,
+                        "page": 1,
+                        "page_size": 20,
+                        "subCatalog": subcatalog,
+                    },
+                },
+            )
+        probe._catalog_templates_protected = probe._protect_catalog_templates(
+            probe._serializable_catalog_templates()
+        )
+        probe._flush()
+
+        restored = PromotionReadOnlyProbe(path)
+        templates = restored._catalog_templates_for_scope(
+            aavid="10001",
+            promotion_scene="product",
+            plan_system="global",
+        )
+        self.assertEqual(2, len(templates))
+        self.assertEqual(
+            ["all_shop", "self_selected"],
+            sorted(template["body"]["subCatalog"] for template in templates),
         )
 
     def test_generated_catalog_replay_cannot_overwrite_observed_template(self):
