@@ -1141,58 +1141,6 @@
                     </div>
                 </section>
 
-                <section class="rr-section space-y-3" id="sectionStrategyTriggerLevel">
-                    <div class="rr-section-title">
-                        <span class="rr-accent-bar" aria-hidden="true"></span>
-                        <i data-lucide="layers-3" class="w-4 h-4 text-cyan-400/90"></i>
-                        触发层级
-                    </div>
-                    <div class="pl-[calc(0.5rem+3px)] space-y-3 max-w-4xl">
-                        <label class="block">
-                            <span class="rr-label">触发层级</span>
-                            <select id="strategyTriggerLevel" class="rr-input w-full text-xs">
-                                <option value="material">逐条素材判断</option>
-                                <option value="product">按商品汇总后判断</option>
-                            </select>
-                            <span class="text-[11px] text-slate-600 mt-1.5 block">商品级仅适用于推商品计划；实际执行还要求计划体系已识别且适配器已验证。</span>
-                        </label>
-                        <div id="productStrategyFields" class="hidden grid grid-cols-1 md:grid-cols-2 gap-3">
-                            <label class="block md:col-span-2">
-                                <span class="rr-label">只判断这些商品（可选）</span>
-                                <input id="strategyProductFilter" type="hidden" value="">
-                                <div id="strategyProductOptions" class="mt-1 grid grid-cols-1 md:grid-cols-2 gap-2 rounded-lg border border-slate-700/50 bg-slate-950/35 p-2 text-xs text-slate-300">
-                                    <span class="text-slate-600">选择推商品监控计划后显示商品；不勾选时沿用监控计划的商品范围。</span>
-                                </div>
-                            </label>
-                            <label class="block">
-                                <span class="rr-label">候选素材指标</span>
-                                <select id="candidateMetric" class="rr-input rr-input--flush">
-                                    <option value="costDiff">时段消耗</option>
-                                    <option value="netRoi">净成交ROI</option>
-                                    <option value="netAmount">净成交金额</option>
-                                    <option value="overallPayRoi">整体支付ROI</option>
-                                    <option value="overallAmount">整体成交金额</option>
-                                </select>
-                            </label>
-                            <label class="block">
-                                <span class="rr-label">候选条件</span>
-                                <div class="flex gap-2">
-                                    <select id="candidateOp" class="rr-input rr-input--flush w-[8rem]">
-                                        <option value="gt">大于</option><option value="gte">大于等于</option>
-                                        <option value="lt">小于</option><option value="lte">小于等于</option>
-                                    </select>
-                                    <input id="candidateValue" type="number" step="0.01" class="rr-input rr-input--flush" value="0">
-                                </div>
-                            </label>
-                            <label class="block">
-                                <span class="rr-label">最多选择素材</span>
-                                <input id="candidateLimit" type="number" min="1" max="20" step="1" class="rr-input rr-input--flush" value="1">
-                                <span class="text-[11px] text-slate-600 mt-1.5 block">按净成交ROI从高到低，默认取1条。</span>
-                            </label>
-                        </div>
-                    </div>
-                </section>
-
                 <!-- 分策略限频：每条策略独立的滑动窗口计数 -->
                 <section id="sectionStrategyRunConfig" class="rr-section space-y-3 hidden">
                     <div class="rr-section-title">
@@ -1870,8 +1818,6 @@
         }
 
         function syncProductStrategyVisibility() {
-            const level = document.getElementById('strategyTriggerLevel')?.value || 'material';
-            document.getElementById('productStrategyFields')?.classList.toggle('hidden', level !== 'product');
             const uid = document.getElementById('strategyTargetUid')?.value || '';
             const target = promotionTargetsState.find(x => x.target_uid === uid);
             const hint = document.getElementById('strategyTargetScene');
@@ -1882,7 +1828,6 @@
                         ? '该账户下暂无已勾选监控的计划，请先到“千川账户管理”启用计划。'
                         : '请先选择监控账户。';
             }
-            renderStrategyProductOptions();
             syncRetargetMethodAvailability();
         }
 
@@ -1955,14 +1900,7 @@
             promotionTargetsState = Array.isArray(res?.data)
                 ? res.data.filter(x => x && !!x.account_enabled && !!x.monitor_eligible)
                 : [];
-            const productEntries = await Promise.all(promotionTargetsState.map(async target => {
-                if (target.promotion_scene !== 'product' || !target.retarget_eligible || !api.listPromotionTargetProducts) {
-                    return [target.target_uid, []];
-                }
-                const productRes = await api.listPromotionTargetProducts(target.target_uid);
-                return [target.target_uid, Array.isArray(productRes?.data) ? productRes.data : []];
-            }));
-            promotionTargetProductsState = Object.fromEntries(productEntries);
+            promotionTargetProductsState = {};
             const accountSelect = document.getElementById('strategyAccountUid');
             const targetSelect = document.getElementById('strategyTargetUid');
             const currentAccount = accountSelect?.value || '';
@@ -2191,10 +2129,9 @@
                 title: cur.title || defaultStrategyTitle(activeStrategyIndex),
                 account_uid: document.getElementById('strategyAccountUid')?.value || '',
                 target_uid: document.getElementById('strategyTargetUid')?.value || '',
-                trigger_level: document.getElementById('strategyTriggerLevel')?.value === 'product' ? 'product' : 'material',
-                product_filter: (document.getElementById('strategyProductFilter')?.value || '')
-                    .split(',').map(x => x.trim()).filter(Boolean),
-                candidate_trigger: candidateTriggerFromDom(),
+                trigger_level: 'material',
+                product_filter: [],
+                candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(document.getElementById('candidateLimit')?.value || '1', 10) || 1)),
                 action_mode: actionMode,
@@ -2365,15 +2302,6 @@
             renderStrategyTargetOptions(accountUid, s.target_uid || '');
             const targetSelect = document.getElementById('strategyTargetUid');
             if (targetSelect) targetSelect.value = s.target_uid || '';
-            const levelSelect = document.getElementById('strategyTriggerLevel');
-            if (levelSelect) levelSelect.value = s.trigger_level === 'product' ? 'product' : 'material';
-            const productFilter = document.getElementById('strategyProductFilter');
-            if (productFilter) productFilter.value = Array.isArray(s.product_filter) ? s.product_filter.join(',') : '';
-            const candidate = firstCandidateCondition(s.candidate_trigger || defaultCandidateTriggerPayload());
-            if (document.getElementById('candidateMetric')) document.getElementById('candidateMetric').value = candidate.metric || 'costDiff';
-            if (document.getElementById('candidateOp')) document.getElementById('candidateOp').value = candidate.op || 'gt';
-            if (document.getElementById('candidateValue')) document.getElementById('candidateValue').value = candidate.value != null ? candidate.value : 0;
-            if (document.getElementById('candidateLimit')) document.getElementById('candidateLimit').value = s.candidate_limit || 1;
             syncProductStrategyVisibility();
             const t = s.trigger || defaultTriggerPayload();
             const actionMode = s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm';
@@ -2552,10 +2480,9 @@
                 clearAllRetargetingFieldErrors();
                 const accountUid = document.getElementById('strategyAccountUid')?.value || '';
                 const targetUid = document.getElementById('strategyTargetUid')?.value || '';
-                const triggerLevel = document.getElementById('strategyTriggerLevel')?.value || 'material';
                 const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
                 const configEnabled = !!document.getElementById('cfgEnabled')?.checked;
-                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || (configEnabled && !selectedTarget.retarget_eligible) || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
+                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || (configEnabled && !selectedTarget.retarget_eligible)) {
                     renderStrategyTabs();
                     const accountEl = document.getElementById('strategyAccountUid');
                     const targetEl = document.getElementById('strategyTargetUid');
@@ -2567,7 +2494,7 @@
                                 ? '监控账户与监控计划不一致，请重新选择'
                                 : configEnabled && !selectedTarget.retarget_eligible
                                     ? `该监控计划暂不可追投：${selectedTarget.ineligible_reason || '能力待验证'}`
-                                    : '商品级策略只能选择推商品计划';
+                                    : '监控计划无效，请重新选择';
                     return {
                         ok: false,
                         vt: { ok: true },
@@ -2971,9 +2898,9 @@
                 title: s.title,
                 account_uid: s.account_uid || '',
                 target_uid: s.target_uid || '',
-                trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
-                product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
-                candidate_trigger: s.candidate_trigger || defaultCandidateTriggerPayload(),
+                trigger_level: 'material',
+                product_filter: [],
+                candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
                 action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
@@ -3285,9 +3212,9 @@
                         title: (s.title || '').trim() || defaultStrategyTitle(i),
                         account_uid: s.account_uid || promotionTargetsState.find(target => target.target_uid === s.target_uid)?.account_uid || '',
                         target_uid: s.target_uid || '',
-                        trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
-                        product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
-                        candidate_trigger: s.candidate_trigger || defaultCandidateTriggerPayload(),
+                        trigger_level: 'material',
+                        product_filter: [],
+                        candidate_trigger: defaultCandidateTriggerPayload(),
                         candidate_sort: 'net_roi_desc',
                         candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
                         action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
