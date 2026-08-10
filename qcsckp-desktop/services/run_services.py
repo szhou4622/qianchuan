@@ -2096,7 +2096,31 @@ class ServiceController:
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
         classes: Dict[str, Dict[str, Any]] = {}
-        claimed_plan_classes: Dict[str, tuple[str, str]] = {}
+        # Seed the per-scan collision guard with exact plan details already
+        # verified for this account.  The backend occasionally returns the
+        # same row for a derived dataSetKey request; a previously verified
+        # class is stronger evidence than whichever derived request happened
+        # to finish first in the current refresh.
+        trusted_plan_classes: Dict[str, tuple[str, str]] = {
+            str(item.get("ad_id") or "").strip(): (
+                str(item.get("plan_system") or "").strip().lower(),
+                str(item.get("promotion_scene") or "").strip().lower(),
+            )
+            for item in list_promotion_targets(
+                owner_username=owner_username,
+                db=db,
+            )
+            if str(item.get("aadvid") or "") == aavid
+            and str(item.get("ad_id") or "").strip()
+            and str(item.get("verification_state") or "") == "verified"
+            and str(item.get("plan_system") or "").strip().lower()
+            in {"global", "chengfang"}
+            and str(item.get("promotion_scene") or "").strip().lower()
+            in {"live", "product"}
+        }
+        claimed_plan_classes: Dict[str, tuple[str, str]] = dict(
+            trusted_plan_classes
+        )
         backend_classes = (
             ("global_product", "product", "global"),
             ("global_live", "live", "global"),
@@ -2176,7 +2200,12 @@ class ServiceController:
                 claimed_plan_classes=claimed_plan_classes,
             )
 
-        if backend_template_available:
+        backend_catalog_complete = bool(
+            backend_template_available
+            and len(classes) == len(backend_classes)
+            and all(bool(item.get("complete")) for item in classes.values())
+        )
+        if backend_catalog_complete:
             # 账户名只接受千川后台响应中与当前 aavid 同时出现
             # 的 advName/accountName。导航栏文字可能被截断为一个字，
             # 不能继续覆盖权威账户名。
@@ -2207,6 +2236,18 @@ class ServiceController:
                 owner_username=owner_username,
                 db=db,
             )
+
+        # Capturing one valid request shape is not proof that the same shape
+        # can be rewritten into all four Qianchuan catalog contracts.  In
+        # particular, product and Chengfang requests may carry different
+        # signed fields.  If any derived read failed, navigate the native
+        # class entry once so the page emits that account's genuine signed
+        # read request.  Classification and persistence below still rely on
+        # API dataset/pagination/detail evidence; DOM text is never accepted
+        # as plan identity evidence.  Successful exact templates are kept by
+        # the probe, so later refreshes return to the fast backend path.
+        classes.clear()
+        claimed_plan_classes = dict(trusted_plan_classes)
 
         # 极少数旧页面的兼容兜底。这里只负责触发后台请求；最终落库仍须
         # 通过接口分页和精确计划详情核验，不能仅凭页面文字启用自动化。

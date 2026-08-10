@@ -976,6 +976,94 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             ],
         )
 
+    def test_partial_backend_catalog_recovers_through_native_class_requests(self):
+        ensure_qianchuan_account(
+            "10001",
+            account_name="测试账户",
+            owner_username=self.owner,
+            seen=True,
+            db=self.db,
+        )
+
+        class Page:
+            url = "https://qianchuan.jinritemai.com/uni-prom?aavid=10001"
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        class Probe:
+            def reset_catalog_class(self, **_kwargs):
+                return None
+
+            def set_catalog_context(self, **_kwargs):
+                return None
+
+            async def fetch_catalog_class_from_backend(self, _page, **kwargs):
+                # Reproduce the live-only signed template observed in the
+                # field: derived product contracts fail, while live works.
+                return kwargs["promotion_scene"] == "live"
+
+            def has_backend_catalog_template(self, _aavid):
+                return True
+
+        controller = ServiceController.__new__(ServiceController)
+        scanned = []
+
+        async def scan_class(**kwargs):
+            scanned.append(
+                (kwargs["plan_system"], kwargs["promotion_scene"])
+            )
+            return {
+                "complete": True,
+                "seen": 0,
+                "seen_ids": [],
+                "verified": 0,
+                "candidates": 0,
+                "message": "",
+            }
+
+        controller._scan_catalog_class = scan_class
+        controller._open_explicit_global_catalog = AsyncMock(
+            return_value=Page.url
+        )
+        controller._open_all_product_subcatalogs = AsyncMock()
+        controller._click_visible_exact = AsyncMock(return_value=True)
+        controller._has_visible_action_exact = AsyncMock(return_value=True)
+        controller._open_explicit_chengfang_catalog = AsyncMock(
+            return_value=True
+        )
+
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            result = asyncio.run(
+                controller._scan_global_account_catalog(
+                    fetcher=SimpleNamespace(page=Page()),
+                    probe=Probe(),
+                    db=self.db,
+                    owner_username=self.owner,
+                    account={
+                        "aavid": "10001",
+                        "account_name": "测试账户",
+                    },
+                )
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            [
+                ("global", "product"),
+                ("global", "live"),
+                ("chengfang", "product"),
+                ("chengfang", "live"),
+            ],
+            scanned[-4:],
+        )
+
     def test_exact_detail_verification_can_limit_to_new_plan_ids(self):
         path = os.path.join(self.temp.name, "incremental-verify-probe.json")
         probe = PromotionReadOnlyProbe(path)
