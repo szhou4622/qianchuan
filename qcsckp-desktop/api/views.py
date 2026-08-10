@@ -84,21 +84,33 @@ class Api:
         )
         from services.promotion_browser_lock import browser_queue_snapshot
         from services.qianchuan_accounts import (
-            capacity_snapshot,
+            capacity_snapshot_readonly,
             list_qianchuan_accounts,
-            migrate_existing_qianchuan_accounts,
         )
+        from api.promotion_targets import list_promotion_targets
         from services.qianchuan_session import session_status
         from services.qianchuan_catalog import catalog_sync_status
         from services.windows_autostart import get_windows_autostart_status
 
         try:
-            migrate_existing_qianchuan_accounts(db=self.db)
             feishu = get_local_feishu_status()
-            accounts = list_qianchuan_accounts(db=self.db)
-            targets = self.listPromotionTargets().get("data") or []
+            accounts = list_qianchuan_accounts(
+                db=self.db,
+                ensure_schema=False,
+                perform_repairs=False,
+            )
+            targets = list_promotion_targets(
+                db=self.db,
+                ensure_schema=False,
+                perform_repairs=False,
+            )
             session = session_status()
-            catalog = catalog_sync_status(db=self.db)
+            catalog = catalog_sync_status(
+                db=self.db,
+                accounts_snapshot=accounts,
+                targets_snapshot=targets,
+                ensure_schema=False,
+            )
             if catalog.get("failure_kind") == "login_required":
                 session = {
                     **session,
@@ -148,7 +160,7 @@ class Api:
                 "success": True,
                 "accounts": accounts,
                 "targets": targets,
-                "capacity": capacity_snapshot(db=self.db),
+                "capacity": capacity_snapshot_readonly(db=self.db),
                 "session": session,
                 "catalog": catalog,
                 "onboarding": onboarding,
@@ -162,7 +174,9 @@ class Api:
                     "groups": (feishu.get("profile") or {}).get("groups") or [],
                 },
                 "autostart": get_windows_autostart_status(),
-                "daily_report": get_operation_daily_report_config(),
+                "daily_report": get_operation_daily_report_config(
+                    account_options=accounts,
+                ),
             }
         except Exception as e:
             return {"success": False, "message": str(e)}

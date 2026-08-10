@@ -213,7 +213,10 @@ def list_operation_account_options(database: Optional[str] = None) -> List[Dict[
     return result
 
 
-def get_operation_daily_report_config(database: Optional[str] = None) -> Dict[str, Any]:
+def get_operation_daily_report_config(
+    database: Optional[str] = None,
+    account_options: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     account = current_local_feishu_account()
     if not account:
         return {
@@ -223,7 +226,19 @@ def get_operation_daily_report_config(database: Optional[str] = None) -> Dict[st
             "accounts": [],
         }
     config = _profile_config(account)
-    options = list_operation_account_options(database)
+    options = (
+        list_operation_account_options(database)
+        if account_options is None
+        else [
+            {
+                "account_uid": str(item.get("account_uid") or ""),
+                "aavid": str(item.get("aavid") or ""),
+                "account_name": str(item.get("account_name") or ""),
+                "report_enabled": bool(item.get("report_enabled")),
+            }
+            for item in account_options
+        ]
+    )
     selected = [
         str(item.get("aavid") or "")
         for item in options

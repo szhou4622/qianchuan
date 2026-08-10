@@ -309,10 +309,14 @@ def list_qianchuan_accounts(
     *,
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
+    ensure_schema: bool = True,
+    perform_repairs: bool = True,
 ) -> List[Dict[str, Any]]:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
-    _initialize_directory_selection(store)
+    if ensure_schema:
+        init_sqlite_schema(database=store.config.get("database"))
+    if perform_repairs:
+        _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     rows = store.select(
         "qianchuan_account",
@@ -1109,6 +1113,78 @@ def capacity_snapshot(
         }
     )
     return summary
+
+
+def capacity_snapshot_readonly(
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """Read the persisted capacity state without repairing or writing rows.
+
+    Capacity admission is recalculated when account settings change, target
+    evidence changes and before the scheduler chooses work.  A page view must
+    not repeat that write-heavy calculation for every target.
+    """
+    store = db or SQLiteStore()
+    rows = store.execute(
+        "SELECT t.target_uid,t.enabled,t.monitor_eligible,t.capacity_state,"
+        "t.last_duration_ms,t.last_sync_at,a.enabled AS account_enabled "
+        "FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE a.owner_username=? AND a.directory_selected=1",
+        (_owner_key(owner_username),),
+        fetch=True,
+    ) or []
+    active = 0
+    waiting = 0
+    disabled = 0
+    used_ms = 0
+    delayed: List[str] = []
+    max_lag = 0
+    now = datetime.now()
+    for row in rows:
+        desired = (
+            bool(row.get("enabled"))
+            and bool(row.get("account_enabled"))
+            and bool(row.get("monitor_eligible"))
+        )
+        state = str(row.get("capacity_state") or "disabled")
+        if not desired:
+            disabled += 1
+            continue
+        if state == "capacity_waiting":
+            waiting += 1
+            continue
+        if state != "active":
+            disabled += 1
+            continue
+        active += 1
+        used_ms += _estimate_duration_ms(row)
+        text = str(row.get("last_sync_at") or "").strip()
+        try:
+            lag = int(
+                (now - datetime.strptime(text, "%Y-%m-%d %H:%M:%S"))
+                .total_seconds()
+            )
+        except Exception:
+            lag = CAPACITY_STALE_SECONDS + 1
+        lag = max(0, lag)
+        max_lag = max(max_lag, lag)
+        if lag > CAPACITY_STALE_SECONDS:
+            delayed.append(str(row.get("target_uid") or ""))
+    return {
+        "active_count": active,
+        "waiting_count": waiting,
+        "disabled_count": disabled,
+        "estimated_cycle_seconds": int(round(used_ms / 1000)),
+        "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
+        "stale_after_seconds": CAPACITY_STALE_SECONDS,
+        "delayed_count": len(delayed),
+        "delayed_target_uids": delayed,
+        "max_lag_seconds": max_lag,
+        "healthy": waiting == 0 and not delayed,
+    }
 
 
 def schedulable_promotion_targets(

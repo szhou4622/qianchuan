@@ -19,6 +19,7 @@ from api.operation_events import upsert_operation_event
 from services import promotion_browser_lock, qianchuan_session, rc23_rollback
 from services.qianchuan_accounts import (
     capacity_snapshot,
+    capacity_snapshot_readonly,
     ensure_qianchuan_account,
     get_qianchuan_account,
     list_qianchuan_accounts,
@@ -366,6 +367,52 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertEqual(12, snapshot["active_count"])
         self.assertEqual(1, snapshot["waiting_count"])
         self.assertLessEqual(snapshot["estimated_cycle_seconds"], 9 * 60)
+
+    def test_readonly_capacity_snapshot_never_mutates_target_lag(self):
+        target = self._target("10001", 1)
+        self.db.update(
+            "promotion_target",
+            {
+                "last_sync_at": "2026-01-01 00:00:00",
+                "last_lag_seconds": 123,
+            },
+            where={"target_uid": target["target_uid"]},
+        )
+        snapshot = capacity_snapshot_readonly(db=self.db)
+        saved = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertEqual(1, snapshot["active_count"])
+        self.assertEqual(1, snapshot["delayed_count"])
+        self.assertEqual(123, saved["last_lag_seconds"])
+
+    def test_daily_report_config_reuses_overview_account_snapshot(self):
+        from services.operation_daily_report import (
+            get_operation_daily_report_config,
+        )
+
+        options = [
+            {
+                "account_uid": "account-fast",
+                "aavid": "10001",
+                "account_name": "快速账户",
+                "report_enabled": True,
+            }
+        ]
+        with patch(
+            "services.operation_daily_report.current_local_feishu_account",
+            return_value="tool-owner",
+        ), patch(
+            "services.operation_daily_report.list_operation_account_options",
+            side_effect=AssertionError("不应重复读取账户目录"),
+        ):
+            result = get_operation_daily_report_config(
+                account_options=options,
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(["10001"], result["config"]["aavids"])
+        self.assertEqual("快速账户", result["accounts"][0]["account_name"])
 
     def test_scheduler_only_returns_current_tool_accounts(self):
         current = self._target("10001", 1)

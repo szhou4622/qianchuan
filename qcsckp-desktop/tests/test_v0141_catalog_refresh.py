@@ -24,6 +24,38 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class CatalogRefreshV0141Tests(unittest.TestCase):
+    def test_status_reuses_overview_snapshots_without_duplicate_directory_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = SQLiteStore(database=os.path.join(directory, "catalog.db"))
+            accounts = [
+                {
+                    "account_uid": "account-fast",
+                    "aavid": "10001",
+                    "catalog_status": "complete",
+                    "catalog_last_sync_at": "2026-08-10 10:00:00",
+                    "catalog_error": "",
+                    "catalog_counts": {},
+                }
+            ]
+            targets = [{"target_uid": "target-fast"}]
+            with patch(
+                "services.qianchuan_catalog.list_qianchuan_accounts",
+                side_effect=AssertionError("不应重复读取账户"),
+            ), patch(
+                "services.qianchuan_catalog.list_promotion_targets",
+                side_effect=AssertionError("不应重复读取计划"),
+            ):
+                result = catalog_sync_status(
+                    owner_username="snapshot-owner",
+                    db=db,
+                    accounts_snapshot=accounts,
+                    targets_snapshot=targets,
+                    ensure_schema=False,
+                )
+            self.assertEqual(1, result["account_count"])
+            self.assertEqual(1, result["plan_count"])
+            self.assertTrue(result["complete"])
+
     def test_status_reconciles_persisted_result_after_running_flag_stalls(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = os.path.join(directory, "catalog.db")

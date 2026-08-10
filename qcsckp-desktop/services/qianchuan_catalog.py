@@ -317,12 +317,24 @@ def catalog_sync_status(
     *,
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
+    accounts_snapshot: Optional[List[Dict[str, Any]]] = None,
+    targets_snapshot: Optional[List[Dict[str, Any]]] = None,
+    ensure_schema: bool = True,
 ) -> Dict[str, Any]:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
+    if ensure_schema:
+        init_sqlite_schema(database=store.config.get("database"))
     owner = _owner_key(owner_username)
-    accounts = list_qianchuan_accounts(owner_username=owner, db=store)
-    targets = list_promotion_targets(owner_username=owner, db=store)
+    accounts = (
+        list(accounts_snapshot)
+        if accounts_snapshot is not None
+        else list_qianchuan_accounts(owner_username=owner, db=store)
+    )
+    targets = (
+        list(targets_snapshot)
+        if targets_snapshot is not None
+        else list_promotion_targets(owner_username=owner, db=store)
+    )
     with _LOCK:
         state = dict(_STATE)
     if str(state.get("owner_username") or "") not in {"", owner}:

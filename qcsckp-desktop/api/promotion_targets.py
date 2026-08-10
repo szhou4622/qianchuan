@@ -469,12 +469,16 @@ def list_promotion_targets(
     enabled: Optional[bool] = None,
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
+    ensure_schema: bool = True,
+    perform_repairs: bool = True,
 ) -> List[Dict[str, Any]]:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
+    if ensure_schema:
+        init_sqlite_schema(database=store.config.get("database"))
     from services.qianchuan_accounts import _initialize_directory_selection
 
-    _initialize_directory_selection(store)
+    if perform_repairs:
+        _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     sql = (
         "SELECT t.*,a.account_name AS account_name,"
