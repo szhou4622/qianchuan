@@ -345,6 +345,22 @@
     try{await load();message('页面显示已更新；本次没有访问千川后台。')}
     finally{button.disabled=false;button.textContent='刷新页面显示'}
   }
+  async function watchAutomaticCatalogPrefetch(accountUid){
+    const uid=String(accountUid||'');
+    const a=await waitApi();
+    for(let attempt=0;attempt<40;attempt+=1){
+      await new Promise(resolve=>setTimeout(resolve,250));
+      let s;
+      try{s=await a.getQianchuanCatalogSyncStatus()}catch(_){continue}
+      const requested=String(s?.requested_account_uid||'');
+      if(requested===uid&&(s?.running||s?.finished_at)){
+        const button=document.querySelector(`[data-refresh-account="${CSS.escape(uid)}"]`);
+        await watchCatalogSync({accountUid:uid,startedAt:String(s?.started_at||''),announce:true,button});
+        return;
+      }
+    }
+    message('账户已经添加，计划正在后台排队读取；页面会自动更新，也可以稍后点击该账户内的刷新按钮。');
+  }
   async function addAccount(){
     $('addAccount').disabled=true;
     const a=await waitApi();let r;
@@ -359,8 +375,7 @@
         await load();
         if(s?.success&&s?.account){
           message('当前千川账户已添加，正在只读刷新这个账户的计划。识别出的计划默认不监控，请刷新完成后自行勾选并保存。');
-          await new Promise(resolve=>setTimeout(resolve,1200));
-          await discover(String(s.account.account_uid||s.account.aavid||''));
+          await watchAutomaticCatalogPrefetch(String(s.account.account_uid||s.account.aavid||''));
         }else{
           message(s?.message||'未完成账户添加，请重试。',true);
         }

@@ -1258,6 +1258,85 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         self.assertIn("模拟登录失败", status["message"])
         self.assertTrue(controller._target_discovery_launch_event.is_set())
 
+    def test_successful_account_selection_queues_catalog_prefetch(self):
+        controller = ServiceController()
+
+        async def finish_selection(*, login_only=False, account_only=False):
+            self.assertFalse(login_only)
+            self.assertTrue(account_only)
+            with controller._lock:
+                controller._target_discovery_status = {
+                    "success": True,
+                    "running": False,
+                    "message": "account added",
+                    "target": None,
+                    "account": {
+                        "account_uid": "account-10002",
+                        "aavid": "10002",
+                        "owner_username": self.owner,
+                    },
+                    "relogin_complete": False,
+                }
+
+        with (
+            patch.object(
+                controller,
+                "_target_discovery_async",
+                side_effect=finish_selection,
+            ),
+            patch.object(
+                controller,
+                "_queue_catalog_prefetch_after_discovery",
+                return_value=True,
+            ) as queue_prefetch,
+        ):
+            controller._target_discovery_entry(account_only=True)
+
+        queue_prefetch.assert_called_once_with(
+            owner_username=self.owner,
+            account_uid="account-10002",
+        )
+        self.assertTrue(
+            controller.target_discovery_status()["catalog_prefetch_requested"]
+        )
+
+    def test_failed_account_selection_does_not_queue_catalog_prefetch(self):
+        controller = ServiceController()
+        with (
+            patch.object(
+                controller,
+                "_target_discovery_async",
+                AsyncMock(side_effect=RuntimeError("selection failed")),
+            ),
+            patch.object(
+                controller,
+                "_queue_catalog_prefetch_after_discovery",
+            ) as queue_prefetch,
+        ):
+            controller._target_discovery_entry(account_only=True)
+        queue_prefetch.assert_not_called()
+
+    def test_catalog_prefetch_starts_selected_account_and_clears_pending(self):
+        controller = ServiceController()
+        controller._catalog_prefetch_pending.add("account-10002")
+        with (
+            patch(
+                "services.run_services.current_session_owner",
+                return_value=self.owner,
+            ),
+            patch.object(
+                controller,
+                "start_catalog_sync",
+                return_value={"success": True},
+            ) as start_sync,
+        ):
+            controller._catalog_prefetch_entry(
+                self.owner,
+                "account-10002",
+            )
+        start_sync.assert_called_once_with("account-10002")
+        self.assertNotIn("account-10002", controller._catalog_prefetch_pending)
+
     def test_relogin_start_waits_for_real_launch_failure_result(self):
         controller = ServiceController()
 

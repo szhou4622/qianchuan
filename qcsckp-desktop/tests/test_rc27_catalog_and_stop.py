@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from api.promotion_targets import (
     set_promotion_target_enabled,
@@ -834,6 +834,269 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             page.calls[0]["dataSetKey"],
         )
 
+    def test_backend_catalog_falls_back_to_canonical_read_contract(self):
+        path = os.path.join(self.temp.name, "canonical-fallback-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates[("10001", "product", "global")] = {
+            "url": "https://qianchuan.test/catalog",
+            "body": {
+                "aavid": "10001",
+                "mar_goal": 1,
+                "dataSetKey": "overall_roi_promotion_list_for_product",
+                "page": 1,
+                "page_size": 100,
+                "requestShape": "page-specific",
+            },
+        }
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                body = dict(arguments["body"])
+                self.calls.append(body)
+                if body.get("requestShape"):
+                    return {
+                        "status": 200,
+                        "payload": {
+                            "status_code": 40001,
+                            "message": "request shape rejected",
+                        },
+                    }
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "totalPage": 1,
+                            "adInfos": [
+                                {
+                                    "id": "30002",
+                                    "name": "标准只读契约计划",
+                                    "adDeliveryName": "投放中",
+                                }
+                            ],
+                        },
+                    },
+                }
+
+        page = Page()
+        complete = asyncio.run(
+            probe.fetch_catalog_class_from_backend(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertTrue(complete)
+        self.assertEqual(2, len(page.calls))
+        self.assertNotIn("requestShape", page.calls[1])
+        self.assertEqual(100, page.calls[1]["PageSize"])
+        self.assertEqual(
+            ["30002"],
+            [
+                row["ad_id"]
+                for row in probe.catalog_rows(
+                    aavid="10001",
+                    promotion_scene="product",
+                    plan_system="global",
+                )
+            ],
+        )
+
+    def test_exact_detail_verification_can_limit_to_new_plan_ids(self):
+        path = os.path.join(self.temp.name, "incremental-verify-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        for ad_id in ("30001", "30002"):
+            probe._catalog_rows[("10001", "product", "global", ad_id)] = {
+                "aavid": "10001",
+                "ad_id": ad_id,
+                "plan_name": ad_id,
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "platform_status": "active",
+                "product_ids": [],
+            }
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                self.calls.append(arguments["adId"])
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "adDetailInfo": {
+                                "id": arguments["adId"],
+                                "name": arguments["adId"],
+                                "advId": "10001",
+                                "marGoal": 1,
+                            }
+                        },
+                    },
+                }
+
+        page = Page()
+        result = asyncio.run(
+            probe.verify_catalog_plans(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+                ad_ids=["30002"],
+            )
+        )
+        self.assertEqual(["30002"], page.calls)
+        self.assertEqual(1, result["candidate_count"])
+
+    def test_exact_detail_verification_uses_bounded_concurrency(self):
+        path = os.path.join(self.temp.name, "concurrent-verify-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        for offset in range(8):
+            ad_id = str(31000 + offset)
+            probe._catalog_rows[("10001", "product", "global", ad_id)] = {
+                "aavid": "10001",
+                "ad_id": ad_id,
+                "plan_name": ad_id,
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "platform_status": "active",
+                "product_ids": [],
+            }
+
+        class Page:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            async def evaluate(self, _script, arguments):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.02)
+                self.active -= 1
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "adDetailInfo": {
+                                "id": arguments["adId"],
+                                "name": arguments["adId"],
+                                "advId": "10001",
+                                "marGoal": 1,
+                            }
+                        },
+                    },
+                }
+
+        page = Page()
+        result = asyncio.run(
+            probe.verify_catalog_plans(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertEqual(8, len(result["verified"]))
+        self.assertGreater(page.max_active, 1)
+        self.assertLessEqual(page.max_active, 6)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPAPI only")
+    def test_catalog_request_template_is_dpapi_persisted(self):
+        path = os.path.join(self.temp.name, "template-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates[("product", "global")] = {
+            "url": "/ad/api/pmc/v1/uni-promotion/ad/list-required",
+            "body": {
+                "aavid": "10001",
+                "Params": {
+                    "SophonxDataSetKey": "overall_roi_promotion_list_for_product",
+                    "AdFilter": {"MarGoal": 1},
+                    "PageParams": {"Page": 1, "PageSize": 100},
+                },
+            },
+        }
+        probe._catalog_templates_protected = probe._protect_catalog_templates(
+            probe._serializable_catalog_templates()
+        )
+        probe._flush()
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertIn('"catalog_templates_protected": "dpapi:', raw)
+        self.assertNotIn("overall_roi_promotion_list_for_product", raw)
+
+        restored = PromotionReadOnlyProbe(path)
+        self.assertIn(("product", "global"), restored._catalog_base_templates)
+
+    def test_generated_catalog_replay_cannot_overwrite_observed_template(self):
+        path = os.path.join(self.temp.name, "generated-template-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        good_body = {
+            "aavid": "10001",
+            "Params": {
+                "SophonxDataSetKey": "observed_product_contract",
+                "AdFilter": {"MarGoal": 1},
+                "PageParams": {"Page": 1, "PageSize": 100},
+            },
+        }
+        generated_body = {
+            "aavid": "10001",
+            "Params": {
+                "SophonxDataSetKey": "generated_replay_contract",
+                "AdFilter": {"MarGoal": 1},
+                "PageParams": {"Page": 1, "PageSize": 100},
+            },
+        }
+        probe._catalog_base_templates[("product", "global")] = {
+            "url": "/ad/api/pmc/v1/uni-promotion/ad/list-required",
+            "body": good_body,
+        }
+        probe._generated_catalog_request_variants.add(
+            probe._catalog_variant_key(
+                "/ad/api/pmc/v1/uni-promotion/ad/list-required",
+                generated_body,
+            )
+        )
+
+        class Request:
+            method = "POST"
+            post_data = json.dumps(generated_body)
+            frame = SimpleNamespace(page=SimpleNamespace())
+
+        class Response:
+            status = 200
+            url = (
+                "https://qianchuan.jinritemai.com"
+                "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+            )
+            request = Request()
+
+            async def json(self):
+                return {"status_code": 0, "data": {"list": []}}
+
+        with (
+            patch.object(
+                probe,
+                "_replay_all_status_variant",
+                AsyncMock(),
+            ),
+            patch.object(
+                probe,
+                "_replay_remaining_product_pages",
+                AsyncMock(),
+            ),
+        ):
+            asyncio.run(probe._on_response(Response()))
+
+        retained = probe._catalog_base_templates[("product", "global")]
+        self.assertEqual("observed_product_contract", retained["body"]["Params"]["SophonxDataSetKey"])
+
     def test_unfiltered_flat_plan_list_is_full_catalog_evidence(self):
         flat = {
             "aavid": "10001",
@@ -980,6 +1243,53 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
                 )
             )
         self.assertTrue(result["complete"])
+
+    def test_complete_pagination_is_not_downgraded_by_inactive_unverified_plan(self):
+        class CapturedProbe:
+            def catalog_rows(self, **_kwargs):
+                return [
+                    {
+                        "ad_id": "30001",
+                        "plan_name": "historical",
+                        "platform_status": "paused",
+                    }
+                ]
+
+            async def verify_catalog_plans(self, _page, **kwargs):
+                self.requested_ids = list(kwargs.get("ad_ids") or [])
+                return {"verified": [], "rejected": [], "complete": True}
+
+        probe = CapturedProbe()
+        controller = ServiceController.__new__(ServiceController)
+
+        async def wait_for_complete(_probe, **_kwargs):
+            return {"complete": True, "message": ""}
+
+        controller._wait_catalog_class = wait_for_complete
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            result = asyncio.run(
+                controller._scan_catalog_class(
+                    fetcher=SimpleNamespace(page=object()),
+                    probe=probe,
+                    db=self.db,
+                    owner_username=self.owner,
+                    account={"aavid": "10001", "account_name": "account"},
+                    promotion_scene="product",
+                    plan_system="global",
+                    page_url="https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+                )
+            )
+        self.assertTrue(result["complete"])
+        self.assertEqual([], probe.requested_ids)
+        target = self.db.select_one(
+            "promotion_target",
+            where={"aadvid": "10001", "ad_id": "30001"},
+        )
+        self.assertEqual("candidate", target["verification_state"])
+        self.assertEqual(0, target["monitor_eligible"])
 
     def test_expired_cookie_never_bypasses_visible_login(self):
         target = {

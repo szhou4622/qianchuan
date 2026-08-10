@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, List
 from urllib.parse import urlparse, parse_qs
 
@@ -49,10 +49,12 @@ from services.qianchuan_session import (
     session_status as qianchuan_session_status,
 )
 from api.promotion_targets import (
+    ACTIVE_PLATFORM_STATUSES,
     detect_confirmed_detail_scene,
     detect_promotion_scene,
     extract_plan_name,
     list_promotion_targets,
+    normalize_platform_status,
     patch_target_sync_state,
     record_target_verification_failure,
     replace_material_product_links,
@@ -851,6 +853,7 @@ class ServiceController:
         self._catalog_sync_thread: Optional[threading.Thread] = None
         self._catalog_scheduler_thread: Optional[threading.Thread] = None
         self._catalog_startup_sync_pending = True
+        self._catalog_prefetch_pending: set[str] = set()
         self._target_discovery_status: dict = {
             "success": True,
             "running": False,
@@ -1769,11 +1772,77 @@ class ServiceController:
             plan_system=plan_system,
         )
         _require_catalog_login(fetcher.page)
+        existing_rows = {
+            str(item.get("ad_id") or ""): item
+            for item in list_promotion_targets(
+                owner_username=owner_username,
+                db=db,
+            )
+            if str(item.get("aadvid") or "") == aavid
+            and str(item.get("promotion_scene") or "") == promotion_scene
+            and str(item.get("plan_system") or "") == plan_system
+        }
+        reverify_before = datetime.now() - timedelta(hours=24)
+        cached_verified: List[Dict[str, Any]] = []
+        verify_ids: List[str] = []
+        skipped_inactive = 0
+        for candidate in candidates:
+            ad_id = str(candidate.get("ad_id") or "").strip()
+            existing = existing_rows.get(ad_id) or {}
+            candidate_status = normalize_platform_status(
+                candidate.get("platform_status")
+            )
+            verified_at = None
+            try:
+                verified_at = datetime.fromisoformat(
+                    str(existing.get("last_verified_at") or "")
+                )
+            except (TypeError, ValueError):
+                verified_at = None
+            if (
+                str(existing.get("verification_state") or "") == "verified"
+                and verified_at is not None
+                and (
+                    verified_at >= reverify_before
+                    or candidate_status not in ACTIVE_PLATFORM_STATUSES
+                )
+            ):
+                # 精确详情只用于首次确认这是同账户下的主计划。
+                # 6 小时内已核验过的计划复用身份证据，名称和状态
+                # 仍以本轮全量列表为准；新计划和过期证据继续逐条核验。
+                cached_verified.append(
+                    {
+                        **candidate,
+                        "verification_state": "verified",
+                        "detail_snapshot": {},
+                    }
+                )
+            elif candidate_status in ACTIVE_PLATFORM_STATUSES:
+                verify_ids.append(ad_id)
+            else:
+                # Terminal and unknown rows still belong to a complete
+                # directory, but cannot be enabled. Avoid opening every
+                # historical detail only to display it; exact verification is
+                # retained as a hard gate for automation-eligible rows.
+                skipped_inactive += 1
         verification = await probe.verify_catalog_plans(
             fetcher.page,
             aavid=aavid,
             promotion_scene=promotion_scene,
             plan_system=plan_system,
+            ad_ids=verify_ids,
+        )
+        freshly_verified = list(verification.get("verified") or [])
+        verification["verified"] = cached_verified + freshly_verified
+        resolved_rejections = sum(
+            1
+            for item in verification.get("rejected") or []
+            if isinstance(item, dict) and item.get("resolved")
+        )
+        verification["candidate_count"] = len(candidates)
+        verification["skipped_inactive"] = skipped_inactive
+        verification["complete"] = len(verify_ids) == (
+            len(freshly_verified) + resolved_rejections
         )
         _require_catalog_login(fetcher.page)
         _require_session_owner(owner_username)
@@ -1789,9 +1858,10 @@ class ServiceController:
             owner_username=owner_username,
             class_complete=bool(status.get("complete")),
         )
-        complete = bool(status.get("complete")) and bool(
-            verification.get("complete")
-        )
+        # Directory completeness comes from the class pagination contract.
+        # A single detail failure blocks only that plan from automation; it
+        # must not downgrade an otherwise complete account directory.
+        complete = bool(status.get("complete"))
         message = str(status.get("message") or "")
         if status.get("complete") and not verification.get("complete"):
             message = (
@@ -2392,6 +2462,92 @@ class ServiceController:
                     "relogin_complete": False,
                 }
             self._target_discovery_launch_event.set()
+        if account_only:
+            with self._lock:
+                status = dict(self._target_discovery_status)
+            account = status.get("account")
+            account = dict(account) if isinstance(account, dict) else {}
+            account_uid = str(
+                account.get("account_uid") or account.get("aavid") or ""
+            ).strip()
+            owner_username = str(
+                account.get("owner_username") or current_session_owner() or ""
+            ).strip()
+            if status.get("success") and account_uid and owner_username:
+                with self._lock:
+                    self._target_discovery_status["catalog_prefetch_requested"] = True
+                self._queue_catalog_prefetch_after_discovery(
+                    owner_username=owner_username,
+                    account_uid=account_uid,
+                )
+
+    def _queue_catalog_prefetch_after_discovery(
+        self,
+        *,
+        owner_username: str,
+        account_uid: str,
+    ) -> bool:
+        """Queue a read-only catalog warm-up after the visible Chrome closes."""
+        uid = str(account_uid or "").strip()
+        owner = str(owner_username or "").strip()
+        if not uid or not owner:
+            return False
+        with self._lock:
+            if uid in self._catalog_prefetch_pending:
+                return False
+            self._catalog_prefetch_pending.add(uid)
+        threading.Thread(
+            target=self._catalog_prefetch_entry,
+            args=(owner, uid),
+            name=f"qianchuan-catalog-prefetch-{uid[-8:]}",
+            daemon=True,
+        ).start()
+        return True
+
+    def _catalog_prefetch_entry(
+        self,
+        owner_username: str,
+        account_uid: str,
+    ) -> None:
+        """Wait for browser ownership, then warm exactly the newly added account."""
+        deadline = time.monotonic() + 10 * 60
+        try:
+            while time.monotonic() < deadline:
+                if current_session_owner() != owner_username:
+                    return
+                with self._lock:
+                    discovery_running = bool(
+                        self._target_discovery_thread
+                        and self._target_discovery_thread.is_alive()
+                    )
+                    catalog_running = bool(
+                        self._catalog_sync_thread
+                        and self._catalog_sync_thread.is_alive()
+                    )
+                if discovery_running or catalog_running:
+                    time.sleep(0.2)
+                    continue
+                result = self.start_catalog_sync(account_uid)
+                if result.get("success"):
+                    logger.info(
+                        "[Qianchuan catalog] queued automatic account prefetch account_uid=%s",
+                        account_uid,
+                    )
+                else:
+                    logger.warning(
+                        "[Qianchuan catalog] automatic account prefetch was not started "
+                        "account_uid=%s reason=%s",
+                        account_uid,
+                        result.get("message") or result.get("failure_kind") or "unknown",
+                    )
+                return
+            logger.warning(
+                "[Qianchuan catalog] automatic account prefetch timed out account_uid=%s",
+                account_uid,
+            )
+        finally:
+            with self._lock:
+                self._catalog_prefetch_pending.discard(account_uid)
 
     async def _target_discovery_async(
         self,
