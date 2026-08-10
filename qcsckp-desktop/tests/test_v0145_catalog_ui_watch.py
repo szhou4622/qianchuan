@@ -29,6 +29,24 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("document.addEventListener('visibilitychange'", self.html)
         self.assertIn("load().then(resumeCatalogWatch)", self.html)
 
+    def test_single_account_refresh_lives_inside_account_card(self):
+        self.assertIn('data-refresh-account="${esc(acc.account_uid)}"', self.html)
+        self.assertIn("刷新此账户计划", self.html)
+        self.assertIn("刷新全部账户计划", self.html)
+        self.assertIn("刷新页面显示", self.html)
+        self.assertIn("本次没有访问千川后台", self.html)
+
+    def test_catalog_watch_does_not_stream_full_overview_every_tick(self):
+        self.assertIn("loadInFlight", self.html)
+        self.assertNotIn(
+            "s=await a.getQianchuanCatalogSyncStatus();\n        overview=await a.getQianchuanAccountOverview();",
+            self.html,
+        )
+        self.assertIn(
+            "if(!dirty&&!catalogWatchBusy&&!document.hidden)load()},60000)",
+            self.html,
+        )
+
     def test_clean_install_opens_login_and_prefills_local_username(self):
         index_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
