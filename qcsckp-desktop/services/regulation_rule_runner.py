@@ -77,6 +77,8 @@ def _stop_strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": str(strategy.get("id") or ""),
         "title": str(strategy.get("title") or ""),
+        "account_uid": str(strategy.get("account_uid") or ""),
+        "aavid": str(strategy.get("aavid") or ""),
         "target_uid": str(strategy.get("target_uid") or ""),
         "trigger": (
             strategy.get("trigger")
@@ -184,6 +186,10 @@ def _revalidate_stop_candidate(
     row_system = normalize_plan_system(row.get("plan_system") or "unknown")
     account_owner = str((account or {}).get("owner_username") or "").strip().casefold()
     row_account_uid = str(row.get("account_uid") or "").strip()
+    strategy_account_uid = str(
+        original_strategy.get("account_uid") or ""
+    ).strip()
+    strategy_aavid = str(original_strategy.get("aavid") or "").strip()
     if (
         not target
         or not bool(target.get("enabled"))
@@ -198,6 +204,11 @@ def _revalidate_stop_candidate(
         or str(target.get("ad_id") or "") != ad_id
         or str(target.get("promotion_scene") or "") != promotion_scene
         or account_owner != expected_owner
+        or (
+            strategy_account_uid
+            and strategy_account_uid != str(target.get("account_uid") or "")
+        )
+        or (strategy_aavid and strategy_aavid != str(target.get("aadvid") or ""))
     ):
         return None, None, target_system, "监控计划已停用、状态异常或目标身份变化"
     if (
@@ -877,16 +888,29 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 action_mode = "auto_execute"
             strategy_target_uid = str(st.get("target_uid") or "").strip()
             if not strategy_target_uid:
-                if len(enabled_targets) == 1:
-                    strategy_target_uid = str(
-                        enabled_targets[0].get("target_uid") or ""
-                    ).strip()
-                elif len(enabled_targets) > 1:
-                    logger.warning(
-                        "%s 未选择监控计划，当前有多条启用计划，已安全跳过",
-                        _tag,
-                    )
-                    return
+                logger.warning("%s 未选择监控计划，已安全跳过", _tag)
+                return
+            strategy_target = next(
+                (
+                    target
+                    for target in enabled_targets
+                    if str(target.get("target_uid") or "") == strategy_target_uid
+                ),
+                None,
+            )
+            if not isinstance(strategy_target, dict):
+                logger.warning("%s 监控计划已停用或不可调度，已安全跳过", _tag)
+                return
+            strategy_account_uid = str(st.get("account_uid") or "").strip()
+            strategy_aavid = str(st.get("aavid") or "").strip()
+            target_account_uid = str(strategy_target.get("account_uid") or "").strip()
+            target_aavid = str(strategy_target.get("aadvid") or "").strip()
+            if (
+                (strategy_account_uid and strategy_account_uid != target_account_uid)
+                or (strategy_aavid and strategy_aavid != target_aavid)
+            ):
+                logger.warning("%s 账户与监控计划归属不一致，已安全跳过", _tag)
+                return
 
             hit_rows: List[Dict[str, Any]] = []
             for row in rows:
@@ -927,6 +951,10 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     target = db.select_one(
                         "promotion_target",
                         where={"target_uid": target_uid},
+                    ) or {}
+                    account = db.select_one(
+                        "qianchuan_account",
+                        where={"account_uid": str(target.get("account_uid") or "")},
                     ) or {}
                     target_plan_system = normalize_plan_system(
                         target.get("plan_system") or "unknown"
@@ -1008,6 +1036,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         if target_uid != "legacy_unscoped":
                             target_matches = (
                                 bool(target)
+                                and bool(account)
+                                and bool(account.get("enabled"))
                                 and bool(target.get("enabled"))
                                 and bool(target.get("monitor_eligible"))
                                 and bool(target.get("stop_eligible"))
@@ -1015,6 +1045,16 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 and str(target.get("ad_id") or "") == ad_id
                                 and str(target.get("promotion_scene") or "live")
                                 == promotion_scene
+                                and (
+                                    not strategy_account_uid
+                                    or str(target.get("account_uid") or "")
+                                    == strategy_account_uid
+                                )
+                                and (
+                                    not strategy_aavid
+                                    or str(target.get("aadvid") or "")
+                                    == strategy_aavid
+                                )
                                 and (
                                     row_plan_system == "unknown"
                                     or row_plan_system == target_plan_system

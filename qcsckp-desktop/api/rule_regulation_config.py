@@ -143,6 +143,8 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
     return {
         "id": _new_strategy_id(),
         "title": f"策略 {index + 1}",
+        "account_uid": "",
+        "aavid": "",
         "target_uid": "",
         "trigger": _normalize_trigger_roi2(None),
         "regulation_stop_action": "pause",
@@ -189,6 +191,8 @@ def _normalize_strategy_entry(
     return {
         "id": sid,
         "title": title,
+        "account_uid": str(raw.get("account_uid") or "").strip(),
+        "aavid": str(raw.get("aavid") or "").strip(),
         "target_uid": str(raw.get("target_uid") or "").strip(),
         "trigger": trig,
         "regulation_stop_action": rsa,
@@ -336,6 +340,65 @@ def validate_rule_regulation_config(data: Dict[str, Any]) -> Tuple[bool, str]:
                     if op in ("gt", "gte") and v <= 0:
                         return False, f"策略{i + 1}：「大于/大于等于」的阈值须大于 0"
 
+    return True, ""
+
+
+def bind_and_validate_strategy_targets(
+    data: Dict[str, Any],
+    targets_by_uid: Dict[str, Dict[str, Any]],
+    accounts_by_uid: Dict[str, Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Bind every stop strategy to one explicit account and monitored plan.
+
+    ``target_uid`` is already globally scoped, but persisting the account
+    snapshot makes the user's selection explicit and lets the scheduler reject
+    a stale or tampered cross-account configuration before it can create a
+    stop candidate.  Legacy strategies are hydrated from their target once.
+    """
+    if not isinstance(data, dict):
+        return False, "配置须为对象"
+    strategies = data.get("strategies")
+    if not isinstance(strategies, list):
+        return True, ""
+    enabled = bool(data.get("enabled", False))
+    for index, strategy in enumerate(strategies):
+        if not isinstance(strategy, dict):
+            continue
+        title = str(strategy.get("title") or f"策略{index + 1}").strip()
+        target_uid = str(strategy.get("target_uid") or "").strip()
+        if not target_uid:
+            if enabled:
+                return False, f"“{title}”必须选择监控计划"
+            continue
+        target = targets_by_uid.get(target_uid)
+        if not isinstance(target, dict):
+            if enabled:
+                return False, f"“{title}”选择的监控计划不存在，请重新选择"
+            continue
+        target_account_uid = str(target.get("account_uid") or "").strip()
+        target_aavid = str(target.get("aadvid") or "").strip()
+        selected_account_uid = str(strategy.get("account_uid") or "").strip()
+        selected_aavid = str(strategy.get("aavid") or "").strip()
+        if enabled and selected_account_uid and selected_account_uid != target_account_uid:
+            return False, f"“{title}”选择的账户与监控计划不一致"
+        if enabled and selected_aavid and selected_aavid != target_aavid:
+            return False, f"“{title}”选择的千川账户ID与监控计划不一致"
+        account = accounts_by_uid.get(target_account_uid)
+        if not isinstance(account, dict):
+            if enabled:
+                return False, f"“{title}”所属千川账户不存在，请重新选择"
+            continue
+        strategy["account_uid"] = target_account_uid
+        strategy["aavid"] = target_aavid
+        if enabled:
+            if not bool(account.get("enabled")):
+                return False, f"“{title}”所属千川账户尚未启用"
+            if not bool(target.get("enabled")):
+                return False, f"“{title}”选择的监控计划尚未勾选监控"
+            if not bool(target.get("monitor_eligible")):
+                return False, f"“{title}”选择的计划当前不可监控"
+            if not bool(target.get("stop_eligible")):
+                return False, f"“{title}”选择的计划尚未取得停投资格"
     return True, ""
 
 

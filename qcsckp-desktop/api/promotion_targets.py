@@ -477,7 +477,8 @@ def list_promotion_targets(
     _initialize_directory_selection(store)
     owner = _owner_key(owner_username)
     sql = (
-        "SELECT t.* FROM promotion_target t "
+        "SELECT t.*,a.account_name AS account_name,"
+        "a.enabled AS account_enabled FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
         "WHERE a.owner_username=? AND a.directory_selected=1"
     )

@@ -527,15 +527,24 @@
                         监控计划
                     </div>
                     <div class="pl-[calc(0.5rem+3px)] space-y-2">
-                        <label class="block max-w-2xl">
-                            <span class="rr-label">本策略所属计划</span>
-                            <select id="regStrategyTargetUid" class="rr-input w-full text-xs">
-                                <option value="">请选择监控计划</option>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-4xl">
+                        <label class="block">
+                            <span class="rr-label">监控账户</span>
+                            <select id="regStrategyAccountUid" class="rr-input w-full text-xs">
+                                <option value="">请选择监控账户</option>
                             </select>
                         </label>
+                        <label class="block">
+                            <span class="rr-label">监控计划</span>
+                            <select id="regStrategyTargetUid" class="rr-input w-full text-xs">
+                                <option value="">请先选择监控账户</option>
+                            </select>
+                        </label>
+                        </div>
                         <p id="regStrategyTargetScene" class="text-[11px] text-slate-500">
-                            请先在“千川账户管理”页面添加账户并勾选监控计划。
+                            这里只显示已启用账户下已勾选监控的计划；停投资格尚未采集完成时可先保存停用草稿。
                         </p>
+                        <p id="errRegulationAccount" class="rr-field-err hidden" role="alert"></p>
                         <p id="errRegulationTarget" class="rr-field-err hidden" role="alert"></p>
                     </div>
                 </section>

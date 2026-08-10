@@ -1124,9 +1124,23 @@ class Api:
         from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
 
         from .rule_regulation_config import load_rule_regulation_config
+        from .promotion_targets import get_promotion_target
 
         c = load_rule_regulation_config()
         out = dict(c)
+        # 旧策略只有 target_uid；读取时补齐账户快照，让前端直接恢复
+        # “账户 → 计划”的级联选择，下一次保存后持久化。
+        strategies = []
+        for raw in out.get("strategies") or []:
+            strategy = dict(raw) if isinstance(raw, dict) else {}
+            target_uid = str(strategy.get("target_uid") or "").strip()
+            target = get_promotion_target(target_uid, db=self.db) if target_uid else None
+            if target:
+                strategy["account_uid"] = str(target.get("account_uid") or "")
+                strategy["aavid"] = str(target.get("aadvid") or "")
+            strategies.append(strategy)
+        if strategies:
+            out["strategies"] = strategies
         stored = configured_chrome_path_or_empty(out.get("browser_executable_path"))
         out["browser_executable_path"] = stored if stored else default_browser_executable_hint()
         out["success"] = True
@@ -1135,10 +1149,13 @@ class Api:
     def setRuleRegulationConfig(self, config=None):
         """保存规则化停投配置（可部分字段）。不含执行次数相关字段。"""
         from .rule_regulation_config import (
+            bind_and_validate_strategy_targets,
             merge_and_save,
             preview_merge,
             validate_rule_regulation_config,
         )
+        from .promotion_targets import get_promotion_target
+        from services.qianchuan_accounts import list_qianchuan_accounts
 
         if config is not None and not isinstance(config, dict):
             return {"success": False, "message": "配置须为对象"}
@@ -1146,7 +1163,28 @@ class Api:
         ok, msg = validate_rule_regulation_config(merged)
         if not ok:
             return {"success": False, "message": msg}
-        saved = merge_and_save(config)
+        targets_by_uid = {}
+        for strategy in merged.get("strategies") or []:
+            if not isinstance(strategy, dict):
+                continue
+            target_uid = str(strategy.get("target_uid") or "").strip()
+            if target_uid and target_uid not in targets_by_uid:
+                target = get_promotion_target(target_uid, db=self.db)
+                if target:
+                    targets_by_uid[target_uid] = target
+        accounts_by_uid = {
+            str(account.get("account_uid") or ""): account
+            for account in list_qianchuan_accounts(db=self.db)
+            if str(account.get("account_uid") or "")
+        }
+        ok, msg = bind_and_validate_strategy_targets(
+            merged,
+            targets_by_uid,
+            accounts_by_uid,
+        )
+        if not ok:
+            return {"success": False, "message": msg}
+        saved = merge_and_save(merged)
         out = dict(saved)
         out["success"] = True
         return out

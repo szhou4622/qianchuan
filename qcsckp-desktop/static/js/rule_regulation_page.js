@@ -311,6 +311,11 @@
             targetErr.textContent = '';
             targetErr.classList.add('hidden');
         }
+        const accountErr = document.getElementById('errRegulationAccount');
+        if (accountErr) {
+            accountErr.textContent = '';
+            accountErr.classList.add('hidden');
+        }
     }
 
     let strategiesState = [];
@@ -334,13 +339,21 @@
     }
 
     function syncRegulationTargetHint() {
+        const accountUid = document.getElementById('regStrategyAccountUid')?.value || '';
         const uid = document.getElementById('regStrategyTargetUid')?.value || '';
         const target = promotionTargetsState.find((x) => x.target_uid === uid);
         const hint = document.getElementById('regStrategyTargetScene');
         if (hint) {
             hint.textContent = target
-                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
-                : '请先在“监控计划”页面添加并启用计划。';
+                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${target.stop_eligible ? '' : ' · 停投资格待采集，可先保存停用草稿'}`
+                : accountUid
+                    ? '该账户下暂无具备停投资格的已监控计划，请先到“千川账户管理”勾选计划并完成采集。'
+                    : '请先选择监控账户。';
+        }
+        const accountErr = document.getElementById('errRegulationAccount');
+        if (accountErr && accountUid) {
+            accountErr.textContent = '';
+            accountErr.classList.add('hidden');
         }
         const err = document.getElementById('errRegulationTarget');
         if (err && uid) {
@@ -349,20 +362,69 @@
         }
     }
 
+    function accountOptionsFromTargets() {
+        const seen = new Map();
+        promotionTargetsState.forEach((target) => {
+            const accountUid = String(target.account_uid || '').trim();
+            if (!accountUid || seen.has(accountUid)) return;
+            seen.set(accountUid, {
+                account_uid: accountUid,
+                aavid: String(target.aadvid || '').trim(),
+                account_name: String(target.account_name || target.aadvid || '未命名账户').trim(),
+            });
+        });
+        return Array.from(seen.values()).sort((left, right) =>
+            left.account_name.localeCompare(right.account_name, 'zh-CN') ||
+            left.aavid.localeCompare(right.aavid)
+        );
+    }
+
+    function regulationTargetSort(left, right) {
+        const systemRank = { chengfang: 0, global: 1 };
+        const sceneRank = { live: 0, product: 1 };
+        return (systemRank[left.plan_system] ?? 9) - (systemRank[right.plan_system] ?? 9) ||
+            (sceneRank[left.promotion_scene] ?? 9) - (sceneRank[right.promotion_scene] ?? 9) ||
+            String(left.plan_name || left.ad_id || '').localeCompare(String(right.plan_name || right.ad_id || ''), 'zh-CN');
+    }
+
+    function renderRegulationPlanOptions(accountUid, selectedTargetUid) {
+        const select = document.getElementById('regStrategyTargetUid');
+        if (!select) return;
+        const plans = promotionTargetsState
+            .filter((target) => String(target.account_uid || '') === String(accountUid || ''))
+            .sort(regulationTargetSort);
+        select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + plans.map((target) =>
+            `<option value="${escapeTargetHtml(target.target_uid)}">${target.plan_system === 'chengfang' ? '乘方' : '全域'}｜${target.promotion_scene === 'live' ? '推直播' : '推商品'}｜${escapeTargetHtml(target.plan_name || target.ad_id)}｜${escapeTargetHtml(target.ad_id)}${target.stop_eligible ? '' : '｜停投资格待采集'}</option>`
+        ).join('');
+        if (selectedTargetUid && plans.some((target) => target.target_uid === selectedTargetUid)) {
+            select.value = selectedTargetUid;
+        }
+        syncRegulationTargetHint();
+    }
+
+    function renderRegulationAccountOptions(selectedAccountUid, selectedTargetUid) {
+        const select = document.getElementById('regStrategyAccountUid');
+        if (!select) return;
+        const accounts = accountOptionsFromTargets();
+        select.innerHTML = '<option value="">请选择监控账户</option>' + accounts.map((account) =>
+            `<option value="${escapeTargetHtml(account.account_uid)}">${escapeTargetHtml(account.account_name)}｜${escapeTargetHtml(account.aavid)}</option>`
+        ).join('');
+        if (selectedAccountUid && accounts.some((account) => account.account_uid === selectedAccountUid)) {
+            select.value = selectedAccountUid;
+        }
+        renderRegulationPlanOptions(select.value, selectedTargetUid);
+    }
+
     async function loadRegulationTargetOptions(api) {
         if (!api?.listPromotionTargets) return;
         const res = await api.listPromotionTargets(true);
         promotionTargetsState = Array.isArray(res?.data)
-            ? res.data.filter((x) => !!x.stop_eligible)
+            ? res.data.filter((x) => !!x.enabled && !!x.account_enabled && !!x.monitor_eligible)
             : [];
-        const select = document.getElementById('regStrategyTargetUid');
-        if (!select) return;
-        const current = select.value;
-        select.innerHTML = '<option value="">请选择监控计划</option>' + promotionTargetsState.map((x) =>
-            `<option value="${escapeTargetHtml(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${escapeTargetHtml(x.plan_name || x.ad_id)}｜${escapeTargetHtml(x.aadvid)}</option>`
-        ).join('');
-        if (current) select.value = current;
-        syncRegulationTargetHint();
+        const targetUid = document.getElementById('regStrategyTargetUid')?.value || '';
+        const target = promotionTargetsState.find((item) => item.target_uid === targetUid);
+        const accountUid = document.getElementById('regStrategyAccountUid')?.value || target?.account_uid || '';
+        renderRegulationAccountOptions(accountUid, targetUid);
     }
 
     function defaultTriggerPayload() {
@@ -631,6 +693,21 @@
             activeStrategyIndex = i;
             applyStrategyToDom(i);
             clearAllFieldErrors();
+            const accountUid = document.getElementById('regStrategyAccountUid')?.value || '';
+            if (!accountUid) {
+                const accountErr = document.getElementById('errRegulationAccount');
+                if (accountErr) {
+                    accountErr.textContent = '请选择本策略所属的监控账户';
+                    accountErr.classList.remove('hidden');
+                }
+                scrollRgValidationTargetIntoView(document.getElementById('regStrategyAccountUid'));
+                activeStrategyIndex = i;
+                return {
+                    ok: false,
+                    vt: { ok: false, firstMsg: '请选择监控账户' },
+                    failedStrategyIndex: i,
+                };
+            }
             const targetUid = document.getElementById('regStrategyTargetUid')?.value || '';
             if (!targetUid) {
                 const targetErr = document.getElementById('errRegulationTarget');
@@ -676,6 +753,8 @@
             strategiesState.push({
                 id: genStrategyId(),
                 title: defaultStrategyTitle(0),
+                account_uid: '',
+                aavid: '',
                 target_uid: '',
                 trigger: defaultTriggerPayload(),
                 regulation_stop_action: 'pause',
@@ -695,10 +774,15 @@
             : 'card_confirm';
         const cur = strategiesState[activeStrategyIndex];
         if (!cur) return;
+        const accountUid = document.getElementById('regStrategyAccountUid')?.value || '';
+        const targetUid = document.getElementById('regStrategyTargetUid')?.value || '';
+        const target = promotionTargetsState.find((item) => item.target_uid === targetUid);
         strategiesState[activeStrategyIndex] = {
             id: cur.id || genStrategyId(),
             title: cur.title || defaultStrategyTitle(activeStrategyIndex),
-            target_uid: document.getElementById('regStrategyTargetUid')?.value || '',
+            account_uid: accountUid,
+            aavid: target?.aadvid || '',
+            target_uid: targetUid,
             trigger: trig,
             regulation_stop_action: stopAct,
             action_mode: actionMode,
@@ -721,6 +805,8 @@
             strategies: strategiesState.map((s) => ({
                 id: s.id,
                 title: s.title,
+                account_uid: s.account_uid || '',
+                aavid: s.aavid || '',
                 target_uid: s.target_uid || '',
                 trigger: s.trigger,
                 regulation_stop_action: s.regulation_stop_action === 'delete' ? 'delete' : 'pause',
@@ -972,6 +1058,8 @@
         strategiesState.push({
             id: genStrategyId(),
             title: defaultStrategyTitle(newIdx),
+            account_uid: '',
+            aavid: '',
             target_uid: '',
             trigger: defaultTriggerPayload(),
             regulation_stop_action: 'pause',
@@ -1008,9 +1096,9 @@
     function applyStrategyToDom(index) {
         const s = strategiesState[index];
         if (!s) return;
-        const targetSelect = document.getElementById('regStrategyTargetUid');
-        if (targetSelect) targetSelect.value = s.target_uid || '';
-        syncRegulationTargetHint();
+        const selectedTarget = promotionTargetsState.find((target) => target.target_uid === (s.target_uid || ''));
+        const accountUid = s.account_uid || selectedTarget?.account_uid || '';
+        renderRegulationAccountOptions(accountUid, s.target_uid || '');
         const t = s.trigger || defaultTriggerPayload();
         mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
         _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
@@ -1040,6 +1128,8 @@
             strategiesState = data.strategies.map((s, i) => ({
                 id: s.id || genStrategyId(),
                 title: (s.title || '').trim() || defaultStrategyTitle(i),
+                account_uid: s.account_uid || '',
+                aavid: s.aavid || '',
                 target_uid: s.target_uid || '',
                 trigger: s.trigger || defaultTriggerPayload(),
                 regulation_stop_action: normStrategyStopAct(s.regulation_stop_action),
@@ -1051,6 +1141,8 @@
                 {
                     id: genStrategyId(),
                     title: defaultStrategyTitle(0),
+                    account_uid: '',
+                    aavid: '',
                     target_uid: '',
                     trigger: t,
                     regulation_stop_action: normStrategyStopAct(undefined),
@@ -1149,6 +1241,10 @@
         }
 
         document.getElementById('groupCombineMount').addEventListener('input', () => rgScheduleDirtyCheck());
+        document.getElementById('regStrategyAccountUid')?.addEventListener('change', (event) => {
+            renderRegulationPlanOptions(event.target.value || '', '');
+            rgScheduleDirtyCheck();
+        });
         document.getElementById('regStrategyTargetUid')?.addEventListener('change', () => {
             syncRegulationTargetHint();
             rgScheduleDirtyCheck();
