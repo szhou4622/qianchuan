@@ -1426,6 +1426,109 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
         self.assertEqual("verified", saved["verification_state"])
         self.assertEqual(1, saved["monitor_eligible"])
 
+    def test_same_plan_returned_by_two_classes_cannot_overwrite_first_class(self):
+        misplaced_global = self._target(
+            ad_id="30021",
+            scene="live",
+            system="chengfang",
+        )
+        real_chengfang = self._target(
+            ad_id="30022",
+            scene="live",
+            system="chengfang",
+        )
+        self.db.update(
+            "promotion_target",
+            {
+                "verification_state": "missing",
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+            },
+            where={"target_uid": real_chengfang["target_uid"]},
+        )
+
+        class CapturedProbe:
+            def catalog_rows(self, **kwargs):
+                if kwargs.get("promotion_scene") != "live":
+                    return []
+                return [
+                    {
+                        "ad_id": "30021",
+                        "plan_name": "同一条接口返回计划",
+                        "platform_status": "active",
+                    }
+                ]
+
+            async def verify_catalog_plans(self, _page, **kwargs):
+                verified = [
+                    {
+                        "ad_id": value,
+                        "plan_name": "同一条接口返回计划",
+                        "platform_status": "active",
+                    }
+                    for value in kwargs.get("ad_ids") or []
+                ]
+                return {
+                    "verified": verified,
+                    "rejected": [],
+                    "complete": True,
+                }
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        controller = ServiceController.__new__(ServiceController)
+
+        async def wait_for_complete(_probe, **_kwargs):
+            return {"complete": True, "message": ""}
+
+        controller._wait_catalog_class = wait_for_complete
+        claims = {}
+        common = {
+            "fetcher": SimpleNamespace(page=Page()),
+            "probe": CapturedProbe(),
+            "db": self.db,
+            "owner_username": self.owner,
+            "account": {"aavid": "10001", "account_name": "account"},
+            "promotion_scene": "live",
+            "page_url": "https://qianchuan.jinritemai.com/uni-prom?aavid=10001",
+            "claimed_plan_classes": claims,
+        }
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            global_result = asyncio.run(
+                controller._scan_catalog_class(
+                    **common,
+                    plan_system="global",
+                )
+            )
+            chengfang_result = asyncio.run(
+                controller._scan_catalog_class(
+                    **common,
+                    plan_system="chengfang",
+                )
+            )
+
+        self.assertTrue(global_result["complete"])
+        self.assertFalse(chengfang_result["complete"])
+        self.assertIn("同时返回到多个分类", chengfang_result["message"])
+        saved_global = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": misplaced_global["target_uid"]},
+        )
+        saved_chengfang = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": real_chengfang["target_uid"]},
+        )
+        self.assertEqual("global", saved_global["plan_system"])
+        self.assertEqual("verified", saved_global["verification_state"])
+        self.assertEqual("chengfang", saved_chengfang["plan_system"])
+        self.assertEqual("verified", saved_chengfang["verification_state"])
+
     def test_existing_partial_empty_damage_is_repaired_on_account_load(self):
         target = self._target(
             ad_id="30010",
@@ -1475,6 +1578,80 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
         )
         self.assertEqual("verified", saved["verification_state"])
         self.assertEqual(1, saved["monitor_eligible"])
+
+    def test_existing_cross_class_damage_is_repaired_on_account_load(self):
+        misplaced_global = self._target(
+            ad_id="30031",
+            scene="live",
+            system="chengfang",
+        )
+        real_chengfang = self._target(
+            ad_id="30032",
+            scene="live",
+            system="chengfang",
+        )
+        account = get_qianchuan_account(
+            "10001",
+            owner_username=self.owner,
+            db=self.db,
+        )
+        self.db.update(
+            "promotion_target",
+            {
+                "verification_state": "missing",
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+            },
+            where={"target_uid": real_chengfang["target_uid"]},
+        )
+        self.db.update(
+            "qianchuan_account",
+            {
+                "catalog_status": "partial",
+                "catalog_counts_json": json.dumps(
+                    {
+                        "class_status": {
+                            "global_live": {
+                                "complete": True,
+                                "seen": 1,
+                                "seen_ids": ["30031"],
+                            },
+                            "chengfang_live": {
+                                "complete": True,
+                                "seen": 1,
+                                "seen_ids": ["30031"],
+                            },
+                        }
+                    }
+                ),
+            },
+            where={"account_uid": account["account_uid"]},
+        )
+
+        list_qianchuan_accounts(
+            owner_username=self.owner,
+            db=self.db,
+        )
+
+        saved_global = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": misplaced_global["target_uid"]},
+        )
+        saved_chengfang = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": real_chengfang["target_uid"]},
+        )
+        saved_account = self.db.select_one(
+            "qianchuan_account",
+            where={"account_uid": account["account_uid"]},
+        )
+        self.assertEqual("global", saved_global["plan_system"])
+        self.assertEqual("verified", saved_global["verification_state"])
+        self.assertEqual("chengfang", saved_chengfang["plan_system"])
+        self.assertEqual("verified", saved_chengfang["verification_state"])
+        self.assertEqual("partial", saved_account["catalog_status"])
+        self.assertIn("跨分类重复计划", saved_account["catalog_error"])
 
     def test_expired_cookie_never_bypasses_visible_login(self):
         target = {

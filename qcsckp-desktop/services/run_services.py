@@ -1728,6 +1728,9 @@ class ServiceController:
         promotion_scene: str,
         plan_system: str,
         page_url: str,
+        claimed_plan_classes: Optional[
+            Dict[str, tuple[str, str]]
+        ] = None,
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
         _require_catalog_login(fetcher.page)
@@ -1772,6 +1775,36 @@ class ServiceController:
             promotion_scene=promotion_scene,
             plan_system=plan_system,
         )
+        # 同一个主计划不能在一轮目录同步中同时属于两个分类。千川接口
+        # 在请求字段不被当前页面版本识别时，偶尔会返回上一分类的数据；
+        # 若继续按“当前请求分类”落库，后扫描的乘方会覆盖先扫描的全域，
+        # 页面就会出现计划消失或体系来回跳变。按固定扫描顺序保留首个
+        # 已验证分类，后续冲突分类降级为 partial，并保留其上次可信目录。
+        claims = claimed_plan_classes if claimed_plan_classes is not None else {}
+        current_class = (plan_system, promotion_scene)
+        conflicting_ids = {
+            str(item.get("ad_id") or "").strip()
+            for item in candidates
+            if str(item.get("ad_id") or "").strip() in claims
+            and claims[str(item.get("ad_id") or "").strip()] != current_class
+        }
+        collision_empty = False
+        if conflicting_ids:
+            candidates = [
+                item
+                for item in candidates
+                if str(item.get("ad_id") or "").strip()
+                not in conflicting_ids
+            ]
+            collision_empty = not candidates
+            status = {
+                **status,
+                "complete": False,
+                "message": (
+                    "目录接口把同一计划同时返回到多个分类；"
+                    "已保留先取得的可信分类并等待重新同步"
+                ),
+            }
         _require_catalog_login(fetcher.page)
         existing_rows = {
             str(item.get("ad_id") or ""): item
@@ -1784,7 +1817,9 @@ class ServiceController:
             and str(item.get("plan_system") or "") == plan_system
         }
         suspicious_empty = bool(
-            status.get("complete") and not candidates and existing_rows
+            (status.get("complete") or collision_empty)
+            and not candidates
+            and existing_rows
         )
         if suspicious_empty:
             # A complete empty response is unsafe when this exact account and
@@ -1813,8 +1848,12 @@ class ServiceController:
                 **status,
                 "complete": False,
                 "message": (
-                    "本轮返回0条，但该账户此分类此前已有计划；"
-                    "已保留旧目录并等待重新取得当前账户完整证据"
+                    str(status.get("message") or "")
+                    if collision_empty
+                    else (
+                        "本轮返回0条，但该账户此分类此前已有计划；"
+                        "已保留旧目录并等待重新取得当前账户完整证据"
+                    )
                 ),
             }
         reverify_before = datetime.now() - timedelta(hours=24)
@@ -1893,6 +1932,8 @@ class ServiceController:
             owner_username=owner_username,
             class_complete=bool(status.get("complete")),
         )
+        for ad_id in persisted.get("seen_ids") or []:
+            claims.setdefault(str(ad_id), current_class)
         # Directory completeness comes from the class pagination contract.
         # A single detail failure blocks only that plan from automation; it
         # must not downgrade an otherwise complete account directory.
@@ -1920,6 +1961,7 @@ class ServiceController:
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
         classes: Dict[str, Dict[str, Any]] = {}
+        claimed_plan_classes: Dict[str, tuple[str, str]] = {}
         backend_classes = (
             ("global_product", "product", "global"),
             ("global_live", "live", "global"),
@@ -1996,6 +2038,7 @@ class ServiceController:
                 promotion_scene=promotion_scene,
                 plan_system=plan_system,
                 page_url=str(fetcher.page.url or backend_page_url),
+                claimed_plan_classes=claimed_plan_classes,
             )
 
         if backend_template_available:
@@ -2063,6 +2106,7 @@ class ServiceController:
                 promotion_scene="product",
                 plan_system="global",
                 page_url=page_url,
+                claimed_plan_classes=claimed_plan_classes,
             )
         else:
             classes["global_product"] = {
@@ -2110,6 +2154,7 @@ class ServiceController:
                 promotion_scene="live",
                 plan_system="global",
                 page_url=str(fetcher.page.url or page_url),
+                claimed_plan_classes=claimed_plan_classes,
             )
         else:
             classes["global_live"] = {
@@ -2171,6 +2216,7 @@ class ServiceController:
                     promotion_scene="product",
                     plan_system="chengfang",
                     page_url=str(fetcher.page.url or ""),
+                    claimed_plan_classes=claimed_plan_classes,
                 )
             else:
                 classes["chengfang_product"] = {
@@ -2232,6 +2278,7 @@ class ServiceController:
                     promotion_scene="live",
                     plan_system="chengfang",
                     page_url=str(fetcher.page.url or ""),
+                    claimed_plan_classes=claimed_plan_classes,
                 )
             else:
                 classes["chengfang_live"] = {

@@ -368,7 +368,167 @@ def _initialize_directory_selection(store: SQLiteStore) -> None:
         "UPDATE qianchuan_account SET directory_selected=0, enabled=0, "
         "report_enabled=0 WHERE lower(COALESCE(last_status,''))='removed'"
     )
+    _repair_conflicting_catalog_classes(store)
     _repair_suspicious_empty_catalog_targets(store)
+
+
+def _repair_conflicting_catalog_classes(store: SQLiteStore) -> None:
+    """Repair rows written by the old cross-class replay bug.
+
+    Some Qianchuan page versions ignore an unsupported dataset field and
+    return the previous catalog class with HTTP 200.  Older builds trusted the
+    requested class name, so a later Chengfang scan could overwrite a verified
+    Global plan.  The persisted per-class ``seen_ids`` let us detect this
+    narrowly: only the same ad id claimed by multiple classes is repaired.
+    """
+    from api.promotion_targets import target_eligibility
+
+    class_order = (
+        ("global_product", "global", "product"),
+        ("global_live", "global", "live"),
+        ("chengfang_product", "chengfang", "product"),
+        ("chengfang_live", "chengfang", "live"),
+    )
+    accounts = store.select(
+        "qianchuan_account",
+        fields=(
+            "account_uid,catalog_status,catalog_error,catalog_counts_json"
+        ),
+        where={"directory_selected": 1},
+    )
+    for account in accounts:
+        try:
+            counts = json.loads(str(account.get("catalog_counts_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        states = counts.get("class_status") if isinstance(counts, dict) else None
+        if not isinstance(states, dict):
+            continue
+        first_claim: Dict[str, tuple[str, str]] = {}
+        losing_classes = set()
+        collisions = set()
+        for class_key, system, scene in class_order:
+            state = states.get(class_key)
+            if not isinstance(state, dict) or not bool(state.get("complete")):
+                continue
+            for value in state.get("seen_ids") or []:
+                ad_id = str(value or "").strip()
+                if not ad_id.isdigit():
+                    continue
+                claimed = first_claim.get(ad_id)
+                if claimed is None:
+                    first_claim[ad_id] = (system, scene)
+                elif claimed != (system, scene):
+                    collisions.add(ad_id)
+                    losing_classes.add((system, scene))
+        if not collisions:
+            continue
+
+        account_uid = str(account.get("account_uid") or "")
+        for ad_id in collisions:
+            target = store.select_one(
+                "promotion_target",
+                where={
+                    "account_uid": account_uid,
+                    "ad_id": ad_id,
+                },
+            )
+            if not target or not str(target.get("last_verified_at") or "").strip():
+                continue
+            system, scene = first_claim[ad_id]
+            try:
+                capability = json.loads(str(target.get("capability_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                capability = {}
+            eligibility = target_eligibility(
+                promotion_scene=scene,
+                plan_system=system,
+                platform_status=target.get("platform_status"),
+                verification_state="verified",
+                capability=capability if isinstance(capability, dict) else {},
+            )
+            store.update(
+                "promotion_target",
+                {
+                    "plan_system": system,
+                    "promotion_scene": scene,
+                    "verification_state": "verified",
+                    "monitor_eligible": 1 if eligibility["monitor_eligible"] else 0,
+                    "retarget_eligible": 1 if eligibility["retarget_eligible"] else 0,
+                    "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
+                    "ineligible_reason": str(
+                        eligibility.get("ineligible_reason") or ""
+                    )[:1000],
+                },
+                where={"target_uid": target["target_uid"]},
+            )
+
+        # A losing class did not provide trustworthy disappearance evidence.
+        # Restore only rows that still carry an earlier successful exact-detail
+        # verification and no verification error.
+        for system, scene in losing_classes:
+            targets = store.select(
+                "promotion_target",
+                where={
+                    "account_uid": account_uid,
+                    "plan_system": system,
+                    "promotion_scene": scene,
+                    "verification_state": "missing",
+                },
+            )
+            for target in targets:
+                if (
+                    not str(target.get("last_verified_at") or "").strip()
+                    or str(target.get("last_verification_error") or "").strip()
+                ):
+                    continue
+                try:
+                    capability = json.loads(
+                        str(target.get("capability_json") or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    capability = {}
+                eligibility = target_eligibility(
+                    promotion_scene=scene,
+                    plan_system=system,
+                    platform_status=target.get("platform_status"),
+                    verification_state="verified",
+                    capability=capability if isinstance(capability, dict) else {},
+                )
+                store.update(
+                    "promotion_target",
+                    {
+                        "verification_state": "verified",
+                        "monitor_eligible": (
+                            1 if eligibility["monitor_eligible"] else 0
+                        ),
+                        "retarget_eligible": (
+                            1 if eligibility["retarget_eligible"] else 0
+                        ),
+                        "stop_eligible": 1 if eligibility["stop_eligible"] else 0,
+                        "ineligible_reason": str(
+                            eligibility.get("ineligible_reason") or ""
+                        )[:1000],
+                    },
+                    where={"target_uid": target["target_uid"]},
+                )
+
+        old_error = str(account.get("catalog_error") or "").strip()
+        collision_error = "目录接口返回跨分类重复计划，已保留先取得的可信分类"
+        store.update(
+            "qianchuan_account",
+            {
+                "catalog_status": "partial",
+                "catalog_error": (
+                    old_error
+                    if collision_error in old_error
+                    else "；".join(value for value in (old_error, collision_error) if value)[
+                        :2000
+                    ]
+                ),
+            },
+            where={"account_uid": account_uid},
+        )
 
 
 def _repair_suspicious_empty_catalog_targets(store: SQLiteStore) -> None:
