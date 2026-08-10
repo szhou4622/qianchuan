@@ -373,6 +373,187 @@ class RuntimeContext:
             params,
         )
 
+    def dashboard_data(
+        self,
+        tool_user_id: str,
+        *,
+        aavid: str | None = None,
+        target_uid: str | None = None,
+        keyword: str | None = None,
+        material_uid: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        """Return the original-style material dashboard from trusted V1A reads only."""
+
+        page = max(1, int(page))
+        page_size = min(100, max(10, int(page_size)))
+        clauses = [
+            "m.tool_user_id=?",
+            "a.removed_at IS NULL",
+            "a.enabled=1",
+            "p.monitor_enabled=1",
+        ]
+        params: list[Any] = [tool_user_id]
+        if aavid:
+            clauses.append("m.aavid=?")
+            params.append(aavid)
+        if target_uid:
+            clauses.append("p.target_uid=?")
+            params.append(target_uid)
+        if keyword:
+            clauses.append(
+                "(m.material_name LIKE ? OR m.material_id LIKE ? OR p.plan_name LIKE ?)"
+            )
+            like = f"%{keyword}%"
+            params.extend([like, like, like])
+        where_sql = " AND ".join(clauses)
+        joins = """
+            FROM material_identity m
+            JOIN source_plan p
+              ON p.tool_user_id=m.tool_user_id AND p.aavid=m.aavid AND p.ad_id=m.ad_id
+            JOIN advertiser_account a
+              ON a.tool_user_id=m.tool_user_id AND a.aavid=m.aavid
+            LEFT JOIN latest_metrics lm ON lm.material_uid=m.material_uid
+            LEFT JOIN material_status_latest ms ON ms.material_uid=m.material_uid
+        """
+        total_row = self.database.query_one(
+            f"SELECT COUNT(*) AS c {joins} WHERE {where_sql}", params
+        ) or {"c": 0}
+        total = int(total_row.get("c") or 0)
+        summary = self.database.query_one(
+            f"""
+            SELECT COALESCE(SUM(lm.spend_cent), 0) AS spend_cent,
+                   COALESCE(SUM(lm.gmv_cent), 0) AS gmv_cent,
+                   COALESCE(SUM(lm.order_count), 0) AS order_count,
+                   MAX(lm.observed_at_beijing) AS observed_at_beijing
+            {joins}
+            WHERE {where_sql}
+            """,
+            params,
+        ) or {}
+        spend_cent = int(summary.get("spend_cent") or 0)
+        gmv_cent = int(summary.get("gmv_cent") or 0)
+        summary["roi_decimal"] = (
+            f"{gmv_cent / spend_cent:.4f}" if spend_cent > 0 else None
+        )
+        materials = self.database.query_all(
+            f"""
+            SELECT m.material_uid, m.material_id, m.material_name,
+                   m.material_created_at, m.last_seen_at,
+                   a.account_name, m.aavid,
+                   p.target_uid, p.ad_id, p.plan_name, p.plan_system,
+                   p.promotion_scene, p.platform_status,
+                   COALESCE(lm.spend_cent, 0) AS spend_cent,
+                   COALESCE(lm.order_count, 0) AS order_count,
+                   COALESCE(lm.gmv_cent, 0) AS gmv_cent,
+                   lm.roi_decimal, lm.observed_at_beijing,
+                   ms.delivery_status, ms.show_status, ms.audit_status,
+                   ms.block_status, ms.is_effectively_deliverable,
+                   MAX(
+                       COALESCE(lm.spend_cent, 0) - COALESCE((
+                           SELECT hm.spend_cent
+                           FROM hourly_metrics hm
+                           WHERE hm.tool_user_id=m.tool_user_id
+                             AND hm.aavid=m.aavid AND hm.ad_id=m.ad_id
+                             AND hm.material_id=m.material_id
+                             AND hm.business_hour < substr(lm.observed_at_beijing, 1, 13)
+                           ORDER BY hm.business_hour DESC LIMIT 1
+                       ), COALESCE(lm.spend_cent, 0)),
+                       0
+                   ) AS hourly_spend_cent
+            {joins}
+            WHERE {where_sql}
+            ORDER BY COALESCE(lm.spend_cent, 0) DESC,
+                     COALESCE(lm.order_count, 0) DESC, m.material_id
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, (page - 1) * page_size],
+        )
+        top_spend = self.database.query_all(
+            f"""
+            SELECT m.material_uid, m.material_id, m.material_name,
+                   COALESCE(lm.spend_cent, 0) AS spend_cent
+            {joins}
+            WHERE {where_sql}
+            ORDER BY COALESCE(lm.spend_cent, 0) DESC, m.material_id
+            LIMIT 20
+            """,
+            params,
+        )
+
+        trend_clauses = [
+            "hm.tool_user_id=?",
+            "a.removed_at IS NULL",
+            "a.enabled=1",
+            "p.monitor_enabled=1",
+        ]
+        trend_params: list[Any] = [tool_user_id]
+        if aavid:
+            trend_clauses.append("hm.aavid=?")
+            trend_params.append(aavid)
+        if target_uid:
+            trend_clauses.append("p.target_uid=?")
+            trend_params.append(target_uid)
+        selected_material = None
+        if material_uid:
+            selected_material = self.database.query_one(
+                "SELECT material_uid, material_id, material_name FROM material_identity WHERE tool_user_id=? AND material_uid=?",
+                (tool_user_id, material_uid),
+            )
+            if selected_material:
+                trend_clauses.append(
+                    "hm.material_id=? AND hm.aavid IN (SELECT aavid FROM material_identity WHERE tool_user_id=? AND material_uid=?) AND hm.ad_id IN (SELECT ad_id FROM material_identity WHERE tool_user_id=? AND material_uid=?)"
+                )
+                trend_params.extend(
+                    [
+                        selected_material["material_id"],
+                        tool_user_id,
+                        material_uid,
+                        tool_user_id,
+                        material_uid,
+                    ]
+                )
+        trend = self.database.query_all(
+            """
+            SELECT * FROM (
+                SELECT hm.business_hour,
+                       SUM(hm.spend_cent) AS spend_cent,
+                       SUM(hm.gmv_cent) AS gmv_cent,
+                       SUM(hm.order_count) AS order_count,
+                       CASE WHEN SUM(hm.spend_cent)>0
+                            THEN ROUND(CAST(SUM(hm.gmv_cent) AS REAL) / SUM(hm.spend_cent), 4)
+                            ELSE NULL END AS roi_decimal
+                FROM hourly_metrics hm
+                JOIN source_plan p
+                  ON p.tool_user_id=hm.tool_user_id AND p.aavid=hm.aavid AND p.ad_id=hm.ad_id
+                JOIN advertiser_account a
+                  ON a.tool_user_id=hm.tool_user_id AND a.aavid=hm.aavid
+                WHERE """
+            + " AND ".join(trend_clauses)
+            + """
+                GROUP BY hm.business_hour
+                ORDER BY hm.business_hour DESC
+                LIMIT 24
+            ) recent
+            ORDER BY business_hour ASC
+            """,
+            trend_params,
+        )
+        return {
+            "summary": summary,
+            "materials": materials,
+            "top_spend": top_spend,
+            "trend": trend,
+            "selected_material": selected_material,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "pages": max(1, (total + page_size - 1) // page_size),
+            },
+        }
+
     def _job_qianchuan_login(self, context: JobContext) -> dict[str, Any]:
         assert context.tool_user_id
         return self.browser.open_visible_login_and_capture(

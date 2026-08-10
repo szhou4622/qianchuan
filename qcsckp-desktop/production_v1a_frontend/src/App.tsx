@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as echarts from "echarts";
 import {
   Button,
   Checkbox,
@@ -24,8 +25,12 @@ import {
   HeartPulseRegular,
   KeyRegular,
   LockClosedRegular,
+  MoneyRegular,
   OpenRegular,
+  PanelLeftContractRegular,
+  PanelLeftExpandRegular,
   PlayRegular,
+  SearchRegular,
   ShieldCheckmarkRegular,
   SignOutRegular,
 } from "@fluentui/react-icons";
@@ -40,6 +45,7 @@ import {
 import type { Account, Health, Job, Plan } from "./types";
 
 type PageKey =
+  | "dashboard"
   | "health"
   | "accounts"
   | "feishu"
@@ -54,11 +60,12 @@ type Notice = {
 };
 
 const nav: Array<{ key: PageKey; label: string; icon: any }> = [
-  { key: "health", label: "运行健康", icon: HeartPulseRegular },
-  { key: "accounts", label: "千川账户", icon: AppsListDetailRegular },
+  { key: "dashboard", label: "数据大屏", icon: DataTrendingRegular },
+  { key: "health", label: "服务控制", icon: HeartPulseRegular },
+  { key: "accounts", label: "千川账户管理", icon: AppsListDetailRegular },
   { key: "feishu", label: "飞书绑定", icon: BotRegular },
-  { key: "retarget", label: "追投策略", icon: PlayRegular },
-  { key: "stop", label: "停投策略", icon: ShieldCheckmarkRegular },
+  { key: "retarget", label: "规则化追投", icon: PlayRegular },
+  { key: "stop", label: "规则化停投", icon: ShieldCheckmarkRegular },
   {
     key: "tasks",
     label: "候选与任务中心",
@@ -96,7 +103,10 @@ const createCondition = (index = 0): StrategyCondition => ({
 function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [authenticated, setAuthenticated] = useState(hasAdminSession());
-  const [page, setPage] = useState<PageKey>("health");
+  const [page, setPage] = useState<PageKey>("dashboard");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => window.localStorage.getItem("qcsckp-sidebar-collapsed") === "1",
+  );
   const [notice, setNotice] = useState<Notice | null>(null);
   const [jobs, setJobs] = useState<Record<string, Job>>({});
   const [refreshKey, setRefreshKey] = useState(0);
@@ -199,57 +209,76 @@ function App() {
     );
 
   const ActiveIcon =
-    nav.find((item) => item.key === page)?.icon ?? HeartPulseRegular;
+    nav.find((item) => item.key === page)?.icon ?? DataTrendingRegular;
+  const username = String((health.authentication as any)?.username || "本机用户");
   return (
-    <div className="app-shell">
+    <div className={sidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"}>
       <aside className="sidebar">
         <div className="brand">
-          <ShieldCheckmarkRegular fontSize={26} />
+          <div className="brand-mark"><DataTrendingRegular fontSize={21} /></div>
           <div>
-            <strong>千川生产工具</strong>
-            <small>Production V1A</small>
+            <strong>千川素材看盘工具</strong>
           </div>
-        </div>
-        <div className="read-only-seal">
-          <LockClosedRegular /> 可信只读 · 真实写入关闭
+          <button
+            className="sidebar-collapse"
+            aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            onClick={() => {
+              const next = !sidebarCollapsed;
+              setSidebarCollapsed(next);
+              window.localStorage.setItem("qcsckp-sidebar-collapsed", next ? "1" : "0");
+            }}
+          >
+            {sidebarCollapsed ? <PanelLeftExpandRegular /> : <PanelLeftContractRegular />}
+          </button>
         </div>
         <nav aria-label="主导航">
-          {nav.map((item, index) => {
+          {nav.map((item) => {
             const Icon = item.icon;
             return (
               <button
                 key={item.key}
                 className={page === item.key ? "nav-item active" : "nav-item"}
                 onClick={() => setPage(item.key)}
+                title={sidebarCollapsed ? item.label : undefined}
               >
-                <span>{index + 1}</span>
                 <Icon />
                 <b>{item.label}</b>
               </button>
             );
           })}
         </nav>
-        <button
-          className="nav-item logout"
-          onClick={() => {
-            void command("/api/v1/admin/logout", {})
-              .catch(() => undefined)
-              .finally(() => {
-                setAdminSession("");
-                setAuthenticated(false);
-              });
-          }}
-        >
-          <span>·</span>
-          <SignOutRegular />
-          <b>退出工具账号</b>
-        </button>
+        <div className="sidebar-footer">
+          <button className="sidebar-user" title={username}>
+            <span className="sidebar-avatar">{username.slice(0, 1).toUpperCase()}</span>
+            <span className="sidebar-user-copy">
+              <small>账号：<strong>{username}</strong></small>
+              <small>状态：<em>正常</em></small>
+            </span>
+          </button>
+          <div className="sidebar-version">
+            <span>版本号：{health.product_version}</span>
+            <button
+              onClick={() => {
+                void command("/api/v1/admin/logout", {})
+                  .catch(() => undefined)
+                  .finally(() => {
+                    setAdminSession("");
+                    setAuthenticated(false);
+                  });
+              }}
+              title="退出工具账号"
+            >
+              <SignOutRegular /> <b>退出</b>
+            </button>
+          </div>
+        </div>
       </aside>
       <main className="workspace">
         <header className="topbar">
           <div>
             <div className="eyebrow">
-              <ActiveIcon /> 生产主流程
+              <ActiveIcon /> 千川素材看盘工具
             </div>
             <h1>{nav.find((item) => item.key === page)?.label}</h1>
           </div>
@@ -259,6 +288,9 @@ function App() {
             <small>Schema {health.schema_version}</small>
           </div>
         </header>
+        <div className="environment-banner">
+          <LockClosedRegular /> V1A只读开发环境 · 规则命中只产生模拟候选，不执行千川操作
+        </div>
         {notice && (
           <div className={`notice ${notice.tone}`} role="status">
             <span>{notice.message}</span>
@@ -268,6 +300,7 @@ function App() {
           </div>
         )}
         <section className="page-content">
+          {page === "dashboard" && <DashboardPage refreshKey={refreshKey} />}
           {page === "health" && (
             <HealthPage
               health={health}
@@ -2322,78 +2355,191 @@ function OperationsPage({
 function DashboardPage({ refreshKey }: { refreshKey: number }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [plans, setPlans] = useState<Plan[]>([]);
-  const [candidates, setCandidates] = useState<any[]>([]);
+  const [aavid, setAavid] = useState("");
+  const [targetUid, setTargetUid] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [submittedKeyword, setSubmittedKeyword] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [selectedMaterialUid, setSelectedMaterialUid] = useState("");
+  const [dashboard, setDashboard] = useState<any>({
+    summary: {}, materials: [], trend: [], top_spend: [],
+    pagination: { page: 1, page_size: 50, total: 0, pages: 1 },
+  });
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [clock, setClock] = useState("");
+  const requestVersion = useRef(0);
+
   useEffect(() => {
     void Promise.all([
       api<Account[]>("/api/v1/accounts"),
       api<Plan[]>("/api/v1/plans"),
-      api<any[]>("/api/v1/candidates"),
-    ]).then(([a, p, c]) => {
+    ]).then(([a, p]) => {
       setAccounts(a);
       setPlans(p);
-      setCandidates(c);
     });
   }, [refreshKey]);
-  const complete = accounts.filter(
-    (account) => account.catalog_status === "complete",
-  ).length;
+  useEffect(() => {
+    const update = () => setClock(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const load = useCallback(async () => {
+    const version = ++requestVersion.current;
+    setLoading(true);
+    setLoadError("");
+    const query = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    if (aavid) query.set("aavid", aavid);
+    if (targetUid) query.set("target_uid", targetUid);
+    if (submittedKeyword) query.set("keyword", submittedKeyword);
+    if (selectedMaterialUid) query.set("material_uid", selectedMaterialUid);
+    try {
+      const data = await api<any>(`/api/v1/dashboard?${query.toString()}`);
+      if (version === requestVersion.current) setDashboard(data);
+    } catch (error) {
+      if (version === requestVersion.current) setLoadError(errorMessage(error));
+    } finally {
+      if (version === requestVersion.current) setLoading(false);
+    }
+  }, [aavid, targetUid, submittedKeyword, selectedMaterialUid, page, pageSize]);
+  useEffect(() => { void load(); }, [load, refreshKey]);
+
+  const visiblePlans = plans.filter((plan) => !aavid || plan.aavid === aavid);
+  const selectedLabel = dashboard.selected_material?.material_name
+    || dashboard.selected_material?.material_id
+    || "全部监控素材";
+  const summary = dashboard.summary || {};
+  const materials = dashboard.materials || [];
+  const pagination = dashboard.pagination || { page: 1, pages: 1, total: 0 };
   return (
-    <>
-      <div className="metric-grid">
-        <Metric
-          label="主动添加账户"
-          value={`${accounts.length}`}
-          detail={`${complete} 个目录完整`}
-        />
-        <Metric
-          label="已登记计划"
-          value={`${plans.length}`}
-          detail={`${plans.filter((plan) => plan.monitor_enabled).length} 个参与监控`}
-        />
-        <Metric
-          label="可监控计划"
-          value={`${plans.filter((plan) => plan.monitor_eligible).length}`}
-          detail="四类身份与状态已确认"
-        />
-        <Metric
-          label="模拟候选批次"
-          value={`${candidates.length}`}
-          detail="不计入真实追投或停投"
-        />
+    <div className="legacy-dashboard">
+      <div className="dashboard-summary-strip">
+        <div><MoneyRegular /><span>整体消耗</span><strong>¥{formatCent(summary.spend_cent)}</strong></div>
+        <div><DataTrendingRegular /><span>整体成交金额</span><strong>¥{formatCent(summary.gmv_cent)}</strong></div>
+        <div><ClipboardTaskListLtrRegular /><span>成交订单数</span><strong>{Number(summary.order_count || 0).toLocaleString()}</strong></div>
+        <div><HeartPulseRegular /><span>整体支付ROI</span><strong>{formatDecimal(summary.roi_decimal)}</strong></div>
+        <small>最新入库：{summary.observed_at_beijing || "暂无数据"}</small>
       </div>
-      <Panel
-        title="只读能力概览"
-        description="数据大屏是次级观察页面，不承担首次配置入口。"
-      >
-        <div className="dashboard-bars">
-          {["全域·推商品", "全域·推直播", "乘方·推商品", "乘方·推直播"].map(
-            (label, index) => {
-              const keys = [
-                ["global", "product"],
-                ["global", "live"],
-                ["chengfang", "product"],
-                ["chengfang", "live"],
-              ][index];
-              const count = plans.filter(
-                (plan) =>
-                  plan.plan_system === keys[0] &&
-                  plan.promotion_scene === keys[1],
-              ).length;
-              return (
-                <div key={label}>
-                  <span>{label}</span>
-                  <div>
-                    <i style={{ width: `${Math.min(100, count * 8)}%` }} />
-                  </div>
-                  <strong>{count}</strong>
-                </div>
-              );
-            },
-          )}
-        </div>
-      </Panel>
-    </>
+      {loadError && <InlineStatus tone="danger">{loadError}</InlineStatus>}
+      <div className="dashboard-workbench">
+        <aside className="dashboard-chart-column">
+          <DashboardLineChart title="素材消耗曲线" color="#60a5fa" rows={dashboard.trend || []} field="spend_cent" money selectedLabel={selectedLabel} />
+          <DashboardLineChart title="整体支付ROI曲线" color="#34d399" rows={dashboard.trend || []} field="roi_decimal" selectedLabel={selectedLabel} />
+          <DashboardLineChart title="整体成交金额曲线" color="#f4b860" rows={dashboard.trend || []} field="gmv_cent" money selectedLabel={selectedLabel} />
+          <DashboardSpendChart rows={dashboard.top_spend || []} total={Number(summary.spend_cent || 0)} />
+        </aside>
+        <section className="dashboard-ranking-panel">
+          <header className="dashboard-ranking-toolbar">
+            <div className="dashboard-ranking-title">
+              <DataTrendingRegular />
+              <span><strong>实时素材消耗榜单</strong><small>{selectedLabel}</small></span>
+            </div>
+            <div className="dashboard-toolbar-controls">
+              <Select value={aavid} onChange={(_, data) => { setAavid(data.value); setTargetUid(""); setSelectedMaterialUid(""); setPage(1); }}>
+                <option value="">全部千川账户</option>
+                {accounts.filter((account) => account.enabled).map((account) => <option value={account.aavid} key={account.aavid}>{account.account_name}</option>)}
+              </Select>
+              <Select value={targetUid} onChange={(_, data) => { setTargetUid(data.value); setSelectedMaterialUid(""); setPage(1); }}>
+                <option value="">全部监控计划</option>
+                {visiblePlans.filter((plan) => plan.monitor_enabled).map((plan) => <option value={plan.target_uid} key={plan.target_uid}>{plan.plan_name}</option>)}
+              </Select>
+              <Input
+                value={keyword}
+                placeholder="素材名称或ID"
+                contentAfter={<SearchRegular />}
+                onChange={(_, data) => setKeyword(data.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { setSubmittedKeyword(keyword.trim()); setPage(1); } }}
+              />
+              <Button appearance="subtle" icon={<ArrowClockwiseRegular />} onClick={() => void load()} disabled={loading}>刷新</Button>
+              <span className="dashboard-cycle">流速周期：1小时</span>
+              <time>{clock}</time>
+            </div>
+          </header>
+          <div className="dashboard-table-scroll">
+            {loading && !materials.length ? <LoadingState label="正在读取监控素材" /> : materials.length ? (
+              <table className="dashboard-material-table">
+                <thead><tr>
+                  <th>素材信息</th><th>千川账户 / 计划</th><th>计划类型</th>
+                  <th>整体消耗(元)</th><th>时段流速</th><th>整体支付ROI</th>
+                  <th>整体成交金额</th><th>成交订单数</th><th>投放状态</th><th>最新入库时间</th>
+                </tr></thead>
+                <tbody>{materials.map((row: any) => (
+                  <tr
+                    key={row.material_uid}
+                    className={selectedMaterialUid === row.material_uid ? "selected" : ""}
+                    onClick={() => setSelectedMaterialUid((current) => current === row.material_uid ? "" : row.material_uid)}
+                  >
+                    <td><strong>{row.material_name || "未命名视频素材"}</strong><small>ID：{row.material_id}</small></td>
+                    <td><strong>{row.account_name}</strong><small>{row.plan_name}</small></td>
+                    <td><span className="dashboard-type-tag">{planSystemName[row.plan_system]} · {sceneName[row.promotion_scene]}</span></td>
+                    <td className="number">{formatCent(row.spend_cent)}</td>
+                    <td className="number velocity">+{formatCent(row.hourly_spend_cent)}</td>
+                    <td className="number">{formatDecimal(row.roi_decimal)}</td>
+                    <td className="number">{formatCent(row.gmv_cent)}</td>
+                    <td className="number">{Number(row.order_count || 0).toLocaleString()}</td>
+                    <td><span className={row.is_effectively_deliverable ? "delivery-state active" : "delivery-state inactive"}>{row.is_effectively_deliverable ? "正常投放" : (row.delivery_status || "不可投放")}</span></td>
+                    <td>{row.observed_at_beijing || "—"}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            ) : <Empty title="暂无监控素材" description="请先在千川账户管理中启用账户、勾选监控计划并完成一次只读采集。" />}
+          </div>
+          <footer className="dashboard-pagination">
+            <span>共 <strong>{pagination.total || 0}</strong> 条数据</span>
+            <div>
+              <label>每页 <Select value={String(pageSize)} onChange={(_, data) => { setPageSize(Number(data.value)); setPage(1); }}><option value="20">20</option><option value="50">50</option><option value="100">100</option></Select> 条</label>
+              <Button disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>上一页</Button>
+              <span>{page} / {pagination.pages || 1}</span>
+              <Button disabled={page >= Number(pagination.pages || 1)} onClick={() => setPage((value) => value + 1)}>下一页</Button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </div>
   );
+}
+
+function DashboardLineChart({
+  title, color, rows, field, money = false, selectedLabel,
+}: {
+  title: string; color: string; rows: any[]; field: string; money?: boolean; selectedLabel: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    const chart = echarts.init(ref.current);
+    chart.setOption({
+      animationDuration: 280,
+      grid: { left: 46, right: 14, top: 18, bottom: 28 },
+      tooltip: { trigger: "axis", valueFormatter: (value: any) => money ? `¥${(Number(value) / 100).toFixed(2)}` : formatDecimal(value) },
+      xAxis: { type: "category", data: rows.map((row) => String(row.business_hour || "").slice(5)), axisLabel: { color: "#6f829b", fontSize: 10 }, axisLine: { lineStyle: { color: "#26394f" } } },
+      yAxis: { type: "value", axisLabel: { color: "#6f829b", fontSize: 10, formatter: (value: number) => money ? (value / 100).toFixed(0) : value.toFixed(1) }, splitLine: { lineStyle: { color: "rgba(71, 91, 116, .22)" } } },
+      series: [{ type: "line", smooth: true, showSymbol: rows.length < 8, data: rows.map((row) => Number(row[field] || 0)), lineStyle: { color, width: 2 }, itemStyle: { color }, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: `${color}44` }, { offset: 1, color: `${color}05` }]) } }],
+    });
+    const observer = new ResizeObserver(() => chart.resize());
+    observer.observe(ref.current);
+    return () => { observer.disconnect(); chart.dispose(); };
+  }, [rows, field, color, money]);
+  return <section className="dashboard-chart-card"><header><strong>{title}</strong><small>{selectedLabel}</small></header><div ref={ref} className="dashboard-chart" /></section>;
+}
+
+function DashboardSpendChart({ rows, total }: { rows: any[]; total: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    const chart = echarts.init(ref.current);
+    chart.setOption({
+      tooltip: { trigger: "item", formatter: "{b}<br/>¥{c} · {d}%" },
+      series: [{ type: "pie", radius: ["52%", "72%"], center: ["50%", "55%"], label: { show: false }, itemStyle: { borderColor: "#0d192a", borderWidth: 2 }, data: rows.map((row) => ({ name: row.material_name || row.material_id, value: Number(row.spend_cent || 0) / 100 })) }],
+    });
+    const observer = new ResizeObserver(() => chart.resize());
+    observer.observe(ref.current);
+    return () => { observer.disconnect(); chart.dispose(); };
+  }, [rows]);
+  return <section className="dashboard-chart-card dashboard-spend-card"><header><strong>Top 20 消耗占比</strong><small>整体消耗 ¥{formatCent(total)}</small></header><div ref={ref} className="dashboard-chart" /></section>;
 }
 
 function RecoveryPage({
@@ -3030,6 +3176,10 @@ function formatCell(value: unknown) {
 function formatCent(value: unknown) {
   const number = Number(value);
   return Number.isFinite(number) ? (number / 100).toFixed(2) : "0.00";
+}
+function formatDecimal(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(2) : "—";
 }
 function catalogLabel(status: string) {
   return (

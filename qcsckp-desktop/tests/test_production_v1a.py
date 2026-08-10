@@ -39,7 +39,7 @@ from production_v1a.security import (
 )
 from production_v1a.service_main import start_service
 from production_v1a.single_instance import mutex_name
-from production_v1a.runtime import V1AScheduler, collection_interval_for_relation_count
+from production_v1a.runtime import RuntimeContext, V1AScheduler, collection_interval_for_relation_count
 from production_v1a.storage import RuntimeDatabase, StorageWriter
 from production_v1a.strategies import StrategyService
 from production_v1a.timeutils import beijing_iso, business_date, utc_iso
@@ -229,6 +229,40 @@ class ProductionV1ASafetyTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(adapter.adapter_name, row["adapter_name"])
         self.assertNotIn("raw_payload", row)
+
+    def test_dashboard_returns_only_enabled_monitored_material_metrics(self):
+        target = self.fx.seed_target()
+        self.fx.seed_material_batch(
+            target,
+            [
+                NormalizedMaterial(
+                    "1001", "2001", "m1", "视频1", None,
+                    "1", "1", None, "1", "0", True, True, (),
+                    10_000, 2, 30_000, "3", {},
+                ),
+                NormalizedMaterial(
+                    "1001", "2001", "m2", "视频2", None,
+                    "1", "1", None, "1", "0", True, True, (),
+                    5_000, 1, 10_000, "2", {},
+                ),
+            ],
+        )
+        runtime = SimpleNamespace(database=self.fx.database)
+        payload = RuntimeContext.dashboard_data(
+            runtime, self.fx.user, aavid="1001", target_uid=target
+        )
+        self.assertEqual(2, payload["pagination"]["total"])
+        self.assertEqual(15_000, payload["summary"]["spend_cent"])
+        self.assertEqual(40_000, payload["summary"]["gmv_cent"])
+        self.assertEqual("2.6667", payload["summary"]["roi_decimal"])
+        self.assertEqual(["m1", "m2"], [row["material_id"] for row in payload["materials"]])
+        self.assertEqual(2, len(payload["top_spend"]))
+        self.fx.writer.execute(
+            "UPDATE advertiser_account SET enabled=0 WHERE tool_user_id=? AND aavid='1001'",
+            (self.fx.user,),
+        )
+        hidden = RuntimeContext.dashboard_data(runtime, self.fx.user)
+        self.assertEqual(0, hidden["pagination"]["total"])
 
     def test_suspicious_empty_catalog_keeps_last_complete_plan(self):
         target = self.fx.seed_target(aavid="3001", ad_id="4001")

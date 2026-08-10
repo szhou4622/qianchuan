@@ -250,6 +250,16 @@ class V1ARequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/v1/accounts":
             data = runtime.list_accounts(tool_user_id)
+        elif path == "/api/v1/dashboard":
+            data = runtime.dashboard_data(
+                tool_user_id,
+                aavid=query.get("aavid"),
+                target_uid=query.get("target_uid"),
+                keyword=query.get("keyword"),
+                material_uid=query.get("material_uid"),
+                page=int(query.get("page") or 1),
+                page_size=int(query.get("page_size") or 50),
+            )
         elif path == "/api/v1/plans":
             data = runtime.list_plans(
                 tool_user_id,
