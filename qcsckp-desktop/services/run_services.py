@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -539,11 +540,8 @@ async def _qianchuan_authenticated_shell_visible(page: Any) -> bool:
     """登录成功总闸：必须位于千川域名且出现登录后的账户导航。"""
     if page is None or _is_qianchuan_login_url(getattr(page, "url", "")):
         return False
-    try:
-        if await page.is_closed():
-            return False
-    except Exception:
-        pass
+    if await _page_is_closed(page):
+        return False
     for selector in (
         "#navigator-right-account",
         ".qc-ui-navigator-account",
@@ -663,6 +661,63 @@ def _extract_aavid_adid(url: str) -> Tuple[Optional[str], Optional[str]]:
     aavid = params.get("aavid") or params.get("aavid".upper()) or params.get("aAvid")
     ad_id = params.get("adId") or params.get("ad_id") or params.get("adID")
     return aavid, ad_id
+
+
+def _trusted_qianchuan_detail_ids(
+    url: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return IDs only for the exact, trusted Qianchuan plan-detail route."""
+    text = str(url or "").strip()
+    parsed = urlparse(text)
+    if (
+        parsed.scheme != "https"
+        or str(parsed.netloc or "").lower() != "qianchuan.jinritemai.com"
+        or str(parsed.path or "").rstrip("/") != "/uni-prom/detail"
+    ):
+        return None, None
+    aavid, ad_id = _extract_aavid_adid(text)
+    if not str(aavid or "").isdigit() or not str(ad_id or "").isdigit():
+        return None, None
+    return str(aavid), str(ad_id)
+
+
+async def _page_is_closed(page: Any) -> bool:
+    """Support both sync and async Playwright page.is_closed implementations."""
+    if page is None:
+        return True
+    checker = getattr(page, "is_closed", None)
+    if not callable(checker):
+        return False
+    try:
+        result = checker()
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+    except Exception:
+        return False
+
+
+async def _visible_qianchuan_login_failure(page: Any) -> str:
+    """Read only visible, explicit authentication failures from the login page."""
+    try:
+        text = await page.locator("body").inner_text(timeout=1_000)
+    except Exception:
+        return ""
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    for marker in (
+        "账号或密码错误",
+        "用户名或密码错误",
+        "密码输入错误",
+        "验证码错误",
+        "二维码已失效",
+        "扫码登录失败",
+        "授权失败",
+        "登录已过期",
+        "登录失败",
+    ):
+        if marker in normalized:
+            return marker
+    return ""
 
 
 def _visible_plan_detail_ad_id(page_text: Any) -> str:
@@ -2301,6 +2356,7 @@ class ServiceController:
             stable_candidate = None
             stable_count = 0
             last_probe_at = 0.0
+            last_login_failure_probe_at = 0.0
             last_ignored_existing = None
             deadline = time.time() + 600
             while time.time() < deadline:
@@ -2309,8 +2365,23 @@ class ServiceController:
                         fetcher.page = fetcher.context.pages[-1]
                 except Exception:
                     pass
+                if await _page_is_closed(fetcher.page):
+                    raise RuntimeError(
+                        "千川Chrome已关闭，本次添加已结束；"
+                        "请重新点击“选择并添加账户”重试"
+                    )
                 cur = str(getattr(fetcher.page, "url", "") or "").strip()
                 if _is_qianchuan_login_url(cur):
+                    if time.time() - last_login_failure_probe_at >= 1.0:
+                        failure_marker = (
+                            await _visible_qianchuan_login_failure(fetcher.page)
+                        )
+                        last_login_failure_probe_at = time.time()
+                        if failure_marker:
+                            raise RuntimeError(
+                                f"千川登录失败（{failure_marker}），本次添加已结束；"
+                                "请重新点击“选择并添加账户”重试"
+                            )
                     with self._lock:
                         self._target_discovery_status["message"] = (
                             "等待千川登录：请在新Chrome完成登录，"
@@ -2332,14 +2403,6 @@ class ServiceController:
                     await probe.observe_page(fetcher.page)
                     last_probe_at = time.time()
                 if login_only:
-                    try:
-                        page_closed = await fetcher.page.is_closed()
-                    except Exception:
-                        page_closed = False
-                    if page_closed:
-                        raise RuntimeError(
-                            "登录Chrome已关闭，尚未完成千川登录确认"
-                        )
                     authenticated = (
                         await _qianchuan_authenticated_shell_visible(
                             fetcher.page
@@ -2410,7 +2473,16 @@ class ServiceController:
                         else ""
                     )
                     url_aavid, url_ad_id = _extract_aavid_adid(cur)
-                    if (
+                    trusted_aavid, trusted_ad_id = (
+                        _trusted_qianchuan_detail_ids(cur)
+                    )
+                    if trusted_aavid:
+                        # The visible, exact plan-detail URL is newer evidence
+                        # than a numeric aavid cached from an earlier account.
+                        latest_aavid = trusted_aavid
+                        url_aavid = trusted_aavid
+                        url_ad_id = trusted_ad_id
+                    elif (
                         not latest_aavid.isdigit()
                         and str(url_aavid or "").isdigit()
                     ):

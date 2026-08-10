@@ -30,8 +30,11 @@ from services.retargeting_service import QianChuanRetargetingService
 from services.run_services import (
     CatalogLoginRequired,
     ServiceController,
+    _page_is_closed,
     _persist_verified_catalog_class,
     _qianchuan_authenticated_shell_visible,
+    _trusted_qianchuan_detail_ids,
+    _visible_qianchuan_login_failure,
     _visible_plan_detail_ad_id,
 )
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -809,6 +812,215 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         save_state.assert_awaited_once()
         mark_available.assert_called_once_with(owner_username=self.owner)
         self.assertTrue(fetcher.closed)
+
+    def test_account_selection_prefers_current_detail_url_over_stale_probe(self):
+        class FakePage:
+            url = "about:blank"
+
+            async def goto(self, _url, **_kwargs):
+                self.url = (
+                    "https://qianchuan.jinritemai.com/uni-prom/detail"
+                    "?aavid=10002&adId=30002"
+                )
+
+            async def bring_to_front(self):
+                return None
+
+            def is_closed(self):
+                return False
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+
+        class FakeFetcher:
+            def __init__(self):
+                self.page = FakePage()
+                self.context = FakeContext(self.page)
+                self.closed = False
+
+            async def _init_browser(self):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class FakeProbe:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def attach(self, _page):
+                return None
+
+            async def observe_page(self, _page):
+                return None
+
+            def latest_observed_aavid(self):
+                return "10001"
+
+            async def current_account_name(self, _page):
+                return "网址中的当前账户"
+
+            def authorized_accounts(self):
+                return []
+
+        cfg = SimpleNamespace(
+            db_path=self.db_path,
+            open_url="https://qianchuan.jinritemai.com/home",
+            wait_url_prefix="https://qianchuan.jinritemai.com/",
+        )
+        cfg.normalize_paths = lambda: cfg
+        controller = ServiceController()
+        fetcher = FakeFetcher()
+        with (
+            patch(
+                "services.run_services.current_session_owner",
+                return_value=self.owner,
+            ),
+            patch("services.run_services.ServiceConfig", return_value=cfg),
+            patch(
+                "services.run_services.load_qianchuan_storage_state",
+                return_value={"cookies": []},
+            ),
+            patch("services.run_services.migrate_legacy_qcookie"),
+            patch(
+                "services.run_services.QianChuanFetcher",
+                return_value=fetcher,
+            ),
+            patch(
+                "services.run_services.PromotionReadOnlyProbe",
+                FakeProbe,
+            ),
+            patch(
+                "services.run_services.save_context_storage_state",
+                AsyncMock(),
+            ),
+            patch(
+                "services.run_services.mark_qianchuan_session_available"
+            ),
+        ):
+            asyncio.run(
+                controller._target_discovery_async(account_only=True)
+            )
+        status = controller.target_discovery_status()
+        self.assertFalse(status["running"])
+        self.assertEqual("10002", status["account"]["aavid"])
+        self.assertEqual(
+            "网址中的当前账户", status["account"]["account_name"]
+        )
+        self.assertTrue(fetcher.closed)
+
+    def test_account_selection_login_failure_releases_running_state(self):
+        class FakeLocator:
+            async def inner_text(self, **_kwargs):
+                return "登录失败，请重新扫码"
+
+        class FakePage:
+            url = "about:blank"
+
+            async def goto(self, url, **_kwargs):
+                self.url = url
+
+            async def bring_to_front(self):
+                return None
+
+            def is_closed(self):
+                return False
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        class FakeContext:
+            def __init__(self, page):
+                self.pages = [page]
+
+        class FakeFetcher:
+            def __init__(self):
+                self.page = FakePage()
+                self.context = FakeContext(self.page)
+                self.closed = False
+
+            async def _init_browser(self):
+                return None
+
+            async def close(self):
+                self.closed = True
+
+        class FakeProbe:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def attach(self, _page):
+                return None
+
+        cfg = SimpleNamespace(
+            db_path=self.db_path,
+            open_url="https://sso.oceanengine.com/login",
+            wait_url_prefix="https://qianchuan.jinritemai.com/",
+        )
+        cfg.normalize_paths = lambda: cfg
+        controller = ServiceController()
+        fetcher = FakeFetcher()
+        with (
+            patch(
+                "services.run_services.current_session_owner",
+                return_value=self.owner,
+            ),
+            patch("services.run_services.ServiceConfig", return_value=cfg),
+            patch(
+                "services.run_services.load_qianchuan_storage_state",
+                return_value=None,
+            ),
+            patch("services.run_services.migrate_legacy_qcookie"),
+            patch(
+                "services.run_services.QianChuanFetcher",
+                return_value=fetcher,
+            ),
+            patch(
+                "services.run_services.PromotionReadOnlyProbe",
+                FakeProbe,
+            ),
+        ):
+            controller._target_discovery_entry(account_only=True)
+        status = controller.target_discovery_status()
+        self.assertFalse(status["success"])
+        self.assertFalse(status["running"])
+        self.assertIn("登录失败", status["message"])
+        self.assertIn("重新点击", status["message"])
+        self.assertTrue(fetcher.closed)
+
+    def test_page_close_and_login_failure_helpers_are_fail_fast(self):
+        class ClosedPage:
+            def is_closed(self):
+                return True
+
+        class FailureLocator:
+            async def inner_text(self, **_kwargs):
+                return "账号或密码错误"
+
+        class FailurePage:
+            def locator(self, _selector):
+                return FailureLocator()
+
+        self.assertTrue(asyncio.run(_page_is_closed(ClosedPage())))
+        self.assertEqual(
+            ("10002", "30002"),
+            _trusted_qianchuan_detail_ids(
+                "https://qianchuan.jinritemai.com/uni-prom/detail"
+                "?aavid=10002&adId=30002"
+            ),
+        )
+        self.assertEqual(
+            (None, None),
+            _trusted_qianchuan_detail_ids(
+                "https://example.com/uni-prom/detail"
+                "?aavid=10002&adId=30002"
+            ),
+        )
+        self.assertEqual(
+            "账号或密码错误",
+            asyncio.run(_visible_qianchuan_login_failure(FailurePage())),
+        )
 
     def test_existing_account_plan_detail_confirms_and_closes_browser(self):
         ensure_qianchuan_account(
