@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -20,6 +21,7 @@ DEFAULT_TARGET_DURATION_MS = 45_000
 MIN_TARGET_DURATION_MS = 5_000
 MAX_TARGET_DURATION_MS = 30 * 60_000
 DAILY_CONFIG_FILE = os.path.join(DATA_DIR, "operation_daily_report.json")
+_ACCOUNT_DIRECTORY_LOCK = threading.RLock()
 
 
 def _now_text() -> str:
@@ -126,6 +128,33 @@ def ensure_qianchuan_account(
     enabled: Optional[bool] = None,
     report_enabled: Optional[bool] = None,
     seen: bool = False,
+    allow_reactivate_removed: bool = False,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    with _ACCOUNT_DIRECTORY_LOCK:
+        return _ensure_qianchuan_account_unlocked(
+            aavid,
+            account_name=account_name,
+            owner_username=owner_username,
+            directory_selected=directory_selected,
+            enabled=enabled,
+            report_enabled=report_enabled,
+            seen=seen,
+            allow_reactivate_removed=allow_reactivate_removed,
+            db=db,
+        )
+
+
+def _ensure_qianchuan_account_unlocked(
+    aavid: Any,
+    *,
+    account_name: Any = "",
+    owner_username: Any = None,
+    directory_selected: Optional[bool] = True,
+    enabled: Optional[bool] = None,
+    report_enabled: Optional[bool] = None,
+    seen: bool = False,
+    allow_reactivate_removed: bool = False,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     store = db or SQLiteStore()
@@ -138,6 +167,12 @@ def ensure_qianchuan_account(
         "qianchuan_account",
         where={"owner_username": owner, "aavid": aid},
     )
+    removed_tombstone = bool(existing) and (
+        str((existing or {}).get("last_status") or "").strip().lower()
+        == "removed"
+        and not bool((existing or {}).get("directory_selected"))
+    )
+    reactivating = bool(allow_reactivate_removed) and bool(directory_selected)
     values: Dict[str, Any] = {
         "account_uid": uid,
         "owner_username": owner,
@@ -151,7 +186,10 @@ def ensure_qianchuan_account(
             1
             if (
                 bool((existing or {}).get("directory_selected"))
-                or bool(directory_selected)
+                or (
+                    bool(directory_selected)
+                    and (not removed_tombstone or reactivating)
+                )
             )
             else 0
         ),
@@ -183,7 +221,13 @@ def ensure_qianchuan_account(
         "last_status": str((existing or {}).get("last_status") or "pending"),
         "last_error": str((existing or {}).get("last_error") or ""),
     }
-    if seen:
+    if removed_tombstone and not reactivating:
+        values["directory_selected"] = 0
+        values["enabled"] = 0
+        values["report_enabled"] = 0
+        values["last_status"] = "removed"
+        values["last_error"] = ""
+    if seen and (not removed_tombstone or reactivating):
         values["last_seen_at"] = _now_text()
         values["last_status"] = "available"
         values["last_error"] = ""
@@ -318,9 +362,29 @@ def _initialize_directory_selection(store: SQLiteStore) -> None:
         "UPDATE qianchuan_account SET directory_selected=0 "
         "WHERE directory_selected IS NULL"
     )
+    # Repair rows resurrected by an older in-flight catalog scan. A removed
+    # account is a tombstone until the user explicitly selects it again.
+    store.execute(
+        "UPDATE qianchuan_account SET directory_selected=0, enabled=0, "
+        "report_enabled=0 WHERE lower(COALESCE(last_status,''))='removed'"
+    )
 
 
 def remove_qianchuan_account(
+    value: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    with _ACCOUNT_DIRECTORY_LOCK:
+        return _remove_qianchuan_account_unlocked(
+            value,
+            owner_username=owner_username,
+            db=db,
+        )
+
+
+def _remove_qianchuan_account_unlocked(
     value: Any,
     *,
     owner_username: Any = None,

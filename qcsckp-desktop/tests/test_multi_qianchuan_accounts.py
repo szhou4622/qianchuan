@@ -217,6 +217,61 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             [],
         )
 
+    def test_removed_account_is_not_resurrected_by_background_catalog(self):
+        self._target("10001", 1)
+        account = get_qianchuan_account(
+            "10001",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        remove_qianchuan_account(
+            account["account_uid"],
+            owner_username="tool-owner",
+            db=self.db,
+        )
+
+        # This mirrors an in-flight catalog persistence that finishes after
+        # the user clicked delete. It must update history without restoring
+        # the account to the visible directory.
+        ensure_qianchuan_account(
+            "10001",
+            account_name="background refresh",
+            owner_username="tool-owner",
+            directory_selected=True,
+            seen=True,
+            db=self.db,
+        )
+        self.assertEqual(
+            [],
+            list_qianchuan_accounts(
+                owner_username="tool-owner",
+                db=self.db,
+            ),
+        )
+
+        # Only a new explicit account-selection action may clear the tombstone.
+        restored = ensure_qianchuan_account(
+            "10001",
+            account_name="explicitly re-added",
+            owner_username="tool-owner",
+            directory_selected=True,
+            seen=True,
+            allow_reactivate_removed=True,
+            db=self.db,
+        )
+        self.assertTrue(restored["directory_selected"])
+        self.assertEqual("available", restored["last_status"])
+        self.assertEqual(
+            ["10001"],
+            [
+                item["aavid"]
+                for item in list_qianchuan_accounts(
+                    owner_username="tool-owner",
+                    db=self.db,
+                )
+            ],
+        )
+
     def test_legacy_user_display_name_does_not_overwrite_account_name(self):
         account = ensure_qianchuan_account(
             "10001",

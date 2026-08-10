@@ -317,7 +317,9 @@
     if(!window.confirm(`确定从工具中删除“${name}”吗？\n\n删除后该账户不再显示，监控、追投、停投和日报会立即关闭；历史操作流水仍会保留。`))return;
     const a=await waitApi();const r=await a.removeQianchuanAccount(card.dataset.account);
     if(!r?.success){message(r?.message||'删除账户失败',true);return}
-    dirty=false;await load();message(r?.message||'账户已删除');
+    dirty=false;card.remove();
+    if(loadInFlight){try{await loadInFlight}catch(_){}}
+    await load();message(r?.message||'账户已删除');
   }
   async function discover(accountUid='',triggerButton=null){
     if(dirty){message('当前有尚未保存的账户或计划选择，请先保存后再刷新千川计划。',true);return}

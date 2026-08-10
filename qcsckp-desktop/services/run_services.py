@@ -2957,6 +2957,7 @@ class ServiceController:
                         owner_username=session_owner,
                         directory_selected=True,
                         seen=True,
+                        allow_reactivate_removed=True,
                         db=db,
                     )
                     if fetcher.context:
