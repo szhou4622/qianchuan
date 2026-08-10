@@ -401,10 +401,22 @@ class PromotionReadOnlyProbe:
                 and system in {"global", "chengfang"}
                 and isinstance(body, dict)
             ):
-                self._catalog_base_templates[(scene, system)] = {
+                template = {
                     "url": str(item.get("url") or CATALOG_REQUIRED_PATH),
                     "body": deepcopy(body),
                 }
+                template_aavid = (
+                    str(item.get("aavid") or "").strip()
+                    or self._request_catalog_aavid(body)
+                )
+                # Persisted templates are account-scoped.  Keep the legacy
+                # scene/system alias for backward-compatible diagnostics, but
+                # backend fetches must verify the body aavid before using it.
+                if template_aavid.isdigit():
+                    self._catalog_base_templates[
+                        (template_aavid, scene, system)
+                    ] = template
+                self._catalog_base_templates[(scene, system)] = template
         self._catalog_templates_protected = self._protect_catalog_templates(
             self._serializable_catalog_templates()
         )
@@ -532,11 +544,19 @@ class PromotionReadOnlyProbe:
 
     def _serializable_catalog_templates(self) -> List[Dict[str, Any]]:
         """Persist only request bodies; browser headers and cookies are absent."""
-        result: List[Dict[str, Any]] = []
+        by_scope: Dict[tuple[str, str, str], Dict[str, Any]] = {}
         for key, template in self._catalog_base_templates.items():
-            if not isinstance(key, tuple) or len(key) != 2:
+            if not isinstance(key, tuple) or len(key) not in {2, 3}:
                 continue
-            scene, system = (str(value or "").strip().lower() for value in key)
+            if len(key) == 3:
+                key_aavid, scene, system = (
+                    str(value or "").strip().lower() for value in key
+                )
+            else:
+                key_aavid = ""
+                scene, system = (
+                    str(value or "").strip().lower() for value in key
+                )
             body = template.get("body") if isinstance(template, Mapping) else None
             if (
                 scene not in {"live", "product"}
@@ -544,15 +564,25 @@ class PromotionReadOnlyProbe:
                 or not isinstance(body, dict)
             ):
                 continue
-            result.append(
-                {
-                    "promotion_scene": scene,
-                    "plan_system": system,
-                    "url": str(template.get("url") or CATALOG_REQUIRED_PATH),
-                    "body": deepcopy(body),
-                }
+            body_aavid = self._request_catalog_aavid(body)
+            template_aavid = key_aavid or body_aavid
+            if not template_aavid.isdigit() or body_aavid != template_aavid:
+                continue
+            by_scope[(template_aavid, scene, system)] = {
+                "aavid": template_aavid,
+                "promotion_scene": scene,
+                "plan_system": system,
+                "url": str(template.get("url") or CATALOG_REQUIRED_PATH),
+                "body": deepcopy(body),
+            }
+        result = list(by_scope.values())
+        result.sort(
+            key=lambda item: (
+                item["aavid"],
+                item["plan_system"],
+                item["promotion_scene"],
             )
-        result.sort(key=lambda item: (item["plan_system"], item["promotion_scene"]))
+        )
         return result
 
     def attach(self, page: Any) -> None:
@@ -876,6 +906,18 @@ class PromotionReadOnlyProbe:
         system = str(plan_system or "").strip().lower()
         exact_key = (aid, scene, system)
         generic_key = (scene, system)
+
+        def matching_template(value: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(value, Mapping):
+                return None
+            body = value.get("body")
+            if (
+                not isinstance(body, dict)
+                or self._request_catalog_aavid(body) != aid
+            ):
+                return None
+            return dict(value)
+
         deadline = time.monotonic() + max(0.2, float(timeout_seconds))
         while time.monotonic() < deadline:
             if self.catalog_class_status(
@@ -884,30 +926,27 @@ class PromotionReadOnlyProbe:
                 plan_system=system,
             ).get("complete"):
                 return True
-            has_class_templates = any(
-                isinstance(key, tuple) and key and str(key[0]) == aid
-                for key in self._catalog_base_templates
-            )
-            if (
-                exact_key in self._catalog_base_templates
-                or generic_key in self._catalog_base_templates
-                or (
-                aid in self._catalog_base_templates
-                and not has_class_templates
-                )
+            if any(
+                matching_template(self._catalog_base_templates.get(key))
+                for key in (exact_key, generic_key, aid)
             ):
                 break
             await asyncio.sleep(0.1)
         # 优先复用页面真实发出的同类请求。商品和直播列表的
         # 请求形状不同，不能像旧逻辑那样用“最后一条请求”同时
         # 派生四类目录，否则会把已返回的商品计划误判为空。
-        template = self._catalog_base_templates.get(exact_key)
-        if not isinstance(template, Mapping):
-            template = self._catalog_base_templates.get(generic_key)
-        if not isinstance(template, Mapping):
-            # 兼容旧测试及旧页面仅观察到一种模板的情形。
-            template = self._catalog_base_templates.get(aid)
-        if not isinstance(template, Mapping):
+        template = matching_template(
+            self._catalog_base_templates.get(exact_key)
+        )
+        if template is None:
+            template = matching_template(
+                self._catalog_base_templates.get(generic_key)
+            )
+        if template is None:
+            # 兼容旧页面只观察到当前账户一种请求形状的情形；绝不能
+            # 使用另一个账户的 scene/system 通用模板。
+            template = matching_template(self._catalog_base_templates.get(aid))
+        if template is None:
             return False
         source_body = template.get("body")
         if not isinstance(source_body, dict):
@@ -919,9 +958,18 @@ class PromotionReadOnlyProbe:
             plan_system=system,
         )
         marker = (CATALOG_REQUIRED_PATH, aid, scene, system)
+        # POST body使用同类契约，URL则优先使用当前账户本轮页面真实
+        # 发出的请求，避免复用上一次登录或另一账户的签名查询参数。
+        transport_template = matching_template(
+            self._catalog_base_templates.get(aid)
+        )
+        request_url = str(
+            (transport_template or template).get("url")
+            or CATALOG_REQUIRED_PATH
+        )
         await self._execute_full_catalog_replay(
             page=page,
-            url=str(template.get("url") or CATALOG_REQUIRED_PATH),
+            url=request_url,
             send_body=send_body,
             marker=marker,
         )
@@ -943,7 +991,7 @@ class PromotionReadOnlyProbe:
         if canonical_body != send_body:
             await self._execute_full_catalog_replay(
                 page=page,
-                url=str(template.get("url") or CATALOG_REQUIRED_PATH),
+                url=request_url,
                 send_body=canonical_body,
                 marker=marker,
             )
@@ -956,7 +1004,21 @@ class PromotionReadOnlyProbe:
         )
 
     def has_backend_catalog_template(self, aavid: Any) -> bool:
-        return bool(self._catalog_base_templates)
+        aid = str(aavid or "").strip()
+        if not aid.isdigit():
+            return False
+        for key, template in self._catalog_base_templates.items():
+            body = template.get("body") if isinstance(template, Mapping) else None
+            if not isinstance(body, dict):
+                continue
+            if self._request_catalog_aavid(body) != aid:
+                continue
+            if key == aid or (
+                isinstance(key, tuple)
+                and len(key) in {2, 3}
+            ):
+                return True
+        return False
 
     @classmethod
     def _request_page_number(cls, body: Any) -> int:

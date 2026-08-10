@@ -368,6 +368,98 @@ def _initialize_directory_selection(store: SQLiteStore) -> None:
         "UPDATE qianchuan_account SET directory_selected=0, enabled=0, "
         "report_enabled=0 WHERE lower(COALESCE(last_status,''))='removed'"
     )
+    _repair_suspicious_empty_catalog_targets(store)
+
+
+def _repair_suspicious_empty_catalog_targets(store: SQLiteStore) -> None:
+    """Restore plans hidden by the old cross-account empty-catalog bug.
+
+    The repair is deliberately narrow: the account sync must be partial, the
+    stored class result must claim a complete zero-row response, and the plan
+    must still carry earlier successful detail-verification evidence.  The
+    account remains partial, so this repair restores visibility without
+    allowing stale catalog data to produce candidates.
+    """
+    from api.promotion_targets import target_eligibility
+
+    accounts = store.select(
+        "qianchuan_account",
+        fields=(
+            "account_uid,catalog_status,catalog_counts_json"
+        ),
+        where={"directory_selected": 1, "catalog_status": "partial"},
+    )
+    class_map = {
+        "global_live": ("global", "live"),
+        "global_product": ("global", "product"),
+        "chengfang_live": ("chengfang", "live"),
+        "chengfang_product": ("chengfang", "product"),
+    }
+    for account in accounts:
+        try:
+            counts = json.loads(str(account.get("catalog_counts_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        states = counts.get("class_status") if isinstance(counts, dict) else None
+        if not isinstance(states, dict):
+            continue
+        for class_key, (system, scene) in class_map.items():
+            state = states.get(class_key)
+            if not isinstance(state, dict) or not bool(state.get("complete")):
+                continue
+            try:
+                seen = int(state.get("seen") or 0)
+            except (TypeError, ValueError):
+                continue
+            if seen != 0:
+                continue
+            targets = store.select(
+                "promotion_target",
+                where={
+                    "account_uid": str(account.get("account_uid") or ""),
+                    "plan_system": system,
+                    "promotion_scene": scene,
+                    "verification_state": "missing",
+                },
+            )
+            for target in targets:
+                if (
+                    not str(target.get("last_verified_at") or "").strip()
+                    or str(target.get("last_verification_error") or "").strip()
+                ):
+                    continue
+                try:
+                    capability = json.loads(
+                        str(target.get("capability_json") or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    capability = {}
+                eligibility = target_eligibility(
+                    promotion_scene=scene,
+                    plan_system=system,
+                    platform_status=target.get("platform_status"),
+                    verification_state="verified",
+                    capability=(capability if isinstance(capability, dict) else {}),
+                )
+                store.update(
+                    "promotion_target",
+                    {
+                        "verification_state": "verified",
+                        "monitor_eligible": (
+                            1 if eligibility["monitor_eligible"] else 0
+                        ),
+                        "retarget_eligible": (
+                            1 if eligibility["retarget_eligible"] else 0
+                        ),
+                        "stop_eligible": (
+                            1 if eligibility["stop_eligible"] else 0
+                        ),
+                        "ineligible_reason": str(
+                            eligibility.get("ineligible_reason") or ""
+                        )[:1000],
+                    },
+                    where={"target_uid": target["target_uid"]},
+                )
 
 
 def remove_qianchuan_account(

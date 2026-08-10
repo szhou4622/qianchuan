@@ -20,6 +20,7 @@ from api.rule_regulation_config import (
 from services.qianchuan_accounts import (
     ensure_qianchuan_account,
     get_qianchuan_account,
+    list_qianchuan_accounts,
     save_qianchuan_account_automation_setup,
 )
 from services.qianchuan_catalog import finalize_catalog_sync
@@ -834,6 +835,75 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             page.calls[0]["dataSetKey"],
         )
 
+    def test_backend_catalog_never_reuses_another_accounts_generic_template(self):
+        path = os.path.join(self.temp.name, "account-scoped-template.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates[("product", "global")] = {
+            "url": "https://qianchuan.test/old-account",
+            "body": {
+                "aavid": "20002",
+                "mar_goal": 1,
+                "dataSetKey": "overall_roi_promotion_list_for_product",
+                "page": 1,
+                "page_size": 100,
+            },
+        }
+        probe._catalog_base_templates["10001"] = {
+            "url": "https://qianchuan.test/current-account",
+            "body": {
+                "aavid": "10001",
+                "mar_goal": 2,
+                "dataSetKey": "site_promotion_list",
+                "page": 1,
+                "page_size": 100,
+            },
+        }
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, arguments):
+                self.calls.append(dict(arguments))
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "totalPage": 1,
+                            "adInfos": [
+                                {
+                                    "id": "30001",
+                                    "name": "当前账户商品计划",
+                                    "adDeliveryName": "投放中",
+                                }
+                            ],
+                        },
+                    },
+                }
+
+        page = Page()
+        complete = asyncio.run(
+            probe.fetch_catalog_class_from_backend(
+                page,
+                aavid="10001",
+                promotion_scene="product",
+                plan_system="global",
+            )
+        )
+        self.assertTrue(complete)
+        self.assertTrue(probe.has_backend_catalog_template("10001"))
+        self.assertFalse(probe.has_backend_catalog_template("30003"))
+        self.assertEqual(
+            "https://qianchuan.test/current-account",
+            page.calls[0]["url"],
+        )
+        self.assertEqual("10001", page.calls[0]["body"]["aavid"])
+        self.assertEqual(
+            "overall_roi_promotion_list_for_product",
+            page.calls[0]["body"]["dataSetKey"],
+        )
+
     def test_backend_catalog_falls_back_to_canonical_read_contract(self):
         path = os.path.join(self.temp.name, "canonical-fallback-probe.json")
         probe = PromotionReadOnlyProbe(path)
@@ -1033,6 +1103,10 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
 
         restored = PromotionReadOnlyProbe(path)
         self.assertIn(("product", "global"), restored._catalog_base_templates)
+        self.assertIn(
+            ("10001", "product", "global"),
+            restored._catalog_base_templates,
+        )
 
     def test_generated_catalog_replay_cannot_overwrite_observed_template(self):
         path = os.path.join(self.temp.name, "generated-template-probe.json")
@@ -1290,6 +1364,117 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
         )
         self.assertEqual("candidate", target["verification_state"])
         self.assertEqual(0, target["monitor_eligible"])
+
+    def test_complete_empty_class_preserves_previously_verified_plan(self):
+        target = self._target(
+            ad_id="30009",
+            scene="live",
+            system="chengfang",
+        )
+        self.db.update(
+            "promotion_target",
+            {
+                "verification_state": "missing",
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+            },
+            where={"target_uid": target["target_uid"]},
+        )
+
+        class CapturedProbe:
+            def catalog_rows(self, **_kwargs):
+                return []
+
+            async def verify_catalog_plans(self, _page, **_kwargs):
+                return {"verified": [], "rejected": [], "complete": True}
+
+        class Page:
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+        controller = ServiceController.__new__(ServiceController)
+
+        async def wait_for_complete(_probe, **_kwargs):
+            return {"complete": True, "message": ""}
+
+        controller._wait_catalog_class = wait_for_complete
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value=self.owner,
+        ):
+            result = asyncio.run(
+                controller._scan_catalog_class(
+                    fetcher=SimpleNamespace(page=Page()),
+                    probe=CapturedProbe(),
+                    db=self.db,
+                    owner_username=self.owner,
+                    account={"aavid": "10001", "account_name": "account"},
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                    page_url=(
+                        "https://qianchuan.jinritemai.com/uni-prom?aavid=10001"
+                    ),
+                )
+            )
+        self.assertFalse(result["complete"])
+        self.assertIn("本轮返回0条", result["message"])
+        saved = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertEqual("verified", saved["verification_state"])
+        self.assertEqual(1, saved["monitor_eligible"])
+
+    def test_existing_partial_empty_damage_is_repaired_on_account_load(self):
+        target = self._target(
+            ad_id="30010",
+            scene="live",
+            system="chengfang",
+        )
+        account = get_qianchuan_account(
+            "10001",
+            owner_username=self.owner,
+            db=self.db,
+        )
+        self.db.update(
+            "promotion_target",
+            {
+                "verification_state": "missing",
+                "monitor_eligible": 0,
+                "retarget_eligible": 0,
+                "stop_eligible": 0,
+            },
+            where={"target_uid": target["target_uid"]},
+        )
+        self.db.update(
+            "qianchuan_account",
+            {
+                "catalog_status": "partial",
+                "catalog_counts_json": json.dumps(
+                    {
+                        "class_status": {
+                            "chengfang_live": {
+                                "complete": True,
+                                "seen": 0,
+                            }
+                        }
+                    }
+                ),
+            },
+            where={"account_uid": account["account_uid"]},
+        )
+
+        list_qianchuan_accounts(
+            owner_username=self.owner,
+            db=self.db,
+        )
+        saved = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertEqual("verified", saved["verification_state"])
+        self.assertEqual(1, saved["monitor_eligible"])
 
     def test_expired_cookie_never_bypasses_visible_login(self):
         target = {

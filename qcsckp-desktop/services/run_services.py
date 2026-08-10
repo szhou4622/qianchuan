@@ -57,6 +57,7 @@ from api.promotion_targets import (
     normalize_platform_status,
     patch_target_sync_state,
     record_target_verification_failure,
+    refresh_target_eligibility,
     replace_material_product_links,
     update_target_catalog_evidence,
     update_target_sync_state,
@@ -1782,6 +1783,40 @@ class ServiceController:
             and str(item.get("promotion_scene") or "") == promotion_scene
             and str(item.get("plan_system") or "") == plan_system
         }
+        suspicious_empty = bool(
+            status.get("complete") and not candidates and existing_rows
+        )
+        if suspicious_empty:
+            # A complete empty response is unsafe when this exact account and
+            # class previously contained plans. It commonly means a stale
+            # signed request or cross-account request context. Preserve the
+            # last verified directory and require a later trustworthy refresh
+            # instead of marking every existing plan as missing.
+            for existing in existing_rows.values():
+                if (
+                    str(existing.get("verification_state") or "") == "missing"
+                    and str(existing.get("last_verified_at") or "").strip()
+                    and not str(
+                        existing.get("last_verification_error") or ""
+                    ).strip()
+                ):
+                    db.update(
+                        "promotion_target",
+                        {"verification_state": "verified"},
+                        where={"target_uid": existing["target_uid"]},
+                    )
+                    refresh_target_eligibility(
+                        existing["target_uid"],
+                        db=db,
+                    )
+            status = {
+                **status,
+                "complete": False,
+                "message": (
+                    "本轮返回0条，但该账户此分类此前已有计划；"
+                    "已保留旧目录并等待重新取得当前账户完整证据"
+                ),
+            }
         reverify_before = datetime.now() - timedelta(hours=24)
         cached_verified: List[Dict[str, Any]] = []
         verify_ids: List[str] = []
