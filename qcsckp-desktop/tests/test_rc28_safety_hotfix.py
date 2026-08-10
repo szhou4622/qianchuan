@@ -33,6 +33,7 @@ from services.run_services import (
     _page_is_closed,
     _persist_verified_catalog_class,
     _qianchuan_authenticated_shell_visible,
+    _resolved_startup_platform_status,
     _trusted_qianchuan_detail_ids,
     _visible_qianchuan_login_failure,
     _visible_plan_detail_ad_id,
@@ -50,6 +51,30 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
 
     def test_system_paused_status_is_normalized_and_remains_ineligible(self):
         self.assertEqual("paused", normalize_platform_status("系统暂停"))
+
+    def test_saved_session_keeps_verified_current_plan_status(self):
+        # A detail page also contains sibling rows. A paused sibling must not
+        # downgrade the exact catalog-verified active target being resumed.
+        self.assertEqual(
+            "active",
+            _resolved_startup_platform_status(
+                "已暂停 投放中",
+                None,
+                existing_status="active",
+                preserve_existing=True,
+            ),
+        )
+
+    def test_exact_payload_status_overrides_saved_catalog_status(self):
+        self.assertEqual(
+            "paused",
+            _resolved_startup_platform_status(
+                "投放中",
+                "paused",
+                existing_status="active",
+                preserve_existing=True,
+            ),
+        )
 
     def test_resolved_cross_scene_catalog_candidate_is_not_persisted(self):
         result = _persist_verified_catalog_class(

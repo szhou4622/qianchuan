@@ -1198,6 +1198,36 @@ def main():
         # ===== 授权账户和四类计划目录：启动同步一次，之后每30分钟只读刷新 =====
         js_api.api.service.start_catalog_scheduler()
 
+        # 已保存并启用的账户/计划在软件重启后自动恢复后台监控。
+        # 目录启动刷新可能仍在占用唯一 Browser Worker，因此由服务层
+        # 等待目录任务结束后再启动，无需用户进入“服务控制”重复操作。
+        def _resume_saved_monitoring() -> None:
+            time.sleep(1.0)
+            from utils.log import logger as runtime_logger
+
+            for attempt in range(1, 4):
+                try:
+                    result = js_api.api.service.start_from_saved_session()
+                    runtime_logger.info(
+                        "[MONITOR] %s",
+                        result.get("message") or result.get("phase"),
+                    )
+                    if result.get("phase") != "tool_login_required":
+                        return
+                except Exception as exc:
+                    runtime_logger.warning(
+                        "[MONITOR] 自动恢复后台监控失败（第%s次）: %s",
+                        attempt,
+                        exc,
+                    )
+                time.sleep(2.0)
+
+        threading.Thread(
+            target=_resume_saved_monitoring,
+            name="qianchuan-monitor-resume",
+            daemon=True,
+        ).start()
+
         # ===== 启动 webview =====
         print("[START] 启动窗口...")
         webview.start(debug=True, http_server=False, private_mode=False, storage_path=storage_path)

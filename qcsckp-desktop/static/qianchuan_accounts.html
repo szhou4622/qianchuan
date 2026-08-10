@@ -310,7 +310,9 @@
     const planStates=Array.from(card.querySelectorAll('[data-target]')).map(x=>({target_uid:x.dataset.target,enabled:x.checked}));
     const r=await a.saveQianchuanAccountAutomationSetup(uid,settings,planStates);
     if(!r?.success){message((r?.message||'账户与计划设置保存失败')+'；本次修改已整体回滚',true);return}
-    dirty=false;await load();message('账户、日报路由和监控计划已保存');
+    dirty=false;await load();
+    const monitorFailed=r?.monitoring&&r.monitoring.success===false;
+    message(r?.message||'账户、日报路由和监控计划已保存，后台监控正在启动',monitorFailed);
   }
   async function removeAccount(card){
     const name=card.querySelector('.account-name')?.textContent||'该账户';

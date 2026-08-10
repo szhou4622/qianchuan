@@ -165,6 +165,79 @@ class CatalogRefreshV0141Tests(unittest.TestCase):
         self.assertEqual("waiting_catalog_sync", result["phase"])
         self.assertIsNone(controller._thread)
 
+    def test_save_account_setup_starts_monitoring_from_saved_session(self):
+        controller = ServiceController()
+        controller.start = Mock(
+            return_value={"success": True, "running": True, "phase": "starting"}
+        )
+        with (
+            patch("services.run_services.current_session_owner", return_value="owner"),
+            patch(
+                "services.run_services.automation_session_ready",
+                return_value={"ready": True},
+            ),
+            patch(
+                "services.run_services.schedulable_promotion_targets",
+                return_value=[{"target_uid": "target_one"}],
+            ),
+        ):
+            result = controller.start_from_saved_session()
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["running"])
+        self.assertEqual("设置已保存，正在启动首次后台采集", result["message"])
+        self.assertTrue(controller._saved_session_bootstrap)
+        controller.start.assert_called_once_with()
+
+    def test_save_account_setup_defers_monitoring_until_catalog_finishes(self):
+        controller = ServiceController()
+        controller._catalog_sync_thread = Mock()
+        controller._catalog_sync_thread.is_alive.return_value = True
+        captured = {}
+
+        class FakeThread:
+            def __init__(self, *, target, args, name, daemon):
+                captured.update(
+                    {"target": target, "args": args, "name": name, "daemon": daemon}
+                )
+
+            def start(self):
+                captured["started"] = True
+
+            def is_alive(self):
+                return False
+
+        with (
+            patch("services.run_services.current_session_owner", return_value="owner"),
+            patch(
+                "services.run_services.automation_session_ready",
+                return_value={"ready": True},
+            ),
+            patch(
+                "services.run_services.schedulable_promotion_targets",
+                return_value=[{"target_uid": "target_one"}],
+            ),
+            patch("services.run_services.threading.Thread", FakeThread),
+        ):
+            result = controller.start_from_saved_session()
+
+        self.assertTrue(result["success"])
+        self.assertEqual("waiting_catalog_sync", result["phase"])
+        self.assertTrue(captured["started"])
+        self.assertEqual("qianchuan-monitor-auto-start", captured["name"])
+        self.assertEqual(("owner",), captured["args"])
+
+    def test_start_returns_status_when_service_is_already_running(self):
+        controller = ServiceController()
+        controller._thread = Mock()
+        controller._thread.is_alive.return_value = True
+
+        result = controller.start()
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["running"])
+        self.assertEqual("服务已在运行", result["message"])
+
     def test_targeted_refresh_normalizes_aavid_to_account_uid(self):
         controller = ServiceController()
         captured = {}

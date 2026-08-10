@@ -612,6 +612,55 @@ class QianchuanSessionTests(unittest.TestCase):
 
 
 class ToolAccountSwitchTests(unittest.TestCase):
+    def test_save_account_setup_immediately_starts_saved_monitoring(self):
+        api = Api.__new__(Api)
+        api.db = Mock()
+        api.service = Mock()
+        api.service.start_from_saved_session.return_value = {
+            "success": True,
+            "running": True,
+            "phase": "starting",
+            "message": "设置已保存，正在启动首次后台采集",
+        }
+        saved = {"account_uid": "account_one", "enabled": True}
+        with patch(
+            "services.qianchuan_accounts.save_qianchuan_account_automation_setup",
+            return_value=saved,
+        ) as save:
+            result = api.saveQianchuanAccountAutomationSetup(
+                "account_one",
+                {"enabled": True},
+                [{"target_uid": "target_one", "enabled": True}],
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(saved, result["data"])
+        self.assertTrue(result["monitoring"]["running"])
+        api.service.start_from_saved_session.assert_called_once_with()
+        save.assert_called_once_with(
+            "account_one",
+            {"enabled": True},
+            [{"target_uid": "target_one", "enabled": True}],
+            db=api.db,
+        )
+
+    def test_monitor_start_failure_does_not_report_saved_settings_rolled_back(self):
+        api = Api.__new__(Api)
+        api.db = Mock()
+        api.service = Mock()
+        api.service.start_from_saved_session.side_effect = RuntimeError("boom")
+        with patch(
+            "services.qianchuan_accounts.save_qianchuan_account_automation_setup",
+            return_value={"account_uid": "account_one"},
+        ):
+            result = api.saveQianchuanAccountAutomationSetup(
+                "account_one", {"enabled": True}, []
+            )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["monitoring"]["success"])
+        self.assertIn("设置已保存", result["message"])
+
     def test_start_service_switch_stops_old_owner_before_remote_verification(self):
         api = Api.__new__(Api)
         api.service = Mock()

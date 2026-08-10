@@ -151,6 +151,28 @@ def _explicit_platform_status(page_text: Any, payload_status: Any = None) -> str
     return "unknown"
 
 
+def _resolved_startup_platform_status(
+    page_text: Any,
+    payload_status: Any = None,
+    *,
+    existing_status: Any = None,
+    preserve_existing: bool = False,
+) -> str:
+    """Resolve the current plan status without trusting unrelated page rows.
+
+    Qianchuan detail pages also render a plan list. Searching the full body can
+    therefore find an inactive sibling before the active current plan. During
+    saved-session bootstrap, preserve the catalog-verified target status unless
+    the exact plan response supplies a newer status.
+    """
+    payload = str(payload_status or "").strip()
+    if preserve_existing and not payload:
+        previous = normalize_platform_status(existing_status)
+        if previous != "unknown":
+            return previous
+    return _explicit_platform_status(page_text, payload)
+
+
 def _persist_product_snapshot(
     db: SQLiteStore,
     target_uid: str,
@@ -853,6 +875,8 @@ class ServiceController:
         self._target_discovery_launch_event = threading.Event()
         self._catalog_sync_thread: Optional[threading.Thread] = None
         self._catalog_scheduler_thread: Optional[threading.Thread] = None
+        self._deferred_monitor_start_thread: Optional[threading.Thread] = None
+        self._saved_session_bootstrap = False
         self._catalog_startup_sync_pending = True
         self._catalog_prefetch_pending: set[str] = set()
         self._target_discovery_status: dict = {
@@ -1119,11 +1143,12 @@ class ServiceController:
     # ---------------- lifecycle ----------------
     def start(self) -> dict:
         """启动采集线程；轮询间隔与无头模式以 control_panel.json → crawl 为准（由 Api.startService 在调用前写入）。"""
+        already_running = False
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 self._message = "服务已在运行"
-                return self.status()
-            if (
+                already_running = True
+            elif (
                 self._catalog_sync_thread is not None
                 and self._catalog_sync_thread.is_alive()
             ):
@@ -1134,15 +1159,125 @@ class ServiceController:
                     "message": "账户计划正在刷新，完成后再启动自动监控",
                 }
 
-            self._stop_event.clear()
-            self._fetch_ready = False
-            self._phase = "starting"
-            self._message = "启动中..."
+            else:
+                self._stop_event.clear()
+                self._fetch_ready = False
+                self._phase = "starting"
+                self._message = "启动中..."
 
-            self._thread = threading.Thread(target=self._thread_entry, daemon=True)
-            self._thread.start()
+                self._thread = threading.Thread(target=self._thread_entry, daemon=True)
+                self._thread.start()
+        if already_running:
+            return self.status()
         self._log("[服务] 已发起启动")
         return self.status()
+
+    def start_from_saved_session(self) -> dict:
+        """Start monitoring after the user saves account/plan selection.
+
+        The tool login has already created a device session and Qianchuan's
+        storage state is DPAPI protected.  Requiring the password again here
+        only duplicates an earlier gate and leaves the frozen account page
+        without a way to start monitoring.  This path never accepts account
+        credentials; it is scoped to the currently logged-in tool user and the
+        already verified Qianchuan session.
+        """
+        owner = current_session_owner()
+        if not owner:
+            self._log("[服务] 自动启动监控跳过：工具账号尚未登录")
+            return {
+                "success": False,
+                "running": False,
+                "phase": "tool_login_required",
+                "message": "工具账号尚未登录，已保存设置但未启动监控",
+            }
+        session_gate = automation_session_ready(owner)
+        if not session_gate.get("ready"):
+            self._log(
+                "[服务] 自动启动监控跳过：千川登录状态不可用 "
+                f"status={session_gate.get('status') or ''}"
+            )
+            return {
+                "success": False,
+                "running": False,
+                "phase": "login_required",
+                "message": str(
+                    session_gate.get("message")
+                    or "千川登录状态不存在或已失效"
+                ),
+            }
+        targets = schedulable_promotion_targets(owner_username=owner)
+        if not targets:
+            self._log("[服务] 自动启动监控跳过：没有已启用且可监控的计划")
+            return {
+                "success": True,
+                "running": False,
+                "phase": "no_targets",
+                "message": "设置已保存；当前没有已启用且可监控的计划",
+            }
+        already_running = False
+        queued_for_catalog = False
+        with self._lock:
+            already_running = bool(
+                self._thread is not None and self._thread.is_alive()
+            )
+            if not already_running:
+                catalog_running = (
+                    self._catalog_sync_thread is not None
+                    and self._catalog_sync_thread.is_alive()
+                )
+                deferred_running = (
+                    self._deferred_monitor_start_thread is not None
+                    and self._deferred_monitor_start_thread.is_alive()
+                )
+                if catalog_running:
+                    queued_for_catalog = True
+                    if not deferred_running:
+                        self._deferred_monitor_start_thread = threading.Thread(
+                            target=self._deferred_monitor_start_entry,
+                            args=(owner,),
+                            name="qianchuan-monitor-auto-start",
+                            daemon=True,
+                        )
+                        self._deferred_monitor_start_thread.start()
+        if already_running:
+            self._log("[服务] 保存设置后确认后台监控已在运行")
+            return {
+                **self.status(),
+                "success": True,
+                "message": "设置已保存，后台监控已在运行",
+            }
+        if queued_for_catalog:
+            self._log("[服务] 目录刷新占用浏览器，监控已进入自动启动队列")
+            return {
+                "success": True,
+                "running": False,
+                "phase": "waiting_catalog_sync",
+                "message": "设置已保存；目录刷新结束后将自动开始监控",
+            }
+        with self._lock:
+            self._saved_session_bootstrap = True
+        self._log(
+            f"[服务] 正在从已保存会话启动监控，计划数={len(targets)}"
+        )
+        result = self.start()
+        if result.get("success", True):
+            result["message"] = "设置已保存，正在启动首次后台采集"
+        return result
+
+    def _deferred_monitor_start_entry(self, owner_username: str) -> None:
+        while True:
+            with self._lock:
+                catalog_running = (
+                    self._catalog_sync_thread is not None
+                    and self._catalog_sync_thread.is_alive()
+                )
+            if not catalog_running:
+                break
+            time.sleep(0.25)
+        if current_session_owner() != str(owner_username or "").casefold():
+            return
+        self.start_from_saved_session()
 
     def stop(self) -> dict:
         self._stop_event.set()
@@ -3320,8 +3455,19 @@ class ServiceController:
         storage_state_path = load_qianchuan_storage_state(
             owner_username=session_owner
         )
-        # 首次/登录阶段必须可见窗口，与「无头」选项无关
-        fetcher = QianChuanFetcher(headless=False, storage_state=storage_state_path)
+        with self._lock:
+            saved_session_bootstrap = bool(self._saved_session_bootstrap)
+            self._saved_session_bootstrap = False
+        # 用户从账户页保存设置后，已经具备经 DPAPI 保护的千川会话和
+        # 精确核验计划，直接在后台复核并采集；只有首次登录或会话失效
+        # 才打开可见 Chrome。
+        initial_headless = bool(
+            saved_session_bootstrap and storage_state_path and headless_mode
+        )
+        fetcher = QianChuanFetcher(
+            headless=initial_headless,
+            storage_state=storage_state_path,
+        )
         await fetcher._init_browser()
         probe = PromotionReadOnlyProbe(PROMOTION_PROBE_FILE)
         probe.attach(fetcher.page)
@@ -3367,7 +3513,9 @@ class ServiceController:
             owner_username=session_owner,
             db=db,
         )
-        reuse_last_target = _reuse_last_target_enabled()
+        reuse_last_target = (
+            True if saved_session_bootstrap else _reuse_last_target_enabled()
+        )
         last_target = _load_last_target(owner_username=session_owner)
         remembered_target = last_target if reuse_last_target else None
         excluded_target = last_target if not reuse_last_target else None
@@ -3403,7 +3551,33 @@ class ServiceController:
             self._message = "等待识别 URL（进入投放详情页后自动开始抓取）"
 
         discovered = None
-        if _can_reuse_startup_target(
+        if saved_session_bootstrap:
+            authenticated = False
+            for _ in range(8):
+                authenticated = await _qianchuan_authenticated_shell_visible(
+                    fetcher.page
+                )
+                if authenticated:
+                    break
+                await asyncio.sleep(0.5)
+            if authenticated:
+                discovered = _trusted_startup_discovery(
+                    startup_target,
+                    startup_url,
+                )
+            if not discovered:
+                mark_qianchuan_session_invalid(
+                    "保存设置后后台复核登录失败，请重新登录千川",
+                    owner_username=session_owner,
+                )
+                self._log("[服务] 后台启动复核失败，已停止且未采集")
+                with self._lock:
+                    self._phase = "error"
+                    self._message = "千川登录状态已失效，请重新登录"
+                await fetcher.close()
+                return
+            self._log("[服务] 设置保存后已复用登录会话，后台启动监控")
+        elif _can_reuse_startup_target(
             storage_state_available=bool(storage_state_path),
             reuse_last_target=reuse_last_target,
             startup_target=startup_target,
@@ -3497,6 +3671,20 @@ class ServiceController:
             ),
             {},
         )
+        snapshot_status = (
+            ((discovered.get("snapshot") or {}).get("plan") or {}).get(
+                "platform_status"
+            )
+        )
+        existing_status = next(
+            (
+                item.get("platform_status")
+                for item in known_targets
+                if str(item.get("aadvid") or "") == str(aavid)
+                and str(item.get("ad_id") or "") == str(ad_id)
+            ),
+            None,
+        )
         target = upsert_promotion_target(
             {
                 "aavid": aavid,
@@ -3507,11 +3695,11 @@ class ServiceController:
                 "plan_name": plan_name,
                 "promotion_scene": promotion_scene,
                 "plan_system": plan_system,
-                "platform_status": _explicit_platform_status(
+                "platform_status": _resolved_startup_platform_status(
                     page_text,
-                    (
-                        (discovered.get("snapshot") or {}).get("plan") or {}
-                    ).get("platform_status"),
+                    snapshot_status,
+                    existing_status=existing_status,
+                    preserve_existing=saved_session_bootstrap,
                 ),
                 "verification_state": "verified",
                 "page_url": target_url,

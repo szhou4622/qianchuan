@@ -193,17 +193,32 @@ class Api:
         )
 
         try:
-            return {
-                "success": True,
-                "data": save_qianchuan_account_automation_setup(
-                    account_uid,
-                    settings if isinstance(settings, dict) else {},
-                    plan_states if isinstance(plan_states, (list, dict)) else [],
-                    db=self.db,
-                ),
-            }
+            saved = save_qianchuan_account_automation_setup(
+                account_uid,
+                settings if isinstance(settings, dict) else {},
+                plan_states if isinstance(plan_states, (list, dict)) else [],
+                db=self.db,
+            )
         except Exception as e:
             return {"success": False, "message": str(e)}
+        try:
+            monitoring = self.service.start_from_saved_session()
+        except Exception as e:
+            monitoring = {
+                "success": False,
+                "running": False,
+                "phase": "start_failed",
+                "message": f"设置已保存，但后台监控启动失败：{e}",
+            }
+        return {
+            "success": True,
+            "data": saved,
+            "monitoring": monitoring,
+            "message": str(
+                monitoring.get("message")
+                or "账户、日报路由和监控计划已保存"
+            ),
+        }
 
     def removeQianchuanAccount(self, account_uid=None):
         from services.qianchuan_accounts import remove_qianchuan_account
