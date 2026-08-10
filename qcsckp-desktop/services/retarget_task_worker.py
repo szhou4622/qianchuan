@@ -40,6 +40,11 @@ from services.product_rule_engine import evaluate_product_strategy
 from services.plan_system import normalize_plan_system
 from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
+from services.retarget_budget_increase import (
+    assist_task_sync_ready,
+    budget_increase_fingerprint,
+    calculate_budget_increase,
+)
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -101,6 +106,7 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
         "candidate_sort": str(strategy.get("candidate_sort") or "net_roi_desc"),
         "candidate_limit": int(strategy.get("candidate_limit") or 1),
         "action_mode": str(strategy.get("action_mode") or "card_confirm"),
+        "task_action": str(strategy.get("task_action") or "create_retarget"),
         "trigger": strategy.get("trigger") if isinstance(strategy.get("trigger"), dict) else {},
         "retargeting": strategy.get("retargeting") if isinstance(strategy.get("retargeting"), dict) else {},
     }
@@ -760,6 +766,190 @@ def _validate_task(
     return cfg, strategy, [rows_by_id[item["material_id"]] for item in materials]
 
 
+def _validate_budget_increase_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+) -> Tuple[
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
+    """Re-read and validate a control task before adjusting its budget."""
+    cfg = load_rule_retargeting_config()
+    if not cfg.get("enabled"):
+        raise RuntimeError("规则化追投已关闭")
+    strategy_id = str(task.get("strategy_id") or "")
+    strategy = _find_strategy(cfg, strategy_id)
+    if not strategy:
+        raise RuntimeError("追加预算策略已删除")
+    if str(strategy.get("task_action") or "create_retarget") != "increase_budget":
+        raise RuntimeError("策略已不再执行追加预算")
+    if str(strategy.get("action_mode") or "card_confirm") != "card_confirm":
+        raise RuntimeError("策略执行方式已经变更")
+    expected_hash = str(task.get("strategy_hash") or "")
+    task_snapshot = (
+        task.get("rule_snapshot")
+        if isinstance(task.get("rule_snapshot"), dict)
+        else {}
+    )
+    if not task_snapshot or _snapshot_hash(task_snapshot) != expected_hash:
+        raise RuntimeError("追加预算策略快照校验失败")
+    if _strategy_hash(strategy) != expected_hash:
+        raise RuntimeError("追加预算策略已经修改，请等待新的提醒")
+
+    target_uid = str(task.get("target_uid") or "")
+    aavid = str(task.get("aavid") or "")
+    ad_id = str(task.get("ad_id") or "")
+    assist_task_id = str(task.get("assist_task_id") or "")
+    target = db.select_one(
+        "promotion_target",
+        where={"target_uid": target_uid},
+    ) or {}
+    account = (
+        db.select_one(
+            "qianchuan_account",
+            where={"account_uid": str(target.get("account_uid") or "")},
+        )
+        if target
+        else None
+    )
+    if (
+        not target
+        or not bool(target.get("enabled"))
+        or not bool(target.get("monitor_eligible"))
+        or str(target.get("capacity_state") or "") != "active"
+        or bool(target.get("automation_write_blocked"))
+        or str(target.get("last_status") or "").strip().lower() != "ok"
+        or str(target.get("aadvid") or "") != aavid
+        or str(target.get("ad_id") or "") != ad_id
+        or not account
+        or not bool(account.get("enabled"))
+    ):
+        raise RuntimeError("监控账户或计划已停用、异常或归属发生变化")
+    if str(strategy.get("target_uid") or "") != target_uid:
+        raise RuntimeError("策略已经改为其他监控计划")
+    strategy_account_uid = str(strategy.get("account_uid") or "")
+    if strategy_account_uid and strategy_account_uid != str(
+        target.get("account_uid") or ""
+    ):
+        raise RuntimeError("策略已经改为其他千川账户")
+    if normalize_plan_system(target.get("plan_system") or "unknown") == "unknown":
+        raise RuntimeError("计划体系尚未确认")
+    sync_ready, sync_error = assist_task_sync_ready(target, max_age_minutes=10)
+    if not sync_ready:
+        raise RuntimeError(sync_error)
+
+    from services.qianchuan_session import (
+        automation_session_ready,
+        current_session_owner,
+    )
+
+    owner = str(task.get("account_username") or "").strip().casefold()
+    if not owner or str(current_session_owner() or "").strip().casefold() != owner:
+        raise RuntimeError("当前工具账号已经切换或退出")
+    if str((account or {}).get("owner_username") or "").strip().casefold() != owner:
+        raise RuntimeError("千川账户不属于当前工具账号")
+    session_gate = automation_session_ready(owner)
+    if not session_gate.get("ready"):
+        raise RuntimeError(
+            str(session_gate.get("message") or "千川登录状态已失效")
+        )
+    if int(task.get("qianchuan_session_epoch") or 0) != int(
+        session_gate.get("session_epoch") or 1
+    ):
+        raise RuntimeError("千川登录会话已经变化，请等待新的提醒")
+
+    row = db.select_one(
+        "pmc_roi2_assist_task",
+        where={
+            "target_uid": target_uid,
+            "assist_task_id": assist_task_id,
+        },
+    ) or {}
+    if (
+        not row
+        or str(row.get("aadvid") or "") != aavid
+        or str(row.get("ad_id") or "") != ad_id
+    ):
+        raise RuntimeError("调控任务已删除或归属发生变化")
+    delivery_type = row.get("ad_delivery_type")
+    if str(delivery_type if delivery_type is not None else "0").strip() not in {
+        "",
+        "0",
+    }:
+        raise RuntimeError("调控任务已不在执行中")
+    if not _timestamp_is_fresh(row.get("updated_at")):
+        raise RuntimeError("调控任务最新指标已超过10分钟，请等待重新同步")
+    trigger = strategy.get("trigger") or {}
+    if not evaluate_trigger(trigger, row):
+        raise RuntimeError("调控任务最新消耗或ROI已不满足策略")
+
+    retargeting = (
+        strategy.get("retargeting")
+        if isinstance(strategy.get("retargeting"), dict)
+        else {}
+    )
+    increase = (
+        retargeting.get("budget_increase")
+        if isinstance(retargeting.get("budget_increase"), dict)
+        else {}
+    )
+    stored_calculation = task.get("calculation_snapshot")
+    stored_fingerprint = str(task.get("calculation_fingerprint") or "")
+    if not isinstance(stored_calculation, dict) or (
+        budget_increase_fingerprint(
+            target_uid=target_uid,
+            strategy_id=strategy_id,
+            calculation=stored_calculation,
+        )
+        != stored_fingerprint
+    ):
+        raise RuntimeError("卡片预算计算快照校验失败")
+    latest_calculation = calculate_budget_increase(row, increase)
+    return cfg, strategy, target, row, latest_calculation
+
+
+async def _execute_budget_increase_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+) -> Dict[str, Any]:
+    """Validate now; real platform write remains closed until contract evidence."""
+    target_uid = str(task.get("target_uid") or "")
+    assist_task_id = str(task.get("assist_task_id") or "")
+    try:
+        async with exclusive_browser_operation(
+            f"飞书确认追加预算:{target_uid}:{assist_task_id}",
+            priority=10,
+        ):
+            _, _, _, _, calculation = await asyncio.to_thread(
+                _validate_budget_increase_task,
+                task,
+                db,
+            )
+            return {
+                "success": False,
+                "message": "追加预算提交能力尚未完成真实页面接口取证，本次未向千川提交",
+                "detail": _json(
+                    {
+                        "step": "platform_capability_unverified",
+                        "assist_task_id": assist_task_id,
+                        "latest_calculation": calculation,
+                    }
+                ),
+                "step": "platform_capability_unverified",
+                "calculation": calculation,
+            }
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": str(exc),
+            "detail": traceback.format_exc(),
+            "step": "revalidate",
+        }
+
+
 async def _execute_task(
     task: Dict[str, Any],
     db: SQLiteStore,
@@ -770,6 +960,8 @@ async def _execute_task(
     _skip_live_guard: bool = False,
     _allow_groups: bool = True,
 ) -> Dict[str, Any]:
+    if str(task.get("task_operation") or "") == "increase_budget":
+        return await _execute_budget_increase_task(task, db)
     groups = _task_retarget_groups(task)
     if _allow_groups and len(groups) > 1:
         return await _execute_grouped_task(task, db, groups)

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Tuple
+
+from services.promotion_capability import parse_target_capability
 
 
 MONEY_QUANT = Decimal("0.01")
@@ -13,6 +16,37 @@ TASK_METRIC_FIELDS = {
     "assistCost": "stat_cost_for_roi2_assist",
     "assistRoi": "total_prepay_and_pay_order_roi2_assist",
 }
+
+
+def assist_task_sync_ready(
+    target: Dict[str, Any],
+    *,
+    max_age_minutes: int = 10,
+) -> Tuple[bool, str]:
+    """Require a complete, recent control-task collection before matching.
+
+    Budget increases are based on the task's latest budget/spend/ROI.  A stale
+    or partial control-task collection must never produce an actionable card.
+    """
+    capability = parse_target_capability(target)
+    if bool(capability.get("assist_sync_in_progress")):
+        return False, "调控任务正在同步中"
+    if not bool(capability.get("assist_sync_enabled")):
+        return False, "调控任务采集未启用"
+    if not bool(capability.get("assist_sync_ok")):
+        return False, "最近一轮调控任务未完整同步"
+    raw = str(capability.get("assist_synced_at") or "").strip()
+    try:
+        synced_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "调控任务同步时间无效"
+    now = datetime.now(synced_at.tzinfo) if synced_at.tzinfo else datetime.now()
+    age = now - synced_at
+    if age < timedelta(minutes=-5) or age > timedelta(
+        minutes=max(1, int(max_age_minutes))
+    ):
+        return False, "调控任务同步结果已过期"
+    return True, ""
 
 
 def _decimal(value: Any, *, field: str) -> Decimal:
@@ -135,4 +169,3 @@ def budget_increase_fingerprint(
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-

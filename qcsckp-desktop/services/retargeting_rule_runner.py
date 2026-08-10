@@ -46,6 +46,11 @@ from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
 from services.qianchuan_accounts import schedulable_promotion_targets
 from services.qianchuan_session import automation_session_ready, current_session_owner
+from services.retarget_budget_increase import (
+    assist_task_sync_ready,
+    budget_increase_fingerprint,
+    calculate_budget_increase,
+)
 from services.retargeting_service import (
     QianChuanRetargetingService,
     retarget_capability_matches,
@@ -222,6 +227,7 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
         "candidate_sort": str(strategy.get("candidate_sort") or "net_roi_desc"),
         "candidate_limit": int(strategy.get("candidate_limit") or 1),
         "action_mode": str(strategy.get("action_mode") or "card_confirm"),
+        "task_action": str(strategy.get("task_action") or "create_retarget"),
         "trigger": (
             strategy.get("trigger")
             if isinstance(strategy.get("trigger"), dict)
@@ -1171,6 +1177,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
     ws, mc = _interval_from_root_cfg(cfg)
     per_strategy_rl = bool(cfg.get("per_strategy_rate_limit"))
 
+    has_material_strategies = any(
+        str((item or {}).get("task_action") or "create_retarget")
+        != "increase_budget"
+        for item in strategies
+        if isinstance(item, dict)
+    )
     dash = DashboardApi()
     resp = dash.get_table_data(
         period=period,
@@ -1178,12 +1190,44 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         sort_order="desc",
         page=1,
         page_size=_DASHBOARD_PAGE_SIZE,
-    )
+    ) if has_material_strategies else {
+        "success": True,
+        "data": [],
+        "total": 0,
+        "period": period,
+    }
     if not resp.get("success"):
         logger.warning("%s get_table_data 失败: %s", _log_sched, resp.get("message"))
         return
 
     rows: List[Dict[str, Any]] = resp.get("data") or []
+    assist_rows: List[Dict[str, Any]] = []
+    if any(
+        str((item or {}).get("task_action") or "create_retarget")
+        == "increase_budget"
+        for item in strategies
+        if isinstance(item, dict)
+    ):
+        assist_resp = dash.get_roi2_assist_table_data(
+            sort_by="stat_cost_for_roi2_assist",
+            sort_order="desc",
+            page=1,
+            page_size=_DASHBOARD_PAGE_SIZE,
+            ad_delivery_type=0,
+            regulation_full_scan=True,
+            assist_updated_within_minutes=10,
+        )
+        if not assist_resp.get("success"):
+            logger.warning(
+                "%s get_roi2_assist_table_data failed: %s",
+                _log_sched,
+                assist_resp.get("message"),
+            )
+            return
+        assist_rows = [
+            row for row in (assist_resp.get("data") or [])
+            if isinstance(row, dict)
+        ]
     account_name = str((dash.get_dashboard_account_label() or {}).get("label") or "").strip()
     query_at = _beijing_now_str()
     period_label = resp.get("period") or ""
@@ -1303,6 +1347,158 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     _log_sched,
                     st.get("id"),
                 )
+                return
+            task_action = str(
+                st.get("task_action") or "create_retarget"
+            ).strip().lower()
+            if task_action == "increase_budget":
+                sync_ready, sync_error = assist_task_sync_ready(
+                    target,
+                    max_age_minutes=10,
+                )
+                if not sync_ready:
+                    logger.warning(
+                        "%s strategy %s skipped: %s",
+                        _log_sched,
+                        st.get("id"),
+                        sync_error,
+                    )
+                    return
+                action_mode = str(
+                    st.get("action_mode") or "card_confirm"
+                ).strip().lower()
+                if action_mode not in ("card_confirm", "auto_execute"):
+                    action_mode = "card_confirm"
+                increase_config = (
+                    retargeting.get("budget_increase")
+                    if isinstance(retargeting.get("budget_increase"), dict)
+                    else {}
+                )
+                matching_tasks: List[Dict[str, Any]] = []
+                for assist_row in assist_rows:
+                    if (
+                        str(assist_row.get("target_uid") or "") != target_uid
+                        or str(assist_row.get("aadvid") or "")
+                        != str(target.get("aadvid") or "")
+                        or str(assist_row.get("ad_id") or "")
+                        != str(target.get("ad_id") or "")
+                    ):
+                        continue
+                    delivery_type = assist_row.get("ad_delivery_type")
+                    if str(
+                        delivery_type if delivery_type is not None else "0"
+                    ).strip() not in {"", "0"}:
+                        continue
+                    if evaluate_trigger(trigger, assist_row):
+                        matching_tasks.append(assist_row)
+                logger.info(
+                    "%s target=%s task_action=increase_budget hits=%s",
+                    retarget_log_tag(
+                        strategy_title=str(st.get("title") or st.get("id") or "?")[:64]
+                    ),
+                    target_uid,
+                    len(matching_tasks),
+                )
+                if not matching_tasks:
+                    return
+                if action_mode == "auto_execute":
+                    logger.warning(
+                        "%s automatic budget increase is blocked until the live platform adjustment contract is verified",
+                        retarget_log_tag(
+                            strategy_title=str(st.get("title") or st.get("id") or "?")[:64]
+                        ),
+                    )
+                    return
+
+                strategy_snapshot = _strategy_snapshot(st)
+                strategy_json = json.dumps(
+                    strategy_snapshot,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                strategy_hash = hashlib.sha256(
+                    strategy_json.encode("utf-8")
+                ).hexdigest()
+                for assist_row in matching_tasks:
+                    try:
+                        calculation = calculate_budget_increase(
+                            assist_row,
+                            increase_config,
+                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            "%s budget calculation blocked task=%s: %s",
+                            _log_sched,
+                            assist_row.get("assist_task_id"),
+                            exc,
+                        )
+                        continue
+                    assist_task_id = str(
+                        assist_row.get("assist_task_id") or ""
+                    ).strip()
+                    if not assist_task_id:
+                        continue
+                    calculation_fingerprint = budget_increase_fingerprint(
+                        target_uid=target_uid,
+                        strategy_id=str(st.get("id") or ""),
+                        calculation=calculation,
+                    )
+                    card_payload = {
+                        "task_operation": "increase_budget",
+                        "aavid": str(target.get("aadvid") or ""),
+                        "account_name": target_account_name,
+                        "ad_id": str(target.get("ad_id") or ""),
+                        "target_uid": target_uid,
+                        "plan_name": str(target.get("plan_name") or ""),
+                        "promotion_scene": promotion_scene,
+                        "plan_system": plan_system,
+                        "assist_task_id": assist_task_id,
+                        "assist_task_name": str(
+                            assist_row.get("task_name") or assist_task_id
+                        ),
+                        "strategy_id": str(st.get("id") or "__legacy__"),
+                        "strategy_name": str(
+                            st.get("title") or st.get("id") or "追加预算策略"
+                        )[:64],
+                        "strategy_hash": strategy_hash,
+                        "rule_snapshot": strategy_snapshot,
+                        "trigger_snapshot": {
+                            "strategy_id": st.get("id"),
+                            "strategy_title": st.get("title"),
+                            "trigger_config": trigger,
+                            "evaluation": build_trigger_evaluation_snapshot(
+                                trigger,
+                                assist_row,
+                            ),
+                        },
+                        "query_snapshot": {
+                            "data_source": "pmc_roi2_assist_task",
+                            "query_at": query_at,
+                            "assist_row": assist_row,
+                            "target": {
+                                "target_uid": target_uid,
+                                "aavid": target.get("aadvid"),
+                                "ad_id": target.get("ad_id"),
+                                "plan_name": target.get("plan_name"),
+                            },
+                        },
+                        "metrics_snapshot": assist_row,
+                        "budget_increase": increase_config,
+                        "calculation_snapshot": calculation,
+                        "calculation_fingerprint": calculation_fingerprint,
+                    }
+                    card_result = await asyncio.to_thread(
+                        create_retarget_task,
+                        card_payload,
+                    )
+                    if not card_result.get("success"):
+                        logger.warning(
+                            "%s budget increase card failed task=%s: %s",
+                            _log_sched,
+                            assist_task_id,
+                            card_result.get("message"),
+                        )
                 return
             capability_ok, capability_reason = check_target_capability(
                 target,

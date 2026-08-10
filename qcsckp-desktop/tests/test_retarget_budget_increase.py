@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
+import asyncio
+import json
 import unittest
+from datetime import datetime
+from unittest.mock import patch
 
 from api.rule_retargeting_config import (
     _normalize_full,
     validate_rule_retargeting_config,
 )
 from services.retarget_budget_increase import (
+    assist_task_sync_ready,
     budget_increase_fingerprint,
     calculate_budget_increase,
     classify_assist_task,
 )
+from services.local_feishu_bridge import build_budget_increase_task_card
+from services import retargeting_rule_runner
 
 
 def _strategy(*, task_action="increase_budget", metric="assistCost", increase=None):
@@ -138,7 +145,150 @@ class RetargetBudgetIncreaseCalculationTests(unittest.TestCase):
             budget_increase_fingerprint(target_uid="t", strategy_id="s", calculation=second),
         )
 
+    def test_assist_sync_must_be_complete_and_fresh(self):
+        ready, message = assist_task_sync_ready(
+            {
+                "capability_json": {
+                    "assist_sync_enabled": True,
+                    "assist_sync_ok": True,
+                    "assist_sync_in_progress": False,
+                    "assist_synced_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            }
+        )
+        self.assertTrue(ready)
+        self.assertEqual("", message)
+        blocked, blocked_message = assist_task_sync_ready(
+            {"capability_json": {"assist_sync_enabled": True, "assist_sync_ok": False}}
+        )
+        self.assertFalse(blocked)
+        self.assertIn("未完整同步", blocked_message)
+
+    def test_budget_card_shows_percentage_basis_and_final_budget(self):
+        card = build_budget_increase_task_card(
+            {
+                "task_uid": "task-1",
+                "action_nonce": "nonce-1",
+                "status": "pending",
+                "account_name": "测试账户",
+                "aavid": "123",
+                "plan_name": "测试计划",
+                "ad_id": "456",
+                "promotion_scene": "live",
+                "plan_system": "chengfang",
+                "assist_task_id": "assist-1",
+                "assist_task_name": "放量追投1",
+                "strategy_name": "消耗达标加预算",
+                "budget_increase": {"mode": "spend_percentage"},
+                "calculation_snapshot": {
+                    "task_kind": "volume",
+                    "mode": "spend_percentage",
+                    "current_budget_yuan": 400,
+                    "latest_spend_yuan": 300,
+                    "spend_percentage": 20,
+                    "increment_budget_yuan": 60,
+                    "new_budget_yuan": 460,
+                    "extend_hours": 1,
+                },
+            }
+        )
+        content = str(card)
+        self.assertIn("按最新消耗", content)
+        self.assertIn("新增后预算", content)
+        self.assertIn("460", content)
+        self.assertIn("确认追加预算", content)
+
+    def test_runner_matches_control_task_and_creates_budget_card(self):
+        strategy = _strategy(
+            increase={
+                "mode": "spend_percentage",
+                "fixed_amount_yuan": None,
+                "spend_percentage": 20,
+                "volume_extend_hours": 1,
+            }
+        )
+        target = {
+            "target_uid": "target-1",
+            "account_uid": "account-1",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "plan_name": "直播计划",
+            "promotion_scene": "live",
+            "plan_system": "global",
+            "retarget_eligible": 1,
+            "enabled": 1,
+            "last_status": "ok",
+            "capability_json": json.dumps(
+                {
+                    "assist_sync_enabled": True,
+                    "assist_sync_ok": True,
+                    "assist_sync_in_progress": False,
+                    "assist_synced_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            ),
+        }
+        assist_row = {
+            "target_uid": "target-1",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "assist_task_id": "assist-1",
+            "task_name": "放量任务1",
+            "budget": 400,
+            "start_time": "2026-08-10 10:00:00",
+            "end_time": "2026-08-10 12:00:00",
+            "ad_delivery_type": 0,
+            "stat_cost_for_roi2_assist": 300,
+            "total_prepay_and_pay_order_roi2_assist": 2.5,
+        }
+
+        class FakeDashboard:
+            def get_table_data(self, **_kwargs):
+                raise AssertionError("budget-only strategies must not read material data")
+
+            def get_roi2_assist_table_data(self, **_kwargs):
+                return {"success": True, "data": [assist_row], "total": 1}
+
+            def get_dashboard_account_label(self):
+                return {"label": "测试账户"}
+
+        class FakeStore:
+            def select(self, table, **_kwargs):
+                return [target] if table == "promotion_target" else []
+
+            def select_one(self, table, **_kwargs):
+                if table == "pmc_ad_detail_basic":
+                    return {"user_info_name": "测试账户"}
+                return None
+
+        with patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value={
+                "enabled": True,
+                "trigger_query_period": "1h",
+                "strategies": [strategy],
+            },
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeDashboard(),
+        ), patch(
+            "services.retargeting_rule_runner.evaluate_trigger",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.build_trigger_evaluation_snapshot",
+            return_value={"passed": True},
+        ), patch(
+            "services.retargeting_rule_runner.create_retarget_task",
+            return_value={"success": True, "data": {"task_uid": "budget-card-1"}},
+        ) as create_task:
+            asyncio.run(retargeting_rule_runner.run_one_cycle(FakeStore()))
+
+        self.assertEqual(1, create_task.call_count)
+        payload = create_task.call_args.args[0]
+        self.assertEqual("increase_budget", payload["task_operation"])
+        self.assertEqual("assist-1", payload["assist_task_id"])
+        self.assertEqual(60.0, payload["calculation_snapshot"]["increment_budget_yuan"])
+        self.assertEqual(460.0, payload["calculation_snapshot"]["new_budget_yuan"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
