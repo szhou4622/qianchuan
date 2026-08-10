@@ -264,6 +264,17 @@ class ProductionV1ASafetyTests(unittest.TestCase):
         hidden = RuntimeContext.dashboard_data(runtime, self.fx.user)
         self.assertEqual(0, hidden["pagination"]["total"])
 
+    def test_v1a_desktop_entry_keeps_the_v0146_frontend_frozen(self):
+        desktop_root = Path(__file__).resolve().parents[1]
+        entry = (desktop_root / "desktop_v1a.py").read_text(encoding="utf-8")
+        legacy_index = (desktop_root / "static" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("from gui_app import main as run_frozen_legacy_frontend", entry)
+        self.assertNotIn("production_v1a_frontend", entry)
+        self.assertIn('src="dashboard.html"', legacy_index)
+        self.assertIn("千川素材看盘工具", legacy_index)
+
     def test_suspicious_empty_catalog_keeps_last_complete_plan(self):
         target = self.fx.seed_target(aavid="3001", ad_id="4001")
 
