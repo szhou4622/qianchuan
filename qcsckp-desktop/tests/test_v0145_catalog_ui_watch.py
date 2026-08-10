@@ -52,6 +52,12 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("保存并应用监控", self.html)
         self.assertIn("save.classList.add('pending')", self.html)
 
+    def test_account_save_is_single_flight_and_disables_repeat_clicks(self):
+        self.assertIn("const savingAccounts=new Set()", self.html)
+        self.assertIn("if(!uid||savingAccounts.has(uid))return", self.html)
+        self.assertIn("saveButton.disabled=true", self.html)
+        self.assertIn("savingAccounts.delete(uid)", self.html)
+
     def test_catalog_watch_does_not_stream_full_overview_every_tick(self):
         self.assertIn("loadInFlight", self.html)
         self.assertNotIn(

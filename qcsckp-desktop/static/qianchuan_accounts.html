@@ -84,6 +84,7 @@
   const logStatus=x=>({ok:'同步正常',partial:'部分完成',empty:'暂无记录',login_required:'需要重新登录',not_configured:'尚未配置',error:'同步失败'}[x]||x||'尚未配置');
   const groupDefs=[['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['unknown','all','待确认/其他']];
   let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null;
+  const savingAccounts=new Set();
 
   function filteredPlans(plans){
     const query=($('planSearch')?.value||'').trim().toLowerCase();
@@ -314,7 +315,12 @@
     }
   }
   async function saveAccount(card){
-    const a=await waitApi();const uid=card.dataset.account;
+    const uid=String(card?.dataset.account||'');
+    if(!uid||savingAccounts.has(uid))return;
+    savingAccounts.add(uid);
+    const saveButton=card.querySelector('[data-save]');
+    if(saveButton){saveButton.disabled=true;saveButton.textContent='正在保存…'}
+    const a=await waitApi();
     const settings={
       enabled:card.querySelector('[data-field=enabled]').checked,
       report_enabled:card.querySelector('[data-field=report_enabled]').checked,
@@ -323,11 +329,18 @@
       route_group_ids:Array.from(card.querySelectorAll('[data-group]:checked')).map(x=>x.dataset.group)
     };
     const planStates=Array.from(card.querySelectorAll('[data-target]')).map(x=>({target_uid:x.dataset.target,enabled:x.checked}));
-    const r=await a.saveQianchuanAccountAutomationSetup(uid,settings,planStates);
-    if(!r?.success){message((r?.message||'账户与计划设置保存失败')+'；本次修改已整体回滚',true);return}
-    dirty=false;await load();
-    const monitorFailed=r?.monitoring&&r.monitoring.success===false;
-    message(r?.message||'账户、日报路由和监控计划已保存，后台监控正在启动',monitorFailed);
+    try{
+      const r=await a.saveQianchuanAccountAutomationSetup(uid,settings,planStates);
+      if(!r?.success){message((r?.message||'账户与计划设置保存失败')+'；本次修改已整体回滚',true);return}
+      dirty=false;await load();
+      const monitorFailed=r?.monitoring&&r.monitoring.success===false;
+      message(r?.message||'账户、日报路由和监控计划已保存，后台监控正在启动',monitorFailed);
+    }catch(e){
+      message('账户与计划设置保存失败：'+String(e?.message||e||'未知异常'),true);
+    }finally{
+      savingAccounts.delete(uid);
+      if(saveButton?.isConnected){saveButton.disabled=false;saveButton.textContent='保存并应用监控'}
+    }
   }
   async function removeAccount(card){
     const name=card.querySelector('.account-name')?.textContent||'该账户';
