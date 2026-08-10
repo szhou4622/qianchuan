@@ -519,6 +519,126 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
             still_manually_blocked["write_block_origin"],
         )
 
+    def test_catalog_fresh_detail_releases_only_transient_verification_lock(self):
+        ensure_qianchuan_account(
+            "10001",
+            owner_username=self.owner,
+            enabled=True,
+            seen=True,
+            db=self.db,
+        )
+        target = self._target(
+            ad_id="30016",
+            status="active",
+            verification="verified",
+            enabled=True,
+        )
+        failed = record_target_verification_failure(
+            target["target_uid"],
+            "temporary exact-detail timeout",
+            db=self.db,
+        )
+        verified_at = failed["last_verified_at"]
+
+        common = {
+            "db": self.db,
+            "aavid": "10001",
+            "account_name": "account",
+            "promotion_scene": "live",
+            "plan_system": "global",
+            "page_url": (
+                "https://qianchuan.jinritemai.com/uni-prom?aavid=10001"
+            ),
+            "candidates": [
+                {
+                    "ad_id": "30016",
+                    "plan_name": "plan-30016",
+                    "platform_status": "active",
+                }
+            ],
+            "owner_username": self.owner,
+            "class_complete": True,
+        }
+
+        _persist_verified_catalog_class(
+            **common,
+            verification={
+                "verified": [
+                    {
+                        "ad_id": "30016",
+                        "plan_name": "plan-30016",
+                        "platform_status": "active",
+                        "verification_evidence_fresh": False,
+                    }
+                ],
+                "rejected": [],
+                "complete": True,
+            },
+        )
+        cached = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertTrue(cached["automation_write_blocked"])
+        self.assertEqual("verification_failure", cached["write_block_origin"])
+        self.assertEqual(verified_at, cached["last_verified_at"])
+
+        _persist_verified_catalog_class(
+            **common,
+            verification={
+                "verified": [
+                    {
+                        "ad_id": "30016",
+                        "plan_name": "plan-30016",
+                        "platform_status": "active",
+                        "verification_evidence_fresh": True,
+                    }
+                ],
+                "rejected": [],
+                "complete": True,
+            },
+        )
+        recovered = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertFalse(recovered["automation_write_blocked"])
+        self.assertEqual("", recovered["write_block_origin"])
+        self.assertEqual("", recovered["last_verification_error"])
+        self.assertEqual(1, recovered["monitor_eligible"])
+
+        with patch(
+            "api.promotion_targets._owner_key",
+            return_value=self.owner,
+        ):
+            set_target_automation_write_block(
+                target["target_uid"],
+                True,
+                reason="manual review",
+                db=self.db,
+            )
+        _persist_verified_catalog_class(
+            **common,
+            verification={
+                "verified": [
+                    {
+                        "ad_id": "30016",
+                        "plan_name": "plan-30016",
+                        "platform_status": "active",
+                        "verification_evidence_fresh": True,
+                    }
+                ],
+                "rejected": [],
+                "complete": True,
+            },
+        )
+        manual = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertTrue(manual["automation_write_blocked"])
+        self.assertEqual("manual", manual["write_block_origin"])
+
     def test_legacy_scoped_conflict_migration_prefers_scoped_without_authority_merge(
         self,
     ):
@@ -1399,6 +1519,97 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
         self.assertFalse(asyncio.run(fetcher._wait_for_ad_delivery_gate()))
         self.assertEqual(
             "gate_unavailable", fetcher._delivery_gate_detail["reason"]
+        )
+
+    def test_live_delivery_gate_actively_reads_exact_scoped_plan(self):
+        fetcher = QianChuanFetcher()
+        fetcher._current_aadvid = "10001"
+        fetcher._current_adid = "30005"
+        fetcher._current_target_uid = "target-live-30005"
+        fetcher._current_account_uid = "account-live-10001"
+        fetcher._current_plan_name = "live-plan"
+        fetcher._current_promotion_scene = "live"
+        fetcher._current_plan_system = "chengfang"
+        fetcher.page = AsyncMock()
+        fetcher.page.evaluate.return_value = {
+            "status_code": 0,
+            "data": {
+                "adDetailInfo": {
+                    "id": "30005",
+                    "advId": "10001",
+                    "adDeliveryName": "投放中",
+                    "adDeliveryType": 0,
+                }
+            },
+        }
+
+        self.assertTrue(
+            asyncio.run(fetcher._check_live_delivery_gate(self.db))
+        )
+        self.assertEqual("delivering", fetcher._delivery_gate_detail["reason"])
+        saved = self.db.select_one(
+            "pmc_ad_detail_basic",
+            where={
+                "account_uid": "account-live-10001",
+                "aadvid": "10001",
+                "ad_id": "30005",
+            },
+        )
+        self.assertIsNotNone(saved)
+
+    def test_live_delivery_gate_rejects_account_or_plan_mismatch(self):
+        for detail, reason in (
+            (
+                {
+                    "id": "99999",
+                    "advId": "10001",
+                    "adDeliveryName": "投放中",
+                    "adDeliveryType": 0,
+                },
+                "live_detail_mismatch",
+            ),
+            (
+                {
+                    "id": "30005",
+                    "advId": "20002",
+                    "adDeliveryName": "投放中",
+                    "adDeliveryType": 0,
+                },
+                "live_detail_account_mismatch",
+            ),
+        ):
+            with self.subTest(reason=reason):
+                fetcher = QianChuanFetcher()
+                fetcher._current_aadvid = "10001"
+                fetcher._current_adid = "30005"
+                fetcher.page = AsyncMock()
+                fetcher.page.evaluate.return_value = {
+                    "status_code": 0,
+                    "data": {"adDetailInfo": detail},
+                }
+                self.assertFalse(
+                    asyncio.run(fetcher._check_live_delivery_gate(self.db))
+                )
+                self.assertEqual(
+                    reason,
+                    fetcher._delivery_gate_detail["reason"],
+                )
+
+    def test_delivery_gate_requires_both_name_and_type(self):
+        self.assertTrue(
+            QianChuanFetcher._ad_detail_is_delivering(
+                {"adDeliveryName": "投放中", "adDeliveryType": 0}
+            )
+        )
+        self.assertFalse(
+            QianChuanFetcher._ad_detail_is_delivering(
+                {"adDeliveryName": "已暂停", "adDeliveryType": 0}
+            )
+        )
+        self.assertFalse(
+            QianChuanFetcher._ad_detail_is_delivering(
+                {"adDeliveryName": "投放中", "adDeliveryType": 1}
+            )
         )
 
     def test_collection_marks_previous_ok_target_as_verifying(self):

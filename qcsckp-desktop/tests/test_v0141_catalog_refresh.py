@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from services.promotion_readonly_probe import PromotionReadOnlyProbe
 from services.qianchuan_accounts import ensure_qianchuan_account
@@ -297,6 +297,25 @@ class CatalogRefreshV0141Tests(unittest.TestCase):
         marked.assert_called_once_with(
             owner_username="owner", account_uid="account_two"
         )
+
+    def test_catalog_completion_rechecks_saved_monitor_selection(self):
+        controller = ServiceController()
+        controller._catalog_sync_async = AsyncMock(return_value=None)
+        controller.start_from_saved_session = Mock(
+            return_value={"success": True, "running": True}
+        )
+
+        with patch(
+            "services.run_services.current_session_owner",
+            return_value="owner",
+        ):
+            controller._catalog_sync_entry("owner", "account_one")
+
+        controller._catalog_sync_async.assert_awaited_once_with(
+            owner_username="owner",
+            account_uid="account_one",
+        )
+        controller.start_from_saved_session.assert_called_once_with()
 
 
 if __name__ == "__main__":

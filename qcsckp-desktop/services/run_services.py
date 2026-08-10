@@ -327,6 +327,10 @@ def _persist_verified_catalog_class(
         existing = existing_rows.get(ad_id) or {}
         is_verified = isinstance(exact, dict)
         source = exact if is_verified else candidate
+        verification_evidence_fresh = bool(
+            is_verified
+            and source.get("verification_evidence_fresh", True)
+        )
         target = upsert_promotion_target(
             {
                 "aavid": aavid,
@@ -347,6 +351,7 @@ def _persist_verified_catalog_class(
                 "verification_state": (
                     "verified" if is_verified else "candidate"
                 ),
+                "verification_evidence_fresh": verification_evidence_fresh,
                 "page_url": page_url,
                 "enabled": bool(existing.get("enabled")) if existing else False,
                 "last_status": str(
@@ -1569,6 +1574,21 @@ class ServiceController:
                 refreshed_account_uids=refresh_scope,
                 error=f"账户计划目录同步失败：{exc}",
             )
+        finally:
+            # A fresh catalog verification can turn an enabled target from a
+            # transient verification_failure into a schedulable target.  At
+            # application startup the first monitor bootstrap may already
+            # have returned ``no_targets`` while that verification was still
+            # running.  Re-check after every catalog run so the user does not
+            # need to save the same account settings a second time.
+            if current_session_owner() == str(owner_username or "").casefold():
+                try:
+                    self.start_from_saved_session()
+                except Exception as exc:
+                    logger.warning(
+                        "[千川目录] 目录完成后自动启动监控失败：%s",
+                        exc,
+                    )
 
     async def _wait_catalog_class(
         self,
@@ -2114,6 +2134,14 @@ class ServiceController:
             if (
                 str(existing.get("verification_state") or "") == "verified"
                 and verified_at is not None
+                and not (
+                    bool(existing.get("automation_write_blocked"))
+                    and str(existing.get("write_block_origin") or "")
+                    == "verification_failure"
+                )
+                and not str(
+                    existing.get("last_verification_error") or ""
+                ).strip()
                 and (
                     verified_at >= reverify_before
                     or candidate_status not in ACTIVE_PLATFORM_STATUSES
@@ -2126,6 +2154,7 @@ class ServiceController:
                     {
                         **candidate,
                         "verification_state": "verified",
+                        "verification_evidence_fresh": False,
                         "detail_snapshot": {},
                     }
                 )
@@ -2144,7 +2173,14 @@ class ServiceController:
             plan_system=plan_system,
             ad_ids=verify_ids,
         )
-        freshly_verified = list(verification.get("verified") or [])
+        freshly_verified = [
+            {
+                **item,
+                "verification_evidence_fresh": True,
+            }
+            for item in verification.get("verified") or []
+            if isinstance(item, dict)
+        ]
         verification["verified"] = cached_verified + freshly_verified
         resolved_rejections = sum(
             1

@@ -854,6 +854,11 @@ def upsert_promotion_target(
         )
     )
     incoming_verification_state = verification_state
+    fresh_verification_evidence = bool(
+        trusted_catalog
+        and incoming_verification_state == "verified"
+        and data.get("verification_evidence_fresh", True)
+    )
     if (
         existing
         and normalize_verification_state(existing.get("verification_state"))
@@ -906,12 +911,12 @@ def upsert_promotion_target(
         ),
         "last_verified_at": (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if trusted_catalog and incoming_verification_state == "verified"
+            if fresh_verification_evidence
             else (existing.get("last_verified_at") if existing else None)
         ),
         "last_verification_error": (
             ""
-            if trusted_catalog and incoming_verification_state == "verified"
+            if fresh_verification_evidence
             else (
                 existing.get("last_verification_error")
                 if existing
@@ -945,6 +950,29 @@ def upsert_promotion_target(
             unique_fields=["account_uid", "aadvid", "ad_id"],
             connection=conn,
         )
+        # A transient verification timeout is fail-closed, but it must not
+        # become a permanent extra user step.  Only a fresh exact-detail proof
+        # for the same scoped active plan may release this particular latch.
+        # Manual, legacy-quarantine and execution-failure locks remain intact.
+        if (
+            fresh_verification_evidence
+            and eligibility["platform_status"] in ACTIVE_PLATFORM_STATUSES
+        ):
+            store.update(
+                "promotion_target",
+                {
+                    "automation_write_blocked": 0,
+                    "write_block_reason": "",
+                    "write_block_origin": "",
+                    "write_blocked_at": None,
+                },
+                where=(
+                    "target_uid=? AND automation_write_blocked=1 "
+                    "AND write_block_origin='verification_failure'"
+                ),
+                params=(target_uid,),
+                connection=conn,
+            )
     saved = store.select_one(
         "promotion_target",
         where={

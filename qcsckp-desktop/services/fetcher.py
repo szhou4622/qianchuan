@@ -422,7 +422,7 @@ class QianChuanFetcher:
             di = int(dtype) if dtype is not None else -1
         except (TypeError, ValueError):
             di = -1
-        return name == "投放中" or di == 0
+        return name == "投放中" and di == 0
 
     @staticmethod
     def _pick_user_info_for_ad_detail(detail: dict, user_map: Any) -> Dict[str, Any]:
@@ -723,6 +723,140 @@ class QianChuanFetcher:
             except Exception as exc:
                 logger.warning("[商品抓取] 基础信息写入失败：%s", exc)
         logger.info("[商品抓取] 已按目标计划 ID 确认投放中")
+        return True
+
+    async def _check_live_delivery_gate(self, db=None) -> bool:
+        """Actively verify the exact live plan instead of waiting for page luck."""
+        if not self.page or not self._current_aadvid or not self._current_adid:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "ids_missing",
+            }
+            return False
+        try:
+            payload = await self.page.evaluate(
+                """async ({ aavid, adId }) => {
+                    const query = new URLSearchParams({ aavid, adid: adId });
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 8000);
+                    try {
+                        const response = await fetch(
+                            `/ad/api/creation/v1/ad/ad-detail-basic?${query.toString()}`,
+                            {
+                                credentials: "include",
+                                signal: controller.signal
+                            }
+                        );
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        return await response.json();
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }""",
+                {
+                    "aavid": str(self._current_aadvid),
+                    "adId": str(self._current_adid),
+                },
+            )
+        except Exception as exc:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "live_detail_error",
+                "message": str(exc),
+            }
+            logger.warning("[直播抓取] 目标计划详情主动读取失败：%s", exc)
+            return False
+
+        if not isinstance(payload, dict) or payload.get("status_code") != 0:
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "live_detail_error",
+                "message": (
+                    payload.get("message")
+                    if isinstance(payload, dict)
+                    else "响应格式异常"
+                ),
+            }
+            return False
+        detail = (payload.get("data") or {}).get("adDetailInfo")
+        if not isinstance(detail, dict):
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "live_detail_missing",
+            }
+            return False
+        actual_ad_id = str(
+            detail.get("id") or detail.get("adId") or ""
+        ).strip()
+        if actual_ad_id != str(self._current_adid):
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "live_detail_mismatch",
+                "actual_ad_id": actual_ad_id,
+            }
+            return False
+        actual_aavid = str(
+            detail.get("advId")
+            or detail.get("aavid")
+            or detail.get("advertiserId")
+            or ""
+        ).strip()
+        if actual_aavid and actual_aavid != str(self._current_aadvid):
+            self._delivery_gate_detail = {
+                "ok": False,
+                "reason": "live_detail_account_mismatch",
+                "actual_aavid": actual_aavid,
+            }
+            return False
+
+        ok = self._ad_detail_is_delivering(detail)
+        name = detail.get("adDeliveryName")
+        dtype = detail.get("adDeliveryType")
+        self._delivery_gate_detail = {
+            "ok": bool(ok),
+            "reason": "delivering" if ok else "not_delivering",
+            "delivery_name": name,
+            "delivery_type": dtype,
+        }
+        if not ok:
+            logger.warning(
+                "[直播抓取] 当前非投放中（adDeliveryName=%r, adDeliveryType=%r）",
+                name,
+                dtype,
+            )
+            return False
+
+        row = self._build_pmc_ad_detail_basic_row(payload, detail)
+        if row and db:
+            try:
+                db.insert_or_update(
+                    table="pmc_ad_detail_basic",
+                    data=row,
+                    unique_fields=["account_uid", "aadvid", "ad_id"],
+                    update_fields=[
+                        "account_uid",
+                        "target_uid",
+                        "plan_name",
+                        "promotion_scene",
+                        "plan_system",
+                        "budget",
+                        "audience_coverage_count",
+                        "compensation_convert",
+                        "ecp_roi2_goal",
+                        "creative_type",
+                        "user_info_id",
+                        "user_info_name",
+                        "user_info_unique_id",
+                        "updated_at",
+                    ],
+                )
+                if self._cloud_backup_username and self._cloud_backup_password:
+                    self._pending_ad_detail_basic_cloud_row = dict(row)
+            except Exception as exc:
+                logger.warning("[直播抓取] 基础信息写入失败：%s", exc)
+        logger.info("[直播抓取] 已按账户和目标计划 ID 主动确认投放中")
         return True
 
     def _build_product_material_request_body(
@@ -2155,7 +2289,17 @@ class QianChuanFetcher:
                 await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 await asyncio.sleep(random.uniform(3, 5))
                 await self._raise_if_global_auth_expired()
-                gate_ok = await self._wait_for_ad_delivery_gate()
+                gate_ok = await self._check_live_delivery_gate(db)
+                if (
+                    not gate_ok
+                    and self._delivery_gate_detail.get("reason")
+                    in {"live_detail_error", "live_detail_missing"}
+                ):
+                    # A request already emitted during page load remains a
+                    # valid fallback when the proactive read was transiently
+                    # unavailable.  Explicit mismatch/non-delivery results
+                    # never fall back to an older queued response.
+                    gate_ok = await self._wait_for_ad_delivery_gate()
             finally:
                 self._ad_detail_gate_active = False
                 try:
