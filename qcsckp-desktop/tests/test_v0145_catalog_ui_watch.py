@@ -45,6 +45,13 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         )
         self.assertIn(expected, self.html)
 
+    def test_plan_selection_has_immediate_unsaved_monitoring_feedback(self):
+        self.assertIn('data-persisted-enabled="${p.enabled?', self.html)
+        self.assertIn("待保存并开始监控", self.html)
+        self.assertIn("待保存停止监控", self.html)
+        self.assertIn("保存并应用监控", self.html)
+        self.assertIn("save.classList.add('pending')", self.html)
+
     def test_catalog_watch_does_not_stream_full_overview_every_tick(self):
         self.assertIn("loadInFlight", self.html)
         self.assertNotIn(
