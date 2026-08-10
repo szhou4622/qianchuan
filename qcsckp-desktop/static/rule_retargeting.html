@@ -1117,33 +1117,46 @@
                 <section class="rr-section space-y-3" id="sectionStrategyTarget">
                     <div class="rr-section-title">
                         <span class="rr-accent-bar" aria-hidden="true"></span>
-                        <i data-lucide="list-checks" class="w-4 h-4 text-cyan-400/90"></i>
-                        监控计划与触发层级
+                        <i data-lucide="crosshair" class="w-4 h-4 text-cyan-400/90"></i>
+                        监控计划
                     </div>
-                    <div class="pl-[calc(0.5rem+3px)] grid grid-cols-1 md:grid-cols-3 gap-3 max-w-5xl">
-                        <label class="block">
-                            <span class="rr-label">监控账户</span>
-                            <select id="strategyAccountUid" class="rr-input rr-input--flush">
-                                <option value="">请选择监控账户</option>
-                            </select>
-                            <span class="text-[11px] text-slate-600 mt-1.5 block">只显示已启用且已有监控计划的千川账户。</span>
-                        </label>
-                        <label class="block">
-                            <span class="rr-label">监控计划</span>
-                            <select id="strategyTargetUid" class="rr-input rr-input--flush">
-                                <option value="">请先选择监控账户</option>
-                            </select>
-                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先选择监控账户，再选择该账户下已监控的计划。</span>
-                        </label>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-2">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-4xl">
+                            <label class="block">
+                                <span class="rr-label">监控账户</span>
+                                <select id="strategyAccountUid" class="rr-input w-full text-xs">
+                                    <option value="">请选择监控账户</option>
+                                </select>
+                            </label>
+                            <label class="block">
+                                <span class="rr-label">监控计划</span>
+                                <select id="strategyTargetUid" class="rr-input w-full text-xs">
+                                    <option value="">请先选择监控账户</option>
+                                </select>
+                            </label>
+                        </div>
+                        <p id="strategyTargetScene" class="text-[11px] text-slate-500">
+                            这里只显示已启用账户下已勾选监控的计划；追投资格尚未采集完成时可先保存停用草稿。
+                        </p>
+                    </div>
+                </section>
+
+                <section class="rr-section space-y-3" id="sectionStrategyTriggerLevel">
+                    <div class="rr-section-title">
+                        <span class="rr-accent-bar" aria-hidden="true"></span>
+                        <i data-lucide="layers-3" class="w-4 h-4 text-cyan-400/90"></i>
+                        触发层级
+                    </div>
+                    <div class="pl-[calc(0.5rem+3px)] space-y-3 max-w-4xl">
                         <label class="block">
                             <span class="rr-label">触发层级</span>
-                            <select id="strategyTriggerLevel" class="rr-input rr-input--flush">
+                            <select id="strategyTriggerLevel" class="rr-input w-full text-xs">
                                 <option value="material">逐条素材判断</option>
                                 <option value="product">按商品汇总后判断</option>
                             </select>
                             <span class="text-[11px] text-slate-600 mt-1.5 block">商品级仅适用于推商品计划；实际执行还要求计划体系已识别且适配器已验证。</span>
                         </label>
-                        <div id="productStrategyFields" class="hidden md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div id="productStrategyFields" class="hidden grid grid-cols-1 md:grid-cols-2 gap-3">
                             <label class="block md:col-span-2">
                                 <span class="rr-label">只判断这些商品（可选）</span>
                                 <input id="strategyProductFilter" type="hidden" value="">
@@ -1864,8 +1877,10 @@
             const hint = document.getElementById('strategyTargetScene');
             if (hint) {
                 hint.textContent = target
-                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.aadvid} · 计划 ${target.ad_id}`
-                    : '请先在“千川账户管理”页面添加账户并勾选监控计划。';
+                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${target.retarget_eligible ? '' : ' · 追投资格待采集，可先保存停用草稿'}`
+                    : document.getElementById('strategyAccountUid')?.value
+                        ? '该账户下暂无已勾选监控的计划，请先到“千川账户管理”启用计划。'
+                        : '请先选择监控账户。';
             }
             renderStrategyProductOptions();
             syncRetargetMethodAvailability();
@@ -1938,7 +1953,7 @@
             if (!api?.listPromotionTargets) return;
             const res = await api.listPromotionTargets(true);
             promotionTargetsState = Array.isArray(res?.data)
-                ? res.data.filter(x => x && x.account_enabled !== false)
+                ? res.data.filter(x => x && !!x.account_enabled && !!x.monitor_eligible)
                 : [];
             const productEntries = await Promise.all(promotionTargetsState.map(async target => {
                 if (target.promotion_scene !== 'product' || !target.retarget_eligible || !api.listPromotionTargetProducts) {
@@ -2005,10 +2020,10 @@
                 .sort(compareRetargetTargets);
             select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + targets.map(target => {
                 const scene = target.promotion_scene === 'product' ? '推商品' : target.promotion_scene === 'live' ? '推直播' : '场景待确认';
-                const system = target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认';
+                const system = target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '乘方' : '体系待确认';
                 const unavailable = !target.retarget_eligible;
-                const suffix = unavailable ? `｜暂不可追投：${target.ineligible_reason || '能力待验证'}` : '';
-                return `<option value="${rrHtmlEsc(target.target_uid)}"${unavailable ? ' disabled' : ''}>${system}｜${scene}｜${rrHtmlEsc(target.plan_name || target.ad_id)}${rrHtmlEsc(suffix)}</option>`;
+                const suffix = unavailable ? '｜追投资格待采集' : '';
+                return `<option value="${rrHtmlEsc(target.target_uid)}">${system}｜${scene}｜${rrHtmlEsc(target.plan_name || target.ad_id)}｜${rrHtmlEsc(target.ad_id)}${suffix}</option>`;
             }).join('');
             if (selectedTargetUid && targets.some(target => target.target_uid === selectedTargetUid)) {
                 select.value = selectedTargetUid;
@@ -2539,7 +2554,8 @@
                 const targetUid = document.getElementById('strategyTargetUid')?.value || '';
                 const triggerLevel = document.getElementById('strategyTriggerLevel')?.value || 'material';
                 const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
-                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || !selectedTarget.retarget_eligible || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
+                const configEnabled = !!document.getElementById('cfgEnabled')?.checked;
+                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || (configEnabled && !selectedTarget.retarget_eligible) || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
                     renderStrategyTabs();
                     const accountEl = document.getElementById('strategyAccountUid');
                     const targetEl = document.getElementById('strategyTargetUid');
@@ -2549,7 +2565,7 @@
                             ? '请先为策略选择该账户下的监控计划'
                             : selectedTarget.account_uid !== accountUid
                                 ? '监控账户与监控计划不一致，请重新选择'
-                                : !selectedTarget.retarget_eligible
+                                : configEnabled && !selectedTarget.retarget_eligible
                                     ? `该监控计划暂不可追投：${selectedTarget.ineligible_reason || '能力待验证'}`
                                     : '商品级策略只能选择推商品计划';
                     return {

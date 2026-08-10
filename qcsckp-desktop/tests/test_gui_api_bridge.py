@@ -146,6 +146,8 @@ class JSApiBridgeTests(unittest.TestCase):
         )
         self.assertIn('id="strategyAccountUid"', page)
         self.assertIn('id="strategyTargetUid"', page)
+        self.assertIn('id="sectionStrategyTriggerLevel"', page)
+        self.assertIn("grid grid-cols-1 md:grid-cols-2 gap-3 max-w-4xl", page)
         self.assertIn("renderStrategyTargetOptions(accountUid, '')", page)
         self.assertIn("account_uid: s.account_uid || ''", page)
         self.assertLess(
