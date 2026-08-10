@@ -1204,6 +1204,14 @@
                         <button type="button" data-action-mode="auto_execute" class="action-mode-btn seg-btn px-4 py-2 rounded-lg text-sm">自动追投</button>
                     </div>
                     <p class="text-[11px] text-slate-600 leading-relaxed max-w-2xl">默认先发送30分钟有效的飞书卡片；指定用户点击“确认追投”后，桌面工具复核规则并直接执行。</p>
+                    <div class="rr-label pt-2">调控动作</div>
+                    <div class="flex flex-wrap gap-2.5">
+                        <button type="button" data-task-action="create_retarget" class="task-action-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">新建追投任务</button>
+                        <button type="button" data-task-action="increase_budget" class="task-action-btn seg-btn px-4 py-2 rounded-lg text-sm">已有任务追加预算</button>
+                    </div>
+                    <p id="taskActionHint" class="text-[11px] text-slate-600 leading-relaxed max-w-2xl">按单条素材指标命中后新建调控任务。</p>
+
+                    <div id="panelCreateRetarget" class="space-y-3">
                     <div class="rr-label pt-2">追投方式</div>
                     <div class="flex flex-wrap gap-2.5">
                         <button type="button" data-method="volume" class="method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">放量追投</button>
@@ -1279,6 +1287,38 @@
                                class="rr-input rr-input--suffix-compact" placeholder="素材看盘自动追投" />
                         <span class="text-[11px] text-slate-600 mt-1.5 block"><span id="suffixCount">0</span>/15 · 留空保存时为默认「素材看盘自动追投」</span>
                     </label>
+                    </div>
+
+                    <div id="panelIncreaseBudget" class="hidden space-y-4 pt-1 max-w-xl">
+                        <div>
+                            <div class="rr-label">新增预算计算方式</div>
+                            <div class="flex flex-wrap gap-2.5 mt-1.5">
+                                <button type="button" data-increase-mode="fixed" class="increase-mode-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">填写新增金额</button>
+                                <button type="button" data-increase-mode="spend_percentage" class="increase-mode-btn seg-btn px-4 py-2 rounded-lg text-sm">按调控消耗百分比</button>
+                            </div>
+                        </div>
+                        <label id="panelIncreaseFixed" class="block">
+                            <span class="rr-label">每次新增金额（元）</span>
+                            <input type="text" id="increaseFixedAmount" inputmode="decimal" autocomplete="off"
+                                   class="rr-input rr-input--compact num-input" placeholder="例如 200" />
+                            <p id="errIncreaseFixedAmount" class="rr-field-err hidden" role="alert"></p>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">例如当前预算400元，填写200元后，新预算为600元。</span>
+                        </label>
+                        <label id="panelIncreasePercentage" class="hidden block">
+                            <span class="rr-label">按最新调控消耗增加（%）</span>
+                            <input type="text" id="increaseSpendPercentage" inputmode="decimal" autocomplete="off"
+                                   class="rr-input rr-input--compact num-input" placeholder="例如 20" />
+                            <p id="errIncreaseSpendPercentage" class="rr-field-err hidden" role="alert"></p>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">新增金额＝执行前最新调控消耗×该百分比，计算结果保留两位小数。</span>
+                        </label>
+                        <div class="w-fit max-w-full">
+                            <span class="rr-label">放量任务每次延长时长（小时）</span>
+                            <input type="number" id="increaseVolumeHours" step="0.5" min="0.5" max="24"
+                                   class="rr-input rr-input--flush num-input w-[8rem] text-center tabular-nums" value="1" />
+                            <p id="errIncreaseVolumeHours" class="rr-field-err hidden max-w-[20rem]" role="alert"></p>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">只用于放量任务；ROI控成本和成交控成本任务只追加预算。</span>
+                        </div>
+                    </div>
                     </div>
                 </section>
 
@@ -1390,6 +1430,19 @@
             { key: 'overallCtr', label: '整体点击率' },
             { key: 'overallConversionRate', label: '整体转化率' },
         ];
+        const ASSIST_TASK_METRICS = [
+            { key: 'assistCost', label: '调控任务消耗' },
+            { key: 'assistRoi', label: '调控任务ROI' },
+        ];
+        const ASSIST_TASK_METRIC_KEYS = new Set(ASSIST_TASK_METRICS.map((item) => item.key));
+
+        function currentTaskAction() {
+            return document.querySelector('.task-action-btn.seg-btn-active')?.getAttribute('data-task-action') || 'create_retarget';
+        }
+
+        function metricsForCurrentTaskAction() {
+            return currentTaskAction() === 'increase_budget' ? ASSIST_TASK_METRICS : METRICS;
+        }
         /** 率类阈值在 JSON 中存百分数字面量 0~100（如 0.25 表示 0.25%，22 表示 22%）；回填不再把 |x|≤1 当小数比例乘 100 */
         const RATE_METRICS = new Set([
             'hourRefundRate',
@@ -1910,6 +1963,13 @@
             syncProductStrategyVisibility();
         }
 
+        function defaultAssistTaskTriggerPayload() {
+            return {
+                group_combine: 'or',
+                groups: [{ join: 'and', conditions: [{ metric: 'assistCost', op: 'gt', value: 0 }] }],
+            };
+        }
+
         function rrHtmlEsc(value) {
             return String(value ?? '').replace(/[&<>"']/g, c => ({
                 '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -1977,6 +2037,12 @@
                     optimization_goal: 'net_roi',
                     net_roi: { daily_budget_yuan: null, net_roi_target: null },
                     live_room: { daily_budget_yuan: null, bid_per_conversion_yuan: null },
+                },
+                budget_increase: {
+                    mode: 'fixed',
+                    fixed_amount_yuan: null,
+                    spend_percentage: null,
+                    volume_extend_hours: 1,
                 },
                 interval: inv,
                 task_name_suffix: '',
@@ -2063,6 +2129,7 @@
                     candidate_sort: 'net_roi_desc',
                     candidate_limit: 1,
                     action_mode: 'card_confirm',
+                    task_action: 'create_retarget',
                     trigger: defaultTriggerPayload(),
                     retargeting: defaultRetargetingPayload(),
                 });
@@ -2079,6 +2146,7 @@
             const actionMode =
                 document.querySelector('.action-mode-btn.seg-btn-active')?.getAttribute('data-action-mode') ||
                 'card_confirm';
+            const taskAction = currentTaskAction();
             const volBudget = document.getElementById('volBudget').value.trim();
             const volDur = parseFloat(document.getElementById('volDuration').value);
             const cur = strategiesState[activeStrategyIndex];
@@ -2121,6 +2189,21 @@
                         })(),
                     },
                 },
+                budget_increase: {
+                    mode: document.querySelector('.increase-mode-btn.seg-btn-active')?.getAttribute('data-increase-mode') || 'fixed',
+                    fixed_amount_yuan: (() => {
+                        const v = document.getElementById('increaseFixedAmount').value.trim();
+                        return v === '' ? null : parseFloat(v);
+                    })(),
+                    spend_percentage: (() => {
+                        const v = document.getElementById('increaseSpendPercentage').value.trim();
+                        return v === '' ? null : parseFloat(v);
+                    })(),
+                    volume_extend_hours: (() => {
+                        const v = parseFloat(document.getElementById('increaseVolumeHours').value);
+                        return Number.isFinite(v) ? v : 1;
+                    })(),
+                },
                 task_name_suffix: document.getElementById('taskSuffix').value.trim().slice(0, 15),
                 interval: invForStrategy,
             };
@@ -2135,6 +2218,7 @@
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(document.getElementById('candidateLimit')?.value || '1', 10) || 1)),
                 action_mode: actionMode,
+                task_action: taskAction,
                 trigger: trig,
                 retargeting: ret,
             };
@@ -2282,6 +2366,7 @@
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: 1,
                 action_mode: 'card_confirm',
+                task_action: 'create_retarget',
                 trigger: defaultTriggerPayload(),
                 retargeting: defaultRetargetingPayload(),
             });
@@ -2308,6 +2393,11 @@
             document.querySelectorAll('.action-mode-btn').forEach((b) => {
                 b.classList.toggle('seg-btn-active', b.getAttribute('data-action-mode') === actionMode);
             });
+            const taskAction = s.task_action === 'increase_budget' ? 'increase_budget' : 'create_retarget';
+            document.querySelectorAll('.task-action-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-task-action') === taskAction);
+            });
+            syncTaskActionPanels();
             mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
             _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
             renderTriggerGroups(_groupsRef);
@@ -2334,6 +2424,16 @@
             document.getElementById('ccRoiTarget').value = nr.net_roi_target != null ? nr.net_roi_target : '';
             document.getElementById('ccDailyLive').value = lr.daily_budget_yuan != null ? lr.daily_budget_yuan : '';
             document.getElementById('ccBid').value = lr.bid_per_conversion_yuan != null ? lr.bid_per_conversion_yuan : '';
+
+            const increase = r.budget_increase || {};
+            const increaseMode = increase.mode === 'spend_percentage' ? 'spend_percentage' : 'fixed';
+            document.querySelectorAll('.increase-mode-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-increase-mode') === increaseMode);
+            });
+            document.getElementById('increaseFixedAmount').value = increase.fixed_amount_yuan != null ? increase.fixed_amount_yuan : '';
+            document.getElementById('increaseSpendPercentage').value = increase.spend_percentage != null ? increase.spend_percentage : '';
+            document.getElementById('increaseVolumeHours').value = increase.volume_extend_hours != null ? increase.volume_extend_hours : 1;
+            syncIncreaseModePanels();
 
             const sfx = (r.task_name_suffix || '').slice(0, 15);
             document.getElementById('taskSuffix').value = sfx === '素材看盘自动追投' ? '' : sfx;
@@ -2430,6 +2530,9 @@
                 ['ccRoiTarget', 'errCcRoiTarget'],
                 ['ccDailyLive', 'errCcDailyLive'],
                 ['ccBid', 'errCcBid'],
+                ['increaseFixedAmount', 'errIncreaseFixedAmount'],
+                ['increaseSpendPercentage', 'errIncreaseSpendPercentage'],
+                ['increaseVolumeHours', 'errIncreaseVolumeHours'],
                 ['intervalWindowSeconds', 'errIntervalWindowSeconds'],
                 ['intervalMaxCount', 'errIntervalMaxCount'],
                 ['strategyIntervalWindowSeconds', 'errStrategyIntervalWindowSeconds'],
@@ -2704,6 +2807,7 @@
         /** @returns {{ ok: boolean, firstMsg: string, firstScrollEl: Element|null }} */
         function validateRetargetingFields() {
             clearRetargetingFieldErrorsOnly();
+            const taskAction = currentTaskAction();
             const method =
                 document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
             const goal =
@@ -2713,7 +2817,7 @@
             let firstMsg = '';
             let firstScrollEl = null;
 
-            if (method === 'volume') {
+            if (taskAction === 'create_retarget' && method === 'volume') {
                 const vb = document.getElementById('volBudget');
                 const vs = String(vb.value).trim();
                 let m0 = '';
@@ -2738,7 +2842,7 @@
                 }
             }
 
-            if (method === 'cost_control') {
+            if (taskAction === 'create_retarget' && method === 'cost_control') {
                 if (goal === 'net_roi') {
                     const netEl = document.getElementById('ccDailyNet');
                     const ns = String(netEl.value).trim();
@@ -2841,6 +2945,47 @@
                 }
             }
 
+            if (taskAction === 'increase_budget') {
+                const mode = document.querySelector('.increase-mode-btn.seg-btn-active')?.getAttribute('data-increase-mode') || 'fixed';
+                if (mode === 'fixed') {
+                    const input = document.getElementById('increaseFixedAmount');
+                    const raw = String(input.value).trim();
+                    let msg = '';
+                    if (!raw) msg = '请填写每次新增金额';
+                    else if (hasLeadingZeroBad(raw)) msg = '不能以0开头，请正确输入';
+                    else if (hasMoreThanTwoDecimalPlaces(raw)) msg = '仅支持最多2位小数';
+                    else if (!Number.isFinite(parseFloat(raw)) || parseFloat(raw) <= 0) msg = '每次新增金额需大于0元';
+                    if (msg) {
+                        setRrFieldError(input, document.getElementById('errIncreaseFixedAmount'), msg);
+                        ok = false;
+                        firstMsg = firstMsg || msg;
+                        if (!firstScrollEl) firstScrollEl = input;
+                    }
+                } else {
+                    const input = document.getElementById('increaseSpendPercentage');
+                    const raw = String(input.value).trim();
+                    let msg = '';
+                    if (!raw) msg = '请填写消耗金额百分比';
+                    else if (hasLeadingZeroBad(raw)) msg = '不能以0开头，请正确输入';
+                    else if (hasMoreThanTwoDecimalPlaces(raw)) msg = '百分比最多保留2位小数';
+                    else if (!Number.isFinite(parseFloat(raw)) || parseFloat(raw) <= 0 || parseFloat(raw) > 1000) msg = '消耗金额百分比须在0到1000之间';
+                    if (msg) {
+                        setRrFieldError(input, document.getElementById('errIncreaseSpendPercentage'), msg);
+                        ok = false;
+                        firstMsg = firstMsg || msg;
+                        if (!firstScrollEl) firstScrollEl = input;
+                    }
+                }
+                const hours = document.getElementById('increaseVolumeHours');
+                const hoursMessage = validateDurationText(hours.value);
+                if (hoursMessage) {
+                    setRrFieldError(hours, document.getElementById('errIncreaseVolumeHours'), hoursMessage);
+                    ok = false;
+                    firstMsg = firstMsg || hoursMessage;
+                    if (!firstScrollEl) firstScrollEl = hours;
+                }
+            }
+
             if (isPerStrategyRateLimit()) {
                 const iwEl = document.getElementById('strategyIntervalWindowSeconds');
                 const iwMsg = intervalWindowSecondsErrorMsg(iwEl && iwEl.value);
@@ -2881,7 +3026,9 @@
         }
 
         function defaultCondition() {
-            return { metric: 'costDiff', op: 'gt', value: 0 };
+            return currentTaskAction() === 'increase_budget'
+                ? { metric: 'assistCost', op: 'gt', value: 0 }
+                : { metric: 'costDiff', op: 'gt', value: 0 };
         }
         function defaultGroup() {
             return { join: 'and', conditions: [defaultCondition()] };
@@ -2904,6 +3051,7 @@
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
                 action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
+                task_action: s.task_action === 'increase_budget' ? 'increase_budget' : 'create_retarget',
                 trigger: s.trigger,
                 retargeting: {
                     ...s.retargeting,
@@ -3057,7 +3205,10 @@
                     inp.step = 'any';
                     inp.className =
                         'cond-val num-input rr-input rr-input--flush w-28 max-w-full text-xs py-1.5 tabular-nums pr-2';
-                    const m0 = c.metric || 'costDiff';
+                    const availableMetrics = metricsForCurrentTaskAction();
+                    const availableMetricKeys = new Set(availableMetrics.map((item) => item.key));
+                    const fallbackMetric = availableMetrics[0]?.key || 'costDiff';
+                    const m0 = availableMetricKeys.has(c.metric) ? c.metric : fallbackMetric;
                     inp.value = formatCondValForInput(m0, c.value);
                     applyCondValInputRules(inp, m0);
 
@@ -3089,7 +3240,7 @@
                     setRateChrome(m0);
 
                     const ms = createCustomDropdown(
-                        METRICS.map((m) => ({ value: m.key, label: m.label })),
+                        availableMetrics.map((m) => ({ value: m.key, label: m.label })),
                         m0,
                         {
                             hiddenClass: 'cond-metric',
@@ -3218,6 +3369,7 @@
                         candidate_sort: 'net_roi_desc',
                         candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
                         action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
+                        task_action: s.task_action === 'increase_budget' ? 'increase_budget' : 'create_retarget',
                         trigger: s.trigger || defaultTriggerPayload(),
                         retargeting: {
                             ...(s.retargeting || defaultRetargetingPayload(gInv)),
@@ -3240,6 +3392,7 @@
                         candidate_sort: 'net_roi_desc',
                         candidate_limit: 1,
                         action_mode: 'card_confirm',
+                        task_action: 'create_retarget',
                         trigger: t,
                         retargeting: { ...r, interval: gInv },
                     },
@@ -3265,6 +3418,28 @@
             const m = document.querySelector('.method-btn.seg-btn-active')?.getAttribute('data-method') || 'volume';
             document.getElementById('panelVolume').classList.toggle('hidden', m !== 'volume');
             document.getElementById('panelCost').classList.toggle('hidden', m !== 'cost_control');
+        }
+
+        function syncTaskActionPanels() {
+            const increase = currentTaskAction() === 'increase_budget';
+            document.getElementById('panelCreateRetarget')?.classList.toggle('hidden', increase);
+            document.getElementById('panelIncreaseBudget')?.classList.toggle('hidden', !increase);
+            const hint = document.getElementById('taskActionHint');
+            if (hint) {
+                hint.textContent = increase
+                    ? '按调控任务的消耗和ROI判断；命中后读取最新预算，再按增量计算新预算。'
+                    : '按单条素材指标命中后新建调控任务。';
+            }
+            const confirmButton = document.querySelector('.action-mode-btn[data-action-mode="card_confirm"]');
+            const autoButton = document.querySelector('.action-mode-btn[data-action-mode="auto_execute"]');
+            if (confirmButton) confirmButton.textContent = increase ? '飞书确认后加预算' : '飞书确认后追投';
+            if (autoButton) autoButton.textContent = increase ? '自动加预算' : '自动追投';
+        }
+
+        function syncIncreaseModePanels() {
+            const mode = document.querySelector('.increase-mode-btn.seg-btn-active')?.getAttribute('data-increase-mode') || 'fixed';
+            document.getElementById('panelIncreaseFixed')?.classList.toggle('hidden', mode !== 'fixed');
+            document.getElementById('panelIncreasePercentage')?.classList.toggle('hidden', mode !== 'spend_percentage');
         }
 
         function syncGoalPanels() {
@@ -3354,6 +3529,37 @@
                 rrScheduleDirtyCheck();
             });
         });
+        document.querySelectorAll('.task-action-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                const nextAction = b.getAttribute('data-task-action') || 'create_retarget';
+                if (nextAction === currentTaskAction()) return;
+                syncCurrentStrategyFromDom();
+                document.querySelectorAll('.task-action-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                const strategy = strategiesState[activeStrategyIndex];
+                if (strategy) {
+                    strategy.task_action = nextAction;
+                    strategy.trigger = nextAction === 'increase_budget'
+                        ? defaultAssistTaskTriggerPayload()
+                        : defaultTriggerPayload();
+                    _groupsRef = JSON.parse(JSON.stringify(strategy.trigger.groups));
+                    mountGroupCombine(strategy.trigger.group_combine);
+                }
+                syncTaskActionPanels();
+                renderTriggerGroups(_groupsRef);
+                validateRetargetingFields();
+                rrScheduleDirtyCheck();
+            });
+        });
+        document.querySelectorAll('.increase-mode-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                document.querySelectorAll('.increase-mode-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncIncreaseModePanels();
+                validateRetargetingFields();
+                rrScheduleDirtyCheck();
+            });
+        });
         document.querySelectorAll('.goal-btn').forEach((b) => {
             b.addEventListener('click', () => {
                 document.querySelectorAll('.goal-btn').forEach((x) => x.classList.remove('seg-btn-active'));
@@ -3364,7 +3570,7 @@
             });
         });
 
-        ['volBudget', 'ccDailyNet', 'ccRoiTarget', 'ccDailyLive', 'ccBid'].forEach((id) => {
+        ['volBudget', 'ccDailyNet', 'ccRoiTarget', 'ccDailyLive', 'ccBid', 'increaseFixedAmount', 'increaseSpendPercentage', 'increaseVolumeHours'].forEach((id) => {
             const el = document.getElementById(id);
             el.addEventListener('input', () => validateRetargetingFields());
             el.addEventListener('blur', () => validateRetargetingFields());
@@ -3800,6 +4006,7 @@
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: 1,
                 action_mode: 'card_confirm',
+                task_action: 'create_retarget',
                 trigger: defaultTriggerPayload(),
                 retargeting: defaultRetargetingPayload(),
             },
