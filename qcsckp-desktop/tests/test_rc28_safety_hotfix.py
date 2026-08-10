@@ -291,6 +291,38 @@ class Rc28SafetyHotfixTests(unittest.TestCase):
             )
         self.assertFalse(saved["enabled"])
 
+    def test_enabling_account_and_plan_does_not_require_feishu_binding(self):
+        account = ensure_qianchuan_account(
+            "10001",
+            owner_username=self.owner,
+            seen=True,
+            db=self.db,
+        )
+        target = self._target(
+            ad_id="30001",
+            status="active",
+            verification="verified",
+        )
+        saved = save_qianchuan_account_automation_setup(
+            account["account_uid"],
+            {
+                "enabled": True,
+                "report_enabled": False,
+                "route_mode": "custom",
+                "route_send_personal": False,
+                "route_group_ids": [],
+            },
+            [{"target_uid": target["target_uid"], "enabled": True}],
+            owner_username=self.owner,
+            db=self.db,
+        )
+        self.assertTrue(saved["enabled"])
+        persisted = self.db.select_one(
+            "promotion_target",
+            where={"target_uid": target["target_uid"]},
+        )
+        self.assertTrue(persisted["enabled"])
+
     def test_candidate_list_cannot_promote_unknown_verified_target_to_active(self):
         original = self._target(
             ad_id="30002",

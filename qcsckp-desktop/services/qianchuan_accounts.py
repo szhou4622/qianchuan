@@ -431,12 +431,6 @@ def save_qianchuan_account_settings(
         ),
         "route_group_ids_json": json.dumps(groups, ensure_ascii=False),
     }
-    _require_feishu_binding_for_automation(
-        {
-            "enabled": bool(values["enabled"]),
-            "route_mode": route_mode,
-        }
-    )
     store.update(
         "qianchuan_account",
         values,
@@ -460,21 +454,6 @@ def save_qianchuan_account_settings(
     )
     assert saved is not None
     return saved
-
-
-def _require_feishu_binding_for_automation(settings: Dict[str, Any]) -> None:
-    # 安全关闭账户永远不应依赖飞书状态。即使旧配置使用自定义路由，
-    # 用户也必须能在飞书断线时立即停掉全部自动化。
-    if not bool(settings.get("enabled")):
-        return
-    from services.local_feishu_bridge import get_local_feishu_status
-
-    status = get_local_feishu_status()
-    profile = status.get("profile") or {}
-    if not bool(status.get("connected")):
-        raise ValueError("请先完成飞书长连接，再启用千川账户自动化")
-    if not str(profile.get("authorized_open_id") or "").strip():
-        raise ValueError("请先使用绑定码完成飞书个人绑定")
 
 
 def save_qianchuan_account_automation_setup(
@@ -519,15 +498,8 @@ def save_qianchuan_account_automation_setup(
     }
     if normalized_settings["route_mode"] not in {"default", "custom"}:
         raise ValueError("飞书路由模式无效")
-    if (
-        normalized_settings["enabled"]
-        and
-        normalized_settings["route_mode"] == "custom"
-        and not normalized_settings["route_send_personal"]
-        and not normalized_settings["route_group_ids"]
-    ):
-        raise ValueError("账户单独路由至少选择个人或一个已绑定群")
-    _require_feishu_binding_for_automation(normalized_settings)
+    # 账户自动化和飞书通知是两项独立能力。未绑定飞书时仍可启用账户、
+    # 选择监控计划并运行本地自动化；只有需要发卡或通知的动作才检查飞书。
 
     if isinstance(plan_states, dict):
         plan_items = [

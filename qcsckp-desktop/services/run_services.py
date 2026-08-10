@@ -1574,9 +1574,12 @@ class ServiceController:
                 """
                 () => {
                   const definitions = [
-                    ["global", new Set(["全域投放", "全域"])],
-                    ["chengfang", new Set(["乘方", "千川乘方", "乘方投放", "乘方计划"])]
+                     ["global", new Set(["全域投放", "全域"])],
+                     ["chengfang", new Set(["乘方", "千川乘方", "乘方投放", "乘方计划"])]
                   ];
+                  const canonical = (value) => String(value || "")
+                    .replace(/\\s+/g, "")
+                    .replace(/(?:新升级|新版)$/i, "");
                   const visible = (node) => {
                     const style = window.getComputedStyle(node);
                     const rect = node.getBoundingClientRect();
@@ -1607,7 +1610,7 @@ class ServiceController:
                   const visibleLabels = new Set();
                   for (const [system, labels] of definitions) {
                     for (const node of nodes) {
-                      const text = String(node.textContent || "").trim();
+                      const text = canonical(node.textContent);
                       if (labels.has(text) && visible(node)) {
                         visibleLabels.add(text);
                         if (isActive(node)) return system;
@@ -1641,11 +1644,19 @@ class ServiceController:
             timeout=60_000,
         )
         _require_catalog_login(page)
-        try:
-            title = page.get_by_text("全域投放", exact=True)
-            await title.last.wait_for(state="visible", timeout=20_000)
-        except Exception as exc:
-            raise RuntimeError(f"未找到明确的全域投放页面证据：{exc}") from exc
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if await ServiceController._has_visible_exact(
+                page,
+                ["全域投放", "全域"],
+            ):
+                break
+            try:
+                await page.wait_for_timeout(200)
+            except Exception:
+                await asyncio.sleep(0.2)
+        else:
+            raise RuntimeError("未找到明确的全域投放页面证据")
         if await ServiceController._active_catalog_plan_system(page) != "global":
             raise RuntimeError("当前页面无法明确确认是全域计划体系")
         return str(page.url or page_url)
@@ -1658,12 +1669,20 @@ class ServiceController:
     ) -> bool:
         """Open Chengfang only from an explicit interactive navigation label."""
         entry_texts = ["乘方", "千川乘方", "乘方投放", "乘方计划"]
+        badge_pattern = re.compile(
+            r"^\s*(?:乘方|千川乘方|乘方投放|乘方计划)"
+            r"\s*(?:新升级|新版)?\s*$",
+            re.IGNORECASE,
+        )
         roles = ["tab", "link", "button", "menuitem"]
         for text in entry_texts:
-            locators = [
-                page.get_by_role(role, name=text, exact=True)
-                for role in roles
-            ]
+            locators = []
+            for role in roles:
+                locators.append(page.get_by_role(role, name=text, exact=True))
+                try:
+                    locators.append(page.get_by_role(role, name=badge_pattern))
+                except Exception:
+                    pass
             for locator in locators:
                 try:
                     count = await locator.count()
@@ -1796,6 +1815,89 @@ class ServiceController:
     ) -> Dict[str, Any]:
         aavid = str(account["aavid"])
         classes: Dict[str, Dict[str, Any]] = {}
+
+        # 主路径：先让千川 SPA 建立当前账户的登录上下文，再复用它真实
+        # 发出的只读目录请求模板，按 dataSetKey + mar_goal 读取四类计划。
+        # 计划体系和推广场景均由后台契约决定，不依赖页面按钮、文字或 DOM。
+        backend_page_url = (
+            f"https://qianchuan.jinritemai.com/uni-prom?aavid={aavid}"
+        )
+        await fetcher.page.goto(
+            backend_page_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        _require_catalog_login(fetcher.page)
+        backend_template_available = False
+        backend_classes = (
+            ("global_product", "product", "global"),
+            ("global_live", "live", "global"),
+            ("chengfang_product", "product", "chengfang"),
+            ("chengfang_live", "live", "chengfang"),
+        )
+        for class_key, promotion_scene, plan_system in backend_classes:
+            probe.reset_catalog_class(
+                aavid=aavid,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
+            probe.set_catalog_context(
+                aavid=aavid,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
+            try:
+                fetched = await probe.fetch_catalog_class_from_backend(
+                    fetcher.page,
+                    aavid=aavid,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
+                    timeout_seconds=(12.0 if not backend_template_available else 1.0),
+                )
+            except Exception as exc:
+                fetched = False
+                backend_error = str(exc)[:500]
+            else:
+                backend_error = ""
+            if not backend_template_available:
+                backend_template_available = bool(
+                    probe.has_backend_catalog_template(aavid)
+                )
+                if not backend_template_available:
+                    # 老千川页面没有发出可复用的目录请求时，才进入下方
+                    # DOM 兼容流程；新页面正常情况下不会走这里。
+                    classes.clear()
+                    break
+            if not fetched:
+                classes[class_key] = {
+                    "complete": False,
+                    "message": (
+                        "千川只读目录接口未返回完整分页"
+                        + (f"：{backend_error}" if backend_error else "")
+                    ),
+                }
+                continue
+            classes[class_key] = await self._scan_catalog_class(
+                fetcher=fetcher,
+                probe=probe,
+                db=db,
+                owner_username=owner_username,
+                account=account,
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+                page_url=str(fetcher.page.url or backend_page_url),
+            )
+
+        if backend_template_available:
+            return self._finalize_account_catalog_classes(
+                aavid=aavid,
+                classes=classes,
+                owner_username=owner_username,
+                db=db,
+            )
+
+        # 极少数旧页面的兼容兜底。这里只负责触发后台请求；最终落库仍须
+        # 通过接口分页和精确计划详情核验，不能仅凭页面文字启用自动化。
         probe.reset_catalog_class(
             aavid=aavid,
             promotion_scene="product",
@@ -2028,7 +2130,22 @@ class ServiceController:
                     else "未取得千川乘方·推直播目录的明确页面证据"
                 ),
             }
-        complete = all(
+        return self._finalize_account_catalog_classes(
+            aavid=aavid,
+            classes=classes,
+            owner_username=owner_username,
+            db=db,
+        )
+
+    @staticmethod
+    def _finalize_account_catalog_classes(
+        *,
+        aavid: str,
+        classes: Dict[str, Dict[str, Any]],
+        owner_username: str,
+        db: SQLiteStore,
+    ) -> Dict[str, Any]:
+        complete = len(classes) == 4 and all(
             bool(item.get("complete")) for item in classes.values()
         )
         if complete:

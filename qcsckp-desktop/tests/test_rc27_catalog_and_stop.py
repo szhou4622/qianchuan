@@ -666,6 +666,109 @@ class Rc27CatalogAndStopTests(unittest.TestCase):
             ),
         )
 
+    def test_backend_dataset_is_authoritative_for_all_four_catalog_classes(self):
+        expected = {
+            "overall_roi_promotion_list_for_product": ("product", "global"),
+            "site_promotion_list": ("live", "global"),
+            "overall_roi_promotion_list_for_product_v2": (
+                "product",
+                "chengfang",
+            ),
+            "overall_roi_promotion_list_for_live_v2": ("live", "chengfang"),
+        }
+        for dataset, catalog_class in expected.items():
+            with self.subTest(dataset=dataset):
+                self.assertEqual(
+                    catalog_class,
+                    PromotionReadOnlyProbe._request_catalog_class(
+                        {
+                            "aavid": "10001",
+                            "mar_goal": 1,
+                            "dataSetKey": dataset,
+                        }
+                    ),
+                )
+
+    def test_backend_catalog_fetch_does_not_require_dom_navigation(self):
+        path = os.path.join(self.temp.name, "backend-catalog-probe.json")
+        probe = PromotionReadOnlyProbe(path)
+        probe._catalog_base_templates["10001"] = {
+            "url": (
+                "https://qianchuan.jinritemai.com"
+                "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+            ),
+            "body": {
+                "aavid": "10001",
+                "mar_goal": 1,
+                "dataSetKey": "overall_roi_promotion_list_for_product",
+                "adlabScene": 0,
+                "smartBidType": 0,
+                "page": 1,
+                "page_size": 100,
+            },
+        }
+
+        class BackendOnlyPage:
+            def __init__(self):
+                self.requests = []
+
+            async def evaluate(self, _script, arguments):
+                body = dict(arguments["body"])
+                self.requests.append(body)
+                dataset = str(body["dataSetKey"])
+                return {
+                    "status": 200,
+                    "payload": {
+                        "status_code": 0,
+                        "data": {
+                            "totalPage": 1,
+                            "adInfos": [
+                                {
+                                    "id": str(30000 + len(self.requests)),
+                                    "name": dataset,
+                                    "adDeliveryName": "投放中",
+                                }
+                            ],
+                        },
+                    },
+                }
+
+        page = BackendOnlyPage()
+        classes = (
+            ("product", "global"),
+            ("live", "global"),
+            ("product", "chengfang"),
+            ("live", "chengfang"),
+        )
+        for scene, system in classes:
+            complete = asyncio.run(
+                probe.fetch_catalog_class_from_backend(
+                    page,
+                    aavid="10001",
+                    promotion_scene=scene,
+                    plan_system=system,
+                )
+            )
+            self.assertTrue(complete, (scene, system))
+            rows = probe.catalog_rows(
+                aavid="10001",
+                promotion_scene=scene,
+                plan_system=system,
+            )
+            self.assertEqual(1, len(rows), (scene, system))
+            self.assertEqual(system, rows[0]["plan_system"])
+            self.assertEqual(scene, rows[0]["promotion_scene"])
+
+        self.assertEqual(
+            [
+                "overall_roi_promotion_list_for_product",
+                "site_promotion_list",
+                "overall_roi_promotion_list_for_product_v2",
+                "overall_roi_promotion_list_for_live_v2",
+            ],
+            [item["dataSetKey"] for item in page.requests],
+        )
+
     def test_unfiltered_flat_plan_list_is_full_catalog_evidence(self):
         flat = {
             "aavid": "10001",

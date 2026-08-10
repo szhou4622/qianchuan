@@ -113,6 +113,20 @@ ACCOUNT_NAME_KEYS = (
 )
 ACCOUNT_LIST_PATH = "/ad/api/v1/account/user-list"
 
+# 千川四类计划共用同一个只读目录接口，真正区分计划体系和推广场景的
+# 是请求中的数据集与营销目标。目录同步应以这些后台契约为准；页面文字
+# 只负责让千川 SPA 建立登录上下文，不能作为计划分类的主证据。
+CATALOG_DATASET_CLASS = {
+    "overall_roi_promotion_list_for_product": ("product", "global"),
+    "site_promotion_list": ("live", "global"),
+    "overall_roi_promotion_list_for_product_v2": ("product", "chengfang"),
+    "overall_roi_promotion_list_for_live_v2": ("live", "chengfang"),
+}
+CATALOG_CLASS_DATASET = {
+    value: key for key, value in CATALOG_DATASET_CLASS.items()
+}
+CATALOG_REQUIRED_PATH = "/ad/api/pmc/v1/uni-promotion/ad/list-required"
+
 
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: Dict[str, threading.RLock] = {}
@@ -357,6 +371,10 @@ class PromotionReadOnlyProbe:
         self._catalog_replay_templates: Dict[
             tuple[str, str, str, str], Dict[str, Any]
         ] = {}
+        # 只在内存中保留页面已经成功发出的目录请求模板。模板不会写入
+        # probe 文件；随后只替换账户、数据集、场景和分页字段，复用同一
+        # 登录会话读取四类目录，避免依赖页面导航文字和 DOM 结构。
+        self._catalog_base_templates: Dict[str, Dict[str, Any]] = {}
         self._attached_page_ids = set()
         self._catalog_context: Dict[str, str] = {}
         # 千川把一份计划目录拆成 required + optional 两段。optional 请求
@@ -511,6 +529,33 @@ class PromotionReadOnlyProbe:
         return "product" if value == 1 else ("live" if value == 2 else "")
 
     @staticmethod
+    def _request_catalog_dataset(body: Any) -> str:
+        if not isinstance(body, Mapping):
+            return ""
+        params = body.get("Params")
+        params = params if isinstance(params, Mapping) else body.get("params")
+        params = params if isinstance(params, Mapping) else {}
+        value = (
+            body.get("dataSetKey")
+            or body.get("DataSetKey")
+            or body.get("SophonxDataSetKey")
+            or params.get("dataSetKey")
+            or params.get("DataSetKey")
+            or params.get("SophonxDataSetKey")
+            or ""
+        )
+        return str(value or "").strip()
+
+    @classmethod
+    def _request_catalog_class(cls, body: Any) -> tuple[str, str]:
+        """Return (promotion_scene, plan_system) from explicit API fields."""
+        dataset = cls._request_catalog_dataset(body)
+        mapped = CATALOG_DATASET_CLASS.get(dataset)
+        if mapped:
+            return mapped
+        return cls._request_catalog_scene(body), "unknown"
+
+    @staticmethod
     def _request_catalog_aavid(body: Any) -> str:
         if not isinstance(body, Mapping):
             return ""
@@ -556,8 +601,19 @@ class PromotionReadOnlyProbe:
     ) -> tuple[str, str, str]:
         """Resolve required/optional list segments without current-tab guessing."""
         aid = self._request_catalog_aavid(body) or str(fallback_aavid or "").strip()
-        scene = self._request_catalog_scene(body)
-        system = str(self._catalog_context.get("plan_system") or "unknown")
+        scene, request_system = self._request_catalog_class(body)
+        payload_system = detect_plan_system(payload=payload)
+        system = (
+            request_system
+            if request_system in {"global", "chengfang"}
+            else (
+                payload_system
+                if payload_system in {"global", "chengfang"}
+                else str(
+                    self._catalog_context.get("plan_system") or "unknown"
+                )
+            )
+        )
         request_session = self._request_catalog_session_id(body)
         if not scene and request_session:
             linked = self._catalog_session_context.get(request_session)
@@ -577,6 +633,131 @@ class PromotionReadOnlyProbe:
                 )
             return aid, scene, system
         return "", "", "unknown"
+
+    @staticmethod
+    def _set_catalog_request_identity(
+        body: Dict[str, Any],
+        *,
+        aavid: str,
+        promotion_scene: str,
+        plan_system: str,
+    ) -> Dict[str, Any]:
+        """Derive one read-only class request from a real browser request."""
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        dataset = CATALOG_CLASS_DATASET.get((scene, system), "")
+        if not dataset:
+            raise ValueError("不支持的计划目录分类")
+        result = deepcopy(body)
+        aid = str(aavid or "").strip()
+
+        for key in ("aavid", "aadvid", "advertiserId"):
+            if key in result or key == "aavid":
+                result[key] = aid
+                break
+        mar_goal = 1 if scene == "product" else 2
+        if any(key in result for key in ("mar_goal", "marGoal", "MarGoal")):
+            key = next(
+                key
+                for key in ("mar_goal", "marGoal", "MarGoal")
+                if key in result
+            )
+            result[key] = mar_goal
+
+        dataset_written = False
+        for key in ("dataSetKey", "DataSetKey", "SophonxDataSetKey"):
+            if key in result:
+                result[key] = dataset
+                dataset_written = True
+        params = result.get("Params")
+        params = params if isinstance(params, dict) else result.get("params")
+        if isinstance(params, dict):
+            for key in ("dataSetKey", "DataSetKey", "SophonxDataSetKey"):
+                if key in params:
+                    params[key] = dataset
+                    dataset_written = True
+            ad_filter = params.get("AdFilter")
+            ad_filter = (
+                ad_filter
+                if isinstance(ad_filter, dict)
+                else params.get("adFilter")
+            )
+            if isinstance(ad_filter, dict):
+                goal_key = "MarGoal" if "MarGoal" in ad_filter else "marGoal"
+                ad_filter[goal_key] = mar_goal
+        if not dataset_written:
+            result["dataSetKey"] = dataset
+
+        # 乘方目录需要该只读契约标记；传统全域不沿用乘方值。
+        for key in ("adlabScene", "AdlabScene"):
+            if key in result:
+                result[key] = 1 if system == "chengfang" else 0
+        for key in ("isOverallRoi", "IsOverallRoi"):
+            if key in result:
+                result[key] = 1 if system == "chengfang" else 0
+        for key in ("smartBidType", "SmartBidType"):
+            if key in result and system == "chengfang":
+                result[key] = 0
+
+        if "page" in result:
+            result["page"] = 1
+        if "Page" in result:
+            result["Page"] = 1
+        if "page_size" in result:
+            result["page_size"] = max(100, int(result.get("page_size") or 0))
+        if "pageSize" in result:
+            result["pageSize"] = max(100, int(result.get("pageSize") or 0))
+        if "PageSize" in result:
+            result["PageSize"] = max(100, int(result.get("PageSize") or 0))
+        return result
+
+    async def fetch_catalog_class_from_backend(
+        self,
+        page: Any,
+        *,
+        aavid: Any,
+        promotion_scene: Any,
+        plan_system: Any,
+        timeout_seconds: float = 12.0,
+    ) -> bool:
+        """Read a complete catalog class through the observed backend API."""
+        aid = str(aavid or "").strip()
+        deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            if aid in self._catalog_base_templates:
+                break
+            await asyncio.sleep(0.1)
+        template = self._catalog_base_templates.get(aid)
+        if not isinstance(template, Mapping):
+            return False
+        source_body = template.get("body")
+        if not isinstance(source_body, dict):
+            return False
+        scene = str(promotion_scene or "").strip().lower()
+        system = str(plan_system or "").strip().lower()
+        send_body = self._set_catalog_request_identity(
+            source_body,
+            aavid=aid,
+            promotion_scene=scene,
+            plan_system=system,
+        )
+        marker = (CATALOG_REQUIRED_PATH, aid, scene, system)
+        await self._execute_full_catalog_replay(
+            page=page,
+            url=str(template.get("url") or CATALOG_REQUIRED_PATH),
+            send_body=send_body,
+            marker=marker,
+        )
+        return bool(
+            self.catalog_class_status(
+                aavid=aid,
+                promotion_scene=scene,
+                plan_system=system,
+            ).get("complete")
+        )
+
+    def has_backend_catalog_template(self, aavid: Any) -> bool:
+        return str(aavid or "").strip() in self._catalog_base_templates
 
     @classmethod
     def _request_page_number(cls, body: Any) -> int:
@@ -1446,6 +1627,22 @@ class PromotionReadOnlyProbe:
                     request_body = json.loads(post_data or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     request_body = {}
+                if path == CATALOG_REQUIRED_PATH and isinstance(
+                    request_body, dict
+                ):
+                    template_aavid = (
+                        self._request_catalog_aavid(request_body)
+                        or str(
+                            item.get("identifiers", {}).get("aavid") or ""
+                        ).strip()
+                    )
+                    if template_aavid.isdigit():
+                        # 内存模板只用于同一登录会话内派生四类只读请求，
+                        # 不写入 probe 文件，也不包含请求头或 Cookie。
+                        self._catalog_base_templates[template_aavid] = {
+                            "url": str(response.url or ""),
+                            "body": deepcopy(request_body),
+                        }
                 self._record_catalog_response_segment(
                     path=path,
                     body=request_body,

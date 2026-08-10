@@ -163,7 +163,6 @@
       const log=acc.log_sync||{};
       const routeGroups=new Set(acc.route_group_ids||[]);
       const statusClass=acc.last_status==='available'&&!acc.catalog_error?'ok':acc.last_error||acc.catalog_error?'bad':'warn';
-      const feishuReady=!!data.feishu?.connected&&!!data.feishu?.authorized_open_id;
       return `<section class="card ${acc.enabled?'':'off'}" data-account="${esc(acc.account_uid)}">
         <div class="card-head"><div><div class="account-name">${esc(acc.account_name||'未命名账户')}</div><div class="account-id">账户ID ${esc(acc.aavid)}</div></div>
           <div class="badges"><span class="badge ${statusClass}">${accountStatus(acc.last_status)}</span><span class="badge ${acc.catalog_status==='complete'?'ok':'warn'}">目录${catalogStatus(acc.catalog_status)}</span><span class="badge">${acc.plan_count||0} 条 / ${acc.eligible_plan_count||0} 条可监控</span>${acc.waiting_plan_count?`<span class="badge warn">${acc.waiting_plan_count} 条等待容量</span>`:''}</div>
@@ -171,7 +170,7 @@
         <div class="account-grid">
           <div class="panel settings-panel">
             <div class="panel-title">账户与日报</div>
-            <label class="check"><input type="checkbox" data-field="enabled" data-can-enable="${feishuReady?'1':'0'}" ${acc.enabled?'checked':''} ${!feishuReady&&!acc.enabled?'disabled':''}>启用此千川账户；关闭后该账户全部自动化暂停${!feishuReady?'（启用前需完成飞书绑定，安全关闭不受影响）':''}</label>
+            <label class="check"><input type="checkbox" data-field="enabled" ${acc.enabled?'checked':''}>启用此千川账户；关闭后该账户全部自动化暂停</label>
             <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''}>同步昨日操作日志并纳入09:00日报</label>
             <div class="field"><label>飞书接收位置</label><select data-field="route_mode"><option value="default" ${acc.route_mode==='default'?'selected':''}>使用管理员默认位置</option><option value="custom" ${acc.route_mode==='custom'?'selected':''}>为此账户单独配置</option></select></div>
             <div data-custom-route style="${acc.route_mode==='custom'?'':'display:none'}">
@@ -212,11 +211,6 @@
       if(!input.checked&&(!accountEnabled||input.dataset.eligible!=='1'))input.disabled=true;
     });
     document.querySelectorAll('[data-field=enabled]').forEach(input=>input.onchange=event=>{
-      if(input.dataset.canEnable!=='1'&&input.checked){
-        input.checked=false;
-        event.stopPropagation();
-        message('请先完成飞书长连接与个人绑定，再启用账户自动化。',true);
-      }
       const card=input.closest('.card');
       card.classList.toggle('off',!input.checked);
       card.querySelectorAll('[data-target]').forEach(planInput=>{
