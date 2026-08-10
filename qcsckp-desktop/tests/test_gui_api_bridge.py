@@ -144,6 +144,10 @@ class JSApiBridgeTests(unittest.TestCase):
             "await loadPromotionTargetOptions(api);",
             reload_handler,
         )
+        self.assertIn('id="strategyAccountUid"', page)
+        self.assertIn('id="strategyTargetUid"', page)
+        self.assertIn("renderStrategyTargetOptions(accountUid, '')", page)
+        self.assertIn("account_uid: s.account_uid || ''", page)
         self.assertLess(
             reload_handler.index("await loadPromotionTargetOptions(api);"),
             reload_handler.index("await api.getRuleRetargetingConfig();"),

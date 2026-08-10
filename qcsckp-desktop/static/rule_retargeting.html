@@ -1120,13 +1120,20 @@
                         <i data-lucide="list-checks" class="w-4 h-4 text-cyan-400/90"></i>
                         监控计划与触发层级
                     </div>
-                    <div class="pl-[calc(0.5rem+3px)] grid grid-cols-1 md:grid-cols-2 gap-3 max-w-3xl">
+                    <div class="pl-[calc(0.5rem+3px)] grid grid-cols-1 md:grid-cols-3 gap-3 max-w-5xl">
+                        <label class="block">
+                            <span class="rr-label">监控账户</span>
+                            <select id="strategyAccountUid" class="rr-input rr-input--flush">
+                                <option value="">请选择监控账户</option>
+                            </select>
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">只显示已启用且已有监控计划的千川账户。</span>
+                        </label>
                         <label class="block">
                             <span class="rr-label">监控计划</span>
                             <select id="strategyTargetUid" class="rr-input rr-input--flush">
-                                <option value="">请选择监控计划</option>
+                                <option value="">请先选择监控账户</option>
                             </select>
-                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先在“千川账户管理”页面添加账户并勾选监控计划。</span>
+                            <span id="strategyTargetScene" class="text-[11px] text-slate-600 mt-1.5 block">请先选择监控账户，再选择该账户下已监控的计划。</span>
                         </label>
                         <label class="block">
                             <span class="rr-label">触发层级</span>
@@ -1931,27 +1938,81 @@
             if (!api?.listPromotionTargets) return;
             const res = await api.listPromotionTargets(true);
             promotionTargetsState = Array.isArray(res?.data)
-                ? res.data.filter(x => !!x.retarget_eligible)
+                ? res.data.filter(x => x && x.account_enabled !== false)
                 : [];
             const productEntries = await Promise.all(promotionTargetsState.map(async target => {
-                if (target.promotion_scene !== 'product' || !api.listPromotionTargetProducts) {
+                if (target.promotion_scene !== 'product' || !target.retarget_eligible || !api.listPromotionTargetProducts) {
                     return [target.target_uid, []];
                 }
                 const productRes = await api.listPromotionTargetProducts(target.target_uid);
                 return [target.target_uid, Array.isArray(productRes?.data) ? productRes.data : []];
             }));
             promotionTargetProductsState = Object.fromEntries(productEntries);
-            const select = document.getElementById('strategyTargetUid');
-            if (!select) return;
-            const current = select.value;
-            const htmlEsc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+            const accountSelect = document.getElementById('strategyAccountUid');
+            const targetSelect = document.getElementById('strategyTargetUid');
+            const currentAccount = accountSelect?.value || '';
+            const currentTarget = targetSelect?.value || '';
+            renderStrategyAccountOptions(currentAccount);
+            renderStrategyTargetOptions(currentAccount, currentTarget);
+            syncProductStrategyVisibility();
+        }
+
+        function rrHtmlEsc(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({
                 '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
             })[c]);
-            select.innerHTML = '<option value="">请选择监控计划</option>' + promotionTargetsState.map(x =>
-                `<option value="${htmlEsc(x.target_uid)}">${x.promotion_scene === 'product' ? '推商品' : '推直播'}｜${x.plan_system === 'global' ? '全域' : x.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'}｜${htmlEsc(x.plan_name || x.ad_id)}｜${htmlEsc(x.aadvid)}</option>`
+        }
+
+        function compareRetargetTargets(left, right) {
+            const systemOrder = target => target?.plan_system === 'chengfang' ? 0 : target?.plan_system === 'global' ? 1 : 2;
+            const sceneOrder = target => target?.promotion_scene === 'live' ? 0 : target?.promotion_scene === 'product' ? 1 : 2;
+            if (systemOrder(left) !== systemOrder(right)) return systemOrder(left) - systemOrder(right);
+            if (sceneOrder(left) !== sceneOrder(right)) return sceneOrder(left) - sceneOrder(right);
+            return String(left?.plan_name || left?.ad_id || '').localeCompare(
+                String(right?.plan_name || right?.ad_id || ''),
+                'zh-CN',
+                { numeric: true, sensitivity: 'base' }
+            );
+        }
+
+        function renderStrategyAccountOptions(selectedAccountUid) {
+            const select = document.getElementById('strategyAccountUid');
+            if (!select) return;
+            const byUid = new Map();
+            promotionTargetsState.forEach(target => {
+                const uid = String(target.account_uid || '').trim();
+                if (!uid || byUid.has(uid)) return;
+                byUid.set(uid, {
+                    account_uid: uid,
+                    account_name: String(target.account_name || target.aadvid || uid),
+                    aadvid: String(target.aadvid || ''),
+                });
+            });
+            const accounts = Array.from(byUid.values()).sort((a, b) =>
+                a.account_name.localeCompare(b.account_name, 'zh-CN', { numeric: true, sensitivity: 'base' })
+            );
+            select.innerHTML = '<option value="">请选择监控账户</option>' + accounts.map(account =>
+                `<option value="${rrHtmlEsc(account.account_uid)}">${rrHtmlEsc(account.account_name)}｜${rrHtmlEsc(account.aadvid)}</option>`
             ).join('');
-            if (current) select.value = current;
-            syncProductStrategyVisibility();
+            if (selectedAccountUid && byUid.has(selectedAccountUid)) select.value = selectedAccountUid;
+        }
+
+        function renderStrategyTargetOptions(accountUid, selectedTargetUid) {
+            const select = document.getElementById('strategyTargetUid');
+            if (!select) return;
+            const targets = promotionTargetsState
+                .filter(target => String(target.account_uid || '') === String(accountUid || ''))
+                .sort(compareRetargetTargets);
+            select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + targets.map(target => {
+                const scene = target.promotion_scene === 'product' ? '推商品' : target.promotion_scene === 'live' ? '推直播' : '场景待确认';
+                const system = target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认';
+                const unavailable = !target.retarget_eligible;
+                const suffix = unavailable ? `｜暂不可追投：${target.ineligible_reason || '能力待验证'}` : '';
+                return `<option value="${rrHtmlEsc(target.target_uid)}"${unavailable ? ' disabled' : ''}>${system}｜${scene}｜${rrHtmlEsc(target.plan_name || target.ad_id)}${rrHtmlEsc(suffix)}</option>`;
+            }).join('');
+            if (selectedTargetUid && targets.some(target => target.target_uid === selectedTargetUid)) {
+                select.value = selectedTargetUid;
+            }
         }
 
         function defaultRetargetingPayload(intervalObj) {
@@ -2041,6 +2102,7 @@
                 strategiesState.push({
                     id: genStrategyId(),
                     title: defaultStrategyTitle(0),
+                    account_uid: '',
                     target_uid: '',
                     trigger_level: 'material',
                     product_filter: [],
@@ -2112,6 +2174,7 @@
             strategiesState[activeStrategyIndex] = {
                 id: cur.id || genStrategyId(),
                 title: cur.title || defaultStrategyTitle(activeStrategyIndex),
+                account_uid: document.getElementById('strategyAccountUid')?.value || '',
                 target_uid: document.getElementById('strategyTargetUid')?.value || '',
                 trigger_level: document.getElementById('strategyTriggerLevel')?.value === 'product' ? 'product' : 'material',
                 product_filter: (document.getElementById('strategyProductFilter')?.value || '')
@@ -2259,6 +2322,7 @@
             strategiesState.push({
                 id: genStrategyId(),
                 title: defaultStrategyTitle(newIdx),
+                account_uid: '',
                 target_uid: '',
                 trigger_level: 'material',
                 product_filter: [],
@@ -2279,6 +2343,11 @@
         function applyStrategyToDom(index, opts) {
             const s = strategiesState[index];
             if (!s) return;
+            const selectedTarget = promotionTargetsState.find(target => target.target_uid === s.target_uid);
+            const accountUid = s.account_uid || selectedTarget?.account_uid || '';
+            const accountSelect = document.getElementById('strategyAccountUid');
+            if (accountSelect) accountSelect.value = accountUid;
+            renderStrategyTargetOptions(accountUid, s.target_uid || '');
             const targetSelect = document.getElementById('strategyTargetUid');
             if (targetSelect) targetSelect.value = s.target_uid || '';
             const levelSelect = document.getElementById('strategyTriggerLevel');
@@ -2466,17 +2535,27 @@
                 activeStrategyIndex = i;
                 applyStrategyToDom(i);
                 clearAllRetargetingFieldErrors();
+                const accountUid = document.getElementById('strategyAccountUid')?.value || '';
                 const targetUid = document.getElementById('strategyTargetUid')?.value || '';
                 const triggerLevel = document.getElementById('strategyTriggerLevel')?.value || 'material';
                 const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
-                if (!selectedTarget || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
+                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || !selectedTarget.retarget_eligible || (triggerLevel === 'product' && selectedTarget.promotion_scene !== 'product')) {
                     renderStrategyTabs();
+                    const accountEl = document.getElementById('strategyAccountUid');
                     const targetEl = document.getElementById('strategyTargetUid');
-                    const msg = !selectedTarget ? '请先为策略选择监控计划' : '商品级策略只能选择推商品计划';
+                    const msg = !accountUid
+                        ? '请先为策略选择监控账户'
+                        : !selectedTarget
+                            ? '请先为策略选择该账户下的监控计划'
+                            : selectedTarget.account_uid !== accountUid
+                                ? '监控账户与监控计划不一致，请重新选择'
+                                : !selectedTarget.retarget_eligible
+                                    ? `该监控计划暂不可追投：${selectedTarget.ineligible_reason || '能力待验证'}`
+                                    : '商品级策略只能选择推商品计划';
                     return {
                         ok: false,
                         vt: { ok: true },
-                        vr: { ok: false, firstMsg: msg, firstScrollEl: targetEl },
+                        vr: { ok: false, firstMsg: msg, firstScrollEl: !accountUid ? accountEl : targetEl },
                         failedStrategyIndex: i,
                     };
                 }
@@ -2874,6 +2953,7 @@
             const strategies = strategiesState.map((s) => ({
                 id: s.id,
                 title: s.title,
+                account_uid: s.account_uid || '',
                 target_uid: s.target_uid || '',
                 trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
                 product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
@@ -3187,6 +3267,7 @@
                     return {
                         id: s.id || genStrategyId(),
                         title: (s.title || '').trim() || defaultStrategyTitle(i),
+                        account_uid: s.account_uid || promotionTargetsState.find(target => target.target_uid === s.target_uid)?.account_uid || '',
                         target_uid: s.target_uid || '',
                         trigger_level: s.trigger_level === 'product' ? 'product' : 'material',
                         product_filter: Array.isArray(s.product_filter) ? s.product_filter : [],
@@ -3208,6 +3289,7 @@
                     {
                         id: genStrategyId(),
                         title: defaultStrategyTitle(0),
+                        account_uid: '',
                         target_uid: '',
                         trigger_level: 'material',
                         product_filter: [],
@@ -3724,6 +3806,16 @@
         });
 
         document.getElementById('btnRefreshLivePreflight')?.addEventListener('click', refreshLiveRetargetPreflight);
+        document.getElementById('strategyAccountUid')?.addEventListener('change', () => {
+            const accountUid = document.getElementById('strategyAccountUid')?.value || '';
+            const target = document.getElementById('strategyTargetUid');
+            const filter = document.getElementById('strategyProductFilter');
+            if (filter) filter.value = '';
+            renderStrategyTargetOptions(accountUid, '');
+            if (target) target.value = '';
+            syncProductStrategyVisibility();
+            rrScheduleDirtyCheck();
+        });
         document.getElementById('strategyTargetUid')?.addEventListener('change', () => {
             const filter = document.getElementById('strategyProductFilter');
             if (filter) filter.value = '';
@@ -3757,6 +3849,7 @@
             {
                 id: genStrategyId(),
                 title: defaultStrategyTitle(0),
+                account_uid: '',
                 target_uid: '',
                 trigger_level: 'material',
                 product_filter: [],

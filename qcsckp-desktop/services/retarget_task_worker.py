@@ -89,6 +89,7 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": str(strategy.get("id") or ""),
         "title": str(strategy.get("title") or strategy.get("id") or "?")[:64],
+        "account_uid": str(strategy.get("account_uid") or ""),
         "target_uid": str(strategy.get("target_uid") or ""),
         "trigger_level": str(strategy.get("trigger_level") or "material"),
         "product_filter": strategy.get("product_filter") if isinstance(strategy.get("product_filter"), list) else [],
@@ -550,6 +551,11 @@ def _validate_task(
     strategy_target_uid = str(strategy.get("target_uid") or "")
     if strategy_target_uid and strategy_target_uid != target_uid:
         raise RuntimeError("追投策略已改为其他监控计划")
+    strategy_account_uid = str(strategy.get("account_uid") or "").strip()
+    if strategy_account_uid and strategy_account_uid != str(
+        target.get("account_uid") or ""
+    ).strip():
+        raise RuntimeError("追投策略已改为其他千川账户")
     from services.qianchuan_session import (
         automation_session_ready,
         current_session_owner,

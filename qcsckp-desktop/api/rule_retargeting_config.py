@@ -154,6 +154,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "title": f"策略 {index + 1}",
         # 旧配置允许暂时为空。运行时仅在“唯一启用目标”时兼容绑定；
         # 新版前端保存时会显式选择监控计划。
+        "account_uid": "",
         "target_uid": "",
         "trigger_level": "material",
         "product_filter": [],
@@ -624,6 +625,7 @@ def _normalize_strategy_entry(
     action_mode = str(raw.get("action_mode") or "card_confirm").strip().lower()
     if action_mode not in ALLOWED_ACTION_MODES:
         action_mode = "card_confirm"
+    account_uid = str(raw.get("account_uid") or "").strip()
     target_uid = str(raw.get("target_uid") or "").strip()
     trigger_level = str(raw.get("trigger_level") or "material").strip().lower()
     if trigger_level not in ALLOWED_TRIGGER_LEVELS:
@@ -655,6 +657,7 @@ def _normalize_strategy_entry(
     return {
         "id": sid,
         "title": title,
+        "account_uid": account_uid,
         "target_uid": target_uid,
         "trigger_level": trigger_level,
         "product_filter": product_filter,
@@ -693,6 +696,7 @@ def _disk_needs_strategy_migration_rewrite(raw: Optional[Dict[str, Any]]) -> boo
             if any(
                 key not in strategy
                 for key in (
+                    "account_uid",
                     "target_uid",
                     "trigger_level",
                     "product_filter",
@@ -940,9 +944,21 @@ def validate_strategy_target_compatibility(
         if not isinstance(target, dict):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             return False, f"“{title}”选择的监控计划不存在，请重新选择"
+        account_uid = str(strategy.get("account_uid") or "").strip()
+        target_account_uid = str(target.get("account_uid") or "").strip()
+        if account_uid and account_uid != target_account_uid:
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的监控账户与计划不一致，请重新选择"
+        if "account_enabled" in target and not bool(target.get("account_enabled")):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            return False, f"“{title}”选择的千川账户已停用，请先启用账户"
         if not bool(target.get("enabled")):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             return False, f"“{title}”选择的监控计划已停用，请先启用计划"
+        if "retarget_eligible" in target and not bool(target.get("retarget_eligible")):
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            reason = str(target.get("ineligible_reason") or "计划尚未取得追投资格").strip()
+            return False, f"“{title}”当前不可用于追投：{reason}"
         scene = str(target.get("promotion_scene") or "live").strip().lower()
         retargeting = strategy.get("retargeting")
         if not isinstance(retargeting, dict):

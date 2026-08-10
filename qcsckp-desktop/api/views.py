@@ -1076,9 +1076,8 @@ class Api:
         if config is not None and not isinstance(config, dict):
             return {"success": False, "message": "配置须为对象"}
         merged = preview_merge(config)
-        ok, msg = validate_rule_retargeting_config(merged)
-        if not ok:
-            return {"success": False, "message": msg}
+        # 旧版策略只保存 target_uid。保存时从受当前工具账号隔离的目标记录
+        # 补齐 account_uid，后续命中及执行阶段即可进行跨账户防篡改复核。
         target_map = {}
         for strategy in merged.get("strategies") or []:
             if not isinstance(strategy, dict):
@@ -1089,13 +1088,23 @@ class Api:
                     target_uid,
                     db=self.db,
                 )
+            target = target_map.get(target_uid)
+            if isinstance(target, dict) and not str(
+                strategy.get("account_uid") or ""
+            ).strip():
+                strategy["account_uid"] = str(
+                    target.get("account_uid") or ""
+                ).strip()
+        ok, msg = validate_rule_retargeting_config(merged)
+        if not ok:
+            return {"success": False, "message": msg}
         ok, msg = validate_strategy_target_compatibility(
             merged,
             target_map,
         )
         if not ok:
             return {"success": False, "message": msg}
-        saved = merge_and_save(config)
+        saved = merge_and_save(merged)
         out = dict(saved)
         out["success"] = True
         return out

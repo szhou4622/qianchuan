@@ -206,6 +206,7 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": str(strategy.get("id") or ""),
         "title": str(strategy.get("title") or strategy.get("id") or "?")[:64],
+        "account_uid": str(strategy.get("account_uid") or ""),
         "target_uid": str(strategy.get("target_uid") or ""),
         "trigger_level": str(strategy.get("trigger_level") or "material"),
         "product_filter": (
@@ -1246,6 +1247,17 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     target_uid,
                 )
                 return
+            strategy_account_uid = str(st.get("account_uid") or "").strip()
+            target_account_uid = str(target.get("account_uid") or "").strip()
+            if strategy_account_uid and strategy_account_uid != target_account_uid:
+                logger.error(
+                    "%s 策略 %s 的监控账户与计划归属不一致，已安全跳过：strategy_account=%s target_account=%s",
+                    _log_sched,
+                    st.get("id"),
+                    strategy_account_uid,
+                    target_account_uid,
+                )
+                return
             if not bool(target.get("retarget_eligible")):
                 logger.warning(
                     "%s 策略 %s 对应计划尚未取得可追投资格，已跳过：%s",
@@ -1534,6 +1546,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 strategy_snapshot = {
                     "id": str(st.get("id") or ""),
                     "title": st_label,
+                    "account_uid": str(target.get("account_uid") or ""),
                     "target_uid": target_uid,
                     "trigger_level": trigger_level,
                     "product_filter": st.get("product_filter") or [],
