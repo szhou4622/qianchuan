@@ -399,6 +399,29 @@
     try{r=await a.startQianchuanAccountSelection()}catch(e){r={success:false,message:String(e?.message||e)}}
     message(r?.message||'Chrome正在启动。请切换到要添加的千川账户；如果当前账户已经添加，打开该账户任意计划详情即可确认。识别后窗口会自动关闭。',!r?.success);
     if(!r?.success){$('addAccount').disabled=false;return}
+    if(r?.mode==='official_api'&&Array.isArray(r?.candidates)){
+      const candidates=r.candidates.filter(item=>String(item?.aavid||'').trim());
+      if(!candidates.length){$('addAccount').disabled=false;message('当前授权下没有可添加的千川投放账户。',true);return}
+      const options=candidates.map((item,index)=>{
+        const aid=String(item.aavid||'');
+        const name=String(item.account_name||`千川账户 ${aid}`);
+        return `${index+1}. ${name}（ID：${aid}）`;
+      }).join('\n');
+      const answer=window.prompt(`请选择要添加的千川账户：\n\n${options}\n\n请输入序号或账户ID：`,'1');
+      if(answer===null){$('addAccount').disabled=false;message('已取消添加账户。');return}
+      const raw=String(answer||'').trim();
+      const byIndex=/^\d+$/.test(raw)?candidates[Number(raw)-1]:null;
+      const selected=byIndex||candidates.find(item=>String(item.aavid||'')===raw);
+      if(!selected){$('addAccount').disabled=false;message('输入的序号或账户ID不在授权列表中。',true);return}
+      let added;
+      try{added=await a.addOfficialApiQianchuanAccount(String(selected.aavid||''))}catch(e){added={success:false,message:String(e?.message||e)}}
+      $('addAccount').disabled=false;
+      if(!added?.success){message(added?.message||'添加官方 API 账户失败',true);return}
+      await load();
+      message(added?.message||'账户已添加，正在后台读取计划。');
+      await watchAutomaticCatalogPrefetch(String(added?.account?.account_uid||added?.account?.aavid||''));
+      return;
+    }
     const timer=setInterval(async()=>{
       const s=await a.getPromotionTargetDiscoveryStatus();
       message(s?.message||'请在Chrome中切换到要添加的账户；如果当前账户已经添加，打开任意计划详情即可确认并自动关闭窗口。',!s?.success);

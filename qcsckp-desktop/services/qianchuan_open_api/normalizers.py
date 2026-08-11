@@ -59,7 +59,9 @@ def _id_list(value: Any, *keys: str) -> list[str]:
 
 
 def normalize_account(row: Mapping[str, Any]) -> dict[str, Any]:
-    advertiser_id = text_id(first(row, "advertiser_id", "advertiserId", "aavid", "id"))
+    advertiser_id = text_id(
+        first(row, "advertiser_id", "advertiserId", "adv_id", "aavid", "id")
+    )
     return {
         "aavid": advertiser_id,
         "advertiser_id": advertiser_id,

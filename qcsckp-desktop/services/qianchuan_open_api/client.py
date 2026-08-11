@@ -366,7 +366,23 @@ class QianchuanOpenApiClient:
             return [dict(item) for item in data if isinstance(item, Mapping)]
         if not isinstance(data, Mapping):
             return []
-        for key in ("list", "items", "rows", "data_list", "advertisers"):
+        # Ocean Engine uses endpoint-specific collection keys.  Keep the
+        # explicit list ordered so pagination never mistakes a nested metric
+        # array for the endpoint's primary result set.
+        for key in (
+            "list",
+            "items",
+            "rows",
+            "data_list",
+            "advertisers",
+            "adv_id_list",
+            "ad_list",
+            "material_list",
+            "product_list",
+            "task_list",
+            "log_list",
+            "logs",
+        ):
             value = data.get(key)
             if isinstance(value, list):
                 return [dict(item) for item in value if isinstance(item, Mapping)]

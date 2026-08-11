@@ -99,6 +99,8 @@ class QianchuanOfficialApiService:
                 for row in rows:
                     row = dict(row)
                     row["shop_id"] = sid
+                    if len(rows) == 1 and not row.get("advertiser_name"):
+                        row["advertiser_name"] = subject.get("advertiser_name") or ""
                     resolved[text_id(row.get("advertiser_id"))] = row
                 evidence["subjects"].append(
                     {"subject_id": subject_id, "shop_id": sid, "role": role, "resolved": len(rows), "type": "shop"}

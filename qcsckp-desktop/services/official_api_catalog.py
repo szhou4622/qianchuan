@@ -91,7 +91,44 @@ def discover_authorized_accounts() -> dict[str, Any]:
             }
             for row in rows
         ],
-        "message": "已取得官方授权账户候选；待 App ID/OAuth 配置页接入后由用户选择添加",
+        "message": "已取得官方授权账户候选，请选择一个账户添加到工具",
+    }
+
+
+def add_authorized_account(aavid: Any) -> dict[str, Any]:
+    """Add exactly one user-selected official API account, then warm its catalog."""
+    aid = str(aavid or "").strip()
+    if not aid.isdigit():
+        return {"success": False, "code": "invalid_aavid", "message": "请选择有效的千川账户"}
+
+    rows, evidence = get_official_api_service().list_business_accounts()
+    selected = next(
+        (row for row in rows if str(row.get("advertiser_id") or "").strip() == aid),
+        None,
+    )
+    if selected is None:
+        return {
+            "success": False,
+            "code": "account_not_authorized",
+            "message": "该账户不在当前官方 API 授权范围内，请重新授权后再试",
+            "evidence": evidence,
+        }
+
+    account = ensure_qianchuan_account(
+        aid,
+        account_name=str(selected.get("advertiser_name") or ""),
+        owner_username=_owner_key(),
+        directory_selected=True,
+        seen=True,
+        allow_reactivate_removed=True,
+    )
+    sync = start_official_api_catalog_sync(account.get("account_uid") or aid)
+    return {
+        "success": True,
+        "mode": "official_api",
+        "account": account,
+        "catalog_sync": sync,
+        "message": "账户已添加，正在通过千川官方 API 后台读取计划",
     }
 
 

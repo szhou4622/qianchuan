@@ -718,6 +718,9 @@ class JSApi:
     def removeQianchuanAccount(self, accountUid=None):
         return self.api.removeQianchuanAccount(accountUid)
 
+    def addOfficialApiQianchuanAccount(self, aavid=None):
+        return self.api.addOfficialApiQianchuanAccount(aavid)
+
     def startQianchuanCatalogSync(self, accountUid=None):
         return self.api.startQianchuanCatalogSync(accountUid)
 

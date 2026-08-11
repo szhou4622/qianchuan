@@ -12,6 +12,7 @@ from services.qianchuan_open_api.errors import (
     OfficialApiWriteDisabled,
 )
 from services.qianchuan_open_api.normalizers import (
+    normalize_account,
     normalize_control_task,
     normalize_material,
     normalize_plan,
@@ -55,6 +56,82 @@ class _CaptureClient:
 
 
 class OfficialApiBackendTests(unittest.TestCase):
+    def test_single_shop_account_inherits_official_shop_name(self):
+        service = QianchuanOfficialApiService(_CaptureClient())
+        with patch.object(
+            service,
+            "list_authorized_accounts",
+            return_value=[
+                {
+                    "advertiser_id": "55192491",
+                    "advertiser_name": "松鲜鲜松之选专卖店",
+                    "role": "SHOP",
+                    "shop_id": "55192491",
+                }
+            ],
+        ), patch.object(
+            service,
+            "list_shop_advertisers",
+            return_value=[{"advertiser_id": "1782685702496260", "advertiser_name": ""}],
+        ):
+            rows, evidence = service.list_business_accounts()
+        self.assertTrue(evidence["complete"])
+        self.assertEqual(rows[0]["advertiser_name"], "松鲜鲜松之选专卖店")
+
+    def test_user_selected_official_account_is_added_and_warmed(self):
+        from services.official_api_catalog import add_authorized_account
+
+        fake_service = unittest.mock.Mock()
+        fake_service.list_business_accounts.return_value = (
+            [
+                {
+                    "advertiser_id": "1782685702496260",
+                    "advertiser_name": "松鲜鲜松之选专卖店",
+                }
+            ],
+            {"complete": True},
+        )
+        saved = {
+            "account_uid": "account-uid-1",
+            "aavid": "1782685702496260",
+            "account_name": "松鲜鲜松之选专卖店",
+        }
+        with patch(
+            "services.official_api_catalog.get_official_api_service",
+            return_value=fake_service,
+        ), patch(
+            "services.official_api_catalog.ensure_qianchuan_account",
+            return_value=saved,
+        ) as ensure, patch(
+            "services.official_api_catalog.start_official_api_catalog_sync",
+            return_value={"success": True, "running": True},
+        ) as start_sync:
+            result = add_authorized_account("1782685702496260")
+        self.assertTrue(result["success"])
+        ensure.assert_called_once()
+        start_sync.assert_called_once_with("account-uid-1")
+
+    def test_real_oceanengine_collection_keys_are_extracted(self):
+        cases = {
+            "adv_id_list": [{"adv_id": "123"}],
+            "ad_list": [{"ad_id": "456"}],
+            "material_list": [{"material_id": "789"}],
+            "product_list": [{"product_id": "321"}],
+            "task_list": [{"task_id": "654"}],
+            "log_list": [{"log_id": "987"}],
+        }
+        for key, expected in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    QianchuanOpenApiClient.extract_items({key: expected}),
+                    expected,
+                )
+
+    def test_shop_advertiser_adv_id_is_normalized_as_long_string(self):
+        account = normalize_account({"adv_id": 1782685702496260})
+        self.assertEqual(account["advertiser_id"], "1782685702496260")
+        self.assertEqual(account["aavid"], "1782685702496260")
+
     def test_four_plan_classes_are_normalized_from_official_fields(self):
         matrix = {
             ("OVERALL_PROJECT", "LIVE_PROM_GOODS"): ("chengfang", "live"),

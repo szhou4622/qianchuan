@@ -1531,6 +1531,20 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def addOfficialApiQianchuanAccount(self, aavid=None):
+        try:
+            if QIANCHUAN_BACKEND != "official_api":
+                return {
+                    "success": False,
+                    "code": "official_api_required",
+                    "message": "当前未启用千川官方 API 模式",
+                }
+            from services.official_api_catalog import add_authorized_account
+
+            return add_authorized_account(aavid)
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
     def reconcileQianchuanOfficialApiAccount(self, aavid=None):
         """Developer acceptance hook; never launches Chrome or writes to Qianchuan."""
         if QIANCHUAN_BACKEND != "official_api":
