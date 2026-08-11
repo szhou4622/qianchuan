@@ -885,7 +885,16 @@ class JSApi:
         page_size=50,
     ):
         return self.api.listOperationEvents(
-            aavid, date_from, date_to, action_type, source, status, operator, q, page, page_size
+            aavid=aavid,
+            date_from=date_from,
+            date_to=date_to,
+            action_type=action_type,
+            source=source,
+            status=status,
+            operator=operator,
+            q=q,
+            page=page,
+            page_size=page_size,
         )
 
     def getOperationEventDetail(self, event_id=None, aavid=None):
@@ -909,7 +918,14 @@ class JSApi:
         q=None,
     ):
         return self.api.exportOperationEventsCsv(
-            aavid, date_from, date_to, action_type, source, status, operator, q
+            aavid=aavid,
+            date_from=date_from,
+            date_to=date_to,
+            action_type=action_type,
+            source=source,
+            status=status,
+            operator=operator,
+            q=q,
         )
 
     def startOperationRecordBrowser(self, aavid=None):

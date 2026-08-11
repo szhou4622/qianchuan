@@ -207,6 +207,37 @@ class JSApiBridgeTests(unittest.TestCase):
         )
         self.core.syncOperationLogsNow.assert_called_once_with("1001")
 
+    def test_operation_query_uses_named_arguments_without_target_shift(self):
+        self.core.listOperationEvents.return_value = {
+            "success": True,
+            "total": 1,
+        }
+        result = self.bridge.listOperationEvents(
+            "1001",
+            "2026-08-05",
+            "2026-08-11",
+            "stop",
+            "platform_log",
+            "success",
+            "operator",
+            "keyword",
+            2,
+            50,
+        )
+        self.assertEqual(1, result["total"])
+        self.core.listOperationEvents.assert_called_once_with(
+            aavid="1001",
+            date_from="2026-08-05",
+            date_to="2026-08-11",
+            action_type="stop",
+            source="platform_log",
+            status="success",
+            operator="operator",
+            q="keyword",
+            page=2,
+            page_size=50,
+        )
+
     def test_diagnostics_page_has_direct_account_management_return(self):
         page = (
             Path(__file__).resolve().parents[1]
