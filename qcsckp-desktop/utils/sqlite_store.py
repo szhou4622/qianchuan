@@ -57,6 +57,8 @@ class SQLiteStore:
                 'overall_click_count': 'INTEGER',
                 'overall_ctr': 'REAL',
                 'overall_conversion_rate': 'REAL',
+                'data_source': "TEXT NOT NULL DEFAULT 'browser_legacy'",
+                'api_request_id': 'TEXT',
                 'stat_date': "TEXT NOT NULL DEFAULT (date('now', '+8 hours'))",
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
@@ -529,6 +531,37 @@ class SQLiteStore:
             ],
         },
         # 前一日账户操作日报的发送记录；按工具账号、千川账户、日期和飞书接收位置幂等。
+        # 千川官方 API 请求审计。只保存脱敏摘要、官方 request_id 与对账状态。
+        'qianchuan_api_audit': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'request_uid': 'TEXT NOT NULL',
+                'account_username': "TEXT NOT NULL DEFAULT ''",
+                'source': "TEXT NOT NULL DEFAULT 'qianchuan_open_api'",
+                'endpoint': 'TEXT NOT NULL',
+                'method': 'TEXT NOT NULL',
+                'aavid': "TEXT NOT NULL DEFAULT ''",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'task_id': "TEXT NOT NULL DEFAULT ''",
+                'request_id': "TEXT NOT NULL DEFAULT ''",
+                'error_code': "TEXT NOT NULL DEFAULT ''",
+                'permission_status': "TEXT NOT NULL DEFAULT 'unknown'",
+                'reconciliation_status': "TEXT NOT NULL DEFAULT 'not_required'",
+                'status': "TEXT NOT NULL DEFAULT 'requested'",
+                'request_summary_json': "TEXT NOT NULL DEFAULT '{}'",
+                'response_summary_json': "TEXT NOT NULL DEFAULT '{}'",
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_qianchuan_api_audit_account_time', 'account_username, aavid, created_at'),
+                ('idx_qianchuan_api_audit_status', 'status, reconciliation_status'),
+                ('idx_qianchuan_api_audit_request_id', 'request_id'),
+            ],
+            'unique_indexes': [
+                ('uk_qianchuan_api_audit_request_uid', 'request_uid'),
+            ],
+        },
         'operation_daily_report_delivery': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
@@ -617,6 +650,9 @@ class SQLiteStore:
                 'total_pay_order_gmv_for_roi2_assist': 'REAL',
                 'total_pay_order_coupon_amount_for_roi2_assist': 'REAL',
                 'assist_materials_json': 'TEXT',
+                'data_source': "TEXT NOT NULL DEFAULT 'browser_legacy'",
+                'api_request_id': 'TEXT',
+                'reconciliation_status': "TEXT NOT NULL DEFAULT 'not_required'",
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },

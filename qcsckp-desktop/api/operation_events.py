@@ -16,7 +16,12 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 TABLE = "account_operation_event"
-ALLOWED_SOURCES = {"tool_direct", "browser_observed", "platform_log"}
+ALLOWED_SOURCES = {
+    "tool_direct",
+    "browser_observed",
+    "platform_log",
+    "qianchuan_open_api",
+}
 ALLOWED_ACTIONS = {
     "retarget",
     "stop",
@@ -489,14 +494,14 @@ def operation_event_account_summary(
     aggregate = store.execute(
         f"SELECT COUNT(*) AS n, MIN(occurred_at) AS first_at, "
         f"MAX(occurred_at) AS last_at FROM {TABLE} "
-        "WHERE account_uid=? AND aavid=? AND source='platform_log'",
+        "WHERE account_uid=? AND aavid=? AND source IN ('platform_log','qianchuan_open_api')",
         (account_uid, aid),
         fetch=True,
     ) or []
     row = aggregate[0] if aggregate else {}
     operator_rows = store.execute(
         f"SELECT operator_name, operator_id, COUNT(*) AS n FROM {TABLE} "
-        "WHERE account_uid=? AND aavid=? AND source='platform_log' "
+        "WHERE account_uid=? AND aavid=? AND source IN ('platform_log','qianchuan_open_api') "
         "GROUP BY operator_name, operator_id ORDER BY n DESC, operator_name ASC LIMIT 20",
         (account_uid, aid),
         fetch=True,
@@ -589,7 +594,7 @@ def operation_sync_state(
             if row and str(row.get("last_status") or "") == "empty":
                 existing = store.execute(
                     f"SELECT COUNT(*) AS n FROM {TABLE} WHERE account_uid=? "
-                    "AND aavid=? AND source='platform_log'",
+                    "AND aavid=? AND source IN ('platform_log','qianchuan_open_api')",
                     (str(account.get("account_uid") or ""), aid),
                     fetch=True,
                 ) or []
@@ -793,6 +798,7 @@ def ingest_platform_log_rows(
     update_sync_state: bool = True,
     _batched: bool = False,
     _account_uid: str = "",
+    source: str = "platform_log",
 ) -> int:
     """接收记录浏览器发现的平台日志行，保留原文并做基础字段兼容。"""
     aid = str(aavid or "").strip()
@@ -822,8 +828,14 @@ def ingest_platform_log_rows(
                 update_sync_state=update_sync_state,
                 _batched=True,
                 _account_uid=account_uid,
+                source=source,
             )
     account_uid = str(_account_uid or "")
+    normalized_source = (
+        "qianchuan_open_api"
+        if str(source or "").strip() == "qianchuan_open_api"
+        else "platform_log"
+    )
     inserted = 0
     seen_times: List[str] = []
     for raw in rows:
@@ -964,9 +976,9 @@ def ingest_platform_log_rows(
         )
         action = normalize_action_type(description)
         legacy_uid = (
-            f"platform_log:{aid}:{platform_id}"
+            f"{normalized_source}:{aid}:{platform_id}"
             if platform_id
-            else make_event_uid("platform_log", aid, occurred_at, operator_id, description, object_id)
+            else make_event_uid(normalized_source, aid, occurred_at, operator_id, description, object_id)
         )
         legacy_event = store.select_one(
             TABLE,
@@ -979,10 +991,10 @@ def ingest_platform_log_rows(
             not in {"", account_uid}
         ):
             uid = (
-                f"platform_log:{account_uid}:{aid}:{platform_id}"
+                f"{normalized_source}:{account_uid}:{aid}:{platform_id}"
                 if platform_id
                 else make_event_uid(
-                    "platform_log",
+                    normalized_source,
                     account_uid,
                     aid,
                     occurred_at,
@@ -1003,7 +1015,7 @@ def ingest_platform_log_rows(
             (
                 account_uid,
                 aid,
-                "platform_log",
+                normalized_source,
                 action,
                 str(object_id or ""),
                 occurred_at,
@@ -1101,7 +1113,7 @@ def ingest_platform_log_rows(
                 "target_uid": _first(raw, ("target_uid",), "legacy_unscoped"),
                 "promotion_scene": _first(raw, ("promotion_scene", "scene")),
                 "plan_system": _first(raw, ("plan_system", "delivery_system")),
-                "source": "platform_log",
+                "source": normalized_source,
                 "action_type": action,
                 "object_type": object_type,
                 "object_id": object_id,

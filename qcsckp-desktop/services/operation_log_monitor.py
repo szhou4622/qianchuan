@@ -19,7 +19,7 @@ from api.operation_events import (
     update_platform_sync_state,
     upsert_operation_event,
 )
-from config import DATA_DIR
+from config import DATA_DIR, QIANCHUAN_BACKEND
 from services.promotion_browser_lock import (
     PRIORITY_OPERATION_LOG,
     exclusive_browser_operation,
@@ -1306,6 +1306,12 @@ def request_platform_log_sync(
     *,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_operation_logs import (
+            request_official_operation_log_sync,
+        )
+
+        return request_official_operation_log_sync(aavid, db=db)
     aid = str(aavid or "").strip()
     owner = current_session_owner()
     if not aid:
@@ -1610,6 +1616,12 @@ async def platform_log_sync_loop() -> None:
 
 
 def start_platform_log_sync_background_thread() -> threading.Thread:
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_operation_logs import (
+            start_official_operation_log_sync_background_thread,
+        )
+
+        return start_official_operation_log_sync_background_thread()
     def entry() -> None:
         asyncio.run(platform_log_sync_loop())
 

@@ -31,6 +31,7 @@ from config import (
     ALLOW_LIVE_RETARGET,
     AUTH_MODE,
     LOCAL_AUTH_USERNAME,
+    QIANCHUAN_BACKEND,
 )
 from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread
 from services.webhook_push_runtime import start_webhook_push_background_threads
@@ -40,6 +41,12 @@ from services.retarget_task_worker import start_retarget_task_worker_background_
 from services.operation_log_monitor import start_platform_log_sync_background_thread
 from services.operation_daily_report import start_operation_daily_report_background_thread
 from services.control_panel_config import ensure_all_control_defaults
+from services.official_api_collection import (
+    start_official_api_collection_background_thread,
+)
+from services.official_api_catalog import (
+    start_official_api_catalog_scheduler,
+)
 
 
 # ── 打包环境强制 stdout/stderr 使用 UTF-8 ───────────────────────────────
@@ -1269,8 +1276,14 @@ def main():
         # ===== 规则化停投调度（见 services/regulation_rule_runner.py；enabled 见 rule_regulation.json，默认 10 分钟一轮）=====
         start_regulation_rule_runner_background_thread()
 
-        # ===== 授权账户和四类计划目录：启动同步一次，之后每30分钟只读刷新 =====
-        js_api.api.service.start_catalog_scheduler()
+        # ===== 授权账户和四类计划目录 =====
+        # Official API 模式不启动 Browser Worker，目录、素材、调控任务和报表
+        # 全部由 API 调度器处理。旧 Chrome 路径只供 Git 整体回滚。
+        if QIANCHUAN_BACKEND == "official_api":
+            start_official_api_catalog_scheduler()
+            start_official_api_collection_background_thread()
+        else:
+            js_api.api.service.start_catalog_scheduler()
 
         # 已保存并启用的账户/计划在软件重启后自动恢复后台监控。
         # 目录启动刷新可能仍在占用唯一 Browser Worker，因此由服务层
@@ -1296,11 +1309,12 @@ def main():
                     )
                 time.sleep(2.0)
 
-        threading.Thread(
-            target=_resume_saved_monitoring,
-            name="qianchuan-monitor-resume",
-            daemon=True,
-        ).start()
+        if QIANCHUAN_BACKEND != "official_api":
+            threading.Thread(
+                target=_resume_saved_monitoring,
+                name="qianchuan-monitor-resume",
+                daemon=True,
+            ).start()
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")

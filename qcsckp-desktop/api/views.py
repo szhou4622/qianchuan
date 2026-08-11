@@ -9,7 +9,18 @@ from urllib.parse import urlparse
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 from .dashboard import DashboardApi
 from .account_auth import AccountAuthApi
-from services.run_services import get_service_controller
+from config import QIANCHUAN_BACKEND
+
+
+def _get_service_controller():
+    """Keep Playwright out of the official API process import graph."""
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_controller import get_official_api_controller
+
+        return get_official_api_controller()
+    from services.run_services import get_service_controller
+
+    return get_service_controller()
 
 
 class Api:
@@ -35,7 +46,7 @@ class Api:
 
             logger.warning("[千川会话] 旧Cookie加密迁移暂未完成: %s", exc)
         self.dashboard = DashboardApi()
-        self.service = get_service_controller()
+        self.service = _get_service_controller()
         self.account_auth = AccountAuthApi()
 
     # ========== 大屏相关 API ==========
@@ -104,7 +115,12 @@ class Api:
                 ensure_schema=False,
                 perform_repairs=False,
             )
-            session = session_status()
+            if QIANCHUAN_BACKEND == "official_api":
+                from services.official_api_catalog import official_api_session_status
+
+                session = official_api_session_status()
+            else:
+                session = session_status()
             catalog = catalog_sync_status(
                 db=self.db,
                 accounts_snapshot=accounts,
@@ -164,7 +180,16 @@ class Api:
                 "session": session,
                 "catalog": catalog,
                 "onboarding": onboarding,
-                "browser_queue": browser_queue_snapshot(),
+                "browser_queue": (
+                    {
+                        "running": False,
+                        "waiting": 0,
+                        "backend": "official_api",
+                        "message": "官方 API 调度器；不启动 Chrome",
+                    }
+                    if QIANCHUAN_BACKEND == "official_api"
+                    else browser_queue_snapshot()
+                ),
                 "feishu": {
                     "connected": bool(feishu.get("connected")),
                     "authorized_open_id": str(
@@ -215,15 +240,24 @@ class Api:
             )
         except Exception as e:
             return {"success": False, "message": str(e)}
-        try:
-            monitoring = self.service.start_from_saved_session()
-        except Exception as e:
+        if QIANCHUAN_BACKEND == "official_api":
             monitoring = {
+                "success": True,
+                "running": bool(saved.get("enabled")),
+                "phase": "official_api_scheduled",
+                "backend": "official_api",
+                "message": "设置已保存，官方 API 后台采集会按计划运行",
+            }
+        else:
+            try:
+                monitoring = self.service.start_from_saved_session()
+            except Exception as e:
+                monitoring = {
                 "success": False,
                 "running": False,
                 "phase": "start_failed",
                 "message": f"设置已保存，但后台监控启动失败：{e}",
-            }
+                }
         operation_log_sync = {
             "success": True,
             "running": False,
@@ -273,12 +307,20 @@ class Api:
 
     def startQianchuanCatalogSync(self, account_uid=None):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                from services.official_api_catalog import start_official_api_catalog_sync
+
+                return start_official_api_catalog_sync(account_uid)
             return self.service.start_catalog_sync(account_uid)
         except Exception as e:
             return {"success": False, "message": str(e)}
 
     def getQianchuanCatalogSyncStatus(self):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                from services.official_api_catalog import official_api_catalog_status
+
+                return official_api_catalog_status()
             return self.service.catalog_sync_status()
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -435,10 +477,9 @@ class Api:
         from .rule_retargeting_config import load_rule_retargeting_config
         from services.plan_system import normalize_plan_system
         from services.promotion_browser_lock import exclusive_browser_operation
-        from services.promotion_capability import record_target_capability
-        from services.retargeting_service import (
-            QianChuanRetargetingService,
-            RETARGET_PROBE_VERSION,
+        from services.promotion_capability import (
+            check_target_capability,
+            record_target_capability,
         )
 
         uid = str(target_uid or "").strip()
@@ -460,6 +501,27 @@ class Api:
                 "success": False,
                 "message": "请先把计划体系明确设置为“全域”或“千川乘方”",
             }
+        if QIANCHUAN_BACKEND == "official_api":
+            ok, reason = check_target_capability(
+                target,
+                action="retarget",
+                promotion_scene=promotion_scene,
+                plan_system=plan_system,
+            )
+            return {
+                "success": ok,
+                "backend": "official_api",
+                "message": (
+                    "官方 API 已完成账户、计划、场景和体系能力校验"
+                    if ok
+                    else f"官方 API 能力尚未就绪：{reason}；请先刷新该账户计划"
+                ),
+                "data": {"verified": ok, "reason": reason},
+            }
+        from services.retargeting_service import (
+            QianChuanRetargetingService,
+            RETARGET_PROBE_VERSION,
+        )
         if str(target.get("last_status") or "").strip().lower() != "ok":
             return {
                 "success": False,
@@ -628,24 +690,46 @@ class Api:
 
     def startPromotionTargetDiscovery(self):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                from services.official_api_catalog import discover_authorized_accounts
+
+                return discover_authorized_accounts()
             return self.service.start_target_discovery()
         except Exception as e:
             return {"success": False, "message": str(e)}
 
     def startQianchuanAccountSelection(self):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                from services.official_api_catalog import discover_authorized_accounts
+
+                return discover_authorized_accounts()
             return self.service.start_target_discovery(account_only=True)
         except Exception as e:
             return {"success": False, "message": str(e)}
 
     def startQianchuanRelogin(self):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                return {
+                    "success": False,
+                    "backend": "official_api",
+                    "code": "oauth_ui_pending",
+                    "message": "当前版本已切换官方 API；App ID/App Secret 与 OAuth 授权页面按约定暂未开发",
+                }
             return self.service.start_target_discovery(login_only=True)
         except Exception as e:
             return {"success": False, "message": str(e)}
 
     def getPromotionTargetDiscoveryStatus(self):
         try:
+            if QIANCHUAN_BACKEND == "official_api":
+                return {
+                    "success": True,
+                    "running": False,
+                    "backend": "official_api",
+                    "message": "官方 API 模式不使用浏览器识别账户",
+                }
             return self.service.target_discovery_status()
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -1486,6 +1570,12 @@ class Api:
             return {"success": False, "message": str(e)}
 
     def startOperationRecordBrowser(self, aavid=None):
+        if QIANCHUAN_BACKEND == "official_api":
+            return {
+                "success": False,
+                "backend": "official_api",
+                "message": "官方 API 模式不记录浏览器轨迹；请点击立即同步读取千川真实操作日志",
+            }
         from services.operation_log_monitor import start_record_browser
 
         aid = str(aavid or "").strip()

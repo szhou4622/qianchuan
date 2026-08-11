@@ -16,11 +16,11 @@ import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
-
-from config import DATA_DIR
-from services.fetcher import build_qianchuan_url_by_params
-from services.product_scene_adapter import goto_and_confirm_product_target
+from config import DATA_DIR, QIANCHUAN_BACKEND
+if QIANCHUAN_BACKEND == "browser_legacy":
+    from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
+    from services.fetcher import build_qianchuan_url_by_params
+    from services.product_scene_adapter import goto_and_confirm_product_target
 from services.plan_system import (
     confirm_live_page_plan_system,
     normalize_plan_system,
@@ -1336,6 +1336,10 @@ class QianChuanRegulationStopService:
         storage_state_override: Any = None,
         base_url: Optional[str] = None,
     ) -> "QianChuanRegulationStopService":
+        if QIANCHUAN_BACKEND == "official_api":
+            from services.official_api_execution import OfficialApiRegulationStopService
+
+            return OfficialApiRegulationStopService(full_config)  # type: ignore[return-value]
         headless = bool(full_config.get("browser_headless", True))
         be = str(full_config.get("browser_executable_path") or "").strip()
         opt = RegulationSessionOptions(

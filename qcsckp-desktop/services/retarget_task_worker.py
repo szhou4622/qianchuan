@@ -915,7 +915,7 @@ async def _execute_budget_increase_task(
     task: Dict[str, Any],
     db: SQLiteStore,
 ) -> Dict[str, Any]:
-    """Validate now; real platform write remains closed until contract evidence."""
+    """Revalidate and adjust an existing control task through the selected backend."""
     target_uid = str(task.get("target_uid") or "")
     assist_task_id = str(task.get("assist_task_id") or "")
     try:
@@ -923,11 +923,148 @@ async def _execute_budget_increase_task(
             f"飞书确认追加预算:{target_uid}:{assist_task_id}",
             priority=10,
         ):
-            _, _, _, _, calculation = await asyncio.to_thread(
+            _, _, target, row, calculation = await asyncio.to_thread(
                 _validate_budget_increase_task,
                 task,
                 db,
             )
+            from config import QIANCHUAN_BACKEND
+
+            if QIANCHUAN_BACKEND == "official_api":
+                from datetime import datetime, timedelta
+                from decimal import Decimal
+                from services.qianchuan_open_api.audit import OfficialApiAuditStore
+                from services.qianchuan_open_api.errors import ApiWriteOutcomeUnknown
+                from services.qianchuan_open_api.normalizers import text_id
+                from services.qianchuan_open_api.runtime import get_official_api_service
+
+                service = get_official_api_service()
+                aavid = str(target.get("aadvid") or "")
+                ad_id = str(target.get("ad_id") or "")
+                scene = str(target.get("promotion_scene") or "product")
+                goal = "LIVE_PROM_GOODS" if scene == "live" else "VIDEO_PROM_GOODS"
+                now = datetime.now()
+                tasks, _ = await asyncio.to_thread(
+                    service.list_control_tasks,
+                    aavid,
+                    ad_id=ad_id,
+                    marketing_goal=goal,
+                    start_time=(now - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00"),
+                    end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+                )
+                exact = next(
+                    (
+                        item
+                        for item in tasks
+                        if text_id(item.get("task_id")) == text_id(assist_task_id)
+                    ),
+                    None,
+                )
+                if not exact or str(exact.get("scene") or "").upper() != "MATERIAL_ADD_BUDGET":
+                    raise RuntimeError("官方 API 未找到待调整的素材追投调控任务")
+                status = str(exact.get("status") or "").upper()
+                if status in {"PAUSE", "PAUSED", "DISABLE", "DISABLED", "FINISHED", "ENDED"}:
+                    raise RuntimeError("调控任务已不在可调整状态")
+                audit = OfficialApiAuditStore(db)
+
+                async def reconcile_unknown(
+                    exc: ApiWriteOutcomeUnknown,
+                    *,
+                    field: str,
+                    expected: Any,
+                ) -> str:
+                    fresh_tasks, request_ids = await asyncio.to_thread(
+                        service.list_control_tasks,
+                        aavid,
+                        ad_id=ad_id,
+                        marketing_goal=goal,
+                        start_time=(now - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00"),
+                        end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+                    )
+                    fresh = next(
+                        (
+                            item
+                            for item in fresh_tasks
+                            if text_id(item.get("task_id")) == text_id(assist_task_id)
+                        ),
+                        None,
+                    )
+                    confirmed = False
+                    if fresh is not None:
+                        try:
+                            confirmed = Decimal(str(fresh.get(field))) == Decimal(str(expected))
+                        except Exception:
+                            confirmed = False
+                    audit.mark_reconciled(
+                        exc.request_uid,
+                        status="confirmed" if confirmed else "unresolved",
+                        task_id=assist_task_id,
+                        response={
+                            "field": field,
+                            "expected": expected,
+                            "actual": fresh.get(field) if fresh else None,
+                            "list_request_ids": request_ids,
+                        },
+                    )
+                    if not confirmed:
+                        raise RuntimeError(
+                            f"官方 API {field}修改结果未知且对账未确认，禁止自动重试；请人工核对"
+                        ) from exc
+                    return str(exc.request_id or "reconciled")
+
+                budget_request_id = ""
+                try:
+                    budget_response = await asyncio.to_thread(
+                        service.update_control_budget,
+                        aavid,
+                        assist_task_id,
+                        calculation["new_budget_yuan"],
+                    )
+                    budget_request_id = budget_response.request_id
+                except ApiWriteOutcomeUnknown as exc:
+                    budget_request_id = await reconcile_unknown(
+                        exc,
+                        field="budget",
+                        expected=calculation["new_budget_yuan"],
+                    )
+                duration_request_id = ""
+                extend_hours = calculation.get("extend_hours")
+                if extend_hours:
+                    current_duration = exact.get("duration")
+                    if current_duration is None:
+                        raise RuntimeError(
+                            "预算已更新，但官方 API 未返回当前时长，未继续修改时长；请人工核对"
+                        )
+                    new_duration = float(current_duration) + float(extend_hours)
+                    try:
+                        duration_response = await asyncio.to_thread(
+                            service.update_control_duration,
+                            aavid,
+                            assist_task_id,
+                            new_duration,
+                        )
+                        duration_request_id = duration_response.request_id
+                    except ApiWriteOutcomeUnknown as exc:
+                        duration_request_id = await reconcile_unknown(
+                            exc,
+                            field="duration",
+                            expected=new_duration,
+                        )
+                return {
+                    "success": True,
+                    "message": "官方 API 调控任务预算/时长调整成功",
+                    "detail": _json(
+                        {
+                            "source": "qianchuan_open_api",
+                            "assist_task_id": assist_task_id,
+                            "budget_request_id": budget_request_id,
+                            "duration_request_id": duration_request_id,
+                            "latest_calculation": calculation,
+                        }
+                    ),
+                    "step": "done",
+                    "calculation": calculation,
+                }
             return {
                 "success": False,
                 "message": "追加预算提交能力尚未完成真实页面接口取证，本次未向千川提交",

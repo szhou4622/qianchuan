@@ -318,6 +318,28 @@ def has_qianchuan_session() -> bool:
 
 def automation_session_ready(owner_username: Any = None) -> Dict[str, Any]:
     """写操作总闸：已知登录失效时，即使旧Cookie仍可解密也必须暂停。"""
+    from config import QIANCHUAN_BACKEND
+
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_catalog import official_api_session_status
+
+        api_status = official_api_session_status()
+        ready = bool(api_status.get("available"))
+        return {
+            "success": True,
+            "owner_username": str(
+                owner_username or current_session_owner() or ""
+            ).strip().casefold(),
+            "available": ready,
+            "encrypted": True,
+            "status": str(api_status.get("status") or "not_configured"),
+            "updated_at": "",
+            "last_error": str(api_status.get("last_error") or ""),
+            "session_epoch": 1,
+            "source": "qianchuan_open_api",
+            "ready": ready,
+            "message": "" if ready else str(api_status.get("message") or "千川官方 API 尚未授权"),
+        }
     status = session_status(owner_username)
     ready = bool(status.get("available")) and str(
         status.get("status") or ""
@@ -334,6 +356,27 @@ def automation_session_ready(owner_username: Any = None) -> Dict[str, Any]:
 
 
 def session_status(owner_username: Any = None) -> Dict[str, Any]:
+    from config import QIANCHUAN_BACKEND
+
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_catalog import official_api_session_status
+
+        api_status = official_api_session_status()
+        return {
+            "success": True,
+            "owner_username": str(
+                owner_username or current_session_owner() or ""
+            ).strip().casefold(),
+            "available": bool(api_status.get("available")),
+            "encrypted": True,
+            "status": str(api_status.get("status") or "not_configured"),
+            "updated_at": "",
+            "last_error": str(api_status.get("last_error") or ""),
+            "session_epoch": 1,
+            "source": "qianchuan_open_api",
+            "legacy_cookie_present": False,
+            "rollback_cookie_present": os.path.isfile(LEGACY_ROLLBACK_FILE),
+        }
     owner = str(owner_username or current_session_owner() or "").strip().casefold()
     with SESSION_LOCK:
         profile = (

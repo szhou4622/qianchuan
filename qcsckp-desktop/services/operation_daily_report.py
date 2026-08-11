@@ -31,7 +31,7 @@ DETAIL_LIMIT = 20
 # 日报只展示实际投放操作：工具执行、千川后台日志，以及已经由千川
 # 后台日志ID核验过的浏览器记录。纯“记录浏览器模式”轨迹不属于日报。
 REPORTABLE_EVENT_SQL = (
-    "(source IN ('tool_direct','platform_log') "
+    "(source IN ('tool_direct','platform_log','qianchuan_open_api') "
     "OR (source='browser_observed' AND COALESCE(platform_event_id,'')<>''))"
 )
 
@@ -46,6 +46,7 @@ SOURCE_LABELS = {
     "tool_direct": "工具操作",
     "browser_observed": "浏览器记录",
     "platform_log": "千川后台日志",
+    "qianchuan_open_api": "千川官方API日志",
 }
 STATUS_LABELS = {
     "requested": "已请求",

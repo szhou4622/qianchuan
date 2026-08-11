@@ -7,8 +7,8 @@ import heapq
 import itertools
 import threading
 import time
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, List, Optional, Tuple
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncIterator, Iterator, List, Optional, Tuple
 
 
 PRIORITY_RETARGET = 10
@@ -81,6 +81,22 @@ def _release() -> None:
     with _CONDITION:
         _ACTIVE = False
         _CONDITION.notify_all()
+
+
+@contextmanager
+def exclusive_qianchuan_operation(
+    label: str,
+    *,
+    timeout_seconds: float = 900.0,
+    priority: int = PRIORITY_COLLECTION,
+) -> Iterator[None]:
+    """Serialize official-API and legacy-browser work through one priority gate."""
+    if not _acquire(int(priority), max(0.1, float(timeout_seconds))):
+        raise TimeoutError(f"等待千川操作队列超时：{label}")
+    try:
+        yield
+    finally:
+        _release()
 
 
 @asynccontextmanager

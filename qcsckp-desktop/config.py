@@ -87,6 +87,22 @@ TEST_MATERIAL_ID = _env_text("QCSCKP_TEST_MATERIAL_ID")
 ALLOW_LIVE_RETARGET = _env_flag("QCSCKP_ALLOW_LIVE_RETARGET")
 LOCAL_TEST_SECRETS_FILE = _env_text("QCSCKP_LOCAL_TEST_SECRETS_FILE")
 
+# 千川业务后端。开发验收期间继续默认旧运行时；官方 API 模式一旦启用便不会
+# 针对单个任务自动回退浏览器，避免一次任务被两个通道重复执行。
+# Development stays on the proven legacy runtime until the required three-
+# account/four-class read reconciliation and controlled write acceptance pass.
+# The official release switches this environment value once; there is no
+# per-task automatic fallback between the two backends.
+QIANCHUAN_BACKEND = (_env_text("QCSCKP_QIANCHUAN_BACKEND") or "browser_legacy").lower()
+if QIANCHUAN_BACKEND not in {"official_api", "browser_legacy"}:
+    QIANCHUAN_BACKEND = "browser_legacy"
+QIANCHUAN_OFFICIAL_API_BASE_URL = (
+    _env_text("QCSCKP_OE_API_BASE_URL") or "https://api.oceanengine.com"
+).rstrip("/")
+# 真实 API 写入默认关闭。只有受控验收明确设置后才可创建/暂停/结束/调整调控任务。
+ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")
+QIANCHUAN_API_TOKEN_FILE = os.path.join(DATA_DIR, "qianchuan_open_api_token.json")
+
 def _pick_static_dir() -> str:
     """
     前端 static 根目录：

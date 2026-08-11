@@ -17,6 +17,7 @@ from services.plan_system import normalize_plan_system
 RETARGET_FORM_PROBE_VERSION = "retarget-form-v3"
 MANUAL_RETARGET_PROBE_VERSION = "manual-retarget-submit-v1"
 REGULATION_MANUAL_PROBE_VERSION = "manual-stop-batch-v1"
+OFFICIAL_API_CAPABILITY_VERSION = "official-open-api-v1"
 CAPABILITY_MAX_AGE_DAYS = 30
 
 _ACTION_FIELDS = {
@@ -46,9 +47,11 @@ _ACTION_PROBE_VERSIONS = {
     "retarget": {
         RETARGET_FORM_PROBE_VERSION,
         MANUAL_RETARGET_PROBE_VERSION,
+        OFFICIAL_API_CAPABILITY_VERSION,
     },
     "regulation": {
         REGULATION_MANUAL_PROBE_VERSION,
+        OFFICIAL_API_CAPABILITY_VERSION,
     },
 }
 
@@ -201,10 +204,10 @@ def check_target_capability(
     if action == "retarget" and require_batch:
         if not bool(capability.get("retarget_batch_execute")):
             return False, "多素材追投能力尚未通过受控验证"
-        if (
-            str(capability.get("retarget_batch_probe_version") or "").strip()
-            != RETARGET_FORM_PROBE_VERSION
-        ):
+        if str(capability.get("retarget_batch_probe_version") or "").strip() not in {
+            RETARGET_FORM_PROBE_VERSION,
+            OFFICIAL_API_CAPABILITY_VERSION,
+        }:
             return False, "多素材追投探测器版本已过期，请重新验证"
         if not _verified_at_is_recent(
             capability.get("retarget_batch_verified_at")
