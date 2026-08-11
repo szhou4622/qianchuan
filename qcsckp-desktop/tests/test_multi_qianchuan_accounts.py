@@ -669,11 +669,18 @@ class ToolAccountSwitchTests(unittest.TestCase):
             "phase": "starting",
             "message": "设置已保存，正在启动首次后台采集",
         }
-        saved = {"account_uid": "account_one", "enabled": True}
+        saved = {
+            "account_uid": "account_one",
+            "aavid": "10001",
+            "enabled": True,
+        }
         with patch(
             "services.qianchuan_accounts.save_qianchuan_account_automation_setup",
             return_value=saved,
-        ) as save:
+        ) as save, patch(
+            "services.operation_log_monitor.request_platform_log_sync",
+            return_value={"success": True, "running": True},
+        ) as sync_logs:
             result = api.saveQianchuanAccountAutomationSetup(
                 "account_one",
                 {"enabled": True},
@@ -683,7 +690,9 @@ class ToolAccountSwitchTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(saved, result["data"])
         self.assertTrue(result["monitoring"]["running"])
+        self.assertTrue(result["operation_log_sync"]["running"])
         api.service.start_from_saved_session.assert_called_once_with()
+        sync_logs.assert_called_once_with("10001", db=api.db)
         save.assert_called_once_with(
             "account_one",
             {"enabled": True},

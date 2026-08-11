@@ -32,10 +32,14 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 SYNC_INTERVAL_SECONDS = 300
+OPERATION_LOG_ENDPOINT = "/ad/api/pmc/v1/ad/get_opt_log"
+QIANCHUAN_ORIGIN = "https://qianchuan.jinritemai.com"
 _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop: Optional[threading.Event] = None
 _monitor_status: Dict[str, Any] = {"running": False, "aavid": "", "message": "未启动"}
+_platform_sync_lock = threading.Lock()
+_platform_sync_threads: Dict[str, threading.Thread] = {}
 
 
 def _now() -> str:
@@ -89,11 +93,40 @@ def _extract_platform_rows(payload: Any) -> List[Dict[str, Any]]:
             score = 0
             for row in sample:
                 keys = {str(k).lower() for k in row.keys()}
-                if keys & {"operation", "operation_name", "action_name", "description", "操作", "内容"}:
+                if keys & {
+                    "operation",
+                    "operation_name",
+                    "action_name",
+                    "description",
+                    "content",
+                    "optcontent",
+                    "operatetype",
+                    "operationtype",
+                    "操作",
+                    "内容",
+                }:
                     score += 2
-                if keys & {"operate_time", "operation_time", "created_at", "create_time", "time"}:
+                if keys & {
+                    "operate_time",
+                    "operation_time",
+                    "created_at",
+                    "create_time",
+                    "time",
+                    "operatetime",
+                    "opttime",
+                    "createtime",
+                }:
                     score += 1
-                if keys & {"operator_name", "operator_id", "user_name", "operate_user_name", "操作人"}:
+                if keys & {
+                    "operator_name",
+                    "operator_id",
+                    "user_name",
+                    "operate_user_name",
+                    "operatorname",
+                    "username",
+                    "operator",
+                    "操作人",
+                }:
                     score += 1
             if score >= max(2, len(sample)):
                 candidates.append(value)
@@ -111,7 +144,7 @@ def _extract_platform_rows(payload: Any) -> List[Dict[str, Any]]:
 
 def _looks_like_log_url(url: str) -> bool:
     u = str(url or "").lower()
-    return any(x in u for x in ("operation-log", "operation_log", "operation/list", "operation/history", "operate-log", "operate_log", "operate/list", "operate/record", "audit-log", "audit_log", "/log/list", "/log/query", "action/log"))
+    return any(x in u for x in ("get_opt_log", "operation-log", "operation_log", "operation/list", "operation/history", "operate-log", "operate_log", "operate/list", "operate/record", "audit-log", "audit_log", "/log/list", "/log/query", "action/log"))
 
 
 def _with_30_day_range(url: str) -> str:
@@ -728,6 +761,529 @@ def record_browser_status() -> Dict[str, Any]:
     return {"success": True, "data": dict(_monitor_status)}
 
 
+def _account_log_targets(
+    aavid: str,
+    owner_username: str,
+    store: SQLiteStore,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    from services.qianchuan_accounts import get_qianchuan_account
+
+    account = get_qianchuan_account(
+        aavid,
+        owner_username=owner_username,
+        db=store,
+    )
+    if not account:
+        raise ValueError("千川账户不存在或不属于当前工具账号")
+    rows = store.select(
+        "promotion_target",
+        where={"account_uid": str(account.get("account_uid") or "")},
+    )
+    targets: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            not bool(item.get("enabled")),
+            str(item.get("ad_id") or ""),
+        ),
+    ):
+        ad_id = str(row.get("ad_id") or "").strip()
+        if (
+            not ad_id
+            or ad_id in seen
+            or str(row.get("verification_state") or "") != "verified"
+        ):
+            continue
+        seen.add(ad_id)
+        targets.append(row)
+    return account, targets
+
+
+def _enabled_log_account_ids(
+    store: SQLiteStore,
+    owner_username: str,
+) -> List[str]:
+    rows = store.execute(
+        "SELECT a.aavid FROM qianchuan_account a "
+        "WHERE a.enabled=1 AND a.directory_selected=1 "
+        "AND a.owner_username=? ORDER BY a.updated_at DESC",
+        (owner_username,),
+        fetch=True,
+    ) or []
+    return [str(row.get("aavid") or "") for row in rows if row.get("aavid")]
+
+
+def _platform_log_window(
+    state: Dict[str, Any],
+) -> Tuple[datetime, datetime, bool]:
+    end = datetime.now().replace(microsecond=0)
+    coverage_from = str(state.get("coverage_from") or "").strip()
+    last_sync_at = str(state.get("last_sync_at") or "").strip()
+    first_backfill = not coverage_from
+    if first_backfill:
+        start = (end - timedelta(days=29)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+        )
+    else:
+        try:
+            last_sync = datetime.strptime(last_sync_at, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            last_sync = end - timedelta(minutes=10)
+        start = min(end, last_sync) - timedelta(minutes=10)
+    return start, end, first_backfill
+
+
+def _platform_payload_error(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "千川日志接口返回格式异常"
+    for key in ("status_code", "code"):
+        if key not in payload:
+            continue
+        try:
+            if int(payload.get(key) or 0) == 0:
+                continue
+        except Exception:
+            continue
+        return str(
+            payload.get("message")
+            or payload.get("msg")
+            or f"千川日志接口返回错误码 {payload.get(key)}"
+        )
+    return ""
+
+
+async def _fetch_platform_log_payload(page: Any, url: str) -> Dict[str, Any]:
+    last_error = ""
+    for attempt in range(6):
+        result: Dict[str, Any] = {}
+        try:
+            result = await page.evaluate(
+                """
+                async ({url, timeoutMs}) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort(), timeoutMs);
+                  try {
+                    const response = await fetch(url, {
+                      method: 'GET',
+                      credentials: 'include',
+                      signal: controller.signal,
+                    });
+                    return {
+                      ok: response.ok,
+                      status: response.status,
+                      retryAfter: response.headers.get('retry-after') || '',
+                      contentType: response.headers.get('content-type') || '',
+                      text: await response.text(),
+                    };
+                  } finally {
+                    clearTimeout(timer);
+                  }
+                }
+                """,
+                {"url": url, "timeoutMs": 60_000},
+            )
+        except Exception as exc:
+            last_error = str(exc or "千川日志接口网络请求失败")
+            if attempt == 5:
+                raise RuntimeError(last_error) from exc
+            await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
+            continue
+
+        status = int(result.get("status") or 0)
+        text = str(result.get("text") or "")
+        content_type = str(result.get("contentType") or "").lower()
+        if status in {401, 403} or "text/html" in content_type:
+            raise RuntimeError("千川登录状态已失效，请重新登录")
+        if status == 429 or status >= 500:
+            last_error = f"千川日志接口请求失败 HTTP {status}"
+            if attempt == 5:
+                raise RuntimeError(last_error)
+            try:
+                delay = float(str(result.get("retryAfter") or ""))
+            except Exception:
+                delay = 0.5 * (2**attempt)
+            await asyncio.sleep(min(max(delay, 0.5), 8.0))
+            continue
+        if not result.get("ok"):
+            raise RuntimeError(f"千川日志接口请求失败 HTTP {status}")
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            raise RuntimeError("千川日志接口没有返回JSON数据") from exc
+        error = _platform_payload_error(payload)
+        if not error:
+            return payload
+        last_error = error
+        transient = any(
+            marker in error.casefold()
+            for marker in (
+                "网络超时",
+                "稍后重试",
+                "请求频繁",
+                "系统繁忙",
+                "timeout",
+                "too many requests",
+                "temporarily unavailable",
+            )
+        )
+        if not transient or attempt == 5:
+            raise RuntimeError(error)
+        await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
+    raise RuntimeError(last_error or "千川日志接口读取失败")
+
+
+def _platform_log_page_info(
+    payload: Any,
+    *,
+    current_page: int,
+    row_count: int,
+    page_size: int,
+) -> Tuple[int, int, bool]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    pagination = data.get("pagination") if isinstance(data, dict) else None
+    if not isinstance(pagination, dict):
+        return current_page, row_count, row_count >= page_size
+    try:
+        total_page = max(current_page, int(pagination.get("totalPage") or 0))
+    except Exception:
+        total_page = current_page
+    try:
+        total_num = max(row_count, int(pagination.get("totalNum") or 0))
+    except Exception:
+        total_num = row_count
+    return total_page, total_num, current_page < total_page
+
+
+async def _prepare_platform_log_page(
+    page: Any,
+    *,
+    aavid: str,
+    target: Dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> None:
+    source_url = str(target.get("sanitized_page_url") or "").strip()
+    detail_url = build_qianchuan_url_by_params(
+        base_url=f"{QIANCHUAN_ORIGIN}/uni-prom/detail",
+        aavid=int(aavid),
+        ad_id=int(str(target.get("ad_id") or "0")),
+        promotion_scene=str(target.get("promotion_scene") or "live"),
+        source_url=source_url or None,
+    )
+    parts = urlsplit(detail_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["dr"] = f"{start:%Y-%m-%d},{end:%Y-%m-%d}"
+    detail_url = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(query),
+            parts.fragment,
+        )
+    )
+    await page.goto(
+        detail_url,
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    if "login" in str(page.url or "").lower():
+        raise RuntimeError("千川登录状态已失效，请重新登录")
+    try:
+        await page.get_by_text("日志", exact=True).first.wait_for(
+            state="visible",
+            timeout=30_000,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "计划详情未加载出日志页签，无法建立可信日志读取环境"
+        ) from exc
+    # 页签出现后安全 SDK 仍需一个很短的初始化窗口；后续全部请求复用此页。
+    await page.wait_for_timeout(800)
+
+
+def _enrich_platform_log_rows(
+    rows: Iterable[Dict[str, Any]],
+    target: Dict[str, Any],
+    aavid: str,
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        item.setdefault("aavid", aavid)
+        item.setdefault("ad_id", str(target.get("ad_id") or ""))
+        item.setdefault("target_uid", str(target.get("target_uid") or ""))
+        item.setdefault(
+            "promotion_scene",
+            str(target.get("promotion_scene") or ""),
+        )
+        item.setdefault("plan_system", str(target.get("plan_system") or ""))
+        item.setdefault("plan_id", str(target.get("ad_id") or ""))
+        item.setdefault("plan_name", str(target.get("plan_name") or ""))
+        result.append(item)
+    return result
+
+
+async def _sync_account_platform_logs_unlocked(
+    aavid: str,
+    owner_username: str,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    if not owner_username or current_session_owner() != owner_username:
+        raise RuntimeError("工具账号已经切换，日志同步已停止")
+    gate = automation_session_ready(owner_username)
+    if not gate.get("ready"):
+        raise RuntimeError(
+            str(gate.get("message") or "千川登录状态失效或不存在")
+        )
+    storage_state = load_qianchuan_storage_state(owner_username)
+    if storage_state is None:
+        raise RuntimeError("千川登录状态失效或不存在")
+    store = db or SQLiteStore()
+    account, targets = _account_log_targets(aavid, owner_username, store)
+    if not targets:
+        raise RuntimeError("该账户还没有可读取日志的千川计划，请先刷新账户计划")
+    sync_state = store.select_one(
+        "platform_log_sync_state",
+        where={
+            "account_uid": str(account.get("account_uid") or ""),
+            "aavid": aavid,
+        },
+    ) or {}
+    start, end, first_backfill = _platform_log_window(sync_state)
+    fetcher = QianChuanFetcher(headless=True, storage_state=storage_state)
+    processed = 0
+    failed: List[str] = []
+    try:
+        await fetcher._init_browser()
+        page = fetcher.page
+        if page is None:
+            raise RuntimeError("后台日志同步浏览器创建失败")
+        await _prepare_platform_log_page(
+            page,
+            aavid=aavid,
+            target=targets[0],
+            start=start,
+            end=end,
+        )
+        page_size = 100
+        for target in targets:
+            ad_id = str(target.get("ad_id") or "")
+            fingerprints: set[str] = set()
+            target_processed = 0
+            try:
+                for page_number in range(1, 201):
+                    query = urlencode(
+                        {
+                            "objectID": ad_id,
+                            "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
+                            # 千川页面以右开区间查询，结束时间使用次日零点。
+                            "endTime": (
+                                end.replace(hour=0, minute=0, second=0)
+                                + timedelta(days=1)
+                            ).strftime("%Y-%m-%d %H:%M:%S"),
+                            "currentPage": page_number,
+                            "pageSize": page_size,
+                            "type": 1,
+                            "aavid": aavid,
+                        }
+                    )
+                    payload = await _fetch_platform_log_payload(
+                        page,
+                        f"{OPERATION_LOG_ENDPOINT}?{query}",
+                    )
+                    rows = _extract_platform_rows(payload)
+                    if not rows:
+                        break
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            rows,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if fingerprint in fingerprints:
+                        raise RuntimeError("日志接口分页结果重复")
+                    fingerprints.add(fingerprint)
+                    enriched = _enrich_platform_log_rows(rows, target, aavid)
+                    ingest_platform_log_rows(
+                        aavid,
+                        enriched,
+                        owner_username=owner_username,
+                        db=store,
+                        update_sync_state=False,
+                    )
+                    processed += len(enriched)
+                    target_processed += len(enriched)
+                    total_page, total, has_more = _platform_log_page_info(
+                        payload,
+                        current_page=page_number,
+                        row_count=len(rows),
+                        page_size=page_size,
+                    )
+                    if not has_more or target_processed >= total:
+                        break
+                    # 避免连续翻页触发千川的瞬时超时；异常由上层退避重试。
+                    await asyncio.sleep(0.15)
+                else:
+                    raise RuntimeError("日志接口超过200页，已停止同步")
+            except Exception as exc:
+                failed.append(
+                    f"{target.get('plan_name') or ad_id}：{exc}"
+                )
+        status = "partial" if failed else ("ok" if processed else "empty")
+        values: Dict[str, Any] = {
+            "last_status": status,
+            "last_error": "；".join(failed[:5]),
+            "last_sync_at": _now(),
+            "discovered_page_url": f"{QIANCHUAN_ORIGIN}/?aavid={aavid}",
+            "discovered_api_url": (
+                f"{QIANCHUAN_ORIGIN}{OPERATION_LOG_ENDPOINT}"
+            ),
+            "discovered_request_json": {
+                "method": "GET",
+                "source": "built_in_readonly_contract",
+            },
+        }
+        if not failed:
+            values.update(
+                {
+                    "coverage_from": start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "coverage_to": end.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        else:
+            # 任一计划缺页都不能保留“已完整覆盖”的假象；下次继续执行30天补录。
+            values.update({"coverage_from": "", "coverage_to": ""})
+        update_platform_sync_state(
+            aavid,
+            owner_username=owner_username,
+            db=store,
+            **values,
+        )
+        logger.info(
+            "[账户操作流水] 只读同步完成 aavid=%s plans=%s rows=%s status=%s first=%s",
+            aavid,
+            len(targets),
+            processed,
+            status,
+            first_backfill,
+        )
+        return {
+            "success": not failed,
+            "aavid": aavid,
+            "plan_count": len(targets),
+            "row_count": processed,
+            "status": status,
+            "first_backfill": first_backfill,
+            "message": (
+                "账户流水同步完成"
+                if not failed
+                else "部分计划日志读取失败，请查看同步状态"
+            ),
+        }
+    finally:
+        await fetcher.close()
+
+
+async def _sync_account_platform_logs(
+    aavid: str,
+    owner_username: str,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    async with exclusive_browser_operation(
+        f"账户操作日志同步:{aavid}",
+        priority=40,
+        timeout_seconds=900,
+    ):
+        return await _sync_account_platform_logs_unlocked(
+            aavid,
+            owner_username,
+            db=db,
+        )
+
+
+def request_platform_log_sync(
+    aavid: Any,
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    aid = str(aavid or "").strip()
+    owner = current_session_owner()
+    if not aid:
+        return {"success": False, "message": "请先选择千川账户"}
+    if not owner:
+        return {"success": False, "message": "请先登录工具账号"}
+    store = db or SQLiteStore()
+    try:
+        account, _targets = _account_log_targets(aid, owner, store)
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+    with _platform_sync_lock:
+        running = _platform_sync_threads.get(aid)
+        if running and running.is_alive():
+            return {
+                "success": True,
+                "running": True,
+                "message": "该账户流水正在同步，请稍候",
+            }
+        update_platform_sync_state(
+            aid,
+            owner_username=owner,
+            db=store,
+            last_status="syncing",
+            last_error="",
+            last_sync_at=_now(),
+        )
+
+        def entry() -> None:
+            try:
+                asyncio.run(_sync_account_platform_logs(aid, owner, db=store))
+            except Exception as exc:
+                update_platform_sync_state(
+                    aid,
+                    owner_username=owner,
+                    db=store,
+                    last_status=(
+                        "login_required"
+                        if "登录" in str(exc)
+                        else "error"
+                    ),
+                    last_error=str(exc),
+                    last_sync_at=_now(),
+                )
+                logger.warning(
+                    "[账户操作流水] 立即同步失败 aavid=%s: %s",
+                    aid,
+                    exc,
+                )
+            finally:
+                with _platform_sync_lock:
+                    _platform_sync_threads.pop(aid, None)
+
+        thread = threading.Thread(
+            target=entry,
+            name=f"platform-log-sync-{aid}",
+            daemon=True,
+        )
+        _platform_sync_threads[aid] = thread
+        thread.start()
+    return {
+        "success": True,
+        "running": True,
+        "account_uid": str(account.get("account_uid") or ""),
+        "message": "已开始同步该账户最近30天操作流水",
+    }
+
+
 async def _sync_one_unlocked(
     aavid: str,
     page_url: str,
@@ -926,26 +1482,30 @@ async def platform_log_sync_loop() -> None:
             if not owner:
                 await asyncio.sleep(SYNC_INTERVAL_SECONDS)
                 continue
-            rows = SQLiteStore().execute(
-                "SELECT s.aavid,s.discovered_page_url,s.discovered_api_url,"
-                "s.discovered_request_json "
-                "FROM platform_log_sync_state s "
-                "JOIN qianchuan_account a ON a.account_uid=s.account_uid "
-                "WHERE a.enabled=1 AND a.report_enabled=1 "
-                "AND a.owner_username=? "
-                "AND s.discovered_page_url IS NOT NULL "
-                "AND s.discovered_page_url<>''",
-                (owner,),
-                fetch=True,
-            ) or []
-            for row in rows:
-                await _sync_one(
-                    str(row["aavid"]),
-                    str(row["discovered_page_url"]),
-                    str(row.get("discovered_api_url") or ""),
-                    row.get("discovered_request_json") or "",
-                    owner,
-                )
+            for aid in _enabled_log_account_ids(SQLiteStore(), owner):
+                with _platform_sync_lock:
+                    immediate = _platform_sync_threads.get(aid)
+                    if immediate and immediate.is_alive():
+                        continue
+                try:
+                    await _sync_account_platform_logs(aid, owner)
+                except Exception as exc:
+                    update_platform_sync_state(
+                        aid,
+                        owner_username=owner,
+                        last_status=(
+                            "login_required"
+                            if "登录" in str(exc)
+                            else "error"
+                        ),
+                        last_error=str(exc),
+                        last_sync_at=_now(),
+                    )
+                    logger.warning(
+                        "[账户操作流水] 周期同步失败 aavid=%s: %s",
+                        aid,
+                        exc,
+                    )
         except Exception:
             logger.exception("[账户操作流水] 五分钟同步循环异常")
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)

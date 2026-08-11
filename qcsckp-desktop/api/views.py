@@ -224,10 +224,32 @@ class Api:
                 "phase": "start_failed",
                 "message": f"设置已保存，但后台监控启动失败：{e}",
             }
+        operation_log_sync = {
+            "success": True,
+            "running": False,
+            "message": "账户未启用，不启动流水同步",
+        }
+        if bool(saved.get("enabled")):
+            try:
+                from services.operation_log_monitor import (
+                    request_platform_log_sync,
+                )
+
+                operation_log_sync = request_platform_log_sync(
+                    saved.get("aavid"),
+                    db=self.db,
+                )
+            except Exception as e:
+                operation_log_sync = {
+                    "success": False,
+                    "running": False,
+                    "message": f"账户设置已保存，但流水同步启动失败：{e}",
+                }
         return {
             "success": True,
             "data": saved,
             "monitoring": monitoring,
+            "operation_log_sync": operation_log_sync,
             "message": str(
                 monitoring.get("message")
                 or "账户、日报路由和监控计划已保存"
@@ -1418,6 +1440,14 @@ class Api:
 
         try:
             return {"success": True, "data": operation_sync_state(aavid)}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def syncOperationLogsNow(self, aavid=None):
+        from services.operation_log_monitor import request_platform_log_sync
+
+        try:
+            return request_platform_log_sync(aavid, db=self.db)
         except Exception as e:
             return {"success": False, "message": str(e)}
 

@@ -894,6 +894,9 @@ class JSApi:
     def getOperationSyncState(self, aavid=None):
         return self.api.getOperationSyncState(aavid)
 
+    def syncOperationLogsNow(self, aavid=None):
+        return self.api.syncOperationLogsNow(aavid)
+
     def exportOperationEventsCsv(
         self,
         aavid=None,

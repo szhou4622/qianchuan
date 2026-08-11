@@ -182,7 +182,7 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn("'control': 'control.html'", page)
         self.assertIn("'promotion-targets': 'promotion_targets.html'", page)
 
-    def test_operation_page_is_query_export_only_and_renders_account_names(self):
+    def test_operation_page_syncs_exports_and_renders_account_names(self):
         page = (
             Path(__file__).resolve().parents[1]
             / "static"
@@ -190,9 +190,22 @@ class JSApiBridgeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn('id="recordBtn"', page)
         self.assertNotIn("startOperationRecordBrowser", page)
+        self.assertIn('id="syncBtn"', page)
+        self.assertIn("syncOperationLogsNow", page)
         self.assertIn("导出当前结果", page)
         self.assertIn("item.account_name", page)
         self.assertIn("`${name}（${id}）`", page)
+
+    def test_operation_log_sync_is_exposed_and_forwarded(self):
+        self.core.syncOperationLogsNow.return_value = {
+            "success": True,
+            "running": True,
+        }
+        self.assertEqual(
+            self.bridge.syncOperationLogsNow("1001"),
+            {"success": True, "running": True},
+        )
+        self.core.syncOperationLogsNow.assert_called_once_with("1001")
 
     def test_diagnostics_page_has_direct_account_management_return(self):
         page = (

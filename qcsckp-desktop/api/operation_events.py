@@ -113,6 +113,11 @@ def normalize_action_type(text: Any) -> str:
                 "调控手动关闭",
                 "手动关停",
                 "手动关闭",
+                "暂停调控",
+                "-> 已暂停",
+                "→ 已暂停",
+                "-> 已结束",
+                "→ 已结束",
             ),
         ),
         ("retarget", ("追投", "追加投放", "assist task", "assist_task")),
@@ -136,9 +141,15 @@ def make_event_uid(source: str, *parts: Any) -> str:
     return f"{source}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]}"
 
 
-def upsert_operation_event(data: Dict[str, Any], db: Optional[SQLiteStore] = None) -> str:
+def upsert_operation_event(
+    data: Dict[str, Any],
+    db: Optional[SQLiteStore] = None,
+    *,
+    schema_ready: bool = False,
+) -> str:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config["database"])
+    if not schema_ready:
+        init_sqlite_schema(database=store.config["database"])
     source = str(data.get("source") or "tool_direct").strip()
     if source not in ALLOWED_SOURCES:
         source = "tool_direct"
@@ -161,9 +172,15 @@ def upsert_operation_event(data: Dict[str, Any], db: Optional[SQLiteStore] = Non
     regulate_task_name = str(data.get("regulate_task_name") or "").strip()
     if not plan_id and (object_type == "plan" or action.startswith("plan_") or action in {"budget_update", "bid_update", "roi_update"}):
         plan_id, plan_name = object_id, plan_name or object_name
-    if not material_id and (object_type == "material" or action == "retarget"):
+    if not material_id and (
+        object_type == "material"
+        or (action == "retarget" and object_type in {"", "material"})
+    ):
         material_id, material_name = object_id, material_name or object_name
-    if not regulate_task_id and (object_type == "assist_task" or action == "stop"):
+    if not regulate_task_id and (
+        object_type == "assist_task"
+        or (action == "stop" and object_type in {"", "assist_task"})
+    ):
         regulate_task_id, regulate_task_name = object_id, regulate_task_name or object_name
     if not regulate_task_id:
         regulate_task_id = _nested_value(data.get("after") or data.get("after_json"), ("regulate_task_id", "assist_task_id"))
@@ -652,49 +669,214 @@ def _normalize_occurred_at(value: Any) -> str:
     return text[:19] if text else _now()
 
 
+class _ConnectionBoundStore:
+    """Bind the hot-path store calls to one caller-owned SQLite transaction."""
+
+    _BOUND_METHODS = {
+        "delete",
+        "execute",
+        "exists",
+        "insert",
+        "insert_or_update",
+        "select",
+        "select_one",
+        "update",
+    }
+
+    def __init__(self, store: SQLiteStore, connection: Any):
+        self._store = store
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._store, name)
+        if name not in self._BOUND_METHODS or not callable(attribute):
+            return attribute
+
+        def bound(*args: Any, **kwargs: Any) -> Any:
+            kwargs.setdefault("connection", self._connection)
+            return attribute(*args, **kwargs)
+
+        return bound
+
+
 def ingest_platform_log_rows(
     aavid: Any,
     rows: Iterable[Dict[str, Any]],
     *,
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
+    update_sync_state: bool = True,
+    _batched: bool = False,
+    _account_uid: str = "",
 ) -> int:
     """接收记录浏览器发现的平台日志行，保留原文并做基础字段兼容。"""
-    init_sqlite_schema()
     aid = str(aavid or "").strip()
     if not aid:
         raise ValueError("缺少 aavid")
     store = db or SQLiteStore()
-    from services.qianchuan_accounts import ensure_qianchuan_account
+    if not _batched:
+        init_sqlite_schema(database=store.config["database"])
+        from services.qianchuan_accounts import ensure_qianchuan_account
 
-    account_uid = str(
-        ensure_qianchuan_account(
-            aid,
-            owner_username=owner_username,
-            directory_selected=False,
-            db=store,
-        ).get("account_uid")
-        or ""
-    )
+        account_uid = str(
+            ensure_qianchuan_account(
+                aid,
+                owner_username=owner_username,
+                directory_selected=False,
+                db=store,
+            ).get("account_uid")
+            or ""
+        )
+        materialized_rows = list(rows)
+        with store.transaction() as connection:
+            return ingest_platform_log_rows(
+                aid,
+                materialized_rows,
+                owner_username=owner_username,
+                db=_ConnectionBoundStore(store, connection),
+                update_sync_state=update_sync_state,
+                _batched=True,
+                _account_uid=account_uid,
+            )
+    account_uid = str(_account_uid or "")
     inserted = 0
     seen_times: List[str] = []
     for raw in rows:
         if not isinstance(raw, dict):
             continue
-        row_account = str(_first(raw, ("aavid", "aadvid", "advertiser_id"))).strip()
+        row_account = str(_first(raw, ("aavid", "aadvid", "advertiser_id", "advertiserId"))).strip()
         if row_account and row_account != aid:
             continue
-        description = _first(raw, ("operation", "operation_name", "action_name", "description", "内容", "操作"))
-        platform_id = str(_first(raw, ("id", "log_id", "record_id", "operation_id"))).strip()
-        occurred_at = _normalize_occurred_at(
-            _first(raw, ("operate_time", "operation_time", "created_at", "create_time", "time", "操作时间", "时间"), _now())
+        description = _first(
+            raw,
+            (
+                "operation",
+                "operation_name",
+                "action_name",
+                "description",
+                "content",
+                "optContent",
+                "operateType",
+                "operationType",
+                "contentTitle",
+                "内容",
+                "操作",
+            ),
         )
-        operator_id = _first(raw, ("operator_id", "user_id", "creator_id", "operate_user_id"))
-        operator_name = _first(raw, ("operator_name", "user_name", "creator_name", "operate_user_name", "操作人"))
-        object_id = _first(raw, ("object_id", "plan_id", "campaign_id", "ad_id", "material_id", "对象ID", "计划ID", "素材ID"))
-        object_name = _first(raw, ("object_name", "plan_name", "campaign_name", "ad_name", "material_name", "对象名称", "计划名称", "素材名称"))
-        raw_status = str(_first(raw, ("status", "result", "operation_result", "结果"))).strip().lower()
-        event_status = "failed" if any(x in raw_status for x in ("fail", "失败", "错误")) else ("success" if raw_status == "" or any(x in raw_status for x in ("success", "成功")) else "unknown")
+        content_log = raw.get("contentLog")
+        if isinstance(content_log, list):
+            details = "；".join(
+                str(item).strip() for item in content_log if str(item).strip()
+            )
+        else:
+            details = str(content_log or "").strip()
+        description = "；".join(
+            item for item in (str(description or "").strip(), details) if item
+        )
+        platform_id = str(
+            _first(
+                raw,
+                (
+                    "id",
+                    "log_id",
+                    "record_id",
+                    "operation_id",
+                    "logId",
+                    "optLogId",
+                ),
+            )
+        ).strip()
+        occurred_at = _normalize_occurred_at(
+            _first(
+                raw,
+                (
+                    "operate_time",
+                    "operation_time",
+                    "created_at",
+                    "create_time",
+                    "time",
+                    "operateTime",
+                    "optTime",
+                    "createTime",
+                    "操作时间",
+                    "时间",
+                ),
+                _now(),
+            )
+        )
+        operator_id = _first(
+            raw,
+            (
+                "operator_id",
+                "user_id",
+                "creator_id",
+                "operate_user_id",
+                "operatorId",
+                "userId",
+            ),
+        )
+        operator_name = _first(
+            raw,
+            (
+                "operator_name",
+                "user_name",
+                "creator_name",
+                "operate_user_name",
+                "operatorName",
+                "userName",
+                "operator",
+                "操作人",
+            ),
+        )
+        object_id = _first(
+            raw,
+            (
+                "object_id",
+                "plan_id",
+                "campaign_id",
+                "ad_id",
+                "material_id",
+                "objectID",
+                "objectId",
+                "planId",
+                "adId",
+                "materialId",
+                "对象ID",
+                "计划ID",
+                "素材ID",
+            ),
+        )
+        object_name = _first(
+            raw,
+            (
+                "object_name",
+                "plan_name",
+                "campaign_name",
+                "ad_name",
+                "material_name",
+                "objectName",
+                "planName",
+                "adName",
+                "materialName",
+                "对象名称",
+                "计划名称",
+                "素材名称",
+            ),
+        )
+        raw_status = str(
+            _first(raw, ("status", "result", "operation_result", "结果"))
+        ).strip().lower()
+        event_status = (
+            "failed"
+            if raw_status in {"0", "false"}
+            or any(x in raw_status for x in ("fail", "失败", "错误"))
+            else (
+                "success"
+                if raw_status in {"", "1", "true"}
+                or any(x in raw_status for x in ("success", "成功"))
+                else "unknown"
+            )
+        )
         action = normalize_action_type(description)
         legacy_uid = (
             f"platform_log:{aid}:{platform_id}"
@@ -778,25 +960,59 @@ def ingest_platform_log_rows(
                     {"possible_duplicate": 1, "related_event_uid": uid},
                     where={"event_uid": str(candidate["event_uid"])},
                 )
-        object_type = str(_first(raw, ("object_type", "target_type", "resource_type")) or "").strip()
+        object_type = str(
+            _first(
+                raw,
+                ("object_type", "target_type", "resource_type", "objectType"),
+            )
+            or ""
+        ).strip()
         if not object_type:
             object_type = (
                 "material"
                 if action == "retarget"
                 else ("assist_task" if action == "stop" else ("plan" if action != "other" else ""))
             )
-        plan_id = _first(raw, ("plan_id", "campaign_id"))
-        plan_name = _first(raw, ("plan_name", "campaign_name"))
-        material_id = _first(raw, ("material_id",))
-        material_name = _first(raw, ("material_name",))
-        regulate_task_id = _first(raw, ("regulate_task_id", "assist_task_id", "task_id"))
-        regulate_task_name = _first(raw, ("regulate_task_name", "assist_task_name", "task_name"))
+        plan_id = _first(raw, ("plan_id", "campaign_id", "planId", "adId"))
+        plan_name = _first(raw, ("plan_name", "campaign_name", "planName", "adName"))
+        material_id = _first(raw, ("material_id", "materialId"))
+        material_name = _first(raw, ("material_name", "materialName"))
+        regulate_task_id = _first(
+            raw,
+            (
+                "regulate_task_id",
+                "assist_task_id",
+                "task_id",
+                "controlTaskId",
+                "assistTaskId",
+                "taskId",
+            ),
+        )
+        regulate_task_name = _first(
+            raw,
+            (
+                "regulate_task_name",
+                "assist_task_name",
+                "task_name",
+                "controlTaskName",
+                "assistTaskName",
+                "taskName",
+            ),
+        )
+        if not regulate_task_id and action in {"retarget", "stop"}:
+            task_match = re.search(
+                r"(?:素材追投|调控任务)[^；]*?ID\s*[:：]\s*(\d+)",
+                description,
+                re.IGNORECASE,
+            )
+            if task_match:
+                regulate_task_id = task_match.group(1)
         upsert_operation_event(
             {
                 "event_uid": uid,
                 "aavid": aid,
                 "account_uid": account_uid,
-                "ad_id": _first(raw, ("ad_id", "advertiser_id")),
+                "ad_id": _first(raw, ("ad_id", "advertiser_id", "adId")),
                 "target_uid": _first(raw, ("target_uid",), "legacy_unscoped"),
                 "promotion_scene": _first(raw, ("promotion_scene", "scene")),
                 "plan_system": _first(raw, ("plan_system", "delivery_system")),
@@ -826,28 +1042,34 @@ def ingest_platform_log_rows(
                 "occurred_at": occurred_at,
             },
             store,
+            schema_ready=True,
         )
         seen_times.append(occurred_at)
         inserted += 1
-    state = {
-        "aavid": aid,
-        "account_uid": account_uid,
-        "last_sync_at": _now(),
-        "last_status": "ok",
-        "last_error": "",
-    }
-    if seen_times:
-        existing = store.select_one(
+    if update_sync_state:
+        state = {
+            "aavid": aid,
+            "account_uid": account_uid,
+            "last_sync_at": _now(),
+            "last_status": "ok",
+            "last_error": "",
+        }
+        if seen_times:
+            existing = store.select_one(
+                "platform_log_sync_state",
+                where={"account_uid": account_uid, "aavid": aid},
+            ) or {}
+            old_from = str(existing.get("coverage_from") or "")
+            old_to = str(existing.get("coverage_to") or "")
+            state["coverage_from"] = min(
+                [x for x in [old_from, min(seen_times)] if x]
+            )
+            state["coverage_to"] = max(
+                [x for x in [old_to, max(seen_times)] if x]
+            )
+        store.insert_or_update(
             "platform_log_sync_state",
-            where={"account_uid": account_uid, "aavid": aid},
-        ) or {}
-        old_from = str(existing.get("coverage_from") or "")
-        old_to = str(existing.get("coverage_to") or "")
-        state["coverage_from"] = min([x for x in [old_from, min(seen_times)] if x])
-        state["coverage_to"] = max([x for x in [old_to, max(seen_times)] if x])
-    store.insert_or_update(
-        "platform_log_sync_state",
-        state,
-        unique_fields=["account_uid", "aavid"],
-    )
+            state,
+            unique_fields=["account_uid", "aavid"],
+        )
     return inserted
