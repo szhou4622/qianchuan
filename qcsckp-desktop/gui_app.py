@@ -928,6 +928,61 @@ class JSApi:
             q=q,
         )
 
+    def saveOperationEventsCsv(
+        self,
+        aavid=None,
+        date_from=None,
+        date_to=None,
+        action_type=None,
+        source=None,
+        status=None,
+        operator=None,
+        q=None,
+    ):
+        """使用桌面原生“另存为”保存CSV，避免WebView吞掉网页下载。"""
+
+        result = self.api.exportOperationEventsCsv(
+            aavid=aavid,
+            date_from=date_from,
+            date_to=date_to,
+            action_type=action_type,
+            source=source,
+            status=status,
+            operator=operator,
+            q=q,
+        )
+        if not result or not result.get("success"):
+            return result or {"success": False, "message": "导出数据生成失败"}
+        try:
+            if not webview.windows:
+                return {"success": False, "message": "桌面窗口尚未就绪"}
+            filename = str(result.get("filename") or "账户操作流水.csv")
+            selected = webview.windows[0].create_file_dialog(
+                webview.FileDialog.SAVE,
+                directory=str(Path.home() / "Desktop"),
+                save_filename=filename,
+                file_types=("CSV 文件 (*.csv)", "所有文件 (*.*)"),
+            )
+            if not selected:
+                return {"success": True, "cancelled": True, "message": "已取消导出"}
+            path_text = str(selected[0] if isinstance(selected, (list, tuple)) else selected)
+            if not path_text.lower().endswith(".csv"):
+                path_text += ".csv"
+            destination = Path(path_text)
+            destination.write_text(
+                str(result.get("content") or ""),
+                encoding="utf-8",
+                newline="",
+            )
+            return {
+                "success": True,
+                "cancelled": False,
+                "path": str(destination),
+                "message": f"导出成功：{destination}",
+            }
+        except Exception as exc:
+            return {"success": False, "message": f"保存CSV失败：{exc}"}
+
     def startOperationRecordBrowser(self, aavid=None):
         return self.api.startOperationRecordBrowser(aavid)
 

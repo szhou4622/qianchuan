@@ -1,6 +1,7 @@
+import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from gui_app import JSApi
 
@@ -193,8 +194,48 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn('id="syncBtn"', page)
         self.assertIn("syncOperationLogsNow", page)
         self.assertIn("导出当前结果", page)
+        self.assertIn("saveOperationEventsCsv", page)
         self.assertIn("item.account_name", page)
         self.assertIn("`${name}（${id}）`", page)
+
+    def test_operation_csv_uses_native_save_dialog(self):
+        self.core.exportOperationEventsCsv.return_value = {
+            "success": True,
+            "filename": "千川账户_1001_操作流水.csv",
+            "content": "\ufeff账户ID,操作\n1001,修改预算\n",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "流水.csv"
+            window = Mock()
+            window.create_file_dialog.return_value = [str(destination)]
+            with patch("gui_app.webview.windows", [window]):
+                result = self.bridge.saveOperationEventsCsv(
+                    "1001",
+                    "2026-08-01",
+                    "2026-08-11",
+                    "budget_update",
+                    "platform_log",
+                    "success",
+                    "王斌",
+                    "预算",
+                )
+            self.assertTrue(result["success"])
+            self.assertFalse(result["cancelled"])
+            self.assertEqual(
+                "\ufeff账户ID,操作\n1001,修改预算\n",
+                destination.read_text(encoding="utf-8"),
+            )
+            window.create_file_dialog.assert_called_once()
+        self.core.exportOperationEventsCsv.assert_called_once_with(
+            aavid="1001",
+            date_from="2026-08-01",
+            date_to="2026-08-11",
+            action_type="budget_update",
+            source="platform_log",
+            status="success",
+            operator="王斌",
+            q="预算",
+        )
 
     def test_operation_log_sync_is_exposed_and_forwarded(self):
         self.core.syncOperationLogsNow.return_value = {
