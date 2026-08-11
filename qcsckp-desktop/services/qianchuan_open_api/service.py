@@ -87,11 +87,29 @@ class QianchuanOfficialApiService:
             shop_id = text_id(subject.get("shop_id"))
             is_shop = "SHOP" in role or bool(shop_id)
             if not is_shop:
-                if subject_id:
-                    resolved[subject_id] = subject
-                evidence["subjects"].append(
-                    {"subject_id": subject_id, "role": role, "resolved": 1, "type": "advertiser"}
+                is_final_advertiser = "ADVERTISER" in role and not any(
+                    marker in role for marker in ("OPERATOR", "ENTERPRISE", "AGENT", "BP")
                 )
+                if subject_id and is_final_advertiser:
+                    resolved[subject_id] = subject
+                    evidence["subjects"].append(
+                        {"subject_id": subject_id, "role": role, "resolved": 1, "type": "advertiser"}
+                    )
+                else:
+                    # Enterprise/BP/operator identities are OAuth subjects,
+                    # not final Qianchuan advertiser accounts.  Presenting one
+                    # in the selector leads to an account that plan APIs cannot
+                    # read, so keep it as evidence only.
+                    evidence["subjects"].append(
+                        {
+                            "subject_id": subject_id,
+                            "role": role,
+                            "resolved": 0,
+                            "type": "unsupported_subject",
+                            "reason": "not_final_advertiser",
+                            "ignored": True,
+                        }
+                    )
                 continue
             sid = shop_id or subject_id
             try:

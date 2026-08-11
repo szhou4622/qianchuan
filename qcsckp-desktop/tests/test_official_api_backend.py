@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from services.qianchuan_open_api.client import ApiResponse, QianchuanOpenApiClient
 from services.qianchuan_open_api.errors import (
+    ApiRateLimitError,
     ApiRequestError,
     ApiWriteOutcomeUnknown,
     OfficialApiWriteDisabled,
@@ -126,6 +127,48 @@ class OfficialApiBackendTests(unittest.TestCase):
                     QianchuanOpenApiClient.extract_items({key: expected}),
                     expected,
                 )
+
+    def test_shop_advertiser_object_list_is_not_hidden_by_numeric_list(self):
+        data = {
+            "adv_id_list": [{"adv_id": "1782685702496260", "extra_permission": []}],
+            "list": [1782685702496260],
+        }
+        self.assertEqual(
+            QianchuanOpenApiClient.extract_items(data),
+            data["adv_id_list"],
+        )
+
+    def test_enterprise_operator_is_not_exposed_as_final_advertiser(self):
+        service = QianchuanOfficialApiService(_CaptureClient())
+        with patch.object(
+            service,
+            "list_authorized_accounts",
+            return_value=[
+                {
+                    "advertiser_id": "1858078536393860",
+                    "advertiser_name": "企业操作主体",
+                    "role": "PLATFORM_ROLE_ENTERPRISE_BP_OPERATOR",
+                    "shop_id": "",
+                }
+            ],
+        ):
+            rows, evidence = service.list_business_accounts()
+        self.assertEqual([], rows)
+        self.assertTrue(evidence["complete"])
+        self.assertEqual("unsupported_subject", evidence["subjects"][0]["type"])
+        self.assertTrue(evidence["subjects"][0]["ignored"])
+
+    def test_api_code_40100_is_treated_as_rate_limit(self):
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaises(ApiRateLimitError):
+            client._raise_api_error(
+                {"code": 40100, "message": "System request frequency exceeded"},
+                endpoint="/read/",
+                http_status=200,
+            )
 
     def test_shop_advertiser_adv_id_is_normalized_as_long_string(self):
         account = normalize_account({"adv_id": 1782685702496260})

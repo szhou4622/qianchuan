@@ -171,7 +171,13 @@ class QianchuanOpenApiClient:
             "endpoint": endpoint,
             "http_status": http_status,
         }
-        if http_status == 429 or "rate" in message.lower() or "频控" in message:
+        if (
+            http_status == 429
+            or code == "40100"
+            or "rate" in message.lower()
+            or "频控" in message
+            or "请求频繁" in message
+        ):
             raise ApiRateLimitError(message, **kwargs)
         if self._is_token_error(code, message):
             raise ApiTokenError(message, **kwargs)
@@ -325,6 +331,12 @@ class QianchuanOpenApiClient:
                     last_error = exc
                     continue
                 raise
+            except ApiRateLimitError as exc:
+                last_error = exc
+                if verb == "GET" and attempt < attempts:
+                    self._sleep((2 ** (attempt - 1)) + random.random() * 0.25)
+                    continue
+                raise
             except (URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
                 if verb == "POST":
                     error = ApiWriteOutcomeUnknown(
@@ -370,11 +382,6 @@ class QianchuanOpenApiClient:
         # explicit list ordered so pagination never mistakes a nested metric
         # array for the endpoint's primary result set.
         for key in (
-            "list",
-            "items",
-            "rows",
-            "data_list",
-            "advertisers",
             "adv_id_list",
             "ad_list",
             "material_list",
@@ -382,10 +389,21 @@ class QianchuanOpenApiClient:
             "task_list",
             "log_list",
             "logs",
+            "advertisers",
+            "data_list",
+            "items",
+            "rows",
+            "list",
         ):
             value = data.get(key)
             if isinstance(value, list):
-                return [dict(item) for item in value if isinstance(item, Mapping)]
+                rows = [dict(item) for item in value if isinstance(item, Mapping)]
+                # Some Ocean Engine responses contain both a generic ``list``
+                # of bare numeric IDs and a richer endpoint-specific list such
+                # as ``adv_id_list``.  A primitive list must not hide the
+                # structured rows needed by the normalizer.
+                if rows:
+                    return rows
         for value in data.values():
             if isinstance(value, Mapping):
                 found = QianchuanOpenApiClient.extract_items(value)

@@ -76,22 +76,31 @@ def official_api_session_status() -> dict[str, Any]:
 def discover_authorized_accounts() -> dict[str, Any]:
     """只返回候选，不自动把全部授权账户加入用户目录。"""
     rows, evidence = get_official_api_service().list_business_accounts()
+    candidates = [
+        {
+            "aavid": str(row.get("advertiser_id") or ""),
+            "account_name": str(row.get("advertiser_name") or ""),
+            "role": str(row.get("role") or ""),
+            "shop_id": str(row.get("shop_id") or ""),
+        }
+        for row in rows
+        if str(row.get("advertiser_id") or "").strip()
+    ]
+    complete = bool(evidence.get("complete"))
+    if candidates and complete:
+        message = "已取得官方授权的千川投放账户，请选择一个账户添加到工具"
+    elif candidates:
+        message = "已取得部分千川投放账户；未解析的操作主体不会作为账户显示，可先选择已确认账户或稍后重试"
+    else:
+        message = "尚未解析到可投放的千川账户，请稍后重试；店铺或企业操作主体不会直接作为千川账户添加"
     return {
         "success": True,
         "mode": "official_api",
         "requires_selection": True,
-        "complete": bool(evidence.get("complete")),
+        "complete": complete,
         "evidence": evidence,
-        "candidates": [
-            {
-                "aavid": str(row.get("advertiser_id") or ""),
-                "account_name": str(row.get("advertiser_name") or ""),
-                "role": str(row.get("role") or ""),
-                "shop_id": str(row.get("shop_id") or ""),
-            }
-            for row in rows
-        ],
-        "message": "已取得官方授权账户候选，请选择一个账户添加到工具",
+        "candidates": candidates,
+        "message": message,
     }
 
 
