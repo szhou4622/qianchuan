@@ -3,6 +3,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 from api.operation_events import ingest_platform_log_rows
@@ -10,6 +11,7 @@ from services.operation_log_monitor import (
     _enabled_log_account_ids,
     _extract_platform_rows,
     _fetch_platform_log_payload,
+    _prepare_platform_log_page,
     _sync_account_platform_logs_unlocked,
 )
 from services.qianchuan_accounts import ensure_qianchuan_account
@@ -144,6 +146,38 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual(2, page.evaluate.await_count)
         sleep.assert_awaited_once()
 
+    def test_log_page_forces_detail_route_and_uses_readonly_probe(self):
+        page = _FakePage()
+        page.evaluate = AsyncMock(
+            return_value={
+                "ok": True,
+                "status": 200,
+                "contentType": "application/json",
+                "text": '{"status_code": 0, "data": {"list": []}}',
+            }
+        )
+        target = {
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "sanitized_page_url": (
+                "https://qianchuan.jinritemai.com/uni-prom?"
+                "aavid=1001&ct=1"
+            ),
+        }
+        asyncio.run(
+            _prepare_platform_log_page(
+                page,
+                aavid="1001",
+                target=target,
+                start=datetime(2026, 8, 1),
+                end=datetime(2026, 8, 11, 12),
+            )
+        )
+        self.assertIn("/uni-prom/detail?", page.url)
+        requested_url = page.evaluate.await_args.args[1]["url"]
+        self.assertIn("objectID=2001", requested_url)
+        self.assertIn("pageSize=1", requested_url)
+
     def test_paused_retarget_log_is_classified_as_stop(self):
         self._account()
         ingest_platform_log_rows(
@@ -242,6 +276,41 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual("ok", state["last_status"])
         self.assertTrue(state["coverage_from"])
         self.assertTrue(state["coverage_to"])
+
+    def test_log_page_preparation_falls_back_to_another_verified_plan(self):
+        account = self._account()
+        self._target(account, "2001")
+        self._target(account, "2002")
+        payload = {"code": 0, "data": {"list": [], "total": 0}}
+        with patch(
+            "services.operation_log_monitor.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.operation_log_monitor.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.operation_log_monitor.load_qianchuan_storage_state",
+            return_value={"cookies": [], "origins": []},
+        ), patch(
+            "services.operation_log_monitor.QianChuanFetcher",
+            _FakeFetcher,
+        ), patch(
+            "services.operation_log_monitor._prepare_platform_log_page",
+            new=AsyncMock(side_effect=[RuntimeError("首条不可用"), None]),
+        ) as prepare, patch(
+            "services.operation_log_monitor._fetch_platform_log_payload",
+            new=AsyncMock(return_value=payload),
+        ), patch("api.operation_events.init_sqlite_schema"):
+            result = asyncio.run(
+                _sync_account_platform_logs_unlocked(
+                    "1001",
+                    "tool-owner",
+                    db=self.db,
+                )
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual("empty", result["status"])
+        self.assertEqual(2, prepare.await_count)
 
 
 if __name__ == "__main__":

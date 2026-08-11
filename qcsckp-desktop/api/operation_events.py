@@ -526,6 +526,20 @@ def operation_sync_state(aavid: Any) -> Dict[str, Any]:
                     "account_uid": str(account.get("account_uid") or ""),
                 },
             )
+    if row and str(row.get("last_status") or "") == "syncing":
+        try:
+            updated = datetime.strptime(
+                str(row.get("updated_at") or row.get("last_sync_at") or ""),
+                "%Y-%m-%d %H:%M:%S",
+            )
+        except Exception:
+            updated = None
+        if updated and datetime.now() - updated > timedelta(minutes=15):
+            # 进程异常退出后数据库可能遗留 syncing。对前端按失败返回，
+            # 让用户可以直接重试，而不是永久禁用同步按钮。
+            row = dict(row)
+            row["last_status"] = "error"
+            row["last_error"] = "上次同步任务已中断，请重新同步"
     return row or {
         "aavid": aid,
         "coverage_from": "",

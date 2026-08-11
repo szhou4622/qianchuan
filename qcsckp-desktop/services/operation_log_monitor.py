@@ -20,7 +20,10 @@ from api.operation_events import (
     upsert_operation_event,
 )
 from config import DATA_DIR
-from services.promotion_browser_lock import exclusive_browser_operation
+from services.promotion_browser_lock import (
+    PRIORITY_OPERATION_LOG,
+    exclusive_browser_operation,
+)
 from services.qianchuan_session import (
     automation_session_ready,
     current_session_owner,
@@ -966,6 +969,21 @@ async def _prepare_platform_log_page(
     end: datetime,
 ) -> None:
     source_url = str(target.get("sanitized_page_url") or "").strip()
+    # 目录同步保存的经常是 /uni-prom 列表页。日志接口所需的页面 SDK
+    # 只有进入统一详情路由后才会稳定初始化；保留来源查询参数，但不能
+    # 让 build_qianchuan_url_by_params 把详情路径重新覆盖回列表页。
+    if source_url:
+        source_parts = urlsplit(source_url)
+        if source_parts.scheme in {"http", "https"} and source_parts.netloc:
+            source_url = urlunsplit(
+                (
+                    source_parts.scheme,
+                    source_parts.netloc,
+                    "/uni-prom/detail",
+                    source_parts.query,
+                    "",
+                )
+            )
     detail_url = build_qianchuan_url_by_params(
         base_url=f"{QIANCHUAN_ORIGIN}/uni-prom/detail",
         aavid=int(aavid),
@@ -992,17 +1010,30 @@ async def _prepare_platform_log_page(
     )
     if "login" in str(page.url or "").lower():
         raise RuntimeError("千川登录状态已失效，请重新登录")
+    # 不再依赖页面上是否渲染“日志”文字。不同计划状态会隐藏页签，但
+    # 后台只读日志接口仍可用；直接用最小请求验证真实读取能力更可靠。
+    await page.wait_for_timeout(800)
+    probe_query = urlencode(
+        {
+            "objectID": str(target.get("ad_id") or ""),
+            "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": (
+                end.replace(hour=0, minute=0, second=0)
+                + timedelta(days=1)
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "currentPage": 1,
+            "pageSize": 1,
+            "type": 1,
+            "aavid": aavid,
+        }
+    )
     try:
-        await page.get_by_text("日志", exact=True).first.wait_for(
-            state="visible",
-            timeout=30_000,
+        await _fetch_platform_log_payload(
+            page,
+            f"{OPERATION_LOG_ENDPOINT}?{probe_query}",
         )
     except Exception as exc:
-        raise RuntimeError(
-            "计划详情未加载出日志页签，无法建立可信日志读取环境"
-        ) from exc
-    # 页签出现后安全 SDK 仍需一个很短的初始化窗口；后续全部请求复用此页。
-    await page.wait_for_timeout(800)
+        raise RuntimeError(f"计划详情日志能力校验失败：{exc}") from exc
 
 
 def _enrich_platform_log_rows(
@@ -1065,18 +1096,55 @@ async def _sync_account_platform_logs_unlocked(
         page = fetcher.page
         if page is None:
             raise RuntimeError("后台日志同步浏览器创建失败")
-        await _prepare_platform_log_page(
-            page,
-            aavid=aavid,
-            target=targets[0],
-            start=start,
-            end=end,
-        )
+        prepared = False
+        prepare_errors: List[str] = []
+        for index, target in enumerate(targets, start=1):
+            update_platform_sync_state(
+                aavid,
+                owner_username=owner_username,
+                db=store,
+                last_status="syncing",
+                last_error=(
+                    f"正在验证日志读取能力 {index}/{len(targets)}："
+                    f"{target.get('plan_name') or target.get('ad_id') or '未命名计划'}"
+                ),
+            )
+            try:
+                await _prepare_platform_log_page(
+                    page,
+                    aavid=aavid,
+                    target=target,
+                    start=start,
+                    end=end,
+                )
+            except Exception as exc:
+                prepare_errors.append(
+                    f"{target.get('plan_name') or target.get('ad_id') or index}：{exc}"
+                )
+                continue
+            prepared = True
+            break
+        if not prepared:
+            detail = "；".join(prepare_errors[:3])
+            raise RuntimeError(
+                f"已尝试{len(targets)}条计划，均无法建立日志读取环境"
+                + (f"：{detail}" if detail else "")
+            )
         page_size = 100
-        for target in targets:
+        for target_index, target in enumerate(targets, start=1):
             ad_id = str(target.get("ad_id") or "")
             fingerprints: set[str] = set()
             target_processed = 0
+            update_platform_sync_state(
+                aavid,
+                owner_username=owner_username,
+                db=store,
+                last_status="syncing",
+                last_error=(
+                    f"正在读取计划 {target_index}/{len(targets)}："
+                    f"{target.get('plan_name') or ad_id}"
+                ),
+            )
             try:
                 for page_number in range(1, 201):
                     query = urlencode(
@@ -1198,10 +1266,11 @@ async def _sync_account_platform_logs(
     owner_username: str,
     *,
     db: Optional[SQLiteStore] = None,
+    priority: int = PRIORITY_OPERATION_LOG,
 ) -> Dict[str, Any]:
     async with exclusive_browser_operation(
         f"账户操作日志同步:{aavid}",
-        priority=40,
+        priority=priority,
         timeout_seconds=900,
     ):
         return await _sync_account_platform_logs_unlocked(
@@ -1240,13 +1309,21 @@ def request_platform_log_sync(
             owner_username=owner,
             db=store,
             last_status="syncing",
-            last_error="",
+            last_error="正在等待共享浏览器队列",
             last_sync_at=_now(),
         )
 
         def entry() -> None:
             try:
-                asyncio.run(_sync_account_platform_logs(aid, owner, db=store))
+                # 用户手动触发优先于普通采集，但仍低于追投/停投写任务。
+                asyncio.run(
+                    _sync_account_platform_logs(
+                        aid,
+                        owner,
+                        db=store,
+                        priority=25,
+                    )
+                )
             except Exception as exc:
                 update_platform_sync_state(
                     aid,
