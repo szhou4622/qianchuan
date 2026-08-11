@@ -1206,7 +1206,19 @@ async def _sync_account_platform_logs_unlocked(
                 failed.append(
                     f"{target.get('plan_name') or ad_id}：{exc}"
                 )
-        status = "partial" if failed else ("ok" if processed else "empty")
+        stored_rows = store.execute(
+            "SELECT COUNT(*) AS n FROM account_operation_event "
+            "WHERE account_uid=? AND aavid=? AND source='platform_log'",
+            (str(account.get("account_uid") or ""), aavid),
+            fetch=True,
+        ) or []
+        stored_count = int(stored_rows[0].get("n") or 0) if stored_rows else 0
+        # 增量轮询没有新行不等于账户没有流水；已有历史记录时仍是正常。
+        status = (
+            "partial"
+            if failed
+            else ("ok" if processed or stored_count else "empty")
+        )
         values: Dict[str, Any] = {
             "last_status": status,
             "last_error": "；".join(failed[:5]),
@@ -1249,10 +1261,19 @@ async def _sync_account_platform_logs_unlocked(
             "aavid": aavid,
             "plan_count": len(targets),
             "row_count": processed,
+            "stored_row_count": stored_count,
             "status": status,
             "first_backfill": first_backfill,
             "message": (
-                "账户流水同步完成"
+                (
+                    "账户流水同步完成"
+                    if processed
+                    else (
+                        "账户流水同步正常，本次没有新增记录"
+                        if stored_count
+                        else "最近30天没有平台操作记录"
+                    )
+                )
                 if not failed
                 else "部分计划日志读取失败，请查看同步状态"
             ),

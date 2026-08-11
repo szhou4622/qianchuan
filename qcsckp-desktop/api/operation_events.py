@@ -463,6 +463,57 @@ def query_operation_events_page(
     return total, rows
 
 
+def operation_event_account_summary(
+    aavid: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    """返回账户全部真实流水的范围，帮助区分“未同步”和“筛选无匹配”。"""
+
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config["database"])
+    aid = str(aavid or "").strip()
+    if not aid:
+        return {"total": 0, "available_from": "", "available_to": "", "operators": []}
+    from services.qianchuan_accounts import get_qianchuan_account
+
+    account = get_qianchuan_account(
+        aid,
+        owner_username=owner_username,
+        db=store,
+    )
+    if not account:
+        return {"total": 0, "available_from": "", "available_to": "", "operators": []}
+    account_uid = str(account.get("account_uid") or "")
+    aggregate = store.execute(
+        f"SELECT COUNT(*) AS n, MIN(occurred_at) AS first_at, "
+        f"MAX(occurred_at) AS last_at FROM {TABLE} "
+        "WHERE account_uid=? AND aavid=? AND source='platform_log'",
+        (account_uid, aid),
+        fetch=True,
+    ) or []
+    row = aggregate[0] if aggregate else {}
+    operator_rows = store.execute(
+        f"SELECT operator_name, operator_id, COUNT(*) AS n FROM {TABLE} "
+        "WHERE account_uid=? AND aavid=? AND source='platform_log' "
+        "GROUP BY operator_name, operator_id ORDER BY n DESC, operator_name ASC LIMIT 20",
+        (account_uid, aid),
+        fetch=True,
+    ) or []
+    operators: List[str] = []
+    for item in operator_rows:
+        label = str(item.get("operator_name") or item.get("operator_id") or "").strip()
+        if label and label not in operators:
+            operators.append(label)
+    return {
+        "total": int(row.get("n") or 0),
+        "available_from": str(row.get("first_at") or ""),
+        "available_to": str(row.get("last_at") or ""),
+        "operators": operators,
+    }
+
+
 def get_operation_event(event_id: Any, aavid: Any = None) -> Optional[Dict[str, Any]]:
     init_sqlite_schema()
     store = SQLiteStore()

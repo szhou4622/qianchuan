@@ -6,7 +6,10 @@ import unittest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
-from api.operation_events import ingest_platform_log_rows
+from api.operation_events import (
+    ingest_platform_log_rows,
+    operation_event_account_summary,
+)
 from services.operation_log_monitor import (
     _enabled_log_account_ids,
     _extract_platform_rows,
@@ -210,6 +213,31 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual("987654321", event["regulate_task_id"])
         self.assertEqual("", event["material_id"])
 
+    def test_account_summary_explains_filters_that_hide_existing_rows(self):
+        self._account()
+        ingest_platform_log_rows(
+            "1001",
+            [
+                {
+                    "logId": "summary-1",
+                    "operateTime": "2026-08-01 09:00:00",
+                    "optContent": "修改预算",
+                    "operatorName": "王斌",
+                }
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+            update_sync_state=False,
+        )
+        summary = operation_event_account_summary(
+            "1001",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertEqual(1, summary["total"])
+        self.assertEqual("2026-08-01 09:00:00", summary["available_from"])
+        self.assertEqual(["王斌"], summary["operators"])
+
     def test_direct_readonly_endpoint_backfills_and_persists_rows(self):
         account = self._account()
         self._target(account)
@@ -311,6 +339,55 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual("empty", result["status"])
         self.assertEqual(2, prepare.await_count)
+
+    def test_incremental_sync_without_new_rows_keeps_existing_account_ok(self):
+        account = self._account()
+        self._target(account, "2001")
+        ingest_platform_log_rows(
+            "1001",
+            [
+                {
+                    "logId": "existing-1",
+                    "operateTime": "2026-08-01 09:00:00",
+                    "optContent": "修改预算",
+                    "operatorName": "王斌",
+                }
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+            update_sync_state=False,
+        )
+        payload = {"code": 0, "data": {"list": [], "total": 0}}
+        with patch(
+            "services.operation_log_monitor.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.operation_log_monitor.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.operation_log_monitor.load_qianchuan_storage_state",
+            return_value={"cookies": [], "origins": []},
+        ), patch(
+            "services.operation_log_monitor.QianChuanFetcher",
+            _FakeFetcher,
+        ), patch(
+            "services.operation_log_monitor._prepare_platform_log_page",
+            new=AsyncMock(),
+        ), patch(
+            "services.operation_log_monitor._fetch_platform_log_payload",
+            new=AsyncMock(return_value=payload),
+        ), patch("api.operation_events.init_sqlite_schema"):
+            result = asyncio.run(
+                _sync_account_platform_logs_unlocked(
+                    "1001",
+                    "tool-owner",
+                    db=self.db,
+                )
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(0, result["row_count"])
+        self.assertEqual(1, result["stored_row_count"])
 
 
 if __name__ == "__main__":

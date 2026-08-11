@@ -1400,7 +1400,10 @@ class Api:
         page=1,
         page_size=50,
     ):
-        from .operation_events import query_operation_events_page
+        from .operation_events import (
+            operation_event_account_summary,
+            query_operation_events_page,
+        )
 
         try:
             total, items = query_operation_events_page(
@@ -1420,6 +1423,7 @@ class Api:
                 "success": True,
                 "items": items,
                 "total": total,
+                "accountSummary": operation_event_account_summary(aavid),
                 "page": max(1, int(page or 1)),
                 "pageSize": max(1, min(5000, int(page_size or 50))),
             }
