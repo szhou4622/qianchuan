@@ -1531,6 +1531,20 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def reconcileQianchuanOfficialApiAccount(self, aavid=None):
+        """Developer acceptance hook; never launches Chrome or writes to Qianchuan."""
+        if QIANCHUAN_BACKEND != "official_api":
+            return {
+                "success": False,
+                "message": "请在独立的官方 API 联调进程中执行只读对账",
+            }
+        try:
+            from services.official_api_reconciliation import reconcile_account_snapshot
+
+            return reconcile_account_snapshot(aavid, db=self.db)
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
     def syncOperationLogsNow(self, aavid=None):
         from services.operation_log_monitor import request_platform_log_sync
 
