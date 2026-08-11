@@ -560,15 +560,24 @@ def list_operation_accounts(
     return accounts
 
 
-def operation_sync_state(aavid: Any) -> Dict[str, Any]:
-    init_sqlite_schema()
-    store = SQLiteStore()
+def operation_sync_state(
+    aavid: Any,
+    *,
+    owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config["database"])
     aid = str(aavid or "").strip()
     row = None
     if aid:
         from services.qianchuan_accounts import get_qianchuan_account
 
-        account = get_qianchuan_account(aid, db=store)
+        account = get_qianchuan_account(
+            aid,
+            owner_username=owner_username,
+            db=store,
+        )
         if account:
             row = store.select_one(
                 "platform_log_sync_state",
@@ -577,6 +586,17 @@ def operation_sync_state(aavid: Any) -> Dict[str, Any]:
                     "account_uid": str(account.get("account_uid") or ""),
                 },
             )
+            if row and str(row.get("last_status") or "") == "empty":
+                existing = store.execute(
+                    f"SELECT COUNT(*) AS n FROM {TABLE} WHERE account_uid=? "
+                    "AND aavid=? AND source='platform_log'",
+                    (str(account.get("account_uid") or ""), aid),
+                    fetch=True,
+                ) or []
+                if existing and int(existing[0].get("n") or 0) > 0:
+                    row = dict(row)
+                    row["last_status"] = "ok"
+                    row["last_error"] = ""
     if row and str(row.get("last_status") or "") == "syncing":
         try:
             updated = datetime.strptime(

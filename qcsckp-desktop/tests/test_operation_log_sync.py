@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, patch
 from api.operation_events import (
     ingest_platform_log_rows,
     operation_event_account_summary,
+    operation_sync_state,
+    update_platform_sync_state,
 )
 from services.operation_log_monitor import (
     _enabled_log_account_ids,
@@ -237,6 +239,36 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual(1, summary["total"])
         self.assertEqual("2026-08-01 09:00:00", summary["available_from"])
         self.assertEqual(["王斌"], summary["operators"])
+
+    def test_empty_incremental_state_is_reported_ok_when_history_exists(self):
+        self._account()
+        ingest_platform_log_rows(
+            "1001",
+            [
+                {
+                    "logId": "state-existing-1",
+                    "operateTime": "2026-08-01 09:00:00",
+                    "optContent": "修改预算",
+                    "operatorName": "王斌",
+                }
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+            update_sync_state=False,
+        )
+        update_platform_sync_state(
+            "1001",
+            owner_username="tool-owner",
+            db=self.db,
+            last_status="empty",
+            last_error="",
+        )
+        state = operation_sync_state(
+            "1001",
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertEqual("ok", state["last_status"])
 
     def test_direct_readonly_endpoint_backfills_and_persists_rows(self):
         account = self._account()
