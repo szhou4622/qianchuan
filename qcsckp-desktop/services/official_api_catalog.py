@@ -36,6 +36,8 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 _LOCK = threading.Lock()
 _THREAD: Optional[threading.Thread] = None
+_PENDING_ACCOUNT_UIDS: set[str] = set()
+_PENDING_ALL = False
 _SCHEDULER_LOCK = threading.Lock()
 _SCHEDULER_THREAD: Optional[threading.Thread] = None
 _SCHEDULER_STOP = threading.Event()
@@ -217,13 +219,23 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
                 or str(detail.get("ad_id") or "") != ad_id
             ):
                 raise RuntimeError("计划详情账户或计划 ID 不一致")
-            plan = {**plan, **detail}
+            list_plan = plan
+            plan = {**list_plan, **detail}
+            # The current detail response uses numeric ``adlab_scene=0`` for
+            # some full-domain plans, while the list response carries the
+            # explicit ``UNI_PROJECT/OVERALL_PROJECT`` contract.  An unknown
+            # detail value must not overwrite a confirmed list classification.
+            if str(detail.get("plan_system") or "") not in {"global", "chengfang"}:
+                plan["plan_system"] = list_plan.get("plan_system") or "unknown"
+                plan["adlab_scene"] = list_plan.get("adlab_scene") or ""
+            if str(detail.get("promotion_scene") or "") not in {"live", "product"}:
+                plan["promotion_scene"] = list_plan.get("promotion_scene") or ""
+                plan["marketing_goal"] = list_plan.get("marketing_goal") or ""
             detail_evidence[ad_id] = {
                 "complete": True,
                 "request_id": detail_response.request_id,
             }
         except Exception as exc:
-            evidence["complete"] = False
             detail_evidence[ad_id] = {
                 "complete": False,
                 "error": str(exc),
@@ -234,9 +246,11 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
         if f"{system}_{scene}" in class_counts:
             class_counts[f"{system}_{scene}"] += 1
         prior = existing.get(ad_id) or {}
+        # The official paginated list is the catalog source of truth. Detail
+        # evidence strengthens execution eligibility, but a transient detail
+        # failure must not hide a valid plan or mark the directory partial.
         verified = bool(
-            detail_evidence[ad_id].get("complete")
-            and scene in {"live", "product"}
+            scene in {"live", "product"}
             and system in {"global", "chengfang"}
         )
         saved = upsert_promotion_target(
@@ -258,7 +272,7 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
             trusted_catalog=True,
             db=db,
         )
-        if verified:
+        if verified and detail_evidence[ad_id].get("complete"):
             patch_target_sync_state(
                 saved["target_uid"],
                 status="api_catalog_synced",
@@ -350,21 +364,66 @@ def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None)
     )
 
 
+def _next_pending_scope() -> tuple[bool, str]:
+    global _PENDING_ALL, _THREAD
+    with _LOCK:
+        if _PENDING_ALL:
+            _PENDING_ALL = False
+            _PENDING_ACCOUNT_UIDS.clear()
+            return True, ""
+        if _PENDING_ACCOUNT_UIDS:
+            return True, _PENDING_ACCOUNT_UIDS.pop()
+        # Clear ownership while holding the same lock used by enqueue callers.
+        # This closes the race where a request could be queued just as the old
+        # worker was exiting and then never be consumed.
+        _THREAD = None
+        return False, ""
+
+
 def _thread_entry(account_uid: str) -> None:
     global _THREAD
+    scope = str(account_uid or "").strip()
     try:
-        run_catalog_sync(account_uid)
+        while True:
+            try:
+                run_catalog_sync(scope)
+            except Exception as exc:
+                # Never leave the account page in a permanent ``syncing`` state
+                # after an unexpected worker failure.
+                finalize_catalog_sync(
+                    owner_username=_owner_key(),
+                    refreshed_account_uids=[],
+                    account_results={},
+                    error=str(exc),
+                )
+            has_pending, scope = _next_pending_scope()
+            if not has_pending:
+                break
+            mark_catalog_sync_started(
+                owner_username=_owner_key(), account_uid=scope
+            )
     finally:
         with _LOCK:
-            _THREAD = None
+            if _THREAD is threading.current_thread():
+                _THREAD = None
 
 
 def start_official_api_catalog_sync(account_uid: Any = "") -> dict[str, Any]:
-    global _THREAD
+    global _THREAD, _PENDING_ALL
     uid = str(account_uid or "").strip()
     with _LOCK:
         if _THREAD and _THREAD.is_alive():
-            return {"success": True, "running": True, "message": "千川官方 API 目录正在同步"}
+            if uid:
+                _PENDING_ACCOUNT_UIDS.add(uid)
+            else:
+                _PENDING_ALL = True
+                _PENDING_ACCOUNT_UIDS.clear()
+            return {
+                "success": True,
+                "running": True,
+                "queued": True,
+                "message": "千川官方 API 目录正在同步，本次刷新已加入队列",
+            }
         mark_catalog_sync_started(owner_username=_owner_key(), account_uid=uid)
         _THREAD = threading.Thread(target=_thread_entry, args=(uid,), name="official-api-catalog", daemon=True)
         _THREAD.start()

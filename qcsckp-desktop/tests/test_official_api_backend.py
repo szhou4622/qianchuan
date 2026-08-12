@@ -56,7 +56,135 @@ class _CaptureClient:
         )
 
 
+class _PublicInfoClient(_CaptureClient):
+    def get(self, endpoint, query=None, *, advertiser_id=""):
+        self.last_get = (endpoint, dict(query or {}), str(advertiser_id))
+        return ApiResponse(
+            data=[
+                {
+                    "advertiser_id": "1782685702496260",
+                    "advertiser_name": "松之选专卖店",
+                }
+            ],
+            raw={"code": 0},
+            request_id="req-public-info",
+        )
+
+
 class OfficialApiBackendTests(unittest.TestCase):
+    def test_public_info_fills_missing_account_name(self):
+        service = QianchuanOfficialApiService(_PublicInfoClient())
+        rows = service.list_advertiser_public_info(["1782685702496260"])
+        self.assertEqual("松之选专卖店", rows[0]["advertiser_name"])
+        self.assertEqual(
+            "/open_api/2/advertiser/public_info/",
+            service.client.last_get[0],
+        )
+        self.assertEqual(
+            ["1782685702496260"],
+            service.client.last_get[1]["advertiser_ids"],
+        )
+
+    def test_multi_account_shop_names_are_enriched_from_public_info(self):
+        service = QianchuanOfficialApiService(_CaptureClient())
+        with patch.object(
+            service,
+            "list_authorized_accounts",
+            return_value=[
+                {
+                    "advertiser_id": "55192491",
+                    "advertiser_name": "店铺主体",
+                    "role": "SHOP",
+                    "shop_id": "55192491",
+                }
+            ],
+        ), patch.object(
+            service,
+            "list_shop_advertisers",
+            return_value=[
+                {"advertiser_id": "10001", "advertiser_name": ""},
+                {"advertiser_id": "10002", "advertiser_name": ""},
+            ],
+        ), patch.object(
+            service,
+            "list_advertiser_public_info",
+            return_value=[
+                {"advertiser_id": "10001", "advertiser_name": "账户甲"},
+                {"advertiser_id": "10002", "advertiser_name": "账户乙"},
+            ],
+        ):
+            rows, evidence = service.list_business_accounts()
+        self.assertEqual(
+            {"10001": "账户甲", "10002": "账户乙"},
+            {row["advertiser_id"]: row["advertiser_name"] for row in rows},
+        )
+        self.assertTrue(evidence["account_names_complete"])
+
+    def test_account_refresh_is_queued_while_catalog_worker_is_running(self):
+        from services import official_api_catalog as catalog
+
+        worker = unittest.mock.Mock()
+        worker.is_alive.return_value = True
+        with patch.object(catalog, "_THREAD", worker), patch.object(
+            catalog, "_PENDING_ACCOUNT_UIDS", set()
+        ), patch.object(catalog, "_PENDING_ALL", False):
+            result = catalog.start_official_api_catalog_sync("account-uid-2")
+            self.assertTrue(result["queued"])
+            self.assertIn("account-uid-2", catalog._PENDING_ACCOUNT_UIDS)
+
+    def test_unknown_detail_system_does_not_replace_list_classification(self):
+        from services import official_api_catalog as catalog
+
+        fake_service = unittest.mock.Mock()
+        fake_service.list_business_accounts.return_value = (
+            [{"advertiser_id": "10001", "advertiser_name": "测试账户"}],
+            {"complete": True},
+        )
+        fake_service.list_all_plans.return_value = (
+            [
+                {
+                    "aavid": "10001",
+                    "ad_id": "20001",
+                    "plan_name": "直播全域",
+                    "promotion_scene": "live",
+                    "plan_system": "global",
+                    "marketing_goal": "LIVE_PROM_GOODS",
+                    "adlab_scene": "UNI_PROJECT",
+                    "platform_status": "active",
+                }
+            ],
+            {"complete": True, "classes": {}},
+        )
+        fake_service.get_plan_detail.return_value = (
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "直播全域",
+                "promotion_scene": "live",
+                "plan_system": "unknown",
+                "marketing_goal": "LIVE_PROM_GOODS",
+                "adlab_scene": "0",
+                "platform_status": "active",
+            },
+            ApiResponse(data={}, raw={"code": 0}, request_id="req-detail"),
+        )
+        account = {
+            "aavid": "10001",
+            "account_uid": "account-1",
+            "account_name": "测试账户",
+            "owner_username": "owner",
+        }
+        captured = []
+        with patch.object(catalog, "get_official_api_service", return_value=fake_service), patch.object(
+            catalog, "ensure_qianchuan_account"
+        ), patch.object(catalog, "list_promotion_targets", return_value=[]), patch.object(
+            catalog, "upsert_promotion_target", side_effect=lambda payload, **_kwargs: captured.append(payload) or {"target_uid": "target-1"}
+        ), patch.object(catalog, "patch_target_sync_state"):
+            result = catalog._sync_account(account, unittest.mock.Mock())
+        self.assertTrue(result["complete"])
+        self.assertEqual("global", captured[0]["plan_system"])
+        self.assertEqual("live", captured[0]["promotion_scene"])
+
     def test_single_shop_account_inherits_official_shop_name(self):
         service = QianchuanOfficialApiService(_CaptureClient())
         with patch.object(
@@ -194,6 +322,27 @@ class OfficialApiBackendTests(unittest.TestCase):
                     advertiser_id="1234567890123456789",
                 )
                 self.assertEqual((plan["plan_system"], plan["promotion_scene"]), expected)
+
+    def test_live_plan_list_ad_info_wrapper_is_normalized(self):
+        plan = normalize_plan(
+            {
+                "ad_info": {
+                    "id": 1804998056156307,
+                    "name": "直播全域计划",
+                    "adlab_scene": "UNI_PROJECT",
+                    "marketing_goal": "LIVE_PROM_GOODS",
+                    "status": "ENABLE",
+                },
+                "product_info": [{"id": 999}],
+                "room_info": [{"id": 888}],
+            },
+            advertiser_id="1782685702496260",
+        )
+        self.assertEqual("1804998056156307", plan["ad_id"])
+        self.assertEqual("直播全域计划", plan["plan_name"])
+        self.assertEqual("global", plan["plan_system"])
+        self.assertEqual("live", plan["promotion_scene"])
+        self.assertEqual("active", plan["platform_status"])
 
     def test_official_api_capability_is_valid_for_batch_retarget(self):
         verified_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

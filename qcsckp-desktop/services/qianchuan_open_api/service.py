@@ -27,6 +27,7 @@ from .normalizers import (
 class QianchuanOfficialApiService:
     AUTHORIZED_ADVERTISERS = "/open_api/oauth2/advertiser/get/"
     SHOP_ADVERTISERS = "/open_api/v1.0/qianchuan/shop/advertiser/list/"
+    ADVERTISER_PUBLIC_INFO = "/open_api/2/advertiser/public_info/"
     PLAN_LIST = "/open_api/v1.0/qianchuan/uni_promotion/list/"
     PLAN_DETAIL = "/open_api/v1.0/qianchuan/uni_promotion/ad/detail/"
     PLAN_MATERIALS = "/open_api/v1.0/qianchuan/uni_promotion/ad/material/get/"
@@ -71,6 +72,28 @@ class QianchuanOfficialApiService:
             page_size=100,
         )
         return [item for item in (normalize_account(row) for row in rows) if item["advertiser_id"]]
+
+    def list_advertiser_public_info(
+        self, advertiser_ids: Iterable[Any]
+    ) -> list[dict[str, Any]]:
+        """Return authoritative public names for up to 100 advertisers per call."""
+        ids = list(dict.fromkeys(require_digit_id(value, "advertiser_id") for value in advertiser_ids))
+        result: list[dict[str, Any]] = []
+        for offset in range(0, len(ids), 100):
+            batch = ids[offset : offset + 100]
+            response = self.client.get(
+                self.ADVERTISER_PUBLIC_INFO,
+                {"advertiser_ids": batch},
+            )
+            result.extend(
+                item
+                for item in (
+                    normalize_account(row)
+                    for row in QianchuanOpenApiClient.extract_items(response.data)
+                )
+                if item["advertiser_id"]
+            )
+        return result
 
     def list_business_accounts(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Resolve OAuth subjects to final Qianchuan advertiser accounts.
@@ -128,6 +151,31 @@ class QianchuanOfficialApiService:
                 evidence["subjects"].append(
                     {"subject_id": subject_id, "shop_id": sid, "role": role, "resolved": 0, "type": "shop", "error": str(exc)}
                 )
+        missing_name_ids = [
+            account_id
+            for account_id, account in resolved.items()
+            if not str(account.get("advertiser_name") or "").strip()
+        ]
+        evidence["account_names_complete"] = not missing_name_ids
+        if missing_name_ids:
+            try:
+                public_rows = self.list_advertiser_public_info(missing_name_ids)
+                public_by_id = {
+                    text_id(row.get("advertiser_id")): row for row in public_rows
+                }
+                for account_id in missing_name_ids:
+                    public = public_by_id.get(account_id) or {}
+                    public_name = str(public.get("advertiser_name") or "").strip()
+                    if public_name:
+                        resolved[account_id]["advertiser_name"] = public_name
+                evidence["account_names_complete"] = all(
+                    str(account.get("advertiser_name") or "").strip()
+                    for account in resolved.values()
+                )
+            except Exception as exc:
+                # Account IDs are still valid and may be selected.  A name lookup
+                # failure must not make the plan catalog itself incomplete.
+                evidence["account_name_error"] = str(exc)
         return list(resolved.values()), evidence
 
     @staticmethod

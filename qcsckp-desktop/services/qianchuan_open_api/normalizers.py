@@ -107,20 +107,24 @@ def normalize_platform_status(value: Any) -> str:
 
 
 def normalize_plan(row: Mapping[str, Any], *, advertiser_id: Any = "") -> dict[str, Any]:
-    ad_id = text_id(first(row, "ad_id", "adId", "promotion_id", "promotionId", "id"))
-    marketing_goal = str(first(row, "marketing_goal", "marketingGoal")).strip().upper()
-    adlab_scene = str(first(row, "adlab_scene", "adlabScene")).strip().upper()
+    # The live list endpoint wraps the plan under ``ad_info`` while detail
+    # returns a flat object.  Prefer the explicit wrapper so generic nested
+    # product/room IDs can never be mistaken for the plan ID.
+    plan_row = row.get("ad_info") if isinstance(row.get("ad_info"), Mapping) else row
+    ad_id = text_id(first(plan_row, "ad_id", "adId", "promotion_id", "promotionId", "id"))
+    marketing_goal = str(first(plan_row, "marketing_goal", "marketingGoal")).strip().upper()
+    adlab_scene = str(first(plan_row, "adlab_scene", "adlabScene")).strip().upper()
     return {
-        "aavid": text_id(advertiser_id or first(row, "advertiser_id", "aavid")),
+        "aavid": text_id(advertiser_id or first(plan_row, "advertiser_id", "aavid")),
         "ad_id": ad_id,
-        "plan_name": str(first(row, "name", "ad_name", "promotion_name", "adName")).strip(),
+        "plan_name": str(first(plan_row, "name", "ad_name", "promotion_name", "adName")).strip(),
         "marketing_goal": marketing_goal,
         "adlab_scene": adlab_scene,
         "promotion_scene": normalize_promotion_scene(marketing_goal),
         "plan_system": normalize_plan_system(adlab_scene),
-        "platform_status": normalize_platform_status(first(row, "status", "opt_status", "delivery_status", "ad_status")),
-        "create_time": str(first(row, "create_time", "createTime")).strip(),
-        "modify_time": str(first(row, "modify_time", "modifyTime", "update_time")).strip(),
+        "platform_status": normalize_platform_status(first(plan_row, "status", "opt_status", "delivery_status", "ad_status")),
+        "create_time": str(first(plan_row, "create_time", "createTime")).strip(),
+        "modify_time": str(first(plan_row, "modify_time", "modifyTime", "update_time")).strip(),
         "raw": dict(row),
     }
 
