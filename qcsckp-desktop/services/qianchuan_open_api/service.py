@@ -249,6 +249,7 @@ class QianchuanOfficialApiService:
         advertiser_id: Any,
         *,
         marketing_goal: str,
+        adlab_scene: str = "",
         start_time: str = "",
         end_time: str = "",
         fields: Optional[Iterable[str]] = None,
@@ -258,6 +259,9 @@ class QianchuanOfficialApiService:
         goal = str(marketing_goal or "").strip().upper()
         if goal not in self.MARKETING_GOALS:
             raise ValueError("marketing_goal 仅支持 LIVE_PROM_GOODS 或 VIDEO_PROM_GOODS")
+        scene = str(adlab_scene or "").strip().upper()
+        if scene and scene not in {"UNI_PROJECT", "OVERALL_PROJECT"}:
+            raise ValueError("adlab_scene 仅支持 UNI_PROJECT 或 OVERALL_PROJECT")
         if not start_time or not end_time:
             start_time, end_time = self._default_plan_window()
         query: dict[str, Any] = {
@@ -267,6 +271,8 @@ class QianchuanOfficialApiService:
             "marketing_goal": goal,
             "fields": list(fields or []),
         }
+        if scene:
+            query["adlab_scene"] = scene
         if filtering:
             query["filtering"] = dict(filtering)
         rows, request_ids = self.client.get_all_pages(
@@ -278,20 +284,37 @@ class QianchuanOfficialApiService:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         combined: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"complete": True, "classes": {}}
-        for goal in self.MARKETING_GOALS:
+        # The official endpoint defaults to UNI_PROJECT when adlab_scene is
+        # omitted.  Query all four classes explicitly or Chengfang plans are
+        # silently absent even though the request itself succeeds.
+        classes = (
+            ("chengfang_live", "LIVE_PROM_GOODS", "OVERALL_PROJECT"),
+            ("chengfang_product", "VIDEO_PROM_GOODS", "OVERALL_PROJECT"),
+            ("global_live", "LIVE_PROM_GOODS", "UNI_PROJECT"),
+            ("global_product", "VIDEO_PROM_GOODS", "UNI_PROJECT"),
+        )
+        for class_key, goal, scene in classes:
             try:
-                plans, request_ids = self.list_plans(aid, marketing_goal=goal)
+                plans, request_ids = self.list_plans(
+                    aid,
+                    marketing_goal=goal,
+                    adlab_scene=scene,
+                )
                 combined.extend(plans)
-                evidence["classes"][goal] = {
+                evidence["classes"][class_key] = {
                     "complete": True,
                     "count": len(plans),
+                    "marketing_goal": goal,
+                    "adlab_scene": scene,
                     "request_ids": request_ids,
                 }
             except Exception as exc:
                 evidence["complete"] = False
-                evidence["classes"][goal] = {
+                evidence["classes"][class_key] = {
                     "complete": False,
                     "count": 0,
+                    "marketing_goal": goal,
+                    "adlab_scene": scene,
                     "error": str(exc),
                 }
         deduped: dict[str, dict[str, Any]] = {}

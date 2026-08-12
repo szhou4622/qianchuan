@@ -43,6 +43,7 @@ class _CaptureClient:
         self.posts = []
 
     def get_all_pages(self, endpoint, query, **kwargs):
+        self.last_pages = (endpoint, dict(query or {}), dict(kwargs or {}))
         if "control_task/list" in endpoint:
             return self.tasks, ["req-list"]
         return [], []
@@ -348,6 +349,48 @@ class OfficialApiBackendTests(unittest.TestCase):
                     advertiser_id="1234567890123456789",
                 )
                 self.assertEqual((plan["plan_system"], plan["promotion_scene"]), expected)
+
+    def test_plan_list_forwards_explicit_chengfang_scene(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        service.list_plans(
+            "1854823495704009",
+            marketing_goal="LIVE_PROM_GOODS",
+            adlab_scene="OVERALL_PROJECT",
+        )
+        self.assertEqual("OVERALL_PROJECT", client.last_pages[1]["adlab_scene"])
+
+    def test_all_plan_catalog_queries_four_explicit_classes(self):
+        service = QianchuanOfficialApiService(_CaptureClient())
+        calls = []
+
+        def fake_list(_advertiser_id, *, marketing_goal, adlab_scene, **_kwargs):
+            calls.append((marketing_goal, adlab_scene))
+            return [], [f"req-{len(calls)}"]
+
+        with patch.object(service, "list_plans", side_effect=fake_list):
+            rows, evidence = service.list_all_plans("1854823495704009")
+
+        self.assertEqual([], rows)
+        self.assertEqual(
+            {
+                ("LIVE_PROM_GOODS", "OVERALL_PROJECT"),
+                ("VIDEO_PROM_GOODS", "OVERALL_PROJECT"),
+                ("LIVE_PROM_GOODS", "UNI_PROJECT"),
+                ("VIDEO_PROM_GOODS", "UNI_PROJECT"),
+            },
+            set(calls),
+        )
+        self.assertEqual(
+            {
+                "chengfang_live",
+                "chengfang_product",
+                "global_live",
+                "global_product",
+            },
+            set(evidence["classes"]),
+        )
+        self.assertTrue(evidence["complete"])
 
     def test_live_plan_list_ad_info_wrapper_is_normalized(self):
         plan = normalize_plan(
