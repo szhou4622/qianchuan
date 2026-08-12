@@ -186,6 +186,58 @@ class OfficialApiBackendTests(unittest.TestCase):
         self.assertEqual("global", captured[0]["plan_system"])
         self.assertEqual("live", captured[0]["promotion_scene"])
 
+    def test_unknown_detail_status_does_not_replace_list_status(self):
+        from services import official_api_catalog as catalog
+
+        fake_service = unittest.mock.Mock()
+        fake_service.list_business_accounts.return_value = (
+            [{"advertiser_id": "10001", "advertiser_name": "测试账户"}],
+            {"complete": True},
+        )
+        fake_service.list_all_plans.return_value = (
+            [{
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "商品全域",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "adlab_scene": "UNI_PROJECT",
+                "platform_status": "active",
+            }],
+            {"complete": True, "classes": {}},
+        )
+        fake_service.get_plan_detail.return_value = (
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "plan_name": "商品全域",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "adlab_scene": "UNI_PROJECT",
+                "platform_status": "unknown",
+            },
+            ApiResponse(data={}, raw={"code": 0}, request_id="req-detail"),
+        )
+        account = {
+            "aavid": "10001",
+            "account_uid": "account-1",
+            "account_name": "测试账户",
+            "owner_username": "owner",
+        }
+        captured = []
+        with patch.object(catalog, "get_official_api_service", return_value=fake_service), patch.object(
+            catalog, "ensure_qianchuan_account"
+        ), patch.object(catalog, "list_promotion_targets", return_value=[]), patch.object(
+            catalog,
+            "upsert_promotion_target",
+            side_effect=lambda payload, **_kwargs: captured.append(payload) or {"target_uid": "target-1"},
+        ), patch.object(catalog, "patch_target_sync_state"):
+            result = catalog._sync_account(account, unittest.mock.Mock())
+        self.assertTrue(result["complete"])
+        self.assertEqual("active", captured[0]["platform_status"])
+
     def test_single_shop_account_inherits_official_shop_name(self):
         service = QianchuanOfficialApiService(_CaptureClient())
         with patch.object(
@@ -349,6 +401,28 @@ class OfficialApiBackendTests(unittest.TestCase):
                     advertiser_id="1234567890123456789",
                 )
                 self.assertEqual((plan["plan_system"], plan["promotion_scene"]), expected)
+
+    def test_official_delivery_status_enums_drive_monitor_eligibility(self):
+        expected = {
+            "DELIVERY_OK": "active",
+            "DISABLE": "paused",
+            "SYSTEM_DISABLE": "paused",
+            "ROI2_DISABLE": "paused",
+            "TIME_DONE": "ended",
+        }
+        for status, normalized in expected.items():
+            with self.subTest(status=status):
+                plan = normalize_plan(
+                    {
+                        "ad_id": "9876543210123456789",
+                        "adlab_scene": "UNI_PROJECT",
+                        "marketing_goal": "VIDEO_PROM_GOODS",
+                        "status": status,
+                        "opt_status": "ENABLE",
+                    },
+                    advertiser_id="1234567890123456789",
+                )
+                self.assertEqual(normalized, plan["platform_status"])
 
     def test_plan_list_forwards_explicit_chengfang_scene(self):
         client = _CaptureClient()

@@ -112,13 +112,40 @@ def normalize_promotion_scene(value: Any) -> str:
 
 def normalize_platform_status(value: Any) -> str:
     raw = str(value or "").strip().upper()
-    if raw in {"ENABLE", "ENABLED", "ACTIVE", "DELIVERY", "DELIVERING", "RUNNING", "投放中"}:
+    if raw in {
+        "ENABLE",
+        "ENABLED",
+        "ACTIVE",
+        "DELIVERY",
+        "DELIVERING",
+        "DELIVERY_OK",
+        "RUNNING",
+        "投放中",
+    }:
         return "active"
     if raw in {"LEARNING", "LEARN", "学习中"}:
         return "learning"
-    if raw in {"PAUSE", "PAUSED", "DISABLE", "DISABLED", "SUSPEND", "已暂停"}:
+    if raw in {
+        "PAUSE",
+        "PAUSED",
+        "DISABLE",
+        "DISABLED",
+        "SUSPEND",
+        "EXTERNAL_URL_DISABLE",
+        "FROZEN",
+        "LIVE_ROOM_OFF",
+        "NO_SCHEDULE",
+        "OFFLINE_AUDIT",
+        "OFFLINE_BALANCE",
+        "OFFLINE_BUDGET",
+        "QUOTA_DISABLE",
+        "ROI2_DISABLE",
+        "SYSTEM_DISABLE",
+        "TIME_NO_REACH",
+        "已暂停",
+    }:
         return "paused"
-    if raw in {"FINISH", "FINISHED", "ENDED", "END", "已结束", "完成"}:
+    if raw in {"FINISH", "FINISHED", "ENDED", "END", "TIME_DONE", "已结束", "完成"}:
         return "ended"
     if raw in {"DELETE", "DELETED", "REMOVED", "已删除"}:
         return "deleted"

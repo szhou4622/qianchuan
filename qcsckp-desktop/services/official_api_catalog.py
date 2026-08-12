@@ -231,6 +231,11 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
             if str(detail.get("promotion_scene") or "") not in {"live", "product"}:
                 plan["promotion_scene"] = list_plan.get("promotion_scene") or ""
                 plan["marketing_goal"] = list_plan.get("marketing_goal") or ""
+            # The list and detail endpoints do not always expose status through
+            # the same field set. An unknown detail enum must not erase a
+            # status already confirmed by the scoped list.
+            if str(detail.get("platform_status") or "") == "unknown":
+                plan["platform_status"] = list_plan.get("platform_status") or "unknown"
             detail_evidence[ad_id] = {
                 "complete": True,
                 "request_id": detail_response.request_id,
