@@ -27,6 +27,7 @@ from .normalizers import (
 class QianchuanOfficialApiService:
     AUTHORIZED_ADVERTISERS = "/open_api/oauth2/advertiser/get/"
     SHOP_ADVERTISERS = "/open_api/v1.0/qianchuan/shop/advertiser/list/"
+    ENTERPRISE_ADVERTISERS = "/open_api/2/ebp/advertiser/list/"
     ADVERTISER_PUBLIC_INFO = "/open_api/2/advertiser/public_info/"
     PLAN_LIST = "/open_api/v1.0/qianchuan/uni_promotion/list/"
     PLAN_DETAIL = "/open_api/v1.0/qianchuan/uni_promotion/ad/detail/"
@@ -73,6 +74,33 @@ class QianchuanOfficialApiService:
         )
         return [item for item in (normalize_account(row) for row in rows) if item["advertiser_id"]]
 
+    def list_enterprise_advertisers(
+        self,
+        enterprise_organization_id: Any,
+        *,
+        account_source: str = "QIANCHUAN",
+    ) -> list[dict[str, Any]]:
+        """Expand an authorized enterprise/BP subject to final ad accounts."""
+        enterprise_id = require_digit_id(
+            enterprise_organization_id, "enterprise_organization_id"
+        )
+        source = str(account_source or "").strip().upper()
+        if source not in {"AD", "LOCAL", "QIANCHUAN"}:
+            raise ValueError("account_source must be AD, LOCAL, or QIANCHUAN")
+        rows, _ = self.client.get_all_pages(
+            self.ENTERPRISE_ADVERTISERS,
+            {
+                "enterprise_organization_id": enterprise_id,
+                "account_source": source,
+            },
+            page_size=100,
+        )
+        return [
+            item
+            for item in (normalize_account(row) for row in rows)
+            if item["advertiser_id"]
+        ]
+
     def list_advertiser_public_info(
         self, advertiser_ids: Iterable[Any]
     ) -> list[dict[str, Any]]:
@@ -110,6 +138,38 @@ class QianchuanOfficialApiService:
             shop_id = text_id(subject.get("shop_id"))
             is_shop = "SHOP" in role or bool(shop_id)
             if not is_shop:
+                is_enterprise = any(
+                    marker in role for marker in ("ENTERPRISE", "BP_OPERATOR")
+                )
+                if subject_id and is_enterprise:
+                    try:
+                        rows = self.list_enterprise_advertisers(subject_id)
+                        for row in rows:
+                            row = dict(row)
+                            row["enterprise_organization_id"] = subject_id
+                            resolved[text_id(row.get("advertiser_id"))] = row
+                        evidence["subjects"].append(
+                            {
+                                "subject_id": subject_id,
+                                "role": role,
+                                "resolved": len(rows),
+                                "type": "enterprise",
+                                "account_source": "QIANCHUAN",
+                            }
+                        )
+                    except Exception as exc:
+                        evidence["complete"] = False
+                        evidence["subjects"].append(
+                            {
+                                "subject_id": subject_id,
+                                "role": role,
+                                "resolved": 0,
+                                "type": "enterprise",
+                                "account_source": "QIANCHUAN",
+                                "error": str(exc),
+                            }
+                        )
+                    continue
                 is_final_advertiser = "ADVERTISER" in role and not any(
                     marker in role for marker in ("OPERATOR", "ENTERPRISE", "AGENT", "BP")
                 )

@@ -383,6 +383,7 @@ class QianchuanOpenApiClient:
         # array for the endpoint's primary result set.
         for key in (
             "adv_id_list",
+            "account_list",
             "ad_list",
             "material_list",
             "product_list",

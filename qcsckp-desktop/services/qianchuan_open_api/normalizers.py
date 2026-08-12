@@ -60,13 +60,32 @@ def _id_list(value: Any, *keys: str) -> list[str]:
 
 def normalize_account(row: Mapping[str, Any]) -> dict[str, Any]:
     advertiser_id = text_id(
-        first(row, "advertiser_id", "advertiserId", "adv_id", "aavid", "id")
+        first(
+            row,
+            "advertiser_id",
+            "advertiserId",
+            "adv_id",
+            "account_id",
+            "aavid",
+            "id",
+        )
     )
     return {
         "aavid": advertiser_id,
         "advertiser_id": advertiser_id,
-        "advertiser_name": str(first(row, "advertiser_name", "advertiserName", "adv_name", "name")).strip(),
-        "role": str(first(row, "role", "advertiser_role", "account_role")).strip(),
+        "advertiser_name": str(
+            first(
+                row,
+                "advertiser_name",
+                "advertiserName",
+                "adv_name",
+                "account_name",
+                "name",
+            )
+        ).strip(),
+        "role": str(
+            first(row, "role", "advertiser_role", "account_role", "account_type")
+        ).strip(),
         "shop_id": text_id(first(row, "shop_id", "shopId")),
         "status": str(first(row, "status", "advertiser_status", default="available")).strip(),
         "raw": dict(row),

@@ -243,6 +243,7 @@ class OfficialApiBackendTests(unittest.TestCase):
     def test_real_oceanengine_collection_keys_are_extracted(self):
         cases = {
             "adv_id_list": [{"adv_id": "123"}],
+            "account_list": [{"account_id": "234"}],
             "ad_list": [{"ad_id": "456"}],
             "material_list": [{"material_id": "789"}],
             "product_list": [{"product_id": "321"}],
@@ -266,7 +267,7 @@ class OfficialApiBackendTests(unittest.TestCase):
             data["adv_id_list"],
         )
 
-    def test_enterprise_operator_is_not_exposed_as_final_advertiser(self):
+    def test_enterprise_operator_is_expanded_to_qianchuan_accounts(self):
         service = QianchuanOfficialApiService(_CaptureClient())
         with patch.object(
             service,
@@ -279,12 +280,37 @@ class OfficialApiBackendTests(unittest.TestCase):
                     "shop_id": "",
                 }
             ],
+        ), patch.object(
+            service,
+            "list_enterprise_advertisers",
+            return_value=[
+                {
+                    "advertiser_id": "1854823495704009",
+                    "advertiser_name": "企业下千川账户",
+                    "role": "QIANCHUAN",
+                }
+            ],
         ):
             rows, evidence = service.list_business_accounts()
-        self.assertEqual([], rows)
+        self.assertEqual(["1854823495704009"], [row["advertiser_id"] for row in rows])
         self.assertTrue(evidence["complete"])
-        self.assertEqual("unsupported_subject", evidence["subjects"][0]["type"])
-        self.assertTrue(evidence["subjects"][0]["ignored"])
+        self.assertEqual("enterprise", evidence["subjects"][0]["type"])
+        self.assertEqual(1, evidence["subjects"][0]["resolved"])
+
+    def test_enterprise_account_list_fields_are_normalized(self):
+        account = normalize_account(
+            {
+                "account_id": 1854823495704009,
+                "account_name": "扬-YB-6050-直播-唐造女装旗舰店-F6.0",
+                "account_type": "QIANCHUAN",
+            }
+        )
+        self.assertEqual("1854823495704009", account["advertiser_id"])
+        self.assertEqual(
+            "扬-YB-6050-直播-唐造女装旗舰店-F6.0",
+            account["advertiser_name"],
+        )
+        self.assertEqual("QIANCHUAN", account["role"])
 
     def test_api_code_40100_is_treated_as_rate_limit(self):
         client = QianchuanOpenApiClient(
