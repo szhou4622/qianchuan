@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import unittest
 from datetime import datetime
 from decimal import Decimal
@@ -23,7 +25,13 @@ from api.promotion_targets import target_eligibility
 from services.qianchuan_open_api.service import QianchuanOfficialApiService
 from services.qianchuan_open_api.token_provider import (
     AccessTokenBundle,
+    DefaultTokenProvider,
+    DpapiTokenProvider,
     InjectedTokenProvider,
+    api_configuration_status,
+    begin_api_authorization,
+    exchange_authorization_code,
+    save_api_credentials,
 )
 from services.promotion_capability import check_target_capability
 
@@ -74,6 +82,65 @@ class _PublicInfoClient(_CaptureClient):
 
 
 class OfficialApiBackendTests(unittest.TestCase):
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    def test_api_credentials_are_saved_without_plaintext_secret(self, _unprotect, _protect):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            status = save_api_credentials("1869344049893595", "secret-value", path)
+            self.assertTrue(status["configured"])
+            self.assertFalse(status["authorized"])
+            self.assertTrue(status["app_secret_saved"])
+            with open(path, "r", encoding="utf-8") as handle:
+                stored = handle.read()
+            self.assertNotIn("secret-value", stored)
+            self.assertNotIn("1869344049893595", stored)
+            self.assertNotIn("app_secret", stored)
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    def test_begin_authorization_uses_saved_app_and_random_state(self, _unprotect, _protect):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            save_api_credentials("1869344049893595", "secret-value", path)
+            first = begin_api_authorization(path)
+            second = begin_api_authorization(path)
+            self.assertIn("app_id=1869344049893595", first["url"])
+            self.assertIn("material_auth=1", first["url"])
+            self.assertNotEqual(first["url"], second["url"])
+            self.assertTrue(api_configuration_status(path)["authorization_pending"])
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    def test_saved_configuration_takes_priority_over_development_token(self, _unprotect, _protect):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"QCSCKP_OE_ACCESS_TOKEN": "old-development-token"}
+        ):
+            path = os.path.join(tmp, "official-api.json")
+            save_api_credentials("1869344049893595", "secret-value", path)
+            provider = DefaultTokenProvider()
+            provider._dpapi = DpapiTokenProvider(path)
+            with self.assertRaises(Exception):
+                provider.get_token()
+
+    @patch("services.qianchuan_open_api.token_provider.urlopen")
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    def test_authorization_callback_requires_matching_state(
+        self, _unprotect, _protect, mocked_urlopen
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            save_api_credentials("1869344049893595", "secret-value", path)
+            auth = begin_api_authorization(path)
+            state = auth["url"].split("state=", 1)[1].split("&", 1)[0]
+            with self.assertRaises(Exception):
+                exchange_authorization_code(
+                    "https://callback.invalid/?auth_code=valid-code&state=wrong",
+                    path,
+                )
+            mocked_urlopen.assert_not_called()
+
     def test_public_info_fills_missing_account_name(self):
         service = QianchuanOfficialApiService(_PublicInfoClient())
         rows = service.list_advertiser_public_info(["1782685702496260"])

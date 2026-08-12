@@ -1,23 +1,23 @@
-"""可注入的千川令牌提供器。
-
-当前不提供 App ID/App Secret 前端。联调可通过环境变量或直接注入 provider；未来
-OAuth 页面只需调用 ``save_token_bundle``，不需要修改 API 客户端。
-"""
+"""可注入的千川令牌提供器与本机 OAuth 配置存储。"""
 
 from __future__ import annotations
 
 import base64
 import json
 import os
+import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional, Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from config import QIANCHUAN_API_TOKEN_FILE, QIANCHUAN_OFFICIAL_API_BASE_URL
 from .errors import ApiTokenError, OfficialApiNotConfigured
+
+
+QIANCHUAN_OAUTH_PAGE = "https://qianchuan.jinritemai.com/openapi/qc/audit/oauth.html"
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class AccessTokenBundle:
     app_id: str = ""
     app_secret: str = ""
     expires_at: float = 0.0
+    oauth_state: str = ""
+    oauth_started_at: float = 0.0
 
     def usable(self, skew_seconds: int = 120) -> bool:
         if not self.access_token:
@@ -108,6 +110,8 @@ def _load_saved_bundle(path: str = QIANCHUAN_API_TOKEN_FILE) -> Optional[AccessT
             app_id=str(data.get("app_id") or ""),
             app_secret=str(data.get("app_secret") or ""),
             expires_at=float(data.get("expires_at") or 0),
+            oauth_state=str(data.get("oauth_state") or ""),
+            oauth_started_at=float(data.get("oauth_started_at") or 0),
         )
     except OfficialApiNotConfigured:
         raise
@@ -156,6 +160,8 @@ class DpapiTokenProvider:
             app_id=bundle.app_id,
             app_secret=bundle.app_secret,
             expires_at=time.time() + expires_in if expires_in else 0,
+            oauth_state="",
+            oauth_started_at=0,
         )
         if not refreshed.access_token:
             raise ApiTokenError("千川 Open API 刷新响应缺少 access_token")
@@ -167,7 +173,7 @@ class DpapiTokenProvider:
             bundle = _load_saved_bundle(self.path)
             if not bundle:
                 raise OfficialApiNotConfigured(
-                    "千川官方 API 尚未配置；请先注入 access_token，后续再接入 OAuth 配置页"
+                    "千川官方 API 尚未配置；请先在千川账户管理页面保存 App ID、App Secret 并完成官方授权"
                 )
             if bundle.usable() and not force_refresh:
                 return bundle
@@ -197,9 +203,162 @@ class DefaultTokenProvider:
         self._dpapi = DpapiTokenProvider()
 
     def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
+        # 用户在页面保存的 DPAPI 配置始终优先。环境变量只是未配置
+        # 本机文件时的开发联调后备，避免用户授权后仍读到旧令牌。
+        if os.path.isfile(self._dpapi.path):
+            return self._dpapi.get_token(force_refresh=force_refresh)
         if str(os.getenv("QCSCKP_OE_ACCESS_TOKEN") or "").strip():
             return self._env.get_token(force_refresh=force_refresh)
         return self._dpapi.get_token(force_refresh=force_refresh)
+
+
+def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, Any]:
+    """返回可向前端展示的脱敏状态，绝不返回 secret 或 token。"""
+    bundle = _load_saved_bundle(path)
+    if bundle is None:
+        return {
+            "configured": False,
+            "authorized": False,
+            "app_id": "",
+            "app_secret_saved": False,
+            "authorization_pending": False,
+            "expires_at": 0,
+        }
+    return {
+        "configured": bool(bundle.app_id and bundle.app_secret),
+        "authorized": bool(bundle.usable()),
+        "app_id": bundle.app_id,
+        "app_secret_saved": bool(bundle.app_secret),
+        "authorization_pending": bool(
+            bundle.oauth_state
+            and bundle.oauth_started_at
+            and time.time() - bundle.oauth_started_at <= 10 * 60
+        ),
+        "expires_at": bundle.expires_at,
+    }
+
+
+def save_api_credentials(
+    app_id: Any,
+    app_secret: Any,
+    path: str = QIANCHUAN_API_TOKEN_FILE,
+) -> dict[str, Any]:
+    aid = str(app_id or "").strip()
+    secret = str(app_secret or "").strip()
+    if not aid.isdigit() or len(aid) < 6:
+        raise ValueError("App ID 格式不正确")
+    existing = _load_saved_bundle(path)
+    if not secret and existing and existing.app_id == aid:
+        secret = existing.app_secret
+    if len(secret) < 6:
+        raise ValueError("请输入 App Secret")
+    same_credentials = bool(
+        existing and existing.app_id == aid and existing.app_secret == secret
+    )
+    save_token_bundle(
+        AccessTokenBundle(
+            access_token=existing.access_token if same_credentials else "",
+            refresh_token=existing.refresh_token if same_credentials else "",
+            app_id=aid,
+            app_secret=secret,
+            expires_at=existing.expires_at if same_credentials else 0,
+        ),
+        path,
+    )
+    return api_configuration_status(path)
+
+
+def begin_api_authorization(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, Any]:
+    bundle = _load_saved_bundle(path)
+    if not bundle or not bundle.app_id or not bundle.app_secret:
+        raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
+    state = secrets.token_urlsafe(24)
+    started = time.time()
+    save_token_bundle(
+        AccessTokenBundle(
+            access_token=bundle.access_token,
+            refresh_token=bundle.refresh_token,
+            app_id=bundle.app_id,
+            app_secret=bundle.app_secret,
+            expires_at=bundle.expires_at,
+            oauth_state=state,
+            oauth_started_at=started,
+        ),
+        path,
+    )
+    return {
+        "url": QIANCHUAN_OAUTH_PAGE
+        + "?"
+        + urlencode({"app_id": bundle.app_id, "state": state, "material_auth": "1"}),
+        "started_at": started,
+    }
+
+
+def exchange_authorization_code(
+    authorization_callback: Any,
+    path: str = QIANCHUAN_API_TOKEN_FILE,
+) -> AccessTokenBundle:
+    callback = str(authorization_callback or "").strip()
+    query = urlparse(callback).query if "://" in callback else callback.lstrip("?")
+    params = parse_qs(query, keep_blank_values=True)
+    code = str((params.get("auth_code") or [""])[0]).strip()
+    returned_state = str((params.get("state") or [""])[0]).strip()
+    if not code or len(code) < 6 or not returned_state:
+        raise ValueError("请粘贴包含 auth_code 和 state 的完整授权回调地址")
+    bundle = _load_saved_bundle(path)
+    if not bundle or not bundle.app_id or not bundle.app_secret:
+        raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
+    if (
+        not bundle.oauth_state
+        or not bundle.oauth_started_at
+        or time.time() - bundle.oauth_started_at > 10 * 60
+    ):
+        raise ApiTokenError("授权请求已过期，请重新打开官方授权页")
+    if not secrets.compare_digest(returned_state, bundle.oauth_state):
+        raise ApiTokenError("授权回调 state 校验失败，请重新授权")
+    body = urlencode(
+        {
+            "app_id": bundle.app_id,
+            "secret": bundle.app_secret,
+            "grant_type": "auth_code",
+            "auth_code": code,
+        }
+    ).encode("utf-8")
+    request = Request(
+        QIANCHUAN_OFFICIAL_API_BASE_URL + "/open_api/oauth2/access_token/",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise ApiTokenError("千川 Open API 授权码交换失败") from exc
+    if str(result.get("code") or "0") not in {"", "0"}:
+        raise ApiTokenError(
+            str(result.get("message") or "千川 Open API 授权失败"),
+            code=result.get("code"),
+            request_id=result.get("request_id"),
+        )
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    expires_in = float(data.get("expires_in") or 0)
+    authorized = AccessTokenBundle(
+        access_token=str(data.get("access_token") or ""),
+        refresh_token=str(data.get("refresh_token") or ""),
+        app_id=bundle.app_id,
+        app_secret=bundle.app_secret,
+        expires_at=time.time() + expires_in if expires_in else 0,
+    )
+    if not authorized.access_token or not authorized.refresh_token:
+        raise ApiTokenError("千川 Open API 授权响应缺少令牌")
+    save_token_bundle(authorized, path)
+    return authorized
+
+
+def clear_api_configuration(path: str = QIANCHUAN_API_TOKEN_FILE) -> None:
+    if os.path.isfile(path):
+        os.remove(path)
 
 
 _DEFAULT_PROVIDER: Optional[DefaultTokenProvider] = None

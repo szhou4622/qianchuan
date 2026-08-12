@@ -16,6 +16,7 @@
     .metric,.card{background:#101b2d;border:1px solid #26364e;border-radius:14px}.metric{padding:14px}
     .metric .label{color:#8295ae;font-size:11px}.metric .value{margin-top:6px;color:#f8fafc;font-weight:700;font-size:17px}.metric .hint{margin-top:5px;color:#71839b;font-size:10px;line-height:1.5}
     .notice{display:none;padding:11px 14px;margin-bottom:14px;border:1px solid #1d4ed866;background:#17255466;color:#bfdbfe;border-radius:10px;font-size:12px}.notice.show{display:block}
+    .api-config{display:none;margin-bottom:14px;padding:16px;background:#101b2d;border:1px solid #1d4ed8;border-radius:14px}.api-config.show{display:block}.api-config-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.api-config h2{margin:0;font-size:15px;color:#f8fafc}.api-config p{margin:6px 0 0;color:#8295ae;font-size:11px;line-height:1.6}.api-state{font-size:11px;color:#fbbf24;white-space:nowrap}.api-state.ok{color:#86efac}.api-config-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.api-field label{display:block;margin-bottom:5px;color:#9fb0c6;font-size:11px}.api-field input{width:100%;min-height:38px;padding:0 11px;border:1px solid #334155;border-radius:8px;background:#08111f;color:#e2e8f0}.api-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}.api-actions .danger-link{margin-left:auto;background:transparent;color:#fda4af}.api-help{margin-top:10px;color:#71839b;font-size:10px;line-height:1.6}
     .onboarding{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-bottom:14px}.step{padding:10px;border:1px solid #26364e;border-radius:10px;background:#0b1627;color:#8295ae;font-size:11px}.step.done{border-color:#166534;color:#86efac}.step.warn{border-color:#92400e;color:#fbbf24}.step.bad{border-color:#be123c;color:#fda4af}
     .toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.toolbar .spacer{flex:1}.toggle-line{display:flex;align-items:center;gap:8px;color:#a8b6c9;font-size:12px}
     input[type=checkbox]{accent-color:#0ea5e9}.accounts{display:grid;gap:14px}.card{height:620px;padding:17px;display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}.card.off{opacity:.78}
@@ -31,7 +32,7 @@
     .plan-name{color:#e2e8f0;font-size:12px;font-weight:600;word-break:break-all}.plan-meta{margin-top:4px;color:#71839b;font-size:10px;line-height:1.55}.plan-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.plan-actions button{height:28px;min-height:28px;padding:0 9px;font-size:10px}.plan-state{white-space:nowrap;font-size:10px}.plan-state.wait{color:#fbbf24}.plan-state.late{color:#fda4af}.plan-state.active{color:#86efac}
     .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.actions [data-save].pending{background:#0284c7;color:#fff;box-shadow:0 0 0 2px #38bdf833}.danger{background:#7f1d1d;color:#fecaca}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
     @media(max-width:1050px){.head{flex-direction:column;gap:14px}.head-actions{width:100%;flex-basis:auto}}
-    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.card{height:auto;min-height:620px;overflow:visible}.panel{min-height:260px}.plans{max-height:480px}}
+    @media(max-width:900px){.summary{grid-template-columns:repeat(2,1fr)}.onboarding{grid-template-columns:1fr}.account-grid{grid-template-columns:1fr}.api-config-grid{grid-template-columns:1fr}.card{height:auto;min-height:620px;overflow:visible}.panel{min-height:260px}.plans{max-height:480px}}
     @media(max-width:560px){.head-actions{grid-template-columns:1fr}}
   </style>
 </head>
@@ -40,22 +41,31 @@
   <div class="head">
     <div class="head-copy">
       <h1>千川账户管理</h1>
-      <div class="sub">所有账户共用当前千川登录会话。工具不会自动导入全部授权账户；请一次选择并添加一个当前账户，之后只刷新已添加账户的计划。</div>
+      <div class="sub">先配置千川官方 API 并完成授权，再从授权账户列表中选择需要管理的账户；工具只同步已添加账户的计划。</div>
     </div>
     <div class="head-actions" aria-label="千川账户操作">
       <button class="primary" id="addAccount">选择并添加账户</button>
       <button class="secondary" id="discover">刷新全部账户计划</button>
-      <button class="secondary" id="relogin">打开Chrome重新登录/核验</button>
-      <button class="diagnostic" id="diagnostics" title="仅在采集、浏览器或推送异常时使用">故障诊断</button>
+      <button class="secondary" id="relogin">重新进行API授权</button>
+      <button class="diagnostic" id="diagnostics" title="仅在API、采集或推送异常时使用">故障诊断</button>
       <div class="head-action-status" id="catalogActionStatus" role="status" aria-live="polite"></div>
     </div>
   </div>
+  <section class="api-config" id="apiConfig">
+    <div class="api-config-head"><div><h2>千川官方 API 配置</h2><p>先配置应用并完成官方授权，再选择要添加的千川账户。配置只保存在本机。</p></div><div class="api-state" id="apiState">读取中</div></div>
+    <div class="api-config-grid">
+      <div class="api-field"><label for="oeAppId">App ID</label><input id="oeAppId" inputmode="numeric" autocomplete="off" placeholder="请输入巨量引擎开放平台 App ID"></div>
+      <div class="api-field"><label for="oeAppSecret">App Secret</label><input id="oeAppSecret" type="password" autocomplete="new-password" placeholder="已保存时可留空；不会回显明文"></div>
+    </div>
+    <div class="api-actions"><button id="saveApiConfig">保存配置</button><button class="primary" id="authorizeApi">打开官方授权页</button><button id="finishApiAuth">粘贴回调地址完成授权</button><button class="danger-link" id="clearApiConfig">清除本机配置</button></div>
+    <div class="api-help">授权完成后复制浏览器地址栏中的完整回调地址，再点击“粘贴回调地址完成授权”。工具会校验 auth_code 和 state，且不会把 App Secret、回调地址或令牌写入日志。</div>
+  </section>
   <div class="onboarding" id="onboarding"></div>
   <div class="summary">
-    <div class="metric"><div class="label">千川主登录会话</div><div class="value" id="sessionValue">读取中</div><div class="hint" id="sessionHint">—</div></div>
+    <div class="metric"><div class="label">千川API授权状态</div><div class="value" id="sessionValue">读取中</div><div class="hint" id="sessionHint">—</div></div>
     <div class="metric"><div class="label">监控容量</div><div class="value" id="capacityValue">—</div><div class="hint" id="capacityHint">—</div></div>
     <div class="metric"><div class="label">监控时效</div><div class="value" id="lagValue">—</div><div class="hint">目标5分钟采集；超过10分钟会明确告警</div></div>
-    <div class="metric"><div class="label">共享浏览器队列</div><div class="value" id="queueValue">—</div><div class="hint">追投 ＞ 停投 ＞ 采集 ＞ 日志同步</div></div>
+    <div class="metric"><div class="label">官方API后台队列</div><div class="value" id="queueValue">—</div><div class="hint">追投 ＞ 停投 ＞ 采集 ＞ 日志同步</div></div>
   </div>
   <div class="notice" id="notice"></div>
   <div class="toolbar">
@@ -66,7 +76,7 @@
     <button id="refresh" title="只重新读取本地数据，不访问千川后台">刷新页面显示</button>
   </div>
   <div class="accounts" id="accounts"></div>
-  <div class="empty" id="empty">尚未添加千川账户。请先完成登录，再点击“选择并添加当前账户”，在Chrome中切换账户并打开任意一条计划详情。</div>
+  <div class="empty" id="empty">尚未添加千川账户。请先在上方保存 App ID、App Secret 并完成官方授权，再点击“选择并添加账户”。</div>
 </main>
 <script>
   const $=id=>document.getElementById(id);
@@ -85,6 +95,56 @@
   const groupDefs=[['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['unknown','all','待确认/其他']];
   let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null;
   const savingAccounts=new Set();
+
+  async function loadApiConfig(){
+    const a=await waitApi();
+    if(!a?.getQianchuanOfficialApiConfig)return null;
+    let r;
+    try{r=await a.getQianchuanOfficialApiConfig()}catch(e){r={success:false,message:String(e?.message||e)}}
+    $('apiConfig').classList.add('show');
+    if(r?.app_id)$('oeAppId').value=String(r.app_id);
+    $('oeAppSecret').value='';
+    $('oeAppSecret').placeholder=r?.app_secret_saved?'已加密保存；不修改请留空':'请输入 App Secret';
+    $('apiState').textContent=!r?.success?'配置读取失败':r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
+    $('apiState').classList.toggle('ok',!!r?.authorized);
+    $('authorizeApi').disabled=!r?.configured;
+    $('finishApiAuth').disabled=!r?.configured;
+    $('addAccount').disabled=!r?.authorized;
+    return r;
+  }
+
+  async function saveApiConfig(){
+    const a=await waitApi();$('saveApiConfig').disabled=true;
+    try{
+      const r=await a.saveQianchuanOfficialApiConfig({app_id:$('oeAppId').value.trim(),app_secret:$('oeAppSecret').value});
+      message(r?.message||'保存 API 配置失败',!r?.success);
+      if(r?.success)await loadApiConfig();
+    }finally{$('saveApiConfig').disabled=false}
+  }
+
+  async function authorizeApi(){
+    const a=await waitApi();$('authorizeApi').disabled=true;
+    try{const r=await a.startQianchuanOfficialApiAuthorization();message(r?.message||'打开官方授权页失败',!r?.success)}
+    finally{await loadApiConfig()}
+  }
+
+  async function finishApiAuth(){
+    const callback=window.prompt('请粘贴千川授权完成后浏览器地址栏中的完整回调地址：','');
+    if(callback===null)return;
+    const a=await waitApi();$('finishApiAuth').disabled=true;
+    try{
+      const r=await a.finishQianchuanOfficialApiAuthorization(String(callback||'').trim());
+      message(r?.message||'完成 API 授权失败',!r?.success);
+      if(r?.success)await load();
+    }finally{await loadApiConfig()}
+  }
+
+  async function clearApiConfig(){
+    if(!window.confirm('确定清除本机的 App ID、App Secret 和授权令牌吗？'))return;
+    const a=await waitApi();const r=await a.clearQianchuanOfficialApiConfig();
+    message(r?.message||'清除 API 配置失败',!r?.success);
+    $('oeAppId').value='';$('oeAppSecret').value='';await loadApiConfig();await load();
+  }
 
   function filteredPlans(plans){
     const query=($('planSearch')?.value||'').trim().toLowerCase();
@@ -126,8 +186,9 @@
     latest=data;
     dirty=false;
     const session=data.session||{};
-    $('sessionValue').textContent=session.available?(session.status==='login_required'?'需要重新登录':'已登录'):'未登录';
-    $('sessionHint').textContent=(session.encrypted?'Cookie已用Windows DPAPI加密':'尚未完成加密迁移')+(session.updated_at?' · '+session.updated_at:'')+(session.last_error?' · '+session.last_error:'');
+    const officialApiSession=session.source==='qianchuan_open_api';
+    $('sessionValue').textContent=officialApiSession?(session.available?'已授权':'需要授权'):(session.available?(session.status==='login_required'?'需要重新登录':'已登录'):'未登录');
+    $('sessionHint').textContent=officialApiSession?('App Secret与令牌使用Windows DPAPI加密保存在本机'+(session.last_error?' · '+session.last_error:'')):((session.encrypted?'Cookie已用Windows DPAPI加密':'尚未完成加密迁移')+(session.updated_at?' · '+session.updated_at:'')+(session.last_error?' · '+session.last_error:''));
     const capacity=data.capacity||{};
     $('capacityValue').textContent=`${capacity.active_count||0} 正常 / ${capacity.waiting_count||0} 容量等待 / ${capacity.disabled_count||0} 未启用或不可用`;
     $('capacityHint').textContent=`容量只统计已核验且已勾选计划；预计一轮 ${capacity.estimated_cycle_seconds||0} 秒，预算 ${capacity.capacity_window_seconds||540} 秒`;
@@ -139,7 +200,7 @@
     const catalog=data.catalog||{};
     const loginFailed=session.status==='login_required'||catalog.failure_kind==='login_required';
     const steps=[
-      {done:progress.qianchuan_login,bad:loginFailed,label:'1. 千川登录',hint:loginFailed?'需要在可见Chrome重新登录':''},
+      {done:progress.qianchuan_login,bad:loginFailed,label:'1. 千川API配置与授权',hint:loginFailed?'请在上方重新完成官方API授权':''},
       {done:progress.catalog_complete,bad:loginFailed||catalog.status==='error',warn:progress.catalog_attempted&&!progress.catalog_complete,label:'2. 账户与计划目录',hint:progress.catalog_complete?'目录完整':progress.catalog_attempted?'同步未完成':'尚未同步'},
       {done:progress.feishu_bound,label:'3. 飞书长连接与绑定'},
       {done:progress.plans_selected,warn:!progress.plans_selected&&progress.catalog_attempted,label:'4. 路由与监控计划',hint:!progress.plans_selected&&progress.catalog_attempted?'暂无可执行计划':''},
@@ -151,7 +212,7 @@
     const accounts=data.accounts||[];
     const daily=data.daily_report?.config||{};
     if(loginFailed){
-      message((catalog.error||session.last_error||'千川登录状态已失效')+'；请点击“打开Chrome重新登录/核验”。',true);
+      message((catalog.error||session.last_error||'千川官方API授权已失效')+'；请在上方重新完成API授权。',true);
     }else if(catalog.status==='error'){
       message(catalog.error||catalog.message||'账户计划目录同步失败',true);
     }else if(accounts.some(acc=>!!acc.report_enabled)&&!daily.enabled){
@@ -253,7 +314,7 @@
     if(loadInFlight)return await loadInFlight;
     loadInFlight=(async()=>{
       const a=await waitApi();if(!a){message('工具接口尚未就绪',true);return null}
-      const r=await a.getQianchuanAccountOverview();if(!r?.success){message(r?.message||'读取账户失败',true);return null}render(r);return r;
+      const r=await a.getQianchuanAccountOverview();if(!r?.success){message(r?.message||'读取账户失败',true);return null}render(r);await loadApiConfig();return r;
     })();
     try{return await loadInFlight}finally{loadInFlight=null}
   }
@@ -362,7 +423,7 @@
     button.disabled=true;button.textContent='正在提交刷新…';showStatus('正在创建只读刷新任务，不会提交任何千川操作。');
     try{r=await a.startQianchuanCatalogSync(accountUid||null)}catch(e){r={success:false,message:String(e?.message||e)}}
     if(!r?.success){button.disabled=false;button.textContent=idleText;showStatus(r?.message||'刷新任务启动失败','bad');message(r?.message||'刷新任务启动失败',true);return}
-    showStatus('刷新任务已进入共享浏览器队列；已排队，等待采集结束');
+    showStatus('刷新任务已进入官方API后台队列；已排队，等待采集结束（仅执行官方API只读同步）');
     stopCatalogWatch();
     await watchCatalogSync({
       accountUid:String(accountUid||''),
@@ -473,7 +534,9 @@
     },1000);
   }
   $('diagnostics').onclick=()=>{window.location.href='control.html'};
-  $('relogin').onclick=relogin;$('addAccount').onclick=addAccount;$('discover').onclick=()=>discover('',$('discover'));$('refresh').onclick=reloadDisplay;
+  $('relogin').textContent='重新进行API授权';
+  $('relogin').onclick=authorizeApi;$('addAccount').onclick=addAccount;$('discover').onclick=()=>discover('',$('discover'));$('refresh').onclick=reloadDisplay;
+  $('saveApiConfig').onclick=saveApiConfig;$('authorizeApi').onclick=authorizeApi;$('finishApiAuth').onclick=finishApiAuth;$('clearApiConfig').onclick=clearApiConfig;
   function rerenderCatalogFilter(){
     if(dirty){
       message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);
@@ -486,7 +549,7 @@
   $('autostart').onchange=async()=>{const a=await waitApi();const r=await a.setWindowsAutostart($('autostart').checked);message(r?.message||($('autostart').checked?'开机自启已开启':'开机自启已关闭'),!r?.success);if(!r?.success)$('autostart').checked=!$('autostart').checked};
   window.addEventListener('focus',async()=>{if(!dirty)await load();await resumeCatalogWatch()});
   document.addEventListener('visibilitychange',async()=>{if(!document.hidden){if(!dirty)await load();await resumeCatalogWatch()}});
-  load().then(resumeCatalogWatch);setInterval(()=>{if(!dirty&&!catalogWatchBusy&&!document.hidden)load()},60000);
+  loadApiConfig();load().then(resumeCatalogWatch);setInterval(()=>{if(!dirty&&!catalogWatchBusy&&!document.hidden)load()},60000);
 </script>
 </body>
 </html>

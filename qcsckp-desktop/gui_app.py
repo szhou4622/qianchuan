@@ -721,6 +721,21 @@ class JSApi:
     def addOfficialApiQianchuanAccount(self, aavid=None):
         return self.api.addOfficialApiQianchuanAccount(aavid)
 
+    def getQianchuanOfficialApiConfig(self):
+        return self.api.getQianchuanOfficialApiConfig()
+
+    def saveQianchuanOfficialApiConfig(self, config=None):
+        return self.api.saveQianchuanOfficialApiConfig(config)
+
+    def startQianchuanOfficialApiAuthorization(self):
+        return self.api.startQianchuanOfficialApiAuthorization()
+
+    def finishQianchuanOfficialApiAuthorization(self, authCode=None):
+        return self.api.finishQianchuanOfficialApiAuthorization(authCode)
+
+    def clearQianchuanOfficialApiConfig(self):
+        return self.api.clearQianchuanOfficialApiConfig()
+
     def startQianchuanCatalogSync(self, accountUid=None):
         return self.api.startQianchuanCatalogSync(accountUid)
 

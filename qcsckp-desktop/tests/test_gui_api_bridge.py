@@ -26,6 +26,11 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.startPromotionTargetDiscovery.return_value = {"success": True}
         self.core.startQianchuanAccountSelection.return_value = {"success": True}
         self.core.startQianchuanRelogin.return_value = {"success": True}
+        self.core.getQianchuanOfficialApiConfig.return_value = {"success": True}
+        self.core.saveQianchuanOfficialApiConfig.return_value = {"success": True}
+        self.core.startQianchuanOfficialApiAuthorization.return_value = {"success": True}
+        self.core.finishQianchuanOfficialApiAuthorization.return_value = {"success": True}
+        self.core.clearQianchuanOfficialApiConfig.return_value = {"success": True}
         self.core.getPromotionTargetDiscoveryStatus.return_value = {"running": False}
 
         self.assertEqual(
@@ -72,6 +77,17 @@ class JSApiBridgeTests(unittest.TestCase):
             self.bridge.startQianchuanRelogin(),
             {"success": True},
         )
+        self.assertTrue(self.bridge.getQianchuanOfficialApiConfig()["success"])
+        self.assertTrue(
+            self.bridge.saveQianchuanOfficialApiConfig(
+                {"app_id": "123456", "app_secret": "secret-value"}
+            )["success"]
+        )
+        self.assertTrue(self.bridge.startQianchuanOfficialApiAuthorization()["success"])
+        self.assertTrue(
+            self.bridge.finishQianchuanOfficialApiAuthorization("auth-code")["success"]
+        )
+        self.assertTrue(self.bridge.clearQianchuanOfficialApiConfig()["success"])
         self.assertEqual(
             self.bridge.getPromotionTargetDiscoveryStatus(),
             {"running": False},
@@ -98,6 +114,15 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.startPromotionTargetDiscovery.assert_called_once_with()
         self.core.startQianchuanAccountSelection.assert_called_once_with()
         self.core.startQianchuanRelogin.assert_called_once_with()
+        self.core.getQianchuanOfficialApiConfig.assert_called_once_with()
+        self.core.saveQianchuanOfficialApiConfig.assert_called_once_with(
+            {"app_id": "123456", "app_secret": "secret-value"}
+        )
+        self.core.startQianchuanOfficialApiAuthorization.assert_called_once_with()
+        self.core.finishQianchuanOfficialApiAuthorization.assert_called_once_with(
+            "auth-code"
+        )
+        self.core.clearQianchuanOfficialApiConfig.assert_called_once_with()
         self.core.getPromotionTargetDiscoveryStatus.assert_called_once_with()
 
     def test_operation_daily_report_methods_are_exposed_and_forwarded(self):

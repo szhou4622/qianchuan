@@ -708,15 +708,42 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    def getQianchuanOfficialApiConfig(self):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import get_configuration
+        return get_configuration()
+
+    def saveQianchuanOfficialApiConfig(self, config=None):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import save_configuration
+        payload = config if isinstance(config, dict) else {}
+        return save_configuration(payload.get("app_id"), payload.get("app_secret"))
+
+    def startQianchuanOfficialApiAuthorization(self):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import start_authorization
+        return start_authorization()
+
+    def finishQianchuanOfficialApiAuthorization(self, authCode=None):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import finish_authorization
+        return finish_authorization(authCode)
+
+    def clearQianchuanOfficialApiConfig(self):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import disconnect_configuration
+        return disconnect_configuration()
+
     def startQianchuanRelogin(self):
         try:
             if QIANCHUAN_BACKEND == "official_api":
-                return {
-                    "success": False,
-                    "backend": "official_api",
-                    "code": "oauth_ui_pending",
-                    "message": "当前版本已切换官方 API；App ID/App Secret 与 OAuth 授权页面按约定暂未开发",
-                }
+                from services.qianchuan_open_api.configuration import start_authorization
+                return start_authorization()
             return self.service.start_target_discovery(login_only=True)
         except Exception as e:
             return {"success": False, "message": str(e)}
