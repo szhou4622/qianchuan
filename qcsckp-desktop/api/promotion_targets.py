@@ -29,6 +29,7 @@ ALLOWED_VERIFICATION_STATES = frozenset(
 ACTIVE_PLATFORM_STATUSES = frozenset(
     {"active", "enabled", "delivering", "learning", "running"}
 )
+WAITING_LIVE_PLATFORM_STATUS = "waiting_live"
 
 
 def normalize_platform_status(value: Any) -> str:
@@ -81,12 +82,16 @@ def target_eligibility(
         reasons.append("推广方式待确认")
     if system not in {"global", "chengfang"}:
         reasons.append("计划体系待确认")
-    if status not in ACTIVE_PLATFORM_STATUSES:
+    monitorable = status in ACTIVE_PLATFORM_STATUSES or (
+        scene == "live" and status == WAITING_LIVE_PLATFORM_STATUS
+    )
+    if not monitorable:
         if status == "unknown":
             reasons.append("平台状态待确认")
         else:
             reasons.append(f"平台状态为{status}，不可参与自动化")
     monitor = not reasons
+    action_ready = monitor and status in ACTIVE_PLATFORM_STATUSES
     cap = capability if isinstance(capability, dict) else {}
     from services.promotion_capability import capability_is_required
 
@@ -113,8 +118,8 @@ def target_eligibility(
         "platform_status": status,
         "verification_state": verification,
         "monitor_eligible": monitor,
-        "retarget_eligible": monitor and retarget_capable,
-        "stop_eligible": monitor and stop_capable,
+        "retarget_eligible": action_ready and retarget_capable,
+        "stop_eligible": action_ready and stop_capable,
         "ineligible_reason": "；".join(reasons),
     }
 

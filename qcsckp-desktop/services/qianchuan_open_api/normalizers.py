@@ -94,9 +94,11 @@ def normalize_account(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def normalize_plan_system(value: Any) -> str:
     raw = str(value or "").strip().upper()
-    if raw == "OVERALL_PROJECT" or "CHENGFANG" in raw:
+    # The list endpoint returns enum strings while detail currently returns
+    # numeric evidence (1=OVERALL_PROJECT, 0=UNI_PROJECT).
+    if raw in {"1", "OVERALL_PROJECT"} or "CHENGFANG" in raw:
         return "chengfang"
-    if raw == "UNI_PROJECT" or raw in {"GLOBAL", "UNI"}:
+    if raw in {"0", "UNI_PROJECT", "GLOBAL", "UNI"}:
         return "global"
     return "unknown"
 
@@ -152,6 +154,22 @@ def normalize_platform_status(value: Any) -> str:
     return "unknown"
 
 
+def normalize_plan_platform_status(row: Mapping[str, Any]) -> str:
+    """Normalize effective status without confusing an offline room with a paused plan.
+
+    Qianchuan can return ``status=LIVE_ROOM_OFF`` while ``opt_status=ENABLE``.
+    The source plan is still enabled in that combination and may be monitored
+    before the room starts, but it is not yet eligible for a write action.
+    """
+    status = first(row, "status", "delivery_status", "ad_status")
+    opt_status = first(row, "opt_status", "optStatus")
+    if str(status or "").strip().upper() == "LIVE_ROOM_OFF":
+        if normalize_platform_status(opt_status) == "active":
+            return "waiting_live"
+        return "paused"
+    return normalize_platform_status(status or opt_status)
+
+
 def normalize_plan(row: Mapping[str, Any], *, advertiser_id: Any = "") -> dict[str, Any]:
     # The live list endpoint wraps the plan under ``ad_info`` while detail
     # returns a flat object.  Prefer the explicit wrapper so generic nested
@@ -168,7 +186,7 @@ def normalize_plan(row: Mapping[str, Any], *, advertiser_id: Any = "") -> dict[s
         "adlab_scene": adlab_scene,
         "promotion_scene": normalize_promotion_scene(marketing_goal),
         "plan_system": normalize_plan_system(adlab_scene),
-        "platform_status": normalize_platform_status(first(plan_row, "status", "opt_status", "delivery_status", "ad_status")),
+        "platform_status": normalize_plan_platform_status(plan_row),
         "create_time": str(first(plan_row, "create_time", "createTime")).strip(),
         "modify_time": str(first(plan_row, "modify_time", "modifyTime", "update_time")).strip(),
         "raw": dict(row),

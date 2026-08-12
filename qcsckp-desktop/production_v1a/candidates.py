@@ -553,15 +553,33 @@ class CandidateService:
                 "metrics": metrics_snapshot,
             }
         )
-        existing = self.database.query_one(
+        frozen_material_json = json.dumps(
+            material_snapshot, ensure_ascii=False, sort_keys=True
+        )
+        frozen_metrics_json = json.dumps(
+            metrics_snapshot, ensure_ascii=False, sort_keys=True
+        )
+        # 采集时间会每轮变化，但不能仅因 observed_at_utc 不同就重复发卡。
+        # 保留完整冻结快照供审计，去重时只比较业务指标。
+        def semantic_metrics(payload: str) -> dict[str, Any]:
+            values = json.loads(payload or "{}")
+            for item in values.values():
+                if isinstance(item, dict):
+                    item.pop("observed_at_utc", None)
+            return values
+
+        semantic_current = semantic_metrics(frozen_metrics_json)
+        existing = None
+        existing_rows = self.database.query_all(
             """
             SELECT candidate_batch_id, status, terminal_at, candidate_fingerprint
+                 , metrics_snapshot_json
             FROM candidate_batch
             WHERE tool_user_id=? AND aavid=? AND target_uid=?
               AND strategy_id=? AND strategy_version=?
               AND business_date=?
-              AND material_snapshot_json=? AND metrics_snapshot_json=?
-            ORDER BY created_at DESC LIMIT 1
+              AND material_snapshot_json=?
+            ORDER BY created_at DESC
             """,
             (
                 tool_user_id,
@@ -570,10 +588,13 @@ class CandidateService:
                 strategy["strategy_id"],
                 strategy["version"],
                 business_date(now),
-                json.dumps(material_snapshot, ensure_ascii=False, sort_keys=True),
-                json.dumps(metrics_snapshot, ensure_ascii=False, sort_keys=True),
+                frozen_material_json,
             ),
         )
+        for row in existing_rows:
+            if semantic_metrics(str(row["metrics_snapshot_json"] or "{}")) == semantic_current:
+                existing = row
+                break
         if existing:
             terminal_at = existing.get("terminal_at")
             if not terminal_at:
@@ -610,8 +631,8 @@ class CandidateService:
                 strategy["version"],
                 business_date(now),
                 fingerprint,
-                json.dumps(material_snapshot, ensure_ascii=False, sort_keys=True),
-                json.dumps(metrics_snapshot, ensure_ascii=False, sort_keys=True),
+                frozen_material_json,
+                frozen_metrics_json,
                 expires,
                 now_iso,
                 now_iso,

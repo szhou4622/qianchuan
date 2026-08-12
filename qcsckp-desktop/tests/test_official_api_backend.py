@@ -19,6 +19,7 @@ from services.qianchuan_open_api.normalizers import (
     normalize_plan,
     stable_material_set,
 )
+from api.promotion_targets import target_eligibility
 from services.qianchuan_open_api.service import QianchuanOfficialApiService
 from services.qianchuan_open_api.token_provider import (
     AccessTokenBundle,
@@ -402,6 +403,24 @@ class OfficialApiBackendTests(unittest.TestCase):
                 )
                 self.assertEqual((plan["plan_system"], plan["promotion_scene"]), expected)
 
+    def test_numeric_detail_scene_matches_official_list_scene(self):
+        matrix = {
+            (1, "LIVE_PROM_GOODS"): ("chengfang", "live"),
+            (0, "VIDEO_PROM_GOODS"): ("global", "product"),
+        }
+        for (adlab_scene, marketing_goal), expected in matrix.items():
+            with self.subTest(adlab_scene=adlab_scene):
+                plan = normalize_plan(
+                    {
+                        "ad_id": "9876543210123456789",
+                        "adlab_scene": adlab_scene,
+                        "marketing_goal": marketing_goal,
+                        "status": "DELIVERY_OK",
+                    },
+                    advertiser_id="1234567890123456789",
+                )
+                self.assertEqual(expected, (plan["plan_system"], plan["promotion_scene"]))
+
     def test_official_delivery_status_enums_drive_monitor_eligibility(self):
         expected = {
             "DELIVERY_OK": "active",
@@ -423,6 +442,42 @@ class OfficialApiBackendTests(unittest.TestCase):
                     advertiser_id="1234567890123456789",
                 )
                 self.assertEqual(normalized, plan["platform_status"])
+
+    def test_enabled_live_plan_can_be_monitored_before_broadcast(self):
+        plan = normalize_plan(
+            {
+                "ad_id": "9876543210123456789",
+                "adlab_scene": "OVERALL_PROJECT",
+                "marketing_goal": "LIVE_PROM_GOODS",
+                "status": "LIVE_ROOM_OFF",
+                "opt_status": "ENABLE",
+            },
+            advertiser_id="1234567890123456789",
+        )
+        self.assertEqual("waiting_live", plan["platform_status"])
+        eligibility = target_eligibility(
+            promotion_scene="live",
+            plan_system="chengfang",
+            platform_status=plan["platform_status"],
+            verification_state="verified",
+            capability={"retarget_supported": True, "stop_supported": True},
+        )
+        self.assertTrue(eligibility["monitor_eligible"])
+        self.assertFalse(eligibility["retarget_eligible"])
+        self.assertFalse(eligibility["stop_eligible"])
+
+    def test_disabled_offline_live_plan_stays_ineligible(self):
+        plan = normalize_plan(
+            {
+                "ad_id": "9876543210123456789",
+                "adlab_scene": "UNI_PROJECT",
+                "marketing_goal": "LIVE_PROM_GOODS",
+                "status": "LIVE_ROOM_OFF",
+                "opt_status": "DISABLE",
+            },
+            advertiser_id="1234567890123456789",
+        )
+        self.assertEqual("paused", plan["platform_status"])
 
     def test_plan_list_forwards_explicit_chengfang_scene(self):
         client = _CaptureClient()

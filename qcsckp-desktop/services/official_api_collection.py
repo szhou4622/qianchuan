@@ -17,6 +17,7 @@ from typing import Any, Iterable, Mapping, Optional
 from api.promotion_targets import (
     patch_target_sync_state,
     replace_material_product_links,
+    update_target_catalog_evidence,
     upsert_products,
 )
 from services.plan_system import normalize_plan_system
@@ -239,8 +240,20 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         raise RuntimeError("官方 API 计划详情与监控账户或计划不一致")
     if actual_scene != expected_scene or actual_system != expected_system:
         raise RuntimeError("官方 API 计划详情的推广方式或计划体系已变化")
-    if str(detail.get("platform_status") or "") not in {"active", "learning"}:
+    detail_status = str(detail.get("platform_status") or "")
+    if detail_status not in {"active", "learning", "waiting_live"}:
         raise RuntimeError("官方 API 返回的计划当前不可投放")
+    # A selected live plan may move between waiting for broadcast and live
+    # while the 5-minute collector is running. Persist that transition here so
+    # the user does not need to refresh the 30-minute catalog or save again.
+    update_target_catalog_evidence(
+        target_uid,
+        platform_status=detail_status,
+        verification_state="verified",
+        plan_system=expected_system,
+        promotion_scene=expected_scene,
+        db=store,
+    )
 
     goal = str(detail.get("marketing_goal") or "")
     units, config_response = service.get_report_config(aavid, marketing_goal=goal)
