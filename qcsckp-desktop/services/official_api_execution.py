@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import secrets
+import threading
+import time
 import traceback
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -23,8 +27,61 @@ from services.qianchuan_open_api.normalizers import (
 from services.qianchuan_open_api.runtime import get_official_api_service
 
 
+CONTROL_TASK_NAME_MAX_LENGTH = 50
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _unique_control_task_name(
+    strategy_title: Optional[str],
+    execution_uid: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> str:
+    """Build a stable, user-readable and per-execution unique task name.
+
+    Qianchuan rejects a new control task when its name is identical to a
+    historical task, including a task the user has already closed.  A Feishu
+    task UID is stable across lease recovery, so it gives retries of the same
+    local execution the same name while different confirmations cannot clash.
+    """
+    # ``now`` remains in the signature for backward compatibility with tests
+    # and callers; uniqueness is represented by a compact 8-character token.
+    _ = now or datetime.now()
+    raw_uid = str(execution_uid or "").strip()
+    if raw_uid:
+        # Parent/group task UIDs share their prefix and differ at the end, so
+        # truncating the prefix made separate groups collide.  Hash the full
+        # UID to keep retries stable while making cards and groups distinct.
+        marker = hashlib.sha256(raw_uid.encode("utf-8")).hexdigest()[:8]
+        suffix = f"-{marker}"
+    else:
+        # Callers without a durable execution UID cannot prove recovery
+        # idempotency, but still receive a per-submission unique name.
+        suffix = f"-{secrets.token_hex(4)}"
+    base = str(strategy_title or "素材追投").strip() or "素材追投"
+    return f"{base[: max(1, CONTROL_TASK_NAME_MAX_LENGTH - len(suffix))]}{suffix}"
+
+
+def _configured_control_task_base_name(
+    retargeting: Mapping[str, Any],
+    strategy_title: Optional[str],
+) -> str:
+    """Return the user-configured task name, with a safe legacy fallback.
+
+    ``task_name_suffix`` is the persisted field name kept for compatibility
+    with existing rule files and the old browser form.  In the official API
+    backend it is the user-visible base task name, not merely a cosmetic
+    suffix.  A unique execution marker is appended separately by
+    :func:`_unique_control_task_name`.
+    """
+    configured = str((retargeting or {}).get("task_name_suffix") or "").strip()
+    if configured:
+        return configured
+    legacy = str(strategy_title or "").strip()
+    return legacy or "素材追投"
 
 
 def _goal(scene: str) -> str:
@@ -86,7 +143,12 @@ def _verify_control_task(
         raise RuntimeError("官方 API 返回成功，但调控任务列表尚未查到该任务")
     if text_id(task.get("ad_id")) not in {"", text_id(ad_id)}:
         raise RuntimeError("新调控任务归属的主计划与请求不一致")
-    if str(task.get("scene") or "").upper() != "MATERIAL_ADD_BUDGET":
+    # The list endpoint is already filtered by MATERIAL_ADD_BUDGET.  Current
+    # production responses may omit ``scene`` entirely, so only reject an
+    # explicit conflicting value.  All remaining identity, material, budget
+    # and duration checks below still have to pass.
+    returned_scene = str(task.get("scene") or "").strip().upper()
+    if returned_scene and returned_scene != "MATERIAL_ADD_BUDGET":
         raise RuntimeError("新调控任务不是素材追投任务")
     if material_ids is not None:
         expected = stable_material_set(material_ids)
@@ -105,11 +167,94 @@ def _verify_control_task(
     return task
 
 
+def _verify_control_task_eventually(
+    service: Any,
+    *,
+    retry_delays: tuple[float, ...] = (1, 2, 4, 6, 8),
+    sleep: Any = time.sleep,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Reconcile a successful create response against an eventually consistent list.
+
+    The control-task create endpoint can return before the list endpoint exposes
+    the task's complete material list.  This function performs read-only
+    reconciliation only; it never resubmits the POST request.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return _verify_control_task(service, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= len(retry_delays):
+                break
+            sleep(retry_delays[attempt])
+    assert last_error is not None
+    raise last_error
+
+
+def _reconcile_created_control_task(
+    service: Any,
+    *,
+    request_uid: str,
+    task_id: str,
+    verify_kwargs: Mapping[str, Any],
+) -> None:
+    """Finish create reconciliation off the user-facing execution path."""
+    try:
+        verified_task = _verify_control_task_eventually(service, **dict(verify_kwargs))
+    except Exception as exc:
+        if request_uid:
+            OfficialApiAuditStore().mark_reconciled(
+                request_uid,
+                status="unresolved",
+                task_id=task_id,
+                response={"verification_error": str(exc)},
+            )
+        return
+    if request_uid:
+        OfficialApiAuditStore().mark_reconciled(
+            request_uid,
+            status="confirmed",
+            task_id=task_id,
+            response=verified_task,
+        )
+
+
+def _start_control_task_reconciliation(
+    service: Any,
+    *,
+    request_uid: str,
+    task_id: str,
+    verify_kwargs: Mapping[str, Any],
+) -> None:
+    """Start read-only reconciliation without delaying the Feishu result card."""
+    if request_uid:
+        OfficialApiAuditStore().mark_reconciled(
+            request_uid,
+            status="pending",
+            task_id=task_id,
+            response={"message": "调控任务已创建，等待列表同步核对"},
+        )
+    threading.Thread(
+        target=_reconcile_created_control_task,
+        kwargs={
+            "service": service,
+            "request_uid": request_uid,
+            "task_id": task_id,
+            "verify_kwargs": dict(verify_kwargs),
+        },
+        daemon=True,
+        name=f"qianchuan-control-reconcile-{task_id[-8:]}",
+    ).start()
+
+
 def _material_is_writable(item: Mapping[str, Any]) -> bool:
     status = str(item.get("material_status") or "").strip().upper()
     audit = str(item.get("audit_status") or "").strip().upper()
     positive_status = {
         "ENABLE", "ENABLED", "ACTIVE", "DELIVERY", "DELIVERING", "RUNNING",
+        "DELIVERY_OK",
         "AVAILABLE", "投放中", "可投放",
     }
     positive_audit = {
@@ -184,6 +329,7 @@ class OfficialApiRetargetingService:
         target_uid: Optional[str] = None,
         promotion_scene: str = "live",
         plan_system: str = "unknown",
+        execution_uid: Optional[str] = None,
         **_: Any,
     ) -> Any:
         from services.retargeting_service import RetargetingRunResult
@@ -191,6 +337,10 @@ class OfficialApiRetargetingService:
         service = get_official_api_service()
         mids = [text_id(value) for value in (material_ids or [material_id]) if text_id(value)]
         rdict = dict(retargeting or {})
+        control_task_name = _unique_control_task_name(
+            _configured_control_task_base_name(rdict, strategy_title),
+            execution_uid,
+        )
         try:
             await asyncio.to_thread(
                 _check_plan,
@@ -224,7 +374,7 @@ class OfficialApiRetargetingService:
                 aavid,
                 ad_id=ad_id,
                 marketing_goal=_goal(promotion_scene),
-                name=str(strategy_title or "素材追投")[:100],
+                name=control_task_name,
                 budget=budget,
                 duration=duration,
                 material_ids=mids,
@@ -239,6 +389,7 @@ class OfficialApiRetargetingService:
                     aavid,
                     ad_id=ad_id,
                     marketing_goal=_goal(promotion_scene),
+                    task_name=control_task_name,
                     budget=budget,
                     duration=duration,
                     material_ids=mids,
@@ -246,41 +397,36 @@ class OfficialApiRetargetingService:
                 task_id = text_id((duplicate or {}).get("task_id"))
             if not task_id:
                 raise RuntimeError("官方 API 已返回成功但未返回可核验的调控任务 ID")
-            try:
-                verified_task = await asyncio.to_thread(
-                    _verify_control_task,
-                    service,
-                    aavid=aavid,
-                    ad_id=ad_id,
-                    promotion_scene=promotion_scene,
-                    task_id=task_id,
-                    material_ids=mids,
-                    budget=budget,
-                    duration=duration,
-                )
-            except Exception as verify_exc:
-                if response.request_uid:
-                    OfficialApiAuditStore().mark_reconciled(
-                        response.request_uid,
-                        status="unresolved",
-                        task_id=task_id,
-                        response={"verification_error": str(verify_exc)},
-                    )
-                raise RuntimeError(
-                    "官方 API 创建响应已返回，但调控任务反查未通过；禁止自动重试，请人工核对"
-                ) from verify_exc
-            if response.request_uid:
-                OfficialApiAuditStore().mark_reconciled(
-                    response.request_uid,
-                    status="confirmed",
-                    task_id=task_id,
-                    response=verified_task,
-                )
+            # A code=0 create response with a concrete task ID is the write
+            # result.  The list endpoint is eventually consistent, so its
+            # read-only verification runs in the background and must not hold
+            # the card in "executing" for another 20+ seconds.
+            _start_control_task_reconciliation(
+                service,
+                request_uid=str(response.request_uid or ""),
+                task_id=task_id,
+                verify_kwargs={
+                    "aavid": aavid,
+                    "ad_id": ad_id,
+                    "promotion_scene": promotion_scene,
+                    "task_id": task_id,
+                    "material_ids": mids,
+                    "budget": budget,
+                    "duration": duration,
+                },
+            )
             return RetargetingRunResult(
                 success=True,
-                message="官方 API 追投成功",
-                step="done",
-                detail=json.dumps({"source": "qianchuan_open_api", "request_id": response.request_id}, ensure_ascii=False),
+                message="官方 API 追投成功（任务已创建，列表核对在后台进行）",
+                step="done_pending_verification",
+                detail=json.dumps(
+                    {
+                        "source": "qianchuan_open_api",
+                        "request_id": response.request_id,
+                        "reconciliation_status": "pending",
+                    },
+                    ensure_ascii=False,
+                ),
                 aavid=text_id(aavid),
                 ad_id=text_id(ad_id),
                 material_id=text_id(material_id),
@@ -298,6 +444,7 @@ class OfficialApiRetargetingService:
                     aavid,
                     ad_id=ad_id,
                     marketing_goal=_goal(promotion_scene),
+                    task_name=control_task_name,
                     budget=budget,
                     duration=duration,
                     material_ids=mids,

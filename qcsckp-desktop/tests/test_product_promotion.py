@@ -8,6 +8,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
+# This module validates the retained browser compatibility adapter. Keep the
+# result deterministic even when the developer machine has selected the
+# official API backend persistently for the running application.
+os.environ.setdefault("QCSCKP_QIANCHUAN_BACKEND", "browser_legacy")
+
 from api.promotion_targets import (
     detect_confirmed_detail_scene,
     detect_plan_system,

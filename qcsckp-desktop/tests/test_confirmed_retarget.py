@@ -5,7 +5,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from api.operation_events import (
@@ -22,6 +24,7 @@ from api.operation_events import (
 )
 from api.rule_retargeting_config import (
     _normalize_full,
+    validate_rule_retargeting_config,
     validate_strategy_target_compatibility,
 )
 from services.cloud_retarget_client import report_retarget_task
@@ -52,7 +55,12 @@ from services.operation_log_monitor import (
     _with_30_day_body,
     _with_30_day_range,
 )
-from services.retarget_task_worker import _snapshot_hash, _strategy_hash, _strategy_snapshot
+from services.retarget_task_worker import (
+    _snapshot_hash,
+    _strategy_hash,
+    _strategy_matches_task_snapshot,
+    _strategy_snapshot,
+)
 from services import retargeting_rule_runner
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -147,18 +155,94 @@ class RetargetConfigTests(unittest.TestCase):
 
     def test_card_account_name_is_resolved_per_target(self):
         class FakeStore:
-            def select_one(self, table, **_kwargs):
-                self.table = table
-                return {"user_info_name": "目标千川账户"}
+            def select_one(self, table, **kwargs):
+                self.calls.append((table, kwargs.get("where")))
+                if table == "qianchuan_account":
+                    return {"account_name": "目标千川账户"}
+                return None
+
+            def __init__(self):
+                self.calls = []
 
         store = FakeStore()
         name = retargeting_rule_runner._account_name_for_target(
             store,
-            {"aadvid": "10001", "ad_id": "30001"},
+            {
+                "account_uid": "account-1",
+                "aadvid": "10001",
+                "ad_id": "30001",
+            },
             "全局标签",
         )
         self.assertEqual("目标千川账户", name)
-        self.assertEqual("pmc_ad_detail_basic", store.table)
+        self.assertEqual(
+            [("qianchuan_account", {"account_uid": "account-1"})],
+            store.calls,
+        )
+
+    def test_legacy_card_snapshot_without_default_task_action_is_accepted(self):
+        strategy = {
+            "id": "strategy-1",
+            "title": "策略1",
+            "account_uid": "account-1",
+            "target_uid": "target-1",
+            "trigger_level": "material",
+            "candidate_limit": 1,
+            "action_mode": "card_confirm",
+            "trigger": {"groups": []},
+            "retargeting": {"method": "volume"},
+        }
+        legacy_snapshot = _strategy_snapshot(strategy)
+        legacy_snapshot.pop("task_action")
+        self.assertTrue(
+            _strategy_matches_task_snapshot(
+                strategy,
+                legacy_snapshot,
+                _snapshot_hash(legacy_snapshot),
+            )
+        )
+
+    def test_legacy_card_snapshot_without_grouping_mode_is_accepted(self):
+        strategy = {
+            "id": "strategy-1",
+            "title": "策略1",
+            "account_uid": "account-1",
+            "target_uid": "target-1",
+            "trigger_level": "material",
+            "candidate_limit": 1,
+            "action_mode": "card_confirm",
+            "trigger": {"groups": []},
+            "retargeting": {"method": "volume"},
+        }
+        legacy_snapshot = _strategy_snapshot(strategy)
+        legacy_snapshot.pop("material_grouping_mode")
+        self.assertTrue(
+            _strategy_matches_task_snapshot(
+                strategy,
+                legacy_snapshot,
+                _snapshot_hash(legacy_snapshot),
+            )
+        )
+
+    def test_legacy_card_bridge_does_not_hide_real_strategy_change(self):
+        strategy = {
+            "id": "strategy-1",
+            "title": "策略1",
+            "target_uid": "target-1",
+            "trigger": {"groups": []},
+            "retargeting": {"method": "volume"},
+        }
+        legacy_snapshot = _strategy_snapshot(strategy)
+        legacy_snapshot.pop("task_action")
+        changed = copy.deepcopy(strategy)
+        changed["retargeting"] = {"method": "volume", "volume": {"total_budget_yuan": 200}}
+        self.assertFalse(
+            _strategy_matches_task_snapshot(
+                changed,
+                legacy_snapshot,
+                _snapshot_hash(legacy_snapshot),
+            )
+        )
 
     def test_existing_strategy_defaults_to_card_confirmation(self):
         cfg = _normalize_full(
@@ -190,6 +274,45 @@ class RetargetConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual("auto_execute", cfg["strategies"][0]["action_mode"])
+
+    def test_material_grouping_mode_defaults_to_separate_and_preserves_merged(self):
+        legacy = _normalize_full({"strategies": [{"id": "s1", "trigger": {}, "retargeting": {}}]})
+        self.assertEqual("separate", legacy["strategies"][0]["material_grouping_mode"])
+
+        merged = _normalize_full(
+            {
+                "strategies": [
+                    {
+                        "id": "s1",
+                        "material_grouping_mode": "merged",
+                        "candidate_limit": 20,
+                        "trigger": {},
+                        "retargeting": {},
+                    }
+                ]
+            }
+        )
+        self.assertEqual("merged", merged["strategies"][0]["material_grouping_mode"])
+        self.assertEqual(20, merged["strategies"][0]["candidate_limit"])
+
+    def test_invalid_material_grouping_mode_is_rejected_when_enabled(self):
+        config = _normalize_full(
+            {
+                "enabled": True,
+                "strategies": [
+                    {
+                        "id": "s1",
+                        "target_uid": "target-1",
+                        "trigger": {},
+                        "retargeting": {},
+                    }
+                ],
+            }
+        )
+        config["strategies"][0]["material_grouping_mode"] = "unsupported"
+        ok, message = validate_rule_retargeting_config(config)
+        self.assertFalse(ok)
+        self.assertIn("分组方式无效", message)
 
     def test_local_test_environment_blocks_auto_execute(self):
         with patch.object(retargeting_rule_runner, "TEST_MODE", True):
@@ -524,6 +647,134 @@ class RetargetConfigTests(unittest.TestCase):
             ["m1", "m2"],
             [item["material_id"] for item in payload["materials"]],
         )
+
+    def test_auto_merged_mode_submits_one_task_up_to_candidate_limit(self):
+        strategy = {
+            "id": "auto-merged",
+            "title": "自动合并追投",
+            "target_uid": "target-product",
+            "trigger_level": "material",
+            "action_mode": "auto_execute",
+            "material_grouping_mode": "merged",
+            "candidate_limit": 2,
+            "trigger": {"groups": []},
+            "retargeting": {
+                "method": "volume",
+                "volume": {"total_budget_yuan": 100, "duration_hours": 1},
+            },
+        }
+        config = {
+            "enabled": True,
+            "trigger_query_period": "1h",
+            "per_strategy_rate_limit": False,
+            "interval": {"window_seconds": 3600, "max_count": 1},
+            "strategies": [strategy],
+        }
+        target = {
+            "target_uid": "target-product",
+            "aadvid": "10001",
+            "ad_id": "30001",
+            "plan_name": "商品全域计划",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "last_status": "ok",
+            "enabled": 1,
+            "monitor_eligible": 1,
+            "retarget_eligible": 1,
+            "automation_write_blocked": 0,
+        }
+        rows = [
+            {"targetUid": "target-product", "aadvid": "10001", "id": "m1", "netRoi": 3, "currentCost": 10},
+            {"targetUid": "target-product", "aadvid": "10001", "id": "m2", "netRoi": 2, "currentCost": 10},
+            {"targetUid": "target-product", "aadvid": "10001", "id": "m3", "netRoi": 1, "currentCost": 10},
+        ]
+
+        class FakeDashboard:
+            def get_table_data(self, **_kwargs):
+                return {"success": True, "data": rows, "total": len(rows), "period": "近1小时"}
+
+            def get_dashboard_account_label(self):
+                return {"label": "测试账户"}
+
+        class FakeStore:
+            def select(self, table, **_kwargs):
+                return [target] if table == "promotion_target" else []
+
+            def select_one(self, *_args, **_kwargs):
+                return None
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    success=True,
+                    aavid="10001",
+                    ad_id="30001",
+                    material_id=kwargs["material_id"],
+                    regulate_task_id="task-merged",
+                    step="done_pending_verification",
+                    message="成功",
+                    detail="",
+                    headless=True,
+                )
+
+            async def close(self):
+                return None
+
+        @asynccontextmanager
+        async def fake_operation(*_args, **_kwargs):
+            yield
+
+        service = FakeService()
+        with patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=config,
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeDashboard(),
+        ), patch(
+            "services.retargeting_rule_runner.row_is_in_test_scope",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.evaluate_trigger",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.check_target_capability",
+            return_value=(True, "ok"),
+        ), patch(
+            "services.retargeting_rule_runner.retarget_capability_matches",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.rate_limit_should_skip",
+            return_value=False,
+        ), patch(
+            "services.retargeting_rule_runner.auto_execute_allowed_in_current_environment",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.exclusive_browser_operation",
+            side_effect=fake_operation,
+        ), patch(
+            "services.retargeting_rule_runner._revalidate_auto_retarget_under_lock",
+            return_value=(config, strategy, target),
+        ), patch(
+            "services.retargeting_rule_runner.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retargeting_rule_runner.record_retarget_rate_success_safely",
+        ) as record_rate, patch(
+            "services.retargeting_rule_runner._insert_run",
+        ) as insert_run:
+            asyncio.run(retargeting_rule_runner.run_one_cycle(FakeStore()))
+
+        self.assertEqual(1, len(service.calls))
+        self.assertEqual(["m1", "m2"], service.calls[0]["material_ids"])
+        record_rate.assert_called_once()
+        self.assertEqual(["m1", "m2"], record_rate.call_args.kwargs["material_ids"])
+        insert_run.assert_called_once()
+        self.assertEqual(2, len(insert_run.call_args.kwargs["materials"]))
 
 
 class OperationEventTests(unittest.TestCase):
@@ -896,6 +1147,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         current_ad_id="30001",
         trigger_passed=True,
         rate_limited=False,
+        last_status="ok",
     ):
         strategy = current_strategy or copy.deepcopy(self.strategy)
         cfg = {
@@ -914,7 +1166,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
                         "promotion_scene": "live",
                         "plan_system": "global",
                         "enabled": 1,
-                        "last_status": "ok",
+                        "last_status": last_status,
                         "capability_json": '{"retarget_execute":true}',
                     }
                 return None
@@ -962,6 +1214,10 @@ class RetargetWorkerValidationTests(unittest.TestCase):
     def test_rate_limit_blocks_execution(self):
         with self.assertRaisesRegex(RuntimeError, "次数上限"):
             self.validate(rate_limited=True)
+
+    def test_collecting_state_keeps_last_verified_snapshot_usable(self):
+        _cfg, _strategy, rows = self.validate(last_status="collecting")
+        self.assertEqual("20001", str(rows[0]["id"]))
 
     def test_product_batch_revalidates_every_material_in_one_task(self):
         task = {

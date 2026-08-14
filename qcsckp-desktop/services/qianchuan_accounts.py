@@ -105,11 +105,18 @@ def _sync_daily_selected_aavids(
     profiles = payload.setdefault("profiles", {})
     profile = profiles.get(owner)
     profile = dict(profile) if isinstance(profile, dict) else {}
-    profile["aavids"] = [
+    selected_aavids = [
         str(item.get("aavid") or "")
         for item in rows
         if str(item.get("aavid") or "")
     ]
+    profile["aavids"] = selected_aavids
+    # “纳入 09:00 日报”本身就是用户对自动日报的明确授权。账户页保存后
+    # 应立即生效，不应再要求用户转到飞书页重复开启一个全局开关。
+    # 当最后一个账户取消勾选时同步关闭，避免发送用户已经取消的日报。
+    profile["enabled"] = bool(selected_aavids)
+    profile.setdefault("send_time", "09:00")
+    profile.setdefault("send_empty", False)
     profile["updated_at"] = _now_text()
     profiles[owner] = profile
     os.makedirs(os.path.dirname(DAILY_CONFIG_FILE), exist_ok=True)
@@ -910,6 +917,20 @@ def save_qianchuan_account_automation_setup(
         db=store,
     )
     assert saved is not None
+    # A save starts first collection only for newly selected, failed or never
+    # collected targets. Healthy targets keep their normal periodic schedule
+    # and must not flash back to a queued state on every account save.
+    saved["immediate_collection_target_uids"] = [
+        uid
+        for uid, enabled in requested.items()
+        if enabled
+        and (
+            not bool(target_by_uid[uid].get("enabled"))
+            or not str(target_by_uid[uid].get("last_sync_at") or "").strip()
+            or str(target_by_uid[uid].get("last_status") or "").lower()
+            in {"error", "failed", "queued"}
+        )
+    ]
     return saved
 
 

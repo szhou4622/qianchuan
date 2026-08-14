@@ -1,9 +1,42 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from gui_app import JSApi
+from gui_app import JSApi, TrayApplication
+
+
+class TrayLifecycleTests(unittest.TestCase):
+    def _tray(self, *, ready: bool, visible: bool = False):
+        tray = TrayApplication.__new__(TrayApplication)
+        tray.window = Mock()
+        tray.icon = Mock()
+        tray.icon.visible = visible
+        tray.enable_tray = True
+        tray.force_close = False
+        tray.tray_ready = threading.Event()
+        tray.tray_failed = threading.Event()
+        tray.tray_thread = None
+        if ready:
+            tray.tray_ready.set()
+        return tray
+
+    def test_close_exits_when_tray_never_became_ready(self):
+        tray = self._tray(ready=False)
+
+        self.assertTrue(tray.on_window_closing())
+        self.assertTrue(tray.force_close)
+        tray.window.hide.assert_not_called()
+        tray.icon.stop.assert_called_once()
+
+    def test_close_hides_only_after_visible_tray_is_confirmed(self):
+        tray = self._tray(ready=True, visible=True)
+
+        self.assertFalse(tray.on_window_closing())
+        self.assertFalse(tray.force_close)
+        tray.window.hide.assert_called_once()
+        tray.icon.stop.assert_not_called()
 
 
 class JSApiBridgeTests(unittest.TestCase):
@@ -29,6 +62,7 @@ class JSApiBridgeTests(unittest.TestCase):
         self.core.getQianchuanOfficialApiConfig.return_value = {"success": True}
         self.core.saveQianchuanOfficialApiConfig.return_value = {"success": True}
         self.core.startQianchuanOfficialApiAuthorization.return_value = {"success": True}
+        self.core.saveAndStartQianchuanOfficialApiAuthorization.return_value = {"success": True}
         self.core.finishQianchuanOfficialApiAuthorization.return_value = {"success": True}
         self.core.clearQianchuanOfficialApiConfig.return_value = {"success": True}
         self.core.getPromotionTargetDiscoveryStatus.return_value = {"running": False}
@@ -85,6 +119,11 @@ class JSApiBridgeTests(unittest.TestCase):
         )
         self.assertTrue(self.bridge.startQianchuanOfficialApiAuthorization()["success"])
         self.assertTrue(
+            self.bridge.saveAndStartQianchuanOfficialApiAuthorization(
+                {"app_id": "123456", "app_secret": "secret-value"}
+            )["success"]
+        )
+        self.assertTrue(
             self.bridge.finishQianchuanOfficialApiAuthorization("auth-code")["success"]
         )
         self.assertTrue(self.bridge.clearQianchuanOfficialApiConfig()["success"])
@@ -119,6 +158,9 @@ class JSApiBridgeTests(unittest.TestCase):
             {"app_id": "123456", "app_secret": "secret-value"}
         )
         self.core.startQianchuanOfficialApiAuthorization.assert_called_once_with()
+        self.core.saveAndStartQianchuanOfficialApiAuthorization.assert_called_once_with(
+            {"app_id": "123456", "app_secret": "secret-value"}
+        )
         self.core.finishQianchuanOfficialApiAuthorization.assert_called_once_with(
             "auth-code"
         )

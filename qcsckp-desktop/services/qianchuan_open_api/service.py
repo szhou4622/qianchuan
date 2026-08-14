@@ -6,9 +6,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional
 
-from config import ALLOW_LIVE_OFFICIAL_API_WRITES
 from .client import ApiResponse, QianchuanOpenApiClient
-from .errors import ApiRequestError, OfficialApiWriteDisabled
+from .errors import OfficialApiWriteDisabled
 from .normalizers import (
     build_metric_unit_map,
     id_number,
@@ -44,6 +43,12 @@ class QianchuanOfficialApiService:
     OPERATION_LOGS = "/open_api/v1.0/qianchuan/tools/log_search/"
 
     MARKETING_GOALS = ("LIVE_PROM_GOODS", "VIDEO_PROM_GOODS")
+    REPORT_MATERIAL_TOPICS = {
+        ("chengfang", "live"): "OVERALL_ROI_LIVE_MATERIAL_VIDEO",
+        ("chengfang", "product"): "OVERALL_ROI_PRODUCT_MATERIAL",
+        ("global", "live"): "SITE_PROMOTION_POST_DATA_VIDEO",
+        ("global", "product"): "SITE_PROMOTION_PRODUCT_POST_DATA_VIDEO",
+    }
 
     def __init__(
         self,
@@ -52,7 +57,14 @@ class QianchuanOfficialApiService:
         allow_writes: Optional[bool] = None,
     ) -> None:
         self.client = client or QianchuanOpenApiClient()
-        self.allow_writes = ALLOW_LIVE_OFFICIAL_API_WRITES if allow_writes is None else bool(allow_writes)
+        if allow_writes is None:
+            import config as runtime_config
+
+            self.allow_writes = bool(
+                runtime_config.ALLOW_LIVE_OFFICIAL_API_WRITES
+            )
+        else:
+            self.allow_writes = bool(allow_writes)
 
     def _require_writes(self) -> None:
         if not self.allow_writes:
@@ -355,36 +367,83 @@ class QianchuanOfficialApiService:
                     "start_date": start_date,
                     "end_date": end_date,
                     "material_select_type": "ALL",
-                    "material_status": "ALL",
+                    # Monitoring and strategy candidates only use materials
+                    # that the platform currently marks as deliverable.  The
+                    # ALL catalog can contain years of paused/deleted rows and
+                    # is retained only in historical local snapshots.
+                    "material_status": "DELIVERY_OK",
                 },
                 "fields": list(fields or []),
+                "order_type": "DESC",
+                "order_field": "stat_cost_for_roi2",
             },
             advertiser_id=aid,
             page_size=100,
+            parallel_workers=4,
         )
         materials = [normalize_material(row) for row in rows]
         materials = [item for item in materials if item["material_id"] not in {"", "-2"} and item["material_type"] == "VIDEO"]
         return materials, request_ids
 
-    def list_plan_products(self, advertiser_id: Any, ad_id: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    def list_plan_products(
+        self,
+        advertiser_id: Any,
+        ad_id: Any,
+        *,
+        start_date: str,
+        end_date: str,
+        fields: Optional[Iterable[str]] = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         pid = require_digit_id(ad_id, "ad_id")
         rows, request_ids = self.client.get_all_pages(
             self.PLAN_PRODUCTS,
-            {"advertiser_id": aid, "ad_id": pid},
+            {
+                "advertiser_id": aid,
+                "ad_id": pid,
+                "start_date": str(start_date or "").strip(),
+                "end_date": str(end_date or "").strip(),
+                # The endpoint requires this member, while identity/name fields
+                # are returned by default and rejected when listed explicitly.
+                "fields": list(fields or []),
+            },
             advertiser_id=aid,
             page_size=100,
         )
         return [normalize_product(row) for row in rows], request_ids
 
-    def get_report_config(self, advertiser_id: Any, *, marketing_goal: str) -> tuple[dict[str, str], ApiResponse]:
+    def get_report_config(
+        self,
+        advertiser_id: Any,
+        *,
+        plan_system: str,
+        promotion_scene: str,
+    ) -> tuple[dict[str, str], ApiResponse]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
+        system = str(plan_system or "").strip().lower()
+        scene = str(promotion_scene or "").strip().lower()
+        topic = self.REPORT_MATERIAL_TOPICS.get((system, scene))
+        if not topic:
+            raise ValueError("plan_system/promotion_scene 必须是已确认的乘方/全域 × 推直播/推商品")
         response = self.client.get(
             self.REPORT_CONFIG,
-            {"advertiser_id": aid, "marketing_goal": str(marketing_goal).upper()},
+            {"advertiser_id": aid, "data_topics": [topic]},
             advertiser_id=aid,
         )
-        return build_metric_unit_map(response.data), response
+        units = build_metric_unit_map(response.data)
+        # The live config contract currently returns metric fields without the
+        # documented ``unit`` member. Values from the plan-material endpoint
+        # are already expressed in their documented business units (yuan,
+        # counts, ROI/rates), so retain them without scaling rather than
+        # rejecting a complete read-only batch.
+        if not units and isinstance(response.data, Mapping):
+            for config in response.data.get("custom_config_datas") or []:
+                if not isinstance(config, Mapping):
+                    continue
+                for metric in config.get("metrics") or []:
+                    if isinstance(metric, Mapping) and metric.get("field"):
+                        units.setdefault(str(metric["field"]), "0")
+        return units, response
 
     def query_report(self, advertiser_id: Any, query: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
@@ -431,6 +490,7 @@ class QianchuanOfficialApiService:
         *,
         ad_id: Any,
         marketing_goal: str,
+        task_name: str,
         budget: Any,
         duration: Any,
         material_ids: Iterable[Any],
@@ -444,19 +504,28 @@ class QianchuanOfficialApiService:
             end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
         )
         wanted = set(stable_material_set(material_ids))
+        wanted_name = str(task_name or "").strip()
+        if not wanted_name:
+            return None
         wanted_budget = Decimal(str(budget))
         wanted_duration = Decimal(str(duration))
         for task in tasks:
+            # Existing control tasks are valid business objects, not implicit
+            # duplicates.  Only the stable name generated for this exact local
+            # execution is an idempotency marker.  This lets a user explicitly
+            # create another retarget for the same material/budget/duration,
+            # while still reconciling a retry of the same Feishu confirmation.
+            if str(task.get("task_name") or "").strip() != wanted_name:
+                continue
             existing = set(stable_material_set(task.get("material_ids") or []))
             try:
                 same_numbers = Decimal(str(task.get("budget"))) == wanted_budget and Decimal(str(task.get("duration"))) == wanted_duration
             except Exception:
                 same_numbers = False
-            status = str(task.get("status") or "").upper()
-            terminal = status in {"DISABLED", "FINISHED", "DELETED", "ENDED"}
-            # Only an identical frozen group is a duplicate.  Overlapping
-            # groups are an intentional v0.1.46 feature and must remain legal.
-            if not terminal and existing == wanted and same_numbers:
+            # The name, frozen group and parameters must all identify the same
+            # execution.  Overlapping or even identical groups from a different
+            # confirmation remain legal business operations.
+            if existing == wanted and same_numbers:
                 return task
         return None
 
@@ -476,6 +545,8 @@ class QianchuanOfficialApiService:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         pid = require_digit_id(ad_id, "ad_id")
         materials = stable_material_set(material_ids)
+        # 千川调控任务名称上限为50字符；唯一执行标识也计入该上限。
+        task_name = str(name or "素材追投")[:50]
         if not 1 <= len(materials) <= 20:
             raise ValueError("每条追投调控任务必须包含 1 至 20 条视频素材")
         money = Decimal(str(budget))
@@ -488,16 +559,25 @@ class QianchuanOfficialApiService:
             aid,
             ad_id=pid,
             marketing_goal=marketing_goal,
+            task_name=task_name,
             budget=money,
             duration=hours,
             material_ids=materials,
         )
         if duplicate:
-            raise ApiRequestError(f"发现可能重复的现有追投调控任务 {duplicate.get('task_id')}")
+            # A retry/recovery of the same local execution is already complete
+            # on the platform.  Return its task ID as a reconciled success and
+            # never submit a second POST.
+            return ApiResponse(
+                data={"task_id": duplicate.get("task_id")},
+                raw={"code": 0, "reconciled_existing": True},
+                request_id="",
+                message="同一执行任务已存在，已完成幂等对账",
+            )
         body: dict[str, Any] = {
             "advertiser_id": id_number(aid, "advertiser_id"),
             "ad_id": id_number(pid, "ad_id"),
-            "name": str(name or "素材追投")[:100],
+            "name": task_name,
             "scene": "MATERIAL_ADD_BUDGET",
             "budget": float(money),
             "duration": float(hours),

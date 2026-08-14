@@ -28,3 +28,10 @@ def replace_official_api_service_for_tests(service: Optional[QianchuanOfficialAp
     global _SERVICE
     with _LOCK:
         _SERVICE = service
+
+
+def apply_live_write_permission(enabled: bool) -> None:
+    """Apply a persisted permission to an already-running singleton."""
+    with _LOCK:
+        if _SERVICE is not None:
+            _SERVICE.allow_writes = bool(enabled)

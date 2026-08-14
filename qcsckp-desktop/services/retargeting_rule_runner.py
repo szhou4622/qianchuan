@@ -7,7 +7,7 @@
 开启分策略限频：「是否跳过」只按各策略的 pmc_retargeting_rate_limit_strategy 判断；成功后策略表 +1，且对全局表按根级 interval 调用 rate_limit_record_success（窗口未过期则 use_count+1，过期则重置 limit_started_at 并记为 1）。
 触发限频时仅跳过，不写流水。
 同一素材在多策略并行时，用「每素材一把 asyncio 锁」串行化：检查限频 → 执行追投 → 成功后记次，避免两策略同时通过检查导致超次数。
-同一策略本轮内多条命中素材：同一浏览器进程内每条素材均重新 goto 投放详情 URL 并切 Tab；该策略全部处理完后再 close。
+同一策略本轮内多条命中素材：可按策略选择逐条分别追投，或最多20条合并成一个追投任务。
 
 运行（项目根目录）:
     python -m services.retargeting_rule_runner
@@ -40,7 +40,7 @@ from api.rule_retargeting_config import (
 from config import CURRENT_VERSION, TEST_MODE
 from services.cloud_retarget_client import create_retarget_task
 from services.local_test_guard import row_is_in_test_scope
-from services.product_rule_engine import evaluate_product_strategy
+from services.product_rule_engine import evaluate_product_strategy, material_net_roi_sort_key
 from services.plan_system import normalize_plan_system
 from services.promotion_capability import check_target_capability
 from services.promotion_browser_lock import exclusive_browser_operation
@@ -61,7 +61,7 @@ from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
-DEFAULT_INTERVAL_SEC = 180
+DEFAULT_INTERVAL_SEC = 300
 MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 
 # 多策略并行上限（同一轮内各策略各起一个浏览器任务）
@@ -103,6 +103,31 @@ async def _lock_for_material_retouch(
         if lock_key not in _material_retouch_locks:
             _material_retouch_locks[lock_key] = asyncio.Lock()
         return _material_retouch_locks[lock_key]
+
+
+async def _locks_for_material_retouch(
+    material_ids: List[str],
+    target_uid: Optional[str] = None,
+) -> List[asyncio.Lock]:
+    """按稳定顺序取得一组素材锁，避免合并任务与单素材任务并发穿透限频。"""
+    locks: List[asyncio.Lock] = []
+    for material_id in sorted({str(item or "").strip() for item in material_ids if str(item or "").strip()}):
+        locks.append(await _lock_for_material_retouch(material_id, target_uid))
+    return locks
+
+
+class _MaterialLockGroup:
+    def __init__(self, locks: List[asyncio.Lock]) -> None:
+        self._locks = locks
+
+    async def __aenter__(self) -> "_MaterialLockGroup":
+        for lock in self._locks:
+            await lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        for lock in reversed(self._locks):
+            lock.release()
 
 
 def _beijing_now_str() -> str:
@@ -226,6 +251,12 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "candidate_sort": str(strategy.get("candidate_sort") or "net_roi_desc"),
         "candidate_limit": int(strategy.get("candidate_limit") or 1),
+        "material_grouping_mode": (
+            "merged"
+            if str(strategy.get("material_grouping_mode") or "separate").strip().lower()
+            == "merged"
+            else "separate"
+        ),
         "action_mode": str(strategy.get("action_mode") or "card_confirm"),
         "task_action": str(strategy.get("task_action") or "create_retarget"),
         "trigger": (
@@ -569,6 +600,28 @@ def _account_name_for_target(
 ) -> str:
     aavid = str(target.get("aadvid") or "").strip()
     ad_id = str(target.get("ad_id") or "").strip()
+    account_uid = str(target.get("account_uid") or "").strip()
+    # The account directory is the authoritative source in official-API mode.
+    # pmc_ad_detail_basic is material-detail data and may legitimately be empty
+    # for a newly enabled plan, which previously produced “未命名账户” cards.
+    account = None
+    if account_uid:
+        account = db.select_one(
+            "qianchuan_account",
+            fields="account_name",
+            where={"account_uid": account_uid},
+            order_by="updated_at DESC",
+        )
+    if not account and aavid:
+        account = db.select_one(
+            "qianchuan_account",
+            fields="account_name",
+            where={"aavid": aavid},
+            order_by="updated_at DESC",
+        )
+    name = str((account or {}).get("account_name") or "").strip()
+    if name:
+        return name[:200]
     if aavid:
         account = db.select_one(
             "pmc_ad_detail_basic",
@@ -1629,6 +1682,24 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         candidate_row["_trigger_level"] = "material"
                         hit_rows.append(candidate_row)
 
+            # 先对候选去重并稳定排序。飞书确认模式仍保留现有的卡内人工选择
+            # 能力；自动模式会在进入执行器前应用 1～20 条候选上限。
+            unique_hit_rows: List[Dict[str, Any]] = []
+            seen_hit_material_ids = set()
+            for row in hit_rows:
+                material_id = str(row.get("id") or "").strip()
+                if not material_id or material_id in seen_hit_material_ids:
+                    continue
+                seen_hit_material_ids.add(material_id)
+                unique_hit_rows.append(row)
+            unique_hit_rows.sort(key=material_net_roi_sort_key)
+            try:
+                candidate_limit = int(st.get("candidate_limit") or 1)
+            except (TypeError, ValueError):
+                candidate_limit = 1
+            candidate_limit = max(1, min(20, candidate_limit))
+            hit_rows = unique_hit_rows
+
             logger.info(
                 "%s target=%s scene=%s level=%s 命中候选素材数=%s",
                 _tag,
@@ -1739,20 +1810,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
                 if not batch_materials:
                     return
-                strategy_snapshot = {
-                    "id": str(st.get("id") or ""),
-                    "title": st_label,
-                    "account_uid": str(target.get("account_uid") or ""),
-                    "target_uid": target_uid,
-                    "trigger_level": trigger_level,
-                    "product_filter": st.get("product_filter") or [],
-                    "candidate_trigger": st.get("candidate_trigger") or {},
-                    "candidate_sort": st.get("candidate_sort") or "net_roi_desc",
-                    "candidate_limit": st.get("candidate_limit") or 1,
-                    "action_mode": action_mode,
-                    "trigger": trigger,
-                    "retargeting": retargeting,
-                }
+                # Keep card creation and confirmation on the exact same
+                # canonical snapshot contract.  A hand-built snapshot here
+                # previously omitted task_action, so every confirmation was
+                # incorrectly rejected as “策略参数已经变更”.
+                strategy_snapshot = _strategy_snapshot(st)
                 strategy_json = json.dumps(
                     strategy_snapshot,
                     ensure_ascii=False,
@@ -1847,6 +1909,195 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
             svc = QianChuanRetargetingService.from_rule_file_dict(cfg)
             headless_cfg = browser_rule
+            if action_mode == "auto_execute":
+                hit_rows = hit_rows[:candidate_limit]
+            grouping_mode = (
+                "merged"
+                if str(st.get("material_grouping_mode") or "separate").strip().lower()
+                == "merged"
+                else "separate"
+            )
+            if action_mode == "auto_execute" and grouping_mode == "merged":
+                batch_rows: List[Dict[str, Any]] = []
+                for row in hit_rows:
+                    material_id = str(row.get("id") or "").strip()
+                    if not material_id:
+                        continue
+                    if per_strategy_rl:
+                        limited = rate_limit_strategy_should_skip(
+                            db,
+                            material_id,
+                            strategy_id_for_rl,
+                            ws_s,
+                            mc_s,
+                            target_uid,
+                        )
+                    else:
+                        limited = rate_limit_should_skip(
+                            db,
+                            material_id,
+                            ws,
+                            mc,
+                            target_uid,
+                        )
+                    if not limited:
+                        batch_rows.append(row)
+                if not batch_rows:
+                    await svc.close()
+                    return
+                if not auto_execute_allowed_in_current_environment():
+                    logger.warning("%s 本地测试模式禁止自动合并追投", _tag)
+                    await svc.close()
+                    return
+
+                material_ids = [str(row.get("id") or "").strip() for row in batch_rows]
+                first_row = batch_rows[0]
+                aavid = str(target.get("aadvid") or "").strip()
+                ad_id = str(target.get("ad_id") or "").strip()
+                started_at = _beijing_now_str()
+                t0 = time.time()
+                result = None
+                locked_retargeting = retargeting
+                try:
+                    aavid_int = int(aavid)
+                    ad_id_int = int(ad_id)
+                    material_locks = await _locks_for_material_retouch(material_ids, target_uid)
+                    async with _MaterialLockGroup(material_locks), exclusive_browser_operation(
+                            f"合并追投:{target_uid}:{','.join(material_ids)}",
+                            priority=10,
+                        ):
+                        locked_cfg = None
+                        locked_strategy = None
+                        locked_target = None
+                        for row in batch_rows:
+                            current_cfg, current_strategy, current_target = await asyncio.to_thread(
+                                _revalidate_auto_retarget_under_lock,
+                                db,
+                                original_strategy=st,
+                                target_uid=target_uid,
+                                aavid=aavid,
+                                ad_id=ad_id,
+                                promotion_scene=promotion_scene,
+                                plan_system=plan_system,
+                                material_id=str(row.get("id") or ""),
+                                product_id=str(row.get("_product_id") or ""),
+                            )
+                            locked_cfg = current_cfg
+                            locked_strategy = current_strategy
+                            locked_target = current_target
+                        locked_retargeting = (
+                            locked_strategy.get("retargeting")
+                            if isinstance((locked_strategy or {}).get("retargeting"), dict)
+                            else {}
+                        )
+                        result = await svc.run(
+                            aavid=aavid_int,
+                            ad_id=ad_id_int,
+                            material_id=material_ids[0],
+                            material_ids=material_ids,
+                            retargeting=locked_retargeting,
+                            strategy_title=st_label,
+                            target_uid=target_uid,
+                            promotion_scene=promotion_scene,
+                            plan_system=plan_system,
+                            source_url=((locked_target or {}).get("sanitized_page_url") or None),
+                            reuse_session=False,
+                            close_session=False,
+                        )
+                        if result.success:
+                            record_retarget_rate_success_safely(
+                                db,
+                                material_ids=material_ids,
+                                target_uid=target_uid,
+                                cfg=locked_cfg or cfg,
+                                strategy=locked_strategy or st,
+                                retargeting=locked_retargeting,
+                            )
+                except Exception as exc:
+                    ended_at = _beijing_now_str()
+                    _insert_run(
+                        db,
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        material_id=material_ids[0],
+                        target_uid=target_uid,
+                        promotion_scene=promotion_scene,
+                        plan_system=plan_system,
+                        trigger_level=trigger_level,
+                        product_id=str(first_row.get("_product_id") or ""),
+                        product_name=str(first_row.get("_product_name") or ""),
+                        material_name=_material_name_from_dashboard_row(first_row),
+                        strategy_name=st_label,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                        duration_ms=int((time.time() - t0) * 1000),
+                        status=-1,
+                        step="batch_exception",
+                        message=str(exc),
+                        detail=traceback.format_exc()[:8000],
+                        retargeting=locked_retargeting,
+                        rule_full_json=rule_full_json,
+                        trigger_snapshot_json=_json_dumps({"material_ids": material_ids}),
+                        query_snapshot_json=_json_dumps({"materials": batch_rows}),
+                        headless=headless_cfg,
+                        browser_headless_rule=browser_rule,
+                        materials=[
+                            {
+                                "material_id": str(row.get("id") or ""),
+                                "material_name": _material_name_from_dashboard_row(row),
+                            }
+                            for row in batch_rows
+                        ],
+                    )
+                    logger.exception("%s 自动合并追投异常 materials=%s", _tag, material_ids)
+                    await svc.close()
+                    return
+
+                ended_at = _beijing_now_str()
+                _insert_run(
+                    db,
+                    aavid=str(result.aavid or aavid),
+                    ad_id=str(result.ad_id or ad_id),
+                    material_id=material_ids[0],
+                    target_uid=target_uid,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
+                    trigger_level=trigger_level,
+                    product_id=str(first_row.get("_product_id") or ""),
+                    product_name=str(first_row.get("_product_name") or ""),
+                    material_name=_material_name_from_dashboard_row(first_row),
+                    strategy_name=st_label,
+                    regulate_task_id=str(result.regulate_task_id or ""),
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_ms=int((time.time() - t0) * 1000),
+                    status=1 if result.success else -1,
+                    step=result.step,
+                    message=result.message,
+                    detail="" if result.success else (result.detail or ""),
+                    retargeting=locked_retargeting,
+                    rule_full_json=rule_full_json,
+                    trigger_snapshot_json=_json_dumps({"material_ids": material_ids}),
+                    query_snapshot_json=_json_dumps({"materials": batch_rows}),
+                    headless=bool(result.headless),
+                    browser_headless_rule=browser_rule,
+                    materials=[
+                        {
+                            "material_id": str(row.get("id") or ""),
+                            "material_name": _material_name_from_dashboard_row(row),
+                        }
+                        for row in batch_rows
+                    ],
+                )
+                logger.info(
+                    "%s 自动合并追投 materials=%s success=%s task_id=%s",
+                    _tag,
+                    len(material_ids),
+                    result.success,
+                    result.regulate_task_id,
+                )
+                await svc.close()
+                return
             try:
                 for row in hit_rows:
                     material_id = str(row.get("id") or "").strip()

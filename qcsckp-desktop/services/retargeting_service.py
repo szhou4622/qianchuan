@@ -2005,7 +2005,9 @@ class QianChuanRetargetingService:
         storage_state_override: Any = None,
         base_url: Optional[str] = None,
     ) -> "QianChuanRetargetingService":
-        if QIANCHUAN_BACKEND == "official_api":
+        import config as runtime_config
+
+        if runtime_config.QIANCHUAN_BACKEND == "official_api":
             from services.official_api_execution import OfficialApiRetargetingService
 
             return OfficialApiRetargetingService(full_config)  # type: ignore[return-value]

@@ -770,6 +770,19 @@
             color: #f87171;
             text-shadow: 0 0 10px rgba(248, 113, 113, 0.5);
         }
+        /* The business shell leaves less horizontal room than a normal browser.
+           Keep the primary save action inside the visible viewport instead of
+           letting the whole action cluster retain its intrinsic width. */
+        .rr-header-actions {
+            min-width: 0;
+            max-width: 100%;
+        }
+        @media (max-width: 1280px) {
+            .rr-header-actions {
+                width: 100%;
+                justify-content: flex-end;
+            }
+        }
     </style>
 </head>
 <body class="page-shell text-[#e2e8f0] h-full antialiased flex flex-col overflow-hidden">
@@ -784,7 +797,7 @@
                     <div class="text-[11px] text-slate-500 mt-0.5 max-w-xl leading-relaxed">多策略 · 多条件组 · 监测达标提醒 · 飞书确认后追投</div>
                 </div>
             </div>
-            <div class="flex flex-wrap items-center gap-3 sm:gap-4 shrink-0">
+            <div class="rr-header-actions flex flex-wrap items-center justify-end gap-3 sm:gap-4">
                 <div class="flex items-center gap-2 sm:gap-2.5 sm:border-r sm:border-slate-600/50 sm:pr-4">
                     <span id="rrConfigUnsavedHint" class="hidden text-xs shrink-0 whitespace-nowrap" role="status">当前配置未保存</span>
                     <span class="text-xs text-slate-400 whitespace-nowrap">启用规则化追投</span>
@@ -966,18 +979,18 @@
                             </div>
                         </div>
                         <label class="block max-w-xl pt-1">
-                            <span class="rr-label">任务名称后缀</span>
+                            <span class="rr-label">追投任务名称</span>
                             <input
                                 type="text"
                                 id="immTaskSuffix"
-                                maxlength="15"
+                                maxlength="41"
                                 autocomplete="off"
                                 class="rr-input rr-input--compact w-full mt-1.5"
-                                placeholder="素材看盘自动追投"
+                                placeholder="例如：晚间高ROI素材追投"
                             />
                             <p id="errImmTaskSuffix" class="rr-field-err hidden mt-1" role="alert"></p>
                             <span class="text-[11px] text-slate-500 mt-1 block"
-                                ><span id="immSuffixCount">0</span>/15 · 留空为默认「素材看盘自动追投」</span
+                                ><span id="immSuffixCount">0</span>/41 · 系统仅追加8位短标识，最终名称不超过50字符</span
                             >
                         </label>
                     </div>
@@ -1212,6 +1225,20 @@
                     <p id="taskActionHint" class="text-[11px] text-slate-600 leading-relaxed max-w-2xl">按单条素材指标命中后新建调控任务。</p>
 
                     <div id="panelCreateRetarget" class="space-y-3">
+                    <div id="autoMaterialGroupingPanel" class="space-y-3 hidden">
+                        <div class="rr-label pt-2">自动追投的素材任务方式</div>
+                        <div class="flex flex-wrap gap-2.5">
+                            <button type="button" data-material-grouping="separate" class="material-grouping-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">单条分别追投</button>
+                            <button type="button" data-material-grouping="merged" class="material-grouping-btn seg-btn px-4 py-2 rounded-lg text-sm">多条合并追投</button>
+                        </div>
+                        <p id="materialGroupingHint" class="text-[11px] text-slate-600 leading-relaxed max-w-2xl">命中多条素材时，每条素材分别创建一条追投任务。</p>
+                        <label class="block max-w-xs">
+                            <span class="rr-label">每轮最多纳入素材数</span>
+                            <input type="number" id="candidateLimit" min="1" max="20" step="1"
+                                   class="rr-input rr-input--compact num-input" value="1" />
+                            <span class="text-[11px] text-slate-600 mt-1.5 block">范围1～20；多条合并时，这些素材会进入同一条追投任务。</span>
+                        </label>
+                    </div>
                     <div class="rr-label pt-2">追投方式</div>
                     <div class="flex flex-wrap gap-2.5">
                         <button type="button" data-method="volume" class="method-btn seg-btn seg-btn-active px-4 py-2 rounded-lg text-sm">放量追投</button>
@@ -1282,10 +1309,10 @@
                     </div>
 
                     <label class="block pt-1 max-w-xl">
-                        <span class="rr-label">任务名称后缀</span>
-                        <input type="text" id="taskSuffix" maxlength="15"
-                               class="rr-input rr-input--suffix-compact" placeholder="素材看盘自动追投" />
-                        <span class="text-[11px] text-slate-600 mt-1.5 block"><span id="suffixCount">0</span>/15 · 留空保存时为默认「素材看盘自动追投」</span>
+                        <span class="rr-label">追投任务名称</span>
+                        <input type="text" id="taskSuffix" maxlength="41"
+                               class="rr-input rr-input--suffix-compact" placeholder="例如：晚间高ROI素材追投" />
+                        <span class="text-[11px] text-slate-600 mt-1.5 block"><span id="suffixCount">0</span>/41 · 系统仅追加8位短标识，最终名称不超过50字符</span>
                     </label>
                     </div>
 
@@ -1758,8 +1785,8 @@
         function defaultIntervalPayload() {
             return { window_seconds: RR_DEFAULT_INTERVAL_WINDOW_SECONDS, max_count: 1 };
         }
-        /** 任务名称后缀留空时与后端 DEFAULT_TASK_NAME_SUFFIX、保存配置逻辑一致 */
-        const RR_DEFAULT_TASK_NAME_SUFFIX = '素材看盘自动追投';
+        /** 字段名为兼容旧配置保留；实际表示用户设置的追投任务名称主体。 */
+        const RR_DEFAULT_TASK_NAME_SUFFIX = '素材追投';
         /** 与后端 rule_retargeting_config.MAX_STRATEGIES 一致 */
         const RR_MAX_STRATEGIES = 10;
         /** 与后端 _STRATEGY_TITLE_MAX_LEN 一致 */
@@ -2128,6 +2155,7 @@
                     candidate_trigger: defaultCandidateTriggerPayload(),
                     candidate_sort: 'net_roi_desc',
                     candidate_limit: 1,
+                    material_grouping_mode: 'separate',
                     action_mode: 'card_confirm',
                     task_action: 'create_retarget',
                     trigger: defaultTriggerPayload(),
@@ -2204,7 +2232,7 @@
                         return Number.isFinite(v) ? v : 1;
                     })(),
                 },
-                task_name_suffix: document.getElementById('taskSuffix').value.trim().slice(0, 15),
+                task_name_suffix: document.getElementById('taskSuffix').value.trim().slice(0, 41),
                 interval: invForStrategy,
             };
             strategiesState[activeStrategyIndex] = {
@@ -2217,6 +2245,10 @@
                 candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(document.getElementById('candidateLimit')?.value || '1', 10) || 1)),
+                material_grouping_mode:
+                    document.querySelector('.material-grouping-btn.seg-btn-active')?.getAttribute('data-material-grouping') === 'merged'
+                        ? 'merged'
+                        : 'separate',
                 action_mode: actionMode,
                 task_action: taskAction,
                 trigger: trig,
@@ -2365,6 +2397,7 @@
                 candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: 1,
+                material_grouping_mode: 'separate',
                 action_mode: 'card_confirm',
                 task_action: 'create_retarget',
                 trigger: defaultTriggerPayload(),
@@ -2398,6 +2431,13 @@
                 b.classList.toggle('seg-btn-active', b.getAttribute('data-task-action') === taskAction);
             });
             syncTaskActionPanels();
+            const groupingMode = s.material_grouping_mode === 'merged' ? 'merged' : 'separate';
+            document.querySelectorAll('.material-grouping-btn').forEach((b) => {
+                b.classList.toggle('seg-btn-active', b.getAttribute('data-material-grouping') === groupingMode);
+            });
+            const candidateLimit = document.getElementById('candidateLimit');
+            if (candidateLimit) candidateLimit.value = Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1));
+            syncMaterialGroupingHint();
             mountGroupCombine(t.group_combine === 'and' ? 'and' : 'or');
             _groupsRef = JSON.parse(JSON.stringify(t.groups && t.groups.length ? t.groups : [defaultGroup()]));
             renderTriggerGroups(_groupsRef);
@@ -2435,8 +2475,8 @@
             document.getElementById('increaseVolumeHours').value = increase.volume_extend_hours != null ? increase.volume_extend_hours : 1;
             syncIncreaseModePanels();
 
-            const sfx = (r.task_name_suffix || '').slice(0, 15);
-            document.getElementById('taskSuffix').value = sfx === '素材看盘自动追投' ? '' : sfx;
+            const sfx = (r.task_name_suffix || '').slice(0, 41);
+            document.getElementById('taskSuffix').value = ['素材看盘自动追投', '素材追投'].includes(sfx) ? '' : sfx;
             updateSuffixCount();
             const inv = r.interval || {};
             let ws = inv.window_seconds;
@@ -3050,6 +3090,7 @@
                 candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
+                material_grouping_mode: s.material_grouping_mode === 'merged' ? 'merged' : 'separate',
                 action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
                 task_action: s.task_action === 'increase_budget' ? 'increase_budget' : 'create_retarget',
                 trigger: s.trigger,
@@ -3368,6 +3409,7 @@
                         candidate_trigger: defaultCandidateTriggerPayload(),
                         candidate_sort: 'net_roi_desc',
                         candidate_limit: Math.max(1, Math.min(20, parseInt(s.candidate_limit || 1, 10) || 1)),
+                        material_grouping_mode: s.material_grouping_mode === 'merged' ? 'merged' : 'separate',
                         action_mode: s.action_mode === 'auto_execute' ? 'auto_execute' : 'card_confirm',
                         task_action: s.task_action === 'increase_budget' ? 'increase_budget' : 'create_retarget',
                         trigger: s.trigger || defaultTriggerPayload(),
@@ -3391,6 +3433,7 @@
                         candidate_trigger: defaultCandidateTriggerPayload(),
                         candidate_sort: 'net_roi_desc',
                         candidate_limit: 1,
+                        material_grouping_mode: 'separate',
                         action_mode: 'card_confirm',
                         task_action: 'create_retarget',
                         trigger: t,
@@ -3434,6 +3477,23 @@
             const autoButton = document.querySelector('.action-mode-btn[data-action-mode="auto_execute"]');
             if (confirmButton) confirmButton.textContent = increase ? '飞书确认后加预算' : '飞书确认后追投';
             if (autoButton) autoButton.textContent = increase ? '自动加预算' : '自动追投';
+            syncMaterialGroupingVisibility();
+        }
+
+        function syncMaterialGroupingVisibility() {
+            const actionMode = document.querySelector('.action-mode-btn.seg-btn-active')?.getAttribute('data-action-mode') || 'card_confirm';
+            const isAutomaticCreate = actionMode === 'auto_execute' && currentTaskAction() === 'create_retarget';
+            document.getElementById('autoMaterialGroupingPanel')?.classList.toggle('hidden', !isAutomaticCreate);
+        }
+
+        function syncMaterialGroupingHint() {
+            const merged = document.querySelector('.material-grouping-btn.seg-btn-active')?.getAttribute('data-material-grouping') === 'merged';
+            const hint = document.getElementById('materialGroupingHint');
+            if (hint) {
+                hint.textContent = merged
+                    ? '本轮命中的素材合并创建一条追投任务，最多20条；不足20条时按实际命中数量创建。'
+                    : '命中多条素材时，每条素材分别创建一条追投任务。';
+            }
         }
 
         function syncIncreaseModePanels() {
@@ -3526,6 +3586,7 @@
             b.addEventListener('click', () => {
                 document.querySelectorAll('.action-mode-btn').forEach((x) => x.classList.remove('seg-btn-active'));
                 b.classList.add('seg-btn-active');
+                syncMaterialGroupingVisibility();
                 rrScheduleDirtyCheck();
             });
         });
@@ -3712,7 +3773,7 @@
                     },
                 },
                 task_name_suffix: (() => {
-                    const t = document.getElementById('immTaskSuffix').value.trim().slice(0, 15);
+                    const t = document.getElementById('immTaskSuffix').value.trim().slice(0, 41);
                     return t || RR_DEFAULT_TASK_NAME_SUFFIX;
                 })(),
                 interval: {
@@ -3923,6 +3984,7 @@
         });
 
         document.getElementById('btnSave').addEventListener('click', async () => {
+            const button = document.getElementById('btnSave');
             const api = getApi();
             if (!api || !api.setRuleRetargetingConfig) {
                 notifyErr('无法连接本地服务');
@@ -3934,16 +3996,42 @@
                 return;
             }
             const payload = collectPayload();
-            const res = await api.setRuleRetargetingConfig(payload);
-            if (res && res.success) {
-                notifyOk('配置保存成功');
-                rrMarkSavedSnapshot();
-                await refreshLiveRetargetPreflight();
-            } else {
-                const msg = (res && res.message) || '保存失败';
-                notifyErr(msg);
+            const previousHtml = button ? button.innerHTML : '';
+            if (button) {
+                button.disabled = true;
+                button.classList.add('opacity-60', 'cursor-wait');
+                button.textContent = '保存中…';
+            }
+            try {
+                const res = await api.setRuleRetargetingConfig(payload);
+                if (res && res.success) {
+                    notifyOk('配置保存成功');
+                    rrMarkSavedSnapshot();
+                    await refreshLiveRetargetPreflight();
+                } else {
+                    const msg = (res && res.message) || '保存失败';
+                    notifyErr(msg);
+                }
+            } catch (error) {
+                notifyErr(String(error && error.message ? error.message : error));
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.classList.remove('opacity-60', 'cursor-wait');
+                    button.innerHTML = previousHtml;
+                    try { lucide.createIcons(); } catch (_) {}
+                }
             }
         });
+        document.querySelectorAll('.material-grouping-btn').forEach((b) => {
+            b.addEventListener('click', () => {
+                document.querySelectorAll('.material-grouping-btn').forEach((x) => x.classList.remove('seg-btn-active'));
+                b.classList.add('seg-btn-active');
+                syncMaterialGroupingHint();
+                rrScheduleDirtyCheck();
+            });
+        });
+        document.getElementById('candidateLimit')?.addEventListener('input', () => rrScheduleDirtyCheck());
 
         document.getElementById('btnReload').addEventListener('click', async () => {
             const api = await waitForApi();
@@ -4005,6 +4093,7 @@
                 candidate_trigger: defaultCandidateTriggerPayload(),
                 candidate_sort: 'net_roi_desc',
                 candidate_limit: 1,
+                material_grouping_mode: 'separate',
                 action_mode: 'card_confirm',
                 task_action: 'create_retarget',
                 trigger: defaultTriggerPayload(),

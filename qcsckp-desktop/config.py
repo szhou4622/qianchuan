@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -79,6 +80,23 @@ else:
     LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
+QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
+    DATA_DIR,
+    "qianchuan_runtime_settings.json",
+)
+
+
+def _load_qianchuan_runtime_settings() -> dict:
+    """Load non-secret backend choices that must survive an app restart."""
+    try:
+        with open(QIANCHUAN_RUNTIME_SETTINGS_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+_QIANCHUAN_RUNTIME_SETTINGS = _load_qianchuan_runtime_settings()
 
 # 本地联调保护。默认全部关闭，正式版行为不变。
 TEST_MODE = _env_flag("QCSCKP_TEST_MODE")
@@ -93,14 +111,27 @@ LOCAL_TEST_SECRETS_FILE = _env_text("QCSCKP_LOCAL_TEST_SECRETS_FILE")
 # account/four-class read reconciliation and controlled write acceptance pass.
 # The official release switches this environment value once; there is no
 # per-task automatic fallback between the two backends.
-QIANCHUAN_BACKEND = (_env_text("QCSCKP_QIANCHUAN_BACKEND") or "browser_legacy").lower()
+QIANCHUAN_BACKEND = (
+    _env_text("QCSCKP_QIANCHUAN_BACKEND")
+    or str(_QIANCHUAN_RUNTIME_SETTINGS.get("backend") or "browser_legacy")
+).lower()
 if QIANCHUAN_BACKEND not in {"official_api", "browser_legacy"}:
     QIANCHUAN_BACKEND = "browser_legacy"
 QIANCHUAN_OFFICIAL_API_BASE_URL = (
     _env_text("QCSCKP_OE_API_BASE_URL") or "https://api.oceanengine.com"
 ).rstrip("/")
+QIANCHUAN_OAUTH_RELAY_BASE_URL = (
+    _env_text("QCSCKP_OE_OAUTH_RELAY_URL")
+    or "https://oceanengine-callback.zjack6173.workers.dev"
+).rstrip("/")
+QIANCHUAN_OAUTH_CALLBACK_URL = QIANCHUAN_OAUTH_RELAY_BASE_URL + "/callback"
 # 真实 API 写入默认关闭。只有受控验收明确设置后才可创建/暂停/结束/调整调控任务。
-ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")
+if os.getenv("QCSCKP_ALLOW_LIVE_API_WRITES") is not None:
+    ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")
+else:
+    ALLOW_LIVE_OFFICIAL_API_WRITES = bool(
+        _QIANCHUAN_RUNTIME_SETTINGS.get("allow_live_api_writes", False)
+    )
 QIANCHUAN_API_TOKEN_FILE = os.path.join(DATA_DIR, "qianchuan_open_api_token.json")
 
 def _pick_static_dir() -> str:
@@ -174,7 +205,7 @@ LOCAL_AUTH_USERNAME = _env_text("QCSCKP_LOCAL_AUTH_USERNAME") or "qcsckp_local"
 LOCAL_AUTH_PASSWORD_SALT = "5c8a04f47e6d2ab047f3a9cc05cd9e6c"
 LOCAL_AUTH_PASSWORD_HASH = (
     _env_text("QCSCKP_LOCAL_AUTH_PASSWORD_HASH")
-    or "a679744f824f1aab1012e99f5279def6d80cc5a8d943ff613dabde41abe9d2a4"
+    or "b31e77ae460ffdc5a09d6388d596194c9f22c0d8ccfe67f0d1fa40e781c060b4"
 )
 LOCAL_AUTH_PBKDF2_ITERATIONS = 240_000
 

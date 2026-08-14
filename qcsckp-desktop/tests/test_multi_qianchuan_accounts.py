@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+os.environ.setdefault("QCSCKP_QIANCHUAN_BACKEND", "browser_legacy")
+
 from api.views import Api
 from api.promotion_targets import upsert_promotion_target
 from api.promotion_targets import list_promotion_targets
@@ -182,6 +184,7 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             ),
             [],
         )
+
         removed = self.db.select_one(
             "qianchuan_account",
             where={"account_uid": account["account_uid"]},
@@ -217,6 +220,42 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_report_account_selection_controls_automatic_daily_report(self):
+        account = ensure_qianchuan_account(
+            "10001",
+            owner_username="tool-owner",
+            enabled=True,
+            seen=True,
+            db=self.db,
+        )
+        daily_path = os.path.join(self.temp.name, "operation_daily_report.json")
+        with (
+            patch("services.qianchuan_accounts.DB_FILE", self.db_path),
+            patch("services.qianchuan_accounts.DAILY_CONFIG_FILE", daily_path),
+        ):
+            save_qianchuan_account_settings(
+                account["account_uid"],
+                {"report_enabled": True},
+                owner_username="tool-owner",
+                db=self.db,
+            )
+            with open(daily_path, "r", encoding="utf-8") as handle:
+                enabled = json.load(handle)["profiles"]["tool-owner"]
+            self.assertTrue(enabled["enabled"])
+            self.assertEqual(["10001"], enabled["aavids"])
+            self.assertEqual("09:00", enabled["send_time"])
+
+            save_qianchuan_account_settings(
+                account["account_uid"],
+                {"report_enabled": False},
+                owner_username="tool-owner",
+                db=self.db,
+            )
+            with open(daily_path, "r", encoding="utf-8") as handle:
+                disabled = json.load(handle)["profiles"]["tool-owner"]
+            self.assertFalse(disabled["enabled"])
+            self.assertEqual([], disabled["aavids"])
 
     def test_removed_account_is_not_resurrected_by_background_catalog(self):
         self._target("10001", 1)
@@ -659,6 +698,79 @@ class QianchuanSessionTests(unittest.TestCase):
 
 
 class ToolAccountSwitchTests(unittest.TestCase):
+    def test_official_api_save_starts_real_collection_scheduler(self):
+        api = Api.__new__(Api)
+        api.db = Mock()
+        api.service = Mock()
+        api.service.start_from_saved_session.return_value = {
+            "success": True,
+            "running": True,
+            "phase": "running",
+            "backend": "official_api",
+        }
+        saved = {
+            "account_uid": "account_one",
+            "aavid": "10001",
+            "enabled": True,
+            "immediate_collection_target_uids": ["target_one"],
+        }
+        with patch("api.views.QIANCHUAN_BACKEND", "official_api"), patch(
+            "services.qianchuan_accounts.save_qianchuan_account_automation_setup",
+            return_value=saved,
+        ), patch(
+            "services.official_api_collection.request_official_api_collection",
+            return_value={
+                "success": True,
+                "running": True,
+                "queued_count": 1,
+                "message": "设置已保存，已加入官方 API 立即采集队列",
+            },
+        ), patch(
+            "services.operation_log_monitor.request_platform_log_sync",
+            return_value={"success": True, "running": True},
+        ):
+            result = api.saveQianchuanAccountAutomationSetup(
+                "account_one", {"enabled": True}, [{"target_uid": "target_one", "enabled": True}]
+            )
+        self.assertTrue(result["success"])
+        self.assertTrue(result["monitoring"]["running"])
+        api.service.start_from_saved_session.assert_called_once_with()
+
+    def test_official_api_save_queues_only_checked_targets_immediately(self):
+        api = Api.__new__(Api)
+        api.db = Mock()
+        api.service = Mock()
+        api.service.start_from_saved_session.return_value = {
+            "success": True,
+            "running": True,
+        }
+        saved = {
+            "account_uid": "account_one",
+            "aavid": "10001",
+            "enabled": True,
+            "immediate_collection_target_uids": ["target_checked"],
+        }
+        with patch("api.views.QIANCHUAN_BACKEND", "official_api"), patch(
+            "services.qianchuan_accounts.save_qianchuan_account_automation_setup",
+            return_value=saved,
+        ), patch(
+            "services.official_api_collection.request_official_api_collection",
+            return_value={"success": True, "running": True, "queued_count": 1},
+        ) as request_collection, patch(
+            "services.operation_log_monitor.request_platform_log_sync",
+            return_value={"success": True, "running": True},
+        ):
+            result = api.saveQianchuanAccountAutomationSetup(
+                "account_one",
+                {"enabled": True},
+                {
+                    "target_checked": True,
+                    "target_unchecked": False,
+                },
+            )
+        self.assertTrue(result["success"])
+        request_collection.assert_called_once_with(["target_checked"], db=api.db)
+
     def test_save_account_setup_immediately_starts_saved_monitoring(self):
         api = Api.__new__(Api)
         api.db = Mock()

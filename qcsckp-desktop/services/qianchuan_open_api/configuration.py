@@ -6,11 +6,13 @@ import webbrowser
 from typing import Any
 
 from .runtime import get_official_api_service
+from .runtime_settings import persist_official_api_runtime
 from .token_provider import (
     api_configuration_status,
     begin_api_authorization,
     clear_api_configuration,
     exchange_authorization_code,
+    poll_api_authorization,
     save_api_credentials,
 )
 
@@ -19,7 +21,11 @@ def get_configuration() -> dict[str, Any]:
     try:
         status = api_configuration_status()
         last_error = ""
-        if status["configured"] and not status["authorized"]:
+        if (
+            status["configured"]
+            and not status["authorized"]
+            and not status["authorization_pending"]
+        ):
             try:
                 # 过期但仍有 refresh_token 时在同一刷新锁内自动续期。
                 get_official_api_service().client.token_provider.get_token()
@@ -48,25 +54,43 @@ def save_configuration(app_id: Any, app_secret: Any) -> dict[str, Any]:
         return {"success": False, "message": str(exc)}
 
 
-def start_authorization() -> dict[str, Any]:
+def start_authorization(app_id: Any = None, app_secret: Any = None) -> dict[str, Any]:
     try:
+        if app_id is not None or app_secret is not None:
+            save_api_credentials(app_id, app_secret)
+        persist_official_api_runtime()
         auth = begin_api_authorization()
         opened = bool(webbrowser.open(str(auth["url"])))
         return {
             "success": True,
             "opened": opened,
             "authorization_pending": True,
-            "message": (
-                "已打开千川官方授权页；授权后请将回调页中的 auth_code 粘贴回工具"
-            ),
+            "message": "已打开千川官方授权页；同意授权后工具会自动完成连接",
         }
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
 
+def save_and_start_authorization(app_id: Any, app_secret: Any) -> dict[str, Any]:
+    """用户只点击一次：保存凭据、创建会话并打开官方授权页。"""
+    return start_authorization(app_id, app_secret)
+
+
 def finish_authorization(authorization_callback: Any) -> dict[str, Any]:
     try:
-        exchange_authorization_code(authorization_callback)
+        if str(authorization_callback or "").strip():
+            # 仅保留旧版桥接兼容；普通用户界面不再要求复制回调地址。
+            exchange_authorization_code(authorization_callback)
+        else:
+            polled = poll_api_authorization()
+            if not polled.get("completed"):
+                return {
+                    "success": True,
+                    **api_configuration_status(),
+                    "completed": False,
+                    "message": "等待在官方页面同意授权",
+                }
+        persist_official_api_runtime()
         # 这一次真实读请求同时验证 token 与应用的账户权限。
         try:
             accounts, evidence = get_official_api_service().list_business_accounts()
@@ -74,12 +98,14 @@ def finish_authorization(authorization_callback: Any) -> dict[str, Any]:
             return {
                 "success": True,
                 **api_configuration_status(),
+                "completed": True,
                 "account_check_success": False,
                 "message": f"官方 API 授权已保存；账户权限检查暂未通过：{exc}",
             }
         return {
             "success": True,
             **api_configuration_status(),
+            "completed": True,
             "account_check_success": True,
             "authorized_account_count": len(accounts),
             "complete": bool(evidence.get("complete")),

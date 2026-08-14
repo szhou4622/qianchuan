@@ -358,6 +358,12 @@ class TrayApplication:
         self.icon = None
         self.enable_tray = PYSTRAY_AVAILABLE
         self.force_close = False
+        # Creating an Icon object is not proof that its event thread actually
+        # reached the Windows tray.  Track real readiness so a failed tray can
+        # never leave an invisible background process after the window closes.
+        self.tray_ready = threading.Event()
+        self.tray_failed = threading.Event()
+        self.tray_thread = None
         self._setup_tray()
 
     def draw_app_icon(self):
@@ -445,30 +451,70 @@ class TrayApplication:
             print(f"[托盘] 配置托盘失败: {e}")
             self.enable_tray = False
 
+    def _mark_tray_ready(self, icon):
+        """只有系统托盘循环真正就绪后，才允许主窗口隐藏。"""
+        try:
+            icon.visible = True
+            self.tray_ready.set()
+            print("[托盘] 托盘图标已显示")
+        except Exception as exc:
+            self.tray_failed.set()
+            self.enable_tray = False
+            print(f"[托盘] 显示托盘图标失败: {exc}")
+
+    def _run_tray_icon(self):
+        try:
+            self.icon.run(setup=self._mark_tray_ready)
+        except Exception as exc:
+            self.tray_failed.set()
+            self.enable_tray = False
+            print(f"[托盘] 托盘事件线程异常退出: {exc}")
+
     def run_tray(self):
-        """启动托盘"""
+        """启动托盘并等待平台线程反馈真实状态。"""
         if not self.icon:
             return
 
         try:
             if platform.system() == "Darwin" and hasattr(self.icon, "run_detached"):
-                self.icon.run_detached()
+                self.icon.run_detached(setup=self._mark_tray_ready)
             else:
-                threading.Thread(target=self.icon.run, daemon=True).start()
-            print("[托盘] 托盘已启动")
-        except Exception as e:
-            print(f"[托盘] 启动托盘失败: {e}")
+                self.tray_thread = threading.Thread(
+                    target=self._run_tray_icon,
+                    name="qcsckp-system-tray",
+                    daemon=True,
+                )
+                self.tray_thread.start()
+            print("[托盘] 正在启动托盘图标")
+        except Exception as exc:
+            self.tray_failed.set()
+            self.enable_tray = False
+            print(f"[托盘] 启动托盘失败: {exc}")
 
     def on_window_closing(self, event=None):
         """窗口关闭事件处理 - 隐藏到托盘而不是退出"""
         # force_close 为 True 时允许真正关闭
         if self.force_close:
             return True
-        if self.enable_tray and self.icon:
+        tray_visible = False
+        if self.enable_tray and self.icon and self.tray_ready.is_set():
+            try:
+                tray_visible = bool(self.icon.visible)
+            except Exception:
+                tray_visible = False
+        if tray_visible:
             print("[窗口] 关闭 -> 隐藏到托盘")
             self.window.hide()
             return False  # 阻止关闭
-        return True  # 无托盘时直接关闭
+        # 托盘未真正显示时绝不保留隐形后台进程。
+        self.force_close = True
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+        print("[窗口] 托盘不可用，关闭窗口将完全退出")
+        return True
 
 
 def configure_macos_lifecycle(window, tray_app):
@@ -729,6 +775,9 @@ class JSApi:
 
     def startQianchuanOfficialApiAuthorization(self):
         return self.api.startQianchuanOfficialApiAuthorization()
+
+    def saveAndStartQianchuanOfficialApiAuthorization(self, config=None):
+        return self.api.saveAndStartQianchuanOfficialApiAuthorization(config)
 
     def finishQianchuanOfficialApiAuthorization(self, authCode=None):
         return self.api.finishQianchuanOfficialApiAuthorization(authCode)
@@ -1279,6 +1328,20 @@ def main():
         # ===== 飞书 / 钉钉 Webhook：每整点推送（见 services/webhook_push_runtime.py）=====
         start_webhook_push_background_threads()
 
+        # Restore the account-scoped Feishu callback channel before rules can
+        # emit a card. This closes the restart race where the card is visible
+        # a few seconds before its local long connection comes online.
+        try:
+            from services.local_feishu_bridge import (
+                restore_local_feishu_account_from_device_session,
+            )
+
+            restore_local_feishu_account_from_device_session()
+        except Exception as exc:
+            from utils.log import logger as runtime_logger
+
+            runtime_logger.warning("[Feishu WS] startup restore failed: %s", exc)
+
         # ===== 规则化追投调度（见 services/retargeting_rule_runner.py；enabled 见 rule_retargeting.json）=====
         start_retargeting_rule_runner_background_thread()
 
@@ -1327,12 +1390,14 @@ def main():
                     )
                 time.sleep(2.0)
 
-        if QIANCHUAN_BACKEND != "official_api":
-            threading.Thread(
-                target=_resume_saved_monitoring,
-                name="qianchuan-monitor-resume",
-                daemon=True,
-            ).start()
+        # Browser mode resumes the Browser Worker; official API mode resumes
+        # its catalog and collection schedulers. Both must recover after an app
+        # restart without another user click.
+        threading.Thread(
+            target=_resume_saved_monitoring,
+            name="qianchuan-monitor-resume",
+            daemon=True,
+        ).start()
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")

@@ -157,6 +157,35 @@ class StopStrategyAccountScopeTests(unittest.TestCase):
             self.assertEqual("account-one", strategy["account_uid"])
             self.assertEqual("10001", strategy["aavid"])
 
+    def test_api_save_enabled_rule_restores_disabled_monitor_target(self):
+        api = Api.__new__(Api)
+        api.db = object()
+        target = self._target(enabled=False)
+        restored = self._target(enabled=True)
+        config = self._config(account_uid="", aavid="")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "rule_regulation.json")
+            with (
+                patch("api.views.QIANCHUAN_BACKEND", "browser_legacy"),
+                patch("api.rule_regulation_config.config_path", return_value=path),
+                patch(
+                    "api.promotion_targets.get_promotion_target",
+                    return_value=target,
+                ),
+                patch(
+                    "api.promotion_targets.set_promotion_target_enabled",
+                    return_value=restored,
+                ) as enable_target,
+                patch(
+                    "services.qianchuan_accounts.list_qianchuan_accounts",
+                    return_value=[{"account_uid": "account-one", "enabled": True}],
+                ),
+            ):
+                result = api.setRuleRegulationConfig(config)
+
+        self.assertTrue(result["success"], result.get("message"))
+        enable_target.assert_called_once_with("target-one", True, db=api.db)
+
     def test_api_rejects_cross_account_plan_tampering(self):
         api = Api.__new__(Api)
         api.db = object()

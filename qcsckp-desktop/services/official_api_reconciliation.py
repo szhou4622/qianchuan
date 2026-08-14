@@ -109,7 +109,11 @@ def reconcile_account_snapshot(
     for target in [row for row in local_plans if bool(row.get("enabled"))]:
         ad_id = text_id(target.get("ad_id"))
         goal = "LIVE_PROM_GOODS" if str(target.get("promotion_scene")) == "live" else "VIDEO_PROM_GOODS"
-        units, config_response = service.get_report_config(aid, marketing_goal=goal)
+        units, config_response = service.get_report_config(
+            aid,
+            plan_system=str(target.get("plan_system") or ""),
+            promotion_scene=str(target.get("promotion_scene") or ""),
+        )
         if not units:
             raise RuntimeError("官方 API 报表配置未返回字段单位，禁止生成指标对账结论")
         materials, material_request_ids = service.list_plan_materials(
@@ -117,10 +121,15 @@ def reconcile_account_snapshot(
             ad_id,
             start_date=start_date,
             end_date=end_date,
-            fields=MATERIAL_METRICS,
+            fields=tuple(field for field in MATERIAL_METRICS if field in units),
         )
         products, product_request_ids = (
-            service.list_plan_products(aid, ad_id)
+            service.list_plan_products(
+                aid,
+                ad_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
             if str(target.get("promotion_scene")) == "product"
             else ([], [])
         )

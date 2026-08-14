@@ -49,7 +49,10 @@ from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
-POLL_SECONDS = 5
+# Local Feishu callbacks and this worker run in the same desktop process.  A
+# one-second idle poll keeps click-to-claim latency predictable without network
+# traffic; the official API is only called after a task has been claimed.
+POLL_SECONDS = 1
 MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 
 
@@ -105,6 +108,12 @@ def _strategy_snapshot(strategy: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "candidate_sort": str(strategy.get("candidate_sort") or "net_roi_desc"),
         "candidate_limit": int(strategy.get("candidate_limit") or 1),
+        "material_grouping_mode": (
+            "merged"
+            if str(strategy.get("material_grouping_mode") or "separate").strip().lower()
+            == "merged"
+            else "separate"
+        ),
         "action_mode": str(strategy.get("action_mode") or "card_confirm"),
         "task_action": str(strategy.get("task_action") or "create_retarget"),
         "trigger": strategy.get("trigger") if isinstance(strategy.get("trigger"), dict) else {},
@@ -120,6 +129,40 @@ def _strategy_hash(strategy: Dict[str, Any]) -> str:
 def _snapshot_hash(snapshot: Dict[str, Any]) -> str:
     raw = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _strategy_matches_task_snapshot(
+    strategy: Dict[str, Any],
+    task_snapshot: Dict[str, Any],
+    expected_hash: str,
+) -> bool:
+    """Compare a queued card with the current strategy, including rc46 cards.
+
+    Cards created before the canonical-snapshot fix did not persist the
+    default ``task_action=create_retarget`` field.  They are safe to accept
+    only when every other normalized field is identical and the current
+    action is still that default.  Non-default actions never use this bridge.
+    """
+    current = _strategy_snapshot(strategy)
+    if _snapshot_hash(current) == expected_hash:
+        return True
+    if str(current.get("task_action") or "") != "create_retarget":
+        return False
+    # Older cards can lack one or both later-added default fields.  Only bridge
+    # the default values; a non-default current action/grouping never matches.
+    removable_defaults = []
+    if str(current.get("task_action") or "") == "create_retarget":
+        removable_defaults.append("task_action")
+    if str(current.get("material_grouping_mode") or "") == "separate":
+        removable_defaults.append("material_grouping_mode")
+    for mask in range(1, 1 << len(removable_defaults)):
+        legacy = dict(current)
+        for index, key in enumerate(removable_defaults):
+            if mask & (1 << index):
+                legacy.pop(key, None)
+        if task_snapshot == legacy and _snapshot_hash(legacy) == expected_hash:
+            return True
+    return False
 
 
 def _find_strategy(cfg: Dict[str, Any], strategy_id: str) -> Optional[Dict[str, Any]]:
@@ -445,7 +488,7 @@ def _validate_task(
     task_snapshot = task.get("rule_snapshot") if isinstance(task.get("rule_snapshot"), dict) else {}
     if not task_snapshot or _snapshot_hash(task_snapshot) != expected_hash:
         raise RuntimeError("云端追投策略快照校验失败")
-    if _strategy_hash(strategy) != expected_hash:
+    if not _strategy_matches_task_snapshot(strategy, task_snapshot, expected_hash):
         raise RuntimeError("追投策略参数已经变更，请等待新提醒")
 
     aavid = str(task.get("aavid") or "")
@@ -519,7 +562,11 @@ def _validate_task(
         and task_account_uid != str(target.get("account_uid") or "")
     ):
         raise RuntimeError("追投任务的千川账户归属已被篡改")
-    if str(target.get("last_status") or "").strip().lower() != "ok":
+    # ``collecting`` is only the transient state of the next read cycle.  The
+    # last completed snapshot remains valid while it is fresh, and the
+    # official execution adapter performs its own live recheck before POST.
+    sync_status = str(target.get("last_status") or "").strip().lower()
+    if sync_status not in {"ok", "collecting"}:
         raise RuntimeError("监控计划当前不是投放中状态，已阻止追投")
     if not legacy_test_double and not _timestamp_is_fresh(
         target.get("last_sync_at")
@@ -1239,6 +1286,7 @@ async def _execute_task(
                 material_ids=material_ids,
                 retargeting=retargeting,
                 strategy_title=strategy_name,
+                execution_uid=task_uid,
                 target_uid=target_uid,
                 promotion_scene=promotion_scene,
                 plan_system=plan_system,

@@ -57,8 +57,8 @@
       <div class="api-field"><label for="oeAppId">App ID</label><input id="oeAppId" inputmode="numeric" autocomplete="off" placeholder="请输入巨量引擎开放平台 App ID"></div>
       <div class="api-field"><label for="oeAppSecret">App Secret</label><input id="oeAppSecret" type="password" autocomplete="new-password" placeholder="已保存时可留空；不会回显明文"></div>
     </div>
-    <div class="api-actions"><button id="saveApiConfig">保存配置</button><button class="primary" id="authorizeApi">打开官方授权页</button><button id="finishApiAuth">粘贴回调地址完成授权</button><button class="danger-link" id="clearApiConfig">清除本机配置</button></div>
-    <div class="api-help">授权完成后复制浏览器地址栏中的完整回调地址，再点击“粘贴回调地址完成授权”。工具会校验 auth_code 和 state，且不会把 App Secret、回调地址或令牌写入日志。</div>
+    <div class="api-actions"><button class="primary" id="authorizeApi">保存并授权</button><button class="danger-link" id="clearApiConfig">清除本机配置</button></div>
+    <div class="api-help">只需填写 App ID 和 App Secret。点击“保存并授权”后在官方页面同意授权，工具会自动完成连接并显示可添加的千川账户，无需复制回调地址。App Secret 和令牌只加密保存在本机。</div>
   </section>
   <div class="onboarding" id="onboarding"></div>
   <div class="summary">
@@ -93,7 +93,7 @@
   const catalogStatus=x=>({complete:'完整',partial:'不完整',not_synced:'未同步',syncing:'同步中',login_required:'需要重新登录',error:'同步失败'}[x]||x||'未同步');
   const logStatus=x=>({ok:'同步正常',partial:'部分完成',empty:'暂无记录',login_required:'需要重新登录',not_configured:'尚未配置',error:'同步失败'}[x]||x||'尚未配置');
   const groupDefs=[['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['unknown','all','待确认/其他']];
-  let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null;
+  let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null,apiAuthTimer=null,apiAuthBusy=false;
   const savingAccounts=new Set();
 
   async function loadApiConfig(){
@@ -107,36 +107,58 @@
     $('oeAppSecret').placeholder=r?.app_secret_saved?'已加密保存；不修改请留空':'请输入 App Secret';
     $('apiState').textContent=!r?.success?'配置读取失败':r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
     $('apiState').classList.toggle('ok',!!r?.authorized);
-    $('authorizeApi').disabled=!r?.configured;
-    $('finishApiAuth').disabled=!r?.configured;
+    $('authorizeApi').textContent=r?.authorized?'重新授权':'保存并授权';
+    $('authorizeApi').disabled=!!apiAuthTimer;
     $('addAccount').disabled=!r?.authorized;
     return r;
   }
 
-  async function saveApiConfig(){
-    const a=await waitApi();$('saveApiConfig').disabled=true;
-    try{
-      const r=await a.saveQianchuanOfficialApiConfig({app_id:$('oeAppId').value.trim(),app_secret:$('oeAppSecret').value});
-      message(r?.message||'保存 API 配置失败',!r?.success);
-      if(r?.success)await loadApiConfig();
-    }finally{$('saveApiConfig').disabled=false}
-  }
-
   async function authorizeApi(){
     const a=await waitApi();$('authorizeApi').disabled=true;
-    try{const r=await a.startQianchuanOfficialApiAuthorization();message(r?.message||'打开官方授权页失败',!r?.success)}
-    finally{await loadApiConfig()}
+    let r;
+    try{
+      const payload={app_id:$('oeAppId').value.trim(),app_secret:$('oeAppSecret').value};
+      if(!a?.saveAndStartQianchuanOfficialApiAuthorization){
+        r={success:false,message:'当前桌面接口版本过旧，请重启工具后再试'};
+      }else{
+        r=await a.saveAndStartQianchuanOfficialApiAuthorization(payload);
+      }
+      message(r?.message||'打开官方授权页失败',!r?.success);
+      if(r?.success)watchApiAuthorization();
+    }catch(e){message('启动官方授权失败：'+String(e?.message||e),true)}
+    finally{if(!r?.success)$('authorizeApi').disabled=false;await loadApiConfig()}
   }
 
-  async function finishApiAuth(){
-    const callback=window.prompt('请粘贴千川授权完成后浏览器地址栏中的完整回调地址：','');
-    if(callback===null)return;
-    const a=await waitApi();$('finishApiAuth').disabled=true;
-    try{
-      const r=await a.finishQianchuanOfficialApiAuthorization(String(callback||'').trim());
-      message(r?.message||'完成 API 授权失败',!r?.success);
-      if(r?.success)await load();
-    }finally{await loadApiConfig()}
+  function stopApiAuthorizationWatch(){
+    if(apiAuthTimer){clearInterval(apiAuthTimer);apiAuthTimer=null}
+    apiAuthBusy=false;
+  }
+
+  function watchApiAuthorization(){
+    stopApiAuthorizationWatch();
+    const started=Date.now();
+    apiAuthTimer=setInterval(async()=>{
+      if(apiAuthBusy)return;
+      if(Date.now()-started>10*60*1000){
+        stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
+        message('授权等待已超时，请重新点击“保存并授权”。',true);return;
+      }
+      apiAuthBusy=true;
+      try{
+        const a=await waitApi();
+        const r=await a.finishQianchuanOfficialApiAuthorization();
+        if(!r?.success){
+          stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
+          message(r?.message||'完成 API 授权失败',true);await loadApiConfig();return;
+        }
+        if(!r?.completed){message(r?.message||'等待在官方页面同意授权');return}
+        stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
+        message(r?.message||'千川官方 API 授权成功');await loadApiConfig();await load();
+      }catch(e){
+        stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
+        message('完成 API 授权失败：'+String(e?.message||e),true);await loadApiConfig();
+      }finally{apiAuthBusy=false}
+    },1500);
   }
 
   async function clearApiConfig(){
@@ -170,14 +192,17 @@
         const state=p.capacity_state||'disabled';
         const selected=!!p.enabled;
         const firstRun=selected&&accountEnabled&&state==='active'&&!p.last_sync_at;
+        const collectionFailed=selected&&accountEnabled&&['error','failed'].includes(String(p.last_status||'').toLowerCase());
+        const collectionQueued=selected&&accountEnabled&&String(p.last_status||'').toLowerCase()==='queued';
         const late=selected&&accountEnabled&&state==='active'&&!!p.last_sync_at&&Number(p.last_lag_seconds||0)>600;
         const blocked=!!p.automation_write_blocked;const eligible=!!p.monitor_eligible;
         const reason=p.ineligible_reason||(!eligible?'目录尚未核验':'');
         const waitingRestore=!eligible&&selected;
         const waitingLive=p.platform_status==='waiting_live';
-        const stateLabel=waitingRestore?'已选择，待核验恢复':!eligible?'禁止自动化':blocked?'自动写入已封锁':!accountEnabled&&selected?'账户已停用':!selected?'未参与监控':waitingLive?'等待开播并持续监控':firstRun?'等待首次采集':late?'监控延迟':capText(state);
+        const collecting=selected&&accountEnabled&&String(p.last_status||'').toLowerCase()==='collecting';
+        const stateLabel=waitingRestore?'已选择，待核验恢复':!eligible?'禁止自动化':blocked?'自动写入已封锁':!accountEnabled&&selected?'账户已停用':!selected?'未参与监控':collectionFailed?'首次采集失败，等待自动重试':collecting?'正在采集':collectionQueued?'正在启动采集':waitingLive?'等待开播并持续监控':firstRun?'等待首次采集':late?'监控延迟':capText(state);
         const disabled=(!eligible&&!p.enabled)||(!accountEnabled&&!p.enabled);
-        return `<label class="plan ${eligible?'':'ineligible'}"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)} · ${platformStatus(p.platform_status)}<br>计划ID ${esc(p.ad_id||'')} · ${verificationText(p.verification_state)}${reason?`<br>不可启用：${esc(reason)}`:''}${p.last_verification_error?`<br>最近核验：${esc(p.last_verification_error)}`:''}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span class="plan-actions"><button type="button" data-advanced="${esc(p.target_uid)}">高级设置</button><input type="checkbox" data-target="${esc(p.target_uid)}" data-eligible="${eligible?'1':'0'}" data-persisted-enabled="${p.enabled?'1':'0'}" ${p.enabled?'checked':''} ${disabled?'disabled':''}><span class="plan-state ${blocked||late||!eligible?'late':firstRun||state==='capacity_waiting'?'wait':selected&&state==='active'?'active':''}" data-enabled-label="${esc(stateLabel)}">${!accountEnabled&&eligible&&!p.enabled?'先启用账户':stateLabel}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
+        return `<label class="plan ${eligible?'':'ineligible'}"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)} · ${platformStatus(p.platform_status)}<br>计划ID ${esc(p.ad_id||'')} · ${verificationText(p.verification_state)}${reason?`<br>不可启用：${esc(reason)}`:''}${p.last_verification_error?`<br>最近核验：${esc(p.last_verification_error)}`:''}${collectionFailed&&p.last_error?`<br>采集异常：${esc(p.last_error)}`:''}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span class="plan-actions"><button type="button" data-advanced="${esc(p.target_uid)}">高级设置</button><input type="checkbox" data-target="${esc(p.target_uid)}" data-eligible="${eligible?'1':'0'}" data-persisted-enabled="${p.enabled?'1':'0'}" ${p.enabled?'checked':''} ${disabled?'disabled':''}><span class="plan-state ${blocked||late||collectionFailed||!eligible?'late':firstRun||state==='capacity_waiting'?'wait':selected&&state==='active'?'active':''}" data-enabled-label="${esc(stateLabel)}">${!accountEnabled&&eligible&&!p.enabled?'先启用账户':stateLabel}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
       }).join('')}</div>`;
     }).join('');
   }
@@ -536,7 +561,7 @@
   $('diagnostics').onclick=()=>{window.location.href='control.html'};
   $('relogin').textContent='重新进行API授权';
   $('relogin').onclick=authorizeApi;$('addAccount').onclick=addAccount;$('discover').onclick=()=>discover('',$('discover'));$('refresh').onclick=reloadDisplay;
-  $('saveApiConfig').onclick=saveApiConfig;$('authorizeApi').onclick=authorizeApi;$('finishApiAuth').onclick=finishApiAuth;$('clearApiConfig').onclick=clearApiConfig;
+  $('authorizeApi').onclick=authorizeApi;$('clearApiConfig').onclick=clearApiConfig;
   function rerenderCatalogFilter(){
     if(dirty){
       message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);
@@ -549,7 +574,8 @@
   $('autostart').onchange=async()=>{const a=await waitApi();const r=await a.setWindowsAutostart($('autostart').checked);message(r?.message||($('autostart').checked?'开机自启已开启':'开机自启已关闭'),!r?.success);if(!r?.success)$('autostart').checked=!$('autostart').checked};
   window.addEventListener('focus',async()=>{if(!dirty)await load();await resumeCatalogWatch()});
   document.addEventListener('visibilitychange',async()=>{if(!document.hidden){if(!dirty)await load();await resumeCatalogWatch()}});
-  loadApiConfig();load().then(resumeCatalogWatch);setInterval(()=>{if(!dirty&&!catalogWatchBusy&&!document.hidden)load()},60000);
+  loadApiConfig().then(r=>{if(r?.authorization_pending&&!r?.authorized&&!apiAuthTimer)watchApiAuthorization()});
+  load().then(resumeCatalogWatch);setInterval(()=>{if(!dirty&&!catalogWatchBusy&&!document.hidden)load()},60000);
 </script>
 </body>
 </html>

@@ -1336,7 +1336,9 @@ class QianChuanRegulationStopService:
         storage_state_override: Any = None,
         base_url: Optional[str] = None,
     ) -> "QianChuanRegulationStopService":
-        if QIANCHUAN_BACKEND == "official_api":
+        import config as runtime_config
+
+        if runtime_config.QIANCHUAN_BACKEND == "official_api":
             from services.official_api_execution import OfficialApiRegulationStopService
 
             return OfficialApiRegulationStopService(full_config)  # type: ignore[return-value]

@@ -258,6 +258,33 @@ class Api:
                 "phase": "start_failed",
                 "message": f"设置已保存，但后台监控启动失败：{e}",
                 }
+        if QIANCHUAN_BACKEND == "official_api":
+            try:
+                # Official API mode still needs to start its catalog and data
+                # schedulers. Saving only a synthetic "scheduled" state leaves
+                # the selected plan permanently stale.
+                monitoring = self.service.start_from_saved_session()
+                enabled_target_uids = [
+                    str(item or "").strip()
+                    for item in saved.get("immediate_collection_target_uids") or []
+                    if str(item or "").strip()
+                ]
+                if bool(saved.get("enabled")) and enabled_target_uids:
+                    from services.official_api_collection import (
+                        request_official_api_collection,
+                    )
+
+                    monitoring = request_official_api_collection(
+                        enabled_target_uids,
+                        db=self.db,
+                    )
+            except Exception as e:
+                monitoring = {
+                    "success": False,
+                    "running": False,
+                    "phase": "start_failed",
+                    "message": f"设置已保存，但千川官方 API 采集启动失败：{e}",
+                }
         operation_log_sync = {
             "success": True,
             "running": False,
@@ -727,11 +754,32 @@ class Api:
         from services.qianchuan_open_api.configuration import start_authorization
         return start_authorization()
 
+    def saveAndStartQianchuanOfficialApiAuthorization(self, config=None):
+        if QIANCHUAN_BACKEND != "official_api":
+            return {"success": False, "message": "当前未启用千川官方 API 模式"}
+        from services.qianchuan_open_api.configuration import save_and_start_authorization
+        payload = config if isinstance(config, dict) else {}
+        return save_and_start_authorization(
+            payload.get("app_id"),
+            payload.get("app_secret"),
+        )
+
     def finishQianchuanOfficialApiAuthorization(self, authCode=None):
         if QIANCHUAN_BACKEND != "official_api":
             return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import finish_authorization
-        return finish_authorization(authCode)
+        result = finish_authorization(authCode)
+        if result.get("success") and result.get("completed") and result.get("authorized"):
+            try:
+                result["monitoring"] = self.service.start_from_saved_session()
+            except Exception as exc:
+                result["monitoring"] = {
+                    "success": False,
+                    "running": False,
+                    "phase": "start_failed",
+                    "message": f"Authorization succeeded, but the official API collector failed to start: {exc}",
+                }
+        return result
 
     def clearQianchuanOfficialApiConfig(self):
         if QIANCHUAN_BACKEND != "official_api":
@@ -1218,7 +1266,10 @@ class Api:
             validate_rule_retargeting_config,
             validate_strategy_target_compatibility,
         )
-        from .promotion_targets import get_promotion_target
+        from .promotion_targets import (
+            get_promotion_target,
+            set_promotion_target_enabled,
+        )
 
         if config is not None and not isinstance(config, dict):
             return {"success": False, "message": "配置须为对象"}
@@ -1245,15 +1296,57 @@ class Api:
         ok, msg = validate_rule_retargeting_config(merged)
         if not ok:
             return {"success": False, "message": msg}
+        targets_for_validation = target_map
+        if bool(merged.get("enabled")):
+            # Validate the requested end state before changing persistent
+            # monitoring flags.  A malformed strategy must never enable a
+            # plan as a side effect of a failed save.
+            targets_for_validation = {
+                target_uid: (
+                    {**target, "enabled": True}
+                    if isinstance(target, dict)
+                    else target
+                )
+                for target_uid, target in target_map.items()
+            }
         ok, msg = validate_strategy_target_compatibility(
             merged,
-            target_map,
+            targets_for_validation,
         )
         if not ok:
             return {"success": False, "message": msg}
+        # Saving an enabled execution strategy is also an explicit request to
+        # monitor its selected plan. This repairs stale/off targets in one
+        # action, while the eligibility and account checks in the target model
+        # still fail closed for unsafe plans.
+        if bool(merged.get("enabled")):
+            try:
+                for target_uid, target in target_map.items():
+                    if isinstance(target, dict) and not target.get("enabled"):
+                        target_map[target_uid] = set_promotion_target_enabled(
+                            target_uid,
+                            True,
+                            db=self.db,
+                        )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "message": f"策略已校验，但绑定计划无法加入监控：{exc}",
+                }
         saved = merge_and_save(merged)
+        runtime = None
+        if QIANCHUAN_BACKEND == "official_api":
+            from services.qianchuan_open_api.runtime_settings import (
+                enable_execution_for_saved_rules,
+            )
+
+            runtime = enable_execution_for_saved_rules(saved)
         out = dict(saved)
         out["success"] = True
+        if runtime is not None:
+            out["officialApiWritesEnabled"] = bool(
+                runtime.get("allow_live_api_writes")
+            )
         return out
 
     def getLiveRetargetPreflight(self):
@@ -1310,7 +1403,10 @@ class Api:
             preview_merge,
             validate_rule_regulation_config,
         )
-        from .promotion_targets import get_promotion_target
+        from .promotion_targets import (
+            get_promotion_target,
+            set_promotion_target_enabled,
+        )
         from services.qianchuan_accounts import list_qianchuan_accounts
 
         if config is not None and not isinstance(config, dict):
@@ -1333,16 +1429,51 @@ class Api:
             for account in list_qianchuan_accounts(db=self.db)
             if str(account.get("account_uid") or "")
         }
+        targets_for_validation = targets_by_uid
+        if bool(merged.get("enabled")):
+            targets_for_validation = {
+                target_uid: (
+                    {**target, "enabled": True}
+                    if isinstance(target, dict)
+                    else target
+                )
+                for target_uid, target in targets_by_uid.items()
+            }
         ok, msg = bind_and_validate_strategy_targets(
             merged,
-            targets_by_uid,
+            targets_for_validation,
             accounts_by_uid,
         )
         if not ok:
             return {"success": False, "message": msg}
+        if bool(merged.get("enabled")):
+            try:
+                for target_uid, target in targets_by_uid.items():
+                    if isinstance(target, dict) and not target.get("enabled"):
+                        targets_by_uid[target_uid] = set_promotion_target_enabled(
+                            target_uid,
+                            True,
+                            db=self.db,
+                        )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "message": f"策略已校验，但绑定计划无法加入监控：{exc}",
+                }
         saved = merge_and_save(merged)
+        runtime = None
+        if QIANCHUAN_BACKEND == "official_api":
+            from services.qianchuan_open_api.runtime_settings import (
+                enable_execution_for_saved_rules,
+            )
+
+            runtime = enable_execution_for_saved_rules(saved)
         out = dict(saved)
         out["success"] = True
+        if runtime is not None:
+            out["officialApiWritesEnabled"] = bool(
+                runtime.get("allow_live_api_writes")
+            )
         return out
 
     def regulationPauseControl(self):

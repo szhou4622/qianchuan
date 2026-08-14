@@ -21,10 +21,6 @@ from api.promotion_targets import (
     upsert_products,
 )
 from services.plan_system import normalize_plan_system
-from services.promotion_browser_lock import (
-    PRIORITY_COLLECTION,
-    exclusive_qianchuan_operation,
-)
 from services.qianchuan_accounts import schedulable_promotion_targets
 from services.qianchuan_open_api.normalizers import (
     first,
@@ -56,17 +52,20 @@ MATERIAL_METRICS = (
 )
 
 _STOP = threading.Event()
+_WAKE = threading.Event()
 _THREAD: Optional[threading.Thread] = None
 _LOCK = threading.Lock()
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_TARGET_UIDS: set[str] = set()
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _date_window(days: int = 30) -> tuple[str, str]:
+def _date_window(days: int = 0) -> tuple[str, str]:
     end = datetime.now()
-    start = end - timedelta(days=max(1, int(days)))
+    start = end - timedelta(days=max(0, int(days)))
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
@@ -98,6 +97,11 @@ def _metric(
                 unit = units[name]
                 break
     return float(normalize_metric_value(raw, unit))
+
+
+def _supported_material_metrics(units: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return only metrics exposed by the selected report topic."""
+    return tuple(field for field in MATERIAL_METRICS if field in units)
 
 
 def _status_number(value: Any) -> int:
@@ -256,17 +260,28 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     )
 
     goal = str(detail.get("marketing_goal") or "")
-    units, config_response = service.get_report_config(aavid, marketing_goal=goal)
+    units, config_response = service.get_report_config(
+        aavid,
+        plan_system=expected_system,
+        promotion_scene=expected_scene,
+    )
     if not units:
         raise RuntimeError("官方 API 报表配置未返回字段单位，本轮数据不入库")
 
-    start_date, end_date = _date_window(30)
+    # V1A rules use today's cumulative values. Restricting the material query
+    # to today also avoids repeatedly paging through historical material rows.
+    start_date, end_date = _date_window(0)
+    # The material endpoint rejects fields that do not belong to the selected
+    # report topic (for example live_show_count on a product plan).  The report
+    # config is the source of truth for the current plan class, so only request
+    # metrics that the platform explicitly exposes for this topic.
+    supported_material_metrics = _supported_material_metrics(units)
     materials, material_request_ids = service.list_plan_materials(
         aavid,
         ad_id,
         start_date=start_date,
         end_date=end_date,
-        fields=MATERIAL_METRICS,
+        fields=supported_material_metrics,
     )
     material_request_id = material_request_ids[-1] if material_request_ids else detail_response.request_id
     snapshots = [
@@ -278,7 +293,12 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     products: list[dict[str, Any]] = []
     product_request_ids: list[str] = []
     if expected_scene == "product":
-        products, product_request_ids = service.list_plan_products(aavid, ad_id)
+        products, product_request_ids = service.list_plan_products(
+            aavid,
+            ad_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
     now = datetime.now()
     control_tasks, control_request_ids = service.list_control_tasks(
@@ -380,6 +400,7 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
             "control_request_ids": control_request_ids,
             "collected_at": _now(),
         },
+        capability_remove_keys=("collection_error_at",),
         db=store,
     )
     return {
@@ -391,16 +412,46 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     }
 
 
-def run_collection_cycle(*, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
+def run_collection_cycle(
+    *,
+    db: Optional[SQLiteStore] = None,
+    target_uids: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
     store = db or SQLiteStore()
     results: list[dict[str, Any]] = []
-    for target in schedulable_promotion_targets(db=store):
+    requested = {
+        str(item or "").strip() for item in (target_uids or ()) if str(item or "").strip()
+    }
+    targets = schedulable_promotion_targets(db=store)
+    if requested:
+        targets = [
+            target
+            for target in targets
+            if str(target.get("target_uid") or "") in requested
+        ]
+    for target in targets:
+        target_uid = str(target.get("target_uid") or "").strip()
+        with _ACTIVE_LOCK:
+            if target_uid in _ACTIVE_TARGET_UIDS:
+                results.append(
+                    {
+                        "success": True,
+                        "target_uid": target_uid,
+                        "already_collecting": True,
+                    }
+                )
+                continue
+            _ACTIVE_TARGET_UIDS.add(target_uid)
         try:
-            with exclusive_qianchuan_operation(
-                f"官方API采集:{target.get('target_uid')}",
-                priority=PRIORITY_COLLECTION,
-            ):
-                results.append(collect_target(target, db=store))
+            patch_target_sync_state(
+                target_uid,
+                status="collecting",
+                error="",
+                synced=False,
+                capability_updates={"collection_started_at": _now()},
+                db=store,
+            )
+            results.append(collect_target(target, db=store))
         except Exception as exc:
             logger.exception("官方 API 采集失败 target=%s", target.get("target_uid"))
             patch_target_sync_state(
@@ -416,6 +467,9 @@ def run_collection_cycle(*, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
                 db=store,
             )
             results.append({"success": False, "target_uid": target.get("target_uid"), "message": str(exc)})
+        finally:
+            with _ACTIVE_LOCK:
+                _ACTIVE_TARGET_UIDS.discard(target_uid)
     return {
         "success": all(item.get("success") for item in results) if results else True,
         "target_count": len(results),
@@ -424,12 +478,22 @@ def run_collection_cycle(*, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
 
 
 def _loop(interval_seconds: int) -> None:
+    interval = max(30, int(interval_seconds))
     while not _STOP.is_set():
         try:
             run_collection_cycle()
         except Exception:
             logger.exception("官方 API 采集轮次异常")
-        _STOP.wait(max(30, int(interval_seconds)))
+        _WAKE.wait(interval)
+        _WAKE.clear()
+
+
+def _run_immediate_target(target_uid: str) -> None:
+    """Collect one newly enabled target without waiting for the periodic cycle."""
+    try:
+        run_collection_cycle(target_uids=(target_uid,))
+    except Exception:
+        logger.exception("官方 API 立即采集异常 target=%s", target_uid)
 
 
 def start_official_api_collection_background_thread(interval_seconds: int = 300) -> threading.Thread:
@@ -438,6 +502,7 @@ def start_official_api_collection_background_thread(interval_seconds: int = 300)
         if _THREAD and _THREAD.is_alive():
             return _THREAD
         _STOP.clear()
+        _WAKE.clear()
         _THREAD = threading.Thread(
             target=_loop,
             args=(interval_seconds,),
@@ -448,5 +513,62 @@ def start_official_api_collection_background_thread(interval_seconds: int = 300)
         return _THREAD
 
 
+def request_official_api_collection(
+    target_uids: Iterable[Any],
+    *,
+    db: Optional[SQLiteStore] = None,
+) -> dict[str, Any]:
+    """Start enabled targets immediately; the periodic loop remains a fallback."""
+    requested = {
+        str(item or "").strip() for item in target_uids if str(item or "").strip()
+    }
+    if not requested:
+        return {
+            "success": True,
+            "running": bool(_THREAD and _THREAD.is_alive()),
+            "queued_count": 0,
+            "message": "没有需要立即采集的监控计划",
+        }
+    store = db or SQLiteStore()
+    started: list[str] = []
+    with _ACTIVE_LOCK:
+        already_collecting = requested.intersection(_ACTIVE_TARGET_UIDS)
+    to_start = requested.difference(already_collecting)
+    for target_uid in to_start:
+        try:
+            patch_target_sync_state(
+                target_uid,
+                status="queued",
+                error="",
+                synced=False,
+                capability_updates={"collection_queued_at": _now()},
+                db=store,
+            )
+        except ValueError:
+            # The scheduler will ignore targets that were removed between save
+            # and queueing.  Do not let one stale UI row block other targets.
+            continue
+    start_official_api_collection_background_thread()
+    for target_uid in sorted(to_start):
+        thread = threading.Thread(
+            target=_run_immediate_target,
+            args=(target_uid,),
+            name=f"qianchuan-api-immediate-{target_uid[-8:]}",
+            daemon=True,
+        )
+        thread.start()
+        started.append(target_uid)
+    return {
+        "success": True,
+        "running": True,
+        "queued_count": 0,
+        "started_count": len(started),
+        "already_collecting_count": len(already_collecting),
+        "target_uids": started,
+        "message": "设置已保存，官方 API 已开始采集新监控计划",
+    }
+
+
 def stop_official_api_collection_background_thread() -> None:
     _STOP.set()
+    _WAKE.set()

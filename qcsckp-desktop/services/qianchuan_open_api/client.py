@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
@@ -153,6 +154,31 @@ class QianchuanOpenApiClient:
     def _is_permission_error(code: str, message: str) -> bool:
         text = f"{code} {message}".lower()
         return any(word in text for word in ("permission", "无权限", "权限未开通", "not authorized", "unauthorized"))
+
+    @staticmethod
+    def _is_transient_service_error(code: str, message: str) -> bool:
+        """Return whether a successful HTTP response describes a transient fault.
+
+        Ocean Engine sometimes returns HTTP 200 with a non-zero business code
+        for a temporary service failure.  These responses are safe to retry for
+        GET requests only; POST requests must still be reconciled instead of
+        being sent again.
+        """
+
+        text = f"{code} {message}".lower()
+        return any(
+            phrase in text
+            for phrase in (
+                "系统开小差",
+                "稍后重试",
+                "服务繁忙",
+                "服务异常",
+                "system busy",
+                "service unavailable",
+                "temporarily unavailable",
+                "internal server error",
+            )
+        )
 
     def _raise_api_error(
         self,
@@ -337,6 +363,16 @@ class QianchuanOpenApiClient:
                     self._sleep((2 ** (attempt - 1)) + random.random() * 0.25)
                     continue
                 raise
+            except ApiRequestError as exc:
+                last_error = exc
+                if (
+                    verb == "GET"
+                    and attempt < attempts
+                    and self._is_transient_service_error(exc.code, str(exc))
+                ):
+                    self._sleep((2 ** (attempt - 1)) + random.random() * 0.25)
+                    continue
+                raise
             except (URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
                 if verb == "POST":
                     error = ApiWriteOutcomeUnknown(
@@ -385,6 +421,7 @@ class QianchuanOpenApiClient:
             "adv_id_list",
             "account_list",
             "ad_list",
+            "ad_material_infos",
             "material_list",
             "product_list",
             "task_list",
@@ -438,16 +475,92 @@ class QianchuanOpenApiClient:
         advertiser_id: Any = "",
         page_size: int = 100,
         max_pages: int = 1000,
+        parallel_workers: int = 1,
     ) -> tuple[list[dict[str, Any]], list[str]]:
+        page_limit = max(1, int(max_pages))
+        workers = max(1, min(8, int(parallel_workers or 1)))
+        first_query = dict(query)
+        first_query["page"] = 1
+        first_query["page_size"] = page_size
+        first_response = self.get(endpoint, first_query, advertiser_id=advertiser_id)
+        first_items = self.extract_items(first_response.data)
+        if not self._has_more(
+            first_response.data,
+            page=1,
+            page_size=page_size,
+            item_count=len(first_items),
+        ):
+            return first_items, ([first_response.request_id] if first_response.request_id else [])
+
+        total_pages = 0
+        if isinstance(first_response.data, Mapping):
+            for key in ("page_info", "pageInfo", "pagination"):
+                info = first_response.data.get(key)
+                if isinstance(info, Mapping):
+                    raw_total = info.get("total_page") or info.get("total_pages")
+                    if raw_total not in (None, ""):
+                        total_pages = int(raw_total)
+                    break
+        if workers > 1 and total_pages:
+            if total_pages > page_limit:
+                raise ApiRequestError(
+                    "千川官方 API 分页超过安全上限，结果已标记为不完整",
+                    endpoint=endpoint,
+                    request_id=first_response.request_id,
+                )
+
+            def fetch_page(page: int) -> tuple[int, ApiResponse, list[dict[str, Any]]]:
+                current = dict(query)
+                current["page"] = page
+                current["page_size"] = page_size
+                response = self.get(endpoint, current, advertiser_id=advertiser_id)
+                return page, response, self.extract_items(response.data)
+
+            pages: dict[int, tuple[ApiResponse, list[dict[str, Any]]]] = {
+                1: (first_response, first_items)
+            }
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="oe-api-page") as pool:
+                futures = {pool.submit(fetch_page, page): page for page in range(2, total_pages + 1)}
+                for future in as_completed(futures):
+                    page, response, items = future.result()
+                    pages[page] = (response, items)
+
+            rows: list[dict[str, Any]] = []
+            request_ids: list[str] = []
+            seen_fingerprints: set[str] = set()
+            for page in range(1, total_pages + 1):
+                response, items = pages[page]
+                fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
+                if fingerprint in seen_fingerprints:
+                    raise ApiRequestError(
+                        "千川官方 API 分页返回重复页面，目录已标记为不完整",
+                        endpoint=endpoint,
+                        request_id=response.request_id,
+                    )
+                if page < total_pages and not items:
+                    raise ApiRequestError(
+                        "千川官方 API 在分页中间返回空页，结果已标记为不完整",
+                        endpoint=endpoint,
+                        request_id=response.request_id,
+                    )
+                seen_fingerprints.add(fingerprint)
+                rows.extend(items)
+                if response.request_id:
+                    request_ids.append(response.request_id)
+            return rows, request_ids
+
         rows: list[dict[str, Any]] = []
         request_ids: list[str] = []
         seen_fingerprints: set[str] = set()
-        for page in range(1, max(1, int(max_pages)) + 1):
-            current = dict(query)
-            current["page"] = page
-            current["page_size"] = page_size
-            response = self.get(endpoint, current, advertiser_id=advertiser_id)
-            items = self.extract_items(response.data)
+        for page in range(1, page_limit + 1):
+            if page == 1:
+                response, items = first_response, first_items
+            else:
+                current = dict(query)
+                current["page"] = page
+                current["page_size"] = page_size
+                response = self.get(endpoint, current, advertiser_id=advertiser_id)
+                items = self.extract_items(response.data)
             fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
             if page > 1 and fingerprint in seen_fingerprints:
                 raise ApiRequestError(

@@ -10,10 +10,16 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional, Protocol
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
-from config import QIANCHUAN_API_TOKEN_FILE, QIANCHUAN_OFFICIAL_API_BASE_URL
+from config import (
+    QIANCHUAN_API_TOKEN_FILE,
+    QIANCHUAN_OAUTH_CALLBACK_URL,
+    QIANCHUAN_OAUTH_RELAY_BASE_URL,
+    QIANCHUAN_OFFICIAL_API_BASE_URL,
+)
 from .errors import ApiTokenError, OfficialApiNotConfigured
 
 
@@ -29,6 +35,7 @@ class AccessTokenBundle:
     expires_at: float = 0.0
     oauth_state: str = ""
     oauth_started_at: float = 0.0
+    oauth_poll_secret: str = ""
 
     def usable(self, skew_seconds: int = 120) -> bool:
         if not self.access_token:
@@ -112,6 +119,7 @@ def _load_saved_bundle(path: str = QIANCHUAN_API_TOKEN_FILE) -> Optional[AccessT
             expires_at=float(data.get("expires_at") or 0),
             oauth_state=str(data.get("oauth_state") or ""),
             oauth_started_at=float(data.get("oauth_started_at") or 0),
+            oauth_poll_secret=str(data.get("oauth_poll_secret") or ""),
         )
     except OfficialApiNotConfigured:
         raise
@@ -162,6 +170,7 @@ class DpapiTokenProvider:
             expires_at=time.time() + expires_in if expires_in else 0,
             oauth_state="",
             oauth_started_at=0,
+            oauth_poll_secret="",
         )
         if not refreshed.access_token:
             raise ApiTokenError("千川 Open API 刷新响应缺少 access_token")
@@ -223,6 +232,7 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "app_secret_saved": False,
             "authorization_pending": False,
             "expires_at": 0,
+            "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
         }
     return {
         "configured": bool(bundle.app_id and bundle.app_secret),
@@ -232,9 +242,11 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
         "authorization_pending": bool(
             bundle.oauth_state
             and bundle.oauth_started_at
+            and bundle.oauth_poll_secret
             and time.time() - bundle.oauth_started_at <= 10 * 60
         ),
         "expires_at": bundle.expires_at,
+        "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
     }
 
 
@@ -268,12 +280,63 @@ def save_api_credentials(
     return api_configuration_status(path)
 
 
-def begin_api_authorization(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, Any]:
+def _relay_json_request(
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 15,
+) -> tuple[int, dict[str, Any]]:
+    request = Request(
+        QIANCHUAN_OAUTH_RELAY_BASE_URL + endpoint,
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Cache-Control": "no-store",
+            # Cloudflare may challenge urllib's default Python-urllib user agent.
+            # Use an explicit desktop-client identity so OAuth session creation and
+            # polling follow the same path as other supported HTTP clients.
+            "User-Agent": "QCSCKP-Desktop/0.1.46",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            result = {}
+        raise ApiTokenError(
+            str(result.get("message") or "千川授权中转服务暂不可用"),
+            code=exc.code,
+        ) from exc
+    except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ApiTokenError("千川授权中转服务连接失败，请检查网络后重试") from exc
+    if not isinstance(result, dict):
+        raise ApiTokenError("千川授权中转服务响应格式异常")
+    return status, result
+
+
+def begin_api_authorization(
+    path: str = QIANCHUAN_API_TOKEN_FILE,
+    *,
+    relay_request: Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]] = _relay_json_request,
+) -> dict[str, Any]:
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     state = secrets.token_urlsafe(24)
+    poll_secret = secrets.token_urlsafe(32)
     started = time.time()
+    status, relay = relay_request(
+        "/oauth/session",
+        {"state": state, "poll_secret": poll_secret},
+    )
+    if status not in {200, 201} or not relay.get("success"):
+        raise ApiTokenError(str(relay.get("message") or "创建千川授权会话失败"))
     save_token_bundle(
         AccessTokenBundle(
             access_token=bundle.access_token,
@@ -283,6 +346,7 @@ def begin_api_authorization(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, A
             expires_at=bundle.expires_at,
             oauth_state=state,
             oauth_started_at=started,
+            oauth_poll_secret=poll_secret,
         ),
         path,
     )
@@ -292,6 +356,45 @@ def begin_api_authorization(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, A
         + urlencode({"app_id": bundle.app_id, "state": state, "material_auth": "1"}),
         "started_at": started,
     }
+
+
+def poll_api_authorization(
+    path: str = QIANCHUAN_API_TOKEN_FILE,
+    *,
+    relay_request: Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]] = _relay_json_request,
+) -> dict[str, Any]:
+    """领取一次性授权码并在本机换令牌；中转服务永远拿不到应用密钥。"""
+    bundle = _load_saved_bundle(path)
+    if not bundle or not bundle.app_id or not bundle.app_secret:
+        raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
+    if (
+        not bundle.oauth_state
+        or not bundle.oauth_poll_secret
+        or not bundle.oauth_started_at
+    ):
+        if bundle.usable():
+            return {"completed": True, "authorized": True}
+        raise ApiTokenError("没有等待中的授权，请点击保存并授权")
+    if time.time() - bundle.oauth_started_at > 10 * 60:
+        raise ApiTokenError("授权请求已过期，请重新点击保存并授权")
+    status, relay = relay_request(
+        "/oauth/result",
+        {"state": bundle.oauth_state, "poll_secret": bundle.oauth_poll_secret},
+    )
+    relay_status = str(relay.get("status") or "").lower()
+    if status == 202 or relay_status == "pending":
+        return {"completed": False, "authorized": False}
+    if status != 200 or not relay.get("success") or relay_status != "ready":
+        raise ApiTokenError(str(relay.get("message") or "读取千川授权结果失败"))
+    auth_code = str(relay.get("auth_code") or "").strip()
+    returned_state = str(relay.get("state") or "").strip()
+    if not auth_code or not returned_state:
+        raise ApiTokenError("千川授权结果不完整，请重新授权")
+    exchange_authorization_code(
+        urlencode({"auth_code": auth_code, "state": returned_state}),
+        path,
+    )
+    return {"completed": True, "authorized": True}
 
 
 def exchange_authorization_code(
@@ -320,7 +423,6 @@ def exchange_authorization_code(
         {
             "app_id": bundle.app_id,
             "secret": bundle.app_secret,
-            "grant_type": "auth_code",
             "auth_code": code,
         }
     ).encode("utf-8")

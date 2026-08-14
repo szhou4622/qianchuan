@@ -22,8 +22,11 @@ from config import DATA_DIR
 FILENAME = "rule_retargeting.json"
 _lock = threading.RLock()
 
-DEFAULT_TASK_SUFFIX = "素材看盘自动追投"
-TASK_NAME_SUFFIX_MAX_LEN = 15
+DEFAULT_TASK_SUFFIX = "素材追投"
+# 字段名为兼容旧配置继续保留 task_name_suffix；官方 API 模式中实际表示
+# 用户设置的追投任务名称主体。千川最终上限50字符，其中预留9字符
+# 给系统短唯一标识（连字符 + 8位码），因此用户可填写部分最多41字符。
+TASK_NAME_SUFFIX_MAX_LEN = 41
 
 ALLOWED_METRICS = frozenset(
     {
@@ -63,6 +66,7 @@ _RATE_TRIGGER_METRICS = frozenset(
 ALLOWED_METHOD = frozenset({"volume", "cost_control"})
 ALLOWED_GOAL = frozenset({"net_roi", "live_room"})
 ALLOWED_ACTION_MODES = frozenset({"card_confirm", "auto_execute"})
+ALLOWED_MATERIAL_GROUPING_MODES = frozenset({"separate", "merged"})
 ALLOWED_TASK_ACTIONS = frozenset({"create_retarget", "increase_budget"})
 ALLOWED_BUDGET_INCREASE_MODES = frozenset({"fixed", "spend_percentage"})
 ASSIST_TASK_METRICS = frozenset({"assistCost", "assistRoi"})
@@ -175,6 +179,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "candidate_trigger": _default_trigger(),
         "candidate_sort": "net_roi_desc",
         "candidate_limit": 1,
+        "material_grouping_mode": "separate",
         "action_mode": "card_confirm",
         "task_action": "create_retarget",
         "trigger": _default_trigger(),
@@ -725,6 +730,11 @@ def _normalize_strategy_entry(
     except (TypeError, ValueError):
         candidate_limit = 1
     candidate_limit = max(1, min(MAX_CANDIDATE_LIMIT, candidate_limit))
+    material_grouping_mode = str(
+        raw.get("material_grouping_mode") or "separate"
+    ).strip().lower()
+    if material_grouping_mode not in ALLOWED_MATERIAL_GROUPING_MODES:
+        material_grouping_mode = "separate"
     if per_strategy_interval:
         rraw = raw.get("retargeting")
         if not isinstance(rraw, dict) or not isinstance(rraw.get("interval"), dict):
@@ -741,6 +751,7 @@ def _normalize_strategy_entry(
         "candidate_trigger": candidate_trigger,
         "candidate_sort": candidate_sort,
         "candidate_limit": candidate_limit,
+        "material_grouping_mode": material_grouping_mode,
         "action_mode": action_mode,
         "task_action": task_action,
         "trigger": trig,
@@ -781,6 +792,7 @@ def _disk_needs_strategy_migration_rewrite(raw: Optional[Dict[str, Any]]) -> boo
                     "candidate_trigger",
                     "candidate_sort",
                     "candidate_limit",
+                    "material_grouping_mode",
                     "task_action",
                 )
             ):
@@ -1015,6 +1027,11 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
                 return False, f"策略{i + 1} 的候选素材数量必须为整数"
             if candidate_limit < 1 or candidate_limit > MAX_CANDIDATE_LIMIT:
                 return False, f"策略{i + 1} 的候选素材数量必须在 1 到 {MAX_CANDIDATE_LIMIT} 之间"
+            grouping_mode = str(
+                st.get("material_grouping_mode") or "separate"
+            ).strip().lower()
+            if grouping_mode not in ALLOWED_MATERIAL_GROUPING_MODES:
+                return False, f"策略{i + 1} 的素材追投分组方式无效"
             if trigger_level == "product" and not isinstance(st.get("candidate_trigger"), dict):
                 return False, f"策略{i + 1} 缺少候选素材条件"
             product_filter = st.get("product_filter")

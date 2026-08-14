@@ -194,19 +194,40 @@ def normalize_plan(row: Mapping[str, Any], *, advertiser_id: Any = "") -> dict[s
 
 
 def normalize_material(row: Mapping[str, Any]) -> dict[str, Any]:
-    material_id = text_id(first(row, "material_id", "materialId", "id"))
-    video = first(row, "video_info", "video", default={})
-    product_ids = first(row, "product_ids", "productIds", "products", default=[])
+    material_info = first(row, "material_info", "materialInfo", default={})
+    if not isinstance(material_info, Mapping):
+        material_info = {}
+    video = first(
+        material_info,
+        "video_material",
+        "videoMaterial",
+        "video_info",
+        "video",
+        default=first(row, "video_info", "video", default={}),
+    )
+    if not isinstance(video, Mapping):
+        video = {}
+    material_id = text_id(
+        first(
+            video,
+            "material_id",
+            "materialId",
+            "id",
+            default=first(material_info, "material_id", "materialId", "id", default=first(row, "material_id", "materialId", "id")),
+        )
+    )
+    product_info = first(row, "product_info", "productInfo", default=[])
+    product_ids = first(row, "product_ids", "productIds", "products", default=product_info)
     return {
         "material_id": material_id,
-        "material_name": str(first(row, "material_name", "title", "name", "video_name")).strip(),
-        "material_type": str(first(row, "material_type", "type", default="VIDEO")).strip().upper(),
+        "material_name": str(first(video, "title", "material_name", "name", default=first(row, "material_name", "title", "name", "video_name"))).strip(),
+        "material_type": str(first(material_info, "material_type", "type", default=first(row, "material_type", "type", default="VIDEO"))).strip().upper(),
         "material_status": str(first(row, "material_status", "status")).strip(),
         "audit_status": str(first(row, "audit_status", "auditStatus")).strip(),
-        "video_id": text_id(first(video if isinstance(video, Mapping) else row, "video_id", "videoId")),
+        "video_id": text_id(first(video, "video_id", "videoId")),
         "product_ids": _id_list(product_ids, "product_id", "productId", "id"),
         "stats_info": dict(first(row, "stats_info", "stats", default={}) or {}),
-        "create_time": str(first(row, "create_time", "createTime")).strip(),
+        "create_time": str(first(video, "create_time", "createTime", default=first(row, "create_time", "createTime"))).strip(),
         "raw": dict(row),
     }
 

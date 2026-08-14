@@ -27,10 +27,6 @@ from services.qianchuan_catalog import (
 )
 from services.qianchuan_open_api.errors import OfficialApiNotConfigured
 from services.qianchuan_open_api.runtime import get_official_api_service
-from services.promotion_browser_lock import (
-    PRIORITY_COLLECTION,
-    exclusive_qianchuan_operation,
-)
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -270,7 +266,14 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
                 "verification_state": "verified" if verified else "candidate",
                 "verification_evidence_fresh": True,
                 "enabled": bool(prior.get("enabled")),
-                "last_status": "api_catalog_synced",
+                # Catalog and material collection are separate state machines.
+                # Preserve the existing collection state so catalog refreshes
+                # cannot turn an already collected target non-runnable.
+                **(
+                    {"last_status": "api_catalog_synced"}
+                    if not prior
+                    else {}
+                ),
                 "last_error": "" if verified else "官方 API 返回的计划体系或推广方式不完整",
             },
             owner_username=account.get("owner_username"),
@@ -280,8 +283,8 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
         if verified and detail_evidence[ad_id].get("complete"):
             patch_target_sync_state(
                 saved["target_uid"],
-                status="api_catalog_synced",
-                error="",
+                status=None,
+                error=None,
                 synced=False,
                 capability_updates=_capability(plan, saved["target_uid"]),
                 db=db,
@@ -345,11 +348,11 @@ def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None)
             message=f"正在通过千川官方 API 同步 {account.get('account_name') or account.get('aavid')}",
         )
         try:
-            with exclusive_qianchuan_operation(
-                f"官方API目录:{uid}",
-                priority=PRIORITY_COLLECTION,
-            ):
-                result = _sync_account(account, store)
+            # Official API reads are protected by the shared endpoint/account
+            # rate limiter. They must not reuse the legacy browser-wide lock:
+            # a long catalog refresh would otherwise block a newly enabled
+            # plan from collecting its first snapshot.
+            result = _sync_account(account, store)
             results[uid] = result
             if result.get("complete"):
                 complete.append(uid)
