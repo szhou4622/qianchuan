@@ -12,6 +12,31 @@ from services.qianchuan_open_api.runtime_settings import (
 
 
 class OfficialApiRuntimeSettingsTests(unittest.TestCase):
+    def test_api_configuration_endpoints_are_available_before_backend_bootstrap(self):
+        api = Api.__new__(Api)
+        with (
+            patch("api.views.QIANCHUAN_BACKEND", "browser_legacy"),
+            patch(
+                "services.qianchuan_open_api.configuration.get_configuration",
+                return_value={"success": True, "configured": False},
+            ) as get_configuration,
+            patch(
+                "services.qianchuan_open_api.configuration.save_and_start_authorization",
+                return_value={"success": True, "authorization_pending": True},
+            ) as start_authorization,
+        ):
+            status = api.getQianchuanOfficialApiConfig()
+            started = api.saveAndStartQianchuanOfficialApiAuthorization(
+                {"app_id": "1869344049893595", "app_secret": "secret-value"}
+            )
+
+        self.assertTrue(status["success"])
+        self.assertTrue(started["success"])
+        get_configuration.assert_called_once_with()
+        start_authorization.assert_called_once_with(
+            "1869344049893595", "secret-value"
+        )
+
     def test_persisted_backend_and_write_permission_survive_reload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "runtime.json"

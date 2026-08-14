@@ -466,6 +466,38 @@ class OfficialApiBackendTests(unittest.TestCase):
             self.assertNotIn("app_secret", stored)
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    def test_new_secret_can_replace_configuration_that_current_user_cannot_decrypt(
+        self, _protect
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            with patch(
+                "services.qianchuan_open_api.token_provider._unprotect",
+                side_effect=lambda raw: raw,
+            ):
+                save_api_credentials("1869344049893595", "old-secret", path)
+
+            calls = 0
+
+            def fail_once(raw):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise ValueError("foreign DPAPI ciphertext")
+                return raw
+
+            with patch(
+                "services.qianchuan_open_api.token_provider._unprotect",
+                side_effect=fail_once,
+            ):
+                status = save_api_credentials(
+                    "1869344049893595", "new-secret", path
+                )
+
+            self.assertTrue(status["configured"])
+            self.assertTrue(status["app_secret_saved"])
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
     def test_begin_authorization_uses_saved_app_and_random_state(self, _unprotect, _protect):
         with tempfile.TemporaryDirectory() as tmp:

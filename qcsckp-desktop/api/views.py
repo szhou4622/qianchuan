@@ -736,27 +736,19 @@ class Api:
             return {"success": False, "message": str(e)}
 
     def getQianchuanOfficialApiConfig(self):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import get_configuration
         return get_configuration()
 
     def saveQianchuanOfficialApiConfig(self, config=None):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import save_configuration
         payload = config if isinstance(config, dict) else {}
         return save_configuration(payload.get("app_id"), payload.get("app_secret"))
 
     def startQianchuanOfficialApiAuthorization(self):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import start_authorization
         return start_authorization()
 
     def saveAndStartQianchuanOfficialApiAuthorization(self, config=None):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import save_and_start_authorization
         payload = config if isinstance(config, dict) else {}
         return save_and_start_authorization(
@@ -765,8 +757,6 @@ class Api:
         )
 
     def finishQianchuanOfficialApiAuthorization(self, authCode=None):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import finish_authorization
         result = finish_authorization(authCode)
         if result.get("success") and result.get("completed") and result.get("authorized"):
@@ -782,8 +772,6 @@ class Api:
         return result
 
     def clearQianchuanOfficialApiConfig(self):
-        if QIANCHUAN_BACKEND != "official_api":
-            return {"success": False, "message": "当前未启用千川官方 API 模式"}
         from services.qianchuan_open_api.configuration import disconnect_configuration
         return disconnect_configuration()
 

@@ -259,7 +259,15 @@ def save_api_credentials(
     secret = str(app_secret or "").strip()
     if not aid.isdigit() or len(aid) < 6:
         raise ValueError("App ID 格式不正确")
-    existing = _load_saved_bundle(path)
+    try:
+        existing = _load_saved_bundle(path)
+    except ApiTokenError:
+        # 用户明确输入了新的 Secret 时，允许覆盖从另一台电脑复制过来、
+        # 当前 Windows 用户无法解密的 DPAPI 文件。否则用户会永远卡在
+        # “配置读取失败”，连重新配置的入口也无法使用。
+        if not secret:
+            raise
+        existing = None
     if not secret and existing and existing.app_id == aid:
         secret = existing.app_secret
     if len(secret) < 6:

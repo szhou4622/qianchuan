@@ -105,15 +105,12 @@ TEST_MATERIAL_ID = _env_text("QCSCKP_TEST_MATERIAL_ID")
 ALLOW_LIVE_RETARGET = _env_flag("QCSCKP_ALLOW_LIVE_RETARGET")
 LOCAL_TEST_SECRETS_FILE = _env_text("QCSCKP_LOCAL_TEST_SECRETS_FILE")
 
-# 千川业务后端。开发验收期间继续默认旧运行时；官方 API 模式一旦启用便不会
-# 针对单个任务自动回退浏览器，避免一次任务被两个通道重复执行。
-# Development stays on the proven legacy runtime until the required three-
-# account/four-class read reconciliation and controlled write acceptance pass.
-# The official release switches this environment value once; there is no
-# per-task automatic fallback between the two backends.
+# 千川业务后端。当前分支是官方 API 发行线：全新电脑没有运行设置文件时必须
+# 直接进入 official_api，否则 API 配置接口本身会被 legacy 模式挡住，用户将
+# 永远无法完成首次配置。需要回归旧浏览器链路时仍可显式设置环境变量。
 QIANCHUAN_BACKEND = (
     _env_text("QCSCKP_QIANCHUAN_BACKEND")
-    or str(_QIANCHUAN_RUNTIME_SETTINGS.get("backend") or "browser_legacy")
+    or str(_QIANCHUAN_RUNTIME_SETTINGS.get("backend") or "official_api")
 ).lower()
 if QIANCHUAN_BACKEND not in {"official_api", "browser_legacy"}:
     QIANCHUAN_BACKEND = "browser_legacy"

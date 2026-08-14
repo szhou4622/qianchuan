@@ -105,7 +105,7 @@
     if(r?.app_id)$('oeAppId').value=String(r.app_id);
     $('oeAppSecret').value='';
     $('oeAppSecret').placeholder=r?.app_secret_saved?'已加密保存；不修改请留空':'请输入 App Secret';
-    $('apiState').textContent=!r?.success?'配置读取失败':r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
+    $('apiState').textContent=!r?.success?('配置读取失败：'+(r?.message||'请清除本机配置后重新填写')):r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
     $('apiState').classList.toggle('ok',!!r?.authorized);
     $('authorizeApi').textContent=r?.authorized?'重新授权':'保存并授权';
     $('authorizeApi').disabled=!!apiAuthTimer;
