@@ -1963,6 +1963,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     "query_snapshot": query_snapshot,
                     "retargeting": retargeting,
                     "rule_snapshot": strategy_snapshot,
+                    "evaluation_interval_seconds": DEFAULT_INTERVAL_SEC,
+                    "effective_rate_limit": {
+                        "window_seconds": ws_s if per_strategy_rl else ws,
+                        "max_count": mc_s if per_strategy_rl else mc,
+                        "scope": "strategy" if per_strategy_rl else "global",
+                    },
                 }
                 card_result = await asyncio.to_thread(
                     create_retarget_task,

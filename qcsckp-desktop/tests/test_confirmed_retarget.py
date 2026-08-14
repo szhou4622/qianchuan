@@ -786,6 +786,11 @@ class RetargetConfigTests(unittest.TestCase):
             ["m1", "m2"],
             [item["material_id"] for item in payload["materials"]],
         )
+        self.assertEqual(300, payload["evaluation_interval_seconds"])
+        self.assertEqual(
+            {"window_seconds": 86400, "max_count": 1, "scope": "global"},
+            payload["effective_rate_limit"],
+        )
 
     def test_auto_merged_mode_submits_one_task_up_to_candidate_limit(self):
         strategy = {

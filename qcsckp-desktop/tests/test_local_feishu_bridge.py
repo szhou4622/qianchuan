@@ -441,6 +441,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
                 "task_uid": "task-1",
                 "status": "pending",
                 "action_nonce": "nonce-1",
+                "triggered_at": "2026-08-14 20:43:00",
                 "expires_at": "2030-01-01 12:00:00",
             }
         )
@@ -487,6 +488,23 @@ class LocalFeishuTaskTests(unittest.TestCase):
         )
         self.assertIn("合并为1条追投", raw)
         self.assertIn("选中素材分别追投（3条）", raw)
+        self.assertIn("触发时间", raw)
+        self.assertIn("2026-08-14 20:43:00", raw)
+        self.assertIn("策略检查：** 每5分钟一轮", raw)
+        self.assertIn("成功限频：** 同一素材24小时内最多1次", raw)
+        self.assertTrue(
+            all(value.get("instance_uid") for value in action_values)
+        )
+
+    def test_created_card_task_records_local_instance_and_trigger_time(self):
+        payload = task_payload(1)
+        payload["query_snapshot"] = {"query_at": "2026-08-14 21:00:05"}
+        created = bridge.create_local_retarget_task(payload)
+        self.assertTrue(created["success"])
+        row = bridge._task_row(created["data"]["task_uid"], "tool-user-a")
+        task = bridge._task_payload(row or {})
+        self.assertEqual(bridge._local_instance_uid(), task["instance_uid"])
+        self.assertEqual("2026-08-14 21:00:05", task["triggered_at"])
 
     def test_owner_can_select_one_partial_or_all_before_approval(self):
         created = bridge.create_local_retarget_task(task_payload(4))
@@ -1007,6 +1025,25 @@ class LocalFeishuBindingTests(unittest.TestCase):
             bridge._connection_error_status("application is not published"),
         )
         self.assertEqual("error", bridge._connection_error_status("network timeout"))
+
+    def test_foreign_installation_card_action_is_silently_ignored(self):
+        local_instance_uid = bridge._local_instance_uid()
+        self.instance._on_card_action(
+            SimpleNamespace(
+                operator=SimpleNamespace(open_id="ou_owner"),
+                action=SimpleNamespace(
+                    value={
+                        "action": "approve",
+                        "task_uid": "foreign-local-task",
+                        "nonce": "foreign-nonce",
+                        "instance_uid": "f" * 32,
+                    }
+                ),
+                message_id="om_foreign",
+            )
+        )
+        self.assertNotEqual("f" * 32, local_instance_uid)
+        self.assertEqual([], self.sent)
 
     def test_card_action_returns_valid_immediate_ack(self):
         from lark_oapi import LogLevel

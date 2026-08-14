@@ -97,6 +97,25 @@ def _save_profiles(data: Dict[str, Any]) -> None:
         _atomic_json_save(PROFILE_FILE, data)
 
 
+def _local_instance_uid() -> str:
+    """Return a stable, non-secret identifier for this local installation.
+
+    One Feishu application can accidentally be configured on multiple PCs.  The
+    long connection then delivers the same card action to more than one local
+    bridge.  Scoping every new card to its creating installation prevents a
+    foreign PC from replying that the local-only task does not exist.
+    """
+    with PROFILE_LOCK:
+        data = _load_profiles()
+        instance_uid = str(data.get("instance_uid") or "").strip().lower()
+        if re.fullmatch(r"[a-f0-9]{32}", instance_uid):
+            return instance_uid
+        instance_uid = uuid.uuid4().hex
+        data["instance_uid"] = instance_uid
+        _save_profiles(data)
+        return instance_uid
+
+
 def _protect_secret(secret: str) -> str:
     if os.name != "nt":
         raise RuntimeError("本地飞书凭据加密当前仅支持 Windows")
@@ -290,6 +309,18 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     payload = _loads(row.get("payload_json"), {})
     if not isinstance(payload, dict):
         payload = {}
+    query_snapshot = (
+        payload.get("query_snapshot")
+        if isinstance(payload.get("query_snapshot"), dict)
+        else {}
+    )
+    created_at = str(row.get("created_at") or payload.get("created_at") or "")
+    triggered_at = str(
+        payload.get("triggered_at")
+        or query_snapshot.get("query_at")
+        or created_at
+        or ""
+    )
     payload.update(
         {
             "task_uid": str(row.get("task_uid") or ""),
@@ -310,6 +341,9 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
             ),
             "status": str(row.get("status") or "pending"),
             "action_nonce": str(row.get("action_nonce") or ""),
+            "instance_uid": str(payload.get("instance_uid") or ""),
+            "created_at": created_at,
+            "triggered_at": triggered_at,
             "expires_at": str(row.get("expires_at") or ""),
             "clicker_open_id": str(row.get("approved_by") or ""),
             "claim_token": str(row.get("claim_token") or ""),
@@ -820,6 +854,37 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         material_lines.append(line)
     trigger = task.get("trigger_snapshot") if isinstance(task.get("trigger_snapshot"), dict) else {}
     retargeting = task.get("retargeting") if isinstance(task.get("retargeting"), dict) else {}
+    interval = task.get("effective_rate_limit")
+    if not isinstance(interval, dict):
+        interval = (
+            retargeting.get("interval")
+            if isinstance(retargeting.get("interval"), dict)
+            else {}
+        )
+    try:
+        limit_window_seconds = max(1, int(interval.get("window_seconds") or 86400))
+    except (TypeError, ValueError):
+        limit_window_seconds = 86400
+    try:
+        limit_max_count = max(1, int(interval.get("max_count") or 1))
+    except (TypeError, ValueError):
+        limit_max_count = 1
+    if limit_window_seconds % 3600 == 0:
+        limit_window_text = f"{limit_window_seconds // 3600}小时"
+    elif limit_window_seconds % 60 == 0:
+        limit_window_text = f"{limit_window_seconds // 60}分钟"
+    else:
+        limit_window_text = f"{limit_window_seconds}秒"
+    try:
+        evaluation_interval_seconds = max(
+            1, int(task.get("evaluation_interval_seconds") or 300)
+        )
+    except (TypeError, ValueError):
+        evaluation_interval_seconds = 300
+    if evaluation_interval_seconds % 60 == 0:
+        evaluation_interval_text = f"{evaluation_interval_seconds // 60}分钟"
+    else:
+        evaluation_interval_text = f"{evaluation_interval_seconds}秒"
     summary_lines = [
         f"千川账户：{task.get('account_name') or '未命名账户'}",
         f"账户ID：{task.get('aavid') or ''}",
@@ -880,6 +945,9 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
             "content": (
                 f"**命中原因：** {_trigger_summary(trigger)}"
                 f"\n**追投参数：** {_retarget_method_summary(retargeting)}"
+                f"\n**触发时间：** {task.get('triggered_at') or task.get('created_at') or '未记录'}"
+                f"\n**策略检查：** 每{evaluation_interval_text}一轮"
+                f"\n**成功限频：** 同一素材{limit_window_text}内最多{limit_max_count}次"
                 f"\n**有效期至：** {task.get('expires_at') or ''}"
                 f"\n**当前状态：** {status_text}"
             ),
@@ -954,7 +1022,11 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
             ]
         )
     if status == "pending":
-        base = {"task_uid": str(task.get("task_uid") or ""), "nonce": str(task.get("action_nonce") or "")}
+        base = {
+            "task_uid": str(task.get("task_uid") or ""),
+            "nonce": str(task.get("action_nonce") or ""),
+            "instance_uid": str(task.get("instance_uid") or _local_instance_uid()),
+        }
         elements.append(
             {
                 "tag": "markdown",
@@ -1216,6 +1288,7 @@ def build_stop_task_card(
         base = {
             "task_uid": str(task.get("task_uid") or ""),
             "nonce": str(task.get("action_nonce") or ""),
+            "instance_uid": str(task.get("instance_uid") or _local_instance_uid()),
         }
         elements.append(
             {
@@ -1368,6 +1441,7 @@ def build_budget_increase_task_card(
         base = {
             "task_uid": str(task.get("task_uid") or ""),
             "nonce": str(task.get("action_nonce") or ""),
+            "instance_uid": str(task.get("instance_uid") or _local_instance_uid()),
         }
         elements.append(
             {
@@ -1627,6 +1701,7 @@ class LocalFeishuBridge:
                                 "value": {
                                     "action": "connection_test",
                                     "nonce": nonce,
+                                    "instance_uid": _local_instance_uid(),
                                 },
                             }
                         ],
@@ -1809,6 +1884,16 @@ class LocalFeishuBridge:
             value = {}
         open_id = str(getattr(operator, "open_id", "") or "")
         action_name = str(value.get("action") or "")
+        event_instance_uid = str(value.get("instance_uid") or "").strip()
+        local_instance_uid = _local_instance_uid()
+        if event_instance_uid and not secrets.compare_digest(
+            event_instance_uid, local_instance_uid
+        ):
+            logger.info(
+                "[飞书长连接] 忽略其他本机实例的卡片事件 action=%s",
+                action_name or "unknown",
+            )
+            return
         if action_name == "connection_test":
             test_result = self._consume_connection_test(
                 str(value.get("nonce") or ""), open_id
@@ -1840,6 +1925,7 @@ class LocalFeishuBridge:
             operator_open_id=open_id,
             material_id=str(value.get("material_id") or ""),
             group_uid=str(value.get("group_uid") or ""),
+            instance_uid=event_instance_uid,
         )
         if result.get("update"):
             threading.Thread(
@@ -1849,7 +1935,7 @@ class LocalFeishuBridge:
                 daemon=True,
                 name="feishu-card-update",
             ).start()
-        if not result.get("success") and open_id:
+        if not result.get("success") and not result.get("silent") and open_id:
             try:
                 self.send_private_text(open_id, str(result.get("message") or "本次操作未生效"))
             except Exception:
@@ -2466,6 +2552,15 @@ def _create_local_retarget_task_for(
     nonce = secrets.token_hex(32)
     created_at = _dt(_now())
     expires_at = _dt(_now() + timedelta(minutes=30))
+    payload["instance_uid"] = _local_instance_uid()
+    query_snapshot = (
+        payload.get("query_snapshot")
+        if isinstance(payload.get("query_snapshot"), dict)
+        else {}
+    )
+    payload["triggered_at"] = str(
+        payload.get("triggered_at") or query_snapshot.get("query_at") or created_at
+    )
     conn = _db()
     try:
         try:
@@ -2902,14 +2997,27 @@ def handle_local_card_action(
     operator_open_id: str,
     material_id: str = "",
     group_uid: str = "",
+    instance_uid: str = "",
 ) -> Dict[str, Any]:
     account = _account_key(account_username)
+    if instance_uid and not secrets.compare_digest(
+        str(instance_uid), _local_instance_uid()
+    ):
+        return {"success": True, "ignored": True, "silent": True, "message": ""}
     profile = _profile_for(account)
     if operator_open_id != str(profile.get("authorized_open_id") or ""):
         return {"success": False, "message": "你不是该工具账号绑定的操作授权人"}
     row = _task_row(task_uid, account)
     if not row:
-        return {"success": False, "message": "追投任务不存在或不属于当前账号"}
+        # A local Feishu task intentionally exists only on the PC that created
+        # it.  Unknown task IDs can therefore be legitimate events from another
+        # installation using the same Feishu app; never send a misleading chat
+        # message or disclose whether another local task exists.
+        return {
+            "success": False,
+            "silent": True,
+            "message": "追投任务不存在或不属于当前账号",
+        }
     if not secrets.compare_digest(str(row.get("action_nonce") or ""), str(nonce or "")):
         return {"success": False, "message": "卡片任务校验失败"}
     expires = _parse_dt(row.get("expires_at"))
