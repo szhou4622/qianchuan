@@ -167,6 +167,98 @@ def _update_profile(username: str, changes: Dict[str, Any]) -> Dict[str, Any]:
     return _profile_for(username)
 
 
+def _binding_code_digest(username: str, purpose: str, code: str) -> str:
+    """Return a non-reversible representation of a short-lived binding code."""
+    payload = f"qcsckp-feishu-binding-v1\0{_account_key(username)}\0{purpose}\0{code}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _persist_binding_code(
+    username: str,
+    purpose: str,
+    code: str,
+    *,
+    expires_at: float,
+) -> None:
+    """Persist a one-time binding code across WebSocket bridge restarts.
+
+    The plain six-digit code is never written to disk.  Codes are deliberately
+    kept outside the profile object so status/config responses cannot expose
+    even their digest.
+    """
+    key = _account_key(username)
+    if not key:
+        raise RuntimeError("请先登录工具账号")
+    with PROFILE_LOCK:
+        data = _load_profiles()
+        all_codes = data.setdefault("binding_codes", {})
+        account_codes = all_codes.get(key)
+        if not isinstance(account_codes, dict):
+            account_codes = {}
+        account_codes[purpose] = {
+            "digest": _binding_code_digest(key, purpose, code),
+            "expires_at": float(expires_at),
+            "issued_at": _dt(_now()),
+        }
+        all_codes[key] = account_codes
+        _save_profiles(data)
+
+
+def _consume_persisted_binding_code(username: str, purpose: str, code: str) -> bool:
+    """Atomically validate and consume a persisted binding code."""
+    key = _account_key(username)
+    if not key:
+        return False
+    with PROFILE_LOCK:
+        data = _load_profiles()
+        all_codes = data.get("binding_codes")
+        if not isinstance(all_codes, dict):
+            return False
+        account_codes = all_codes.get(key)
+        if not isinstance(account_codes, dict):
+            return False
+        item = account_codes.get(purpose)
+        if not isinstance(item, dict):
+            return False
+
+        expired = float(item.get("expires_at") or 0) < time.time()
+        expected = str(item.get("digest") or "")
+        actual = _binding_code_digest(key, purpose, str(code or ""))
+        matched = bool(expected) and secrets.compare_digest(expected, actual)
+        if not expired and not matched:
+            # A typo must not destroy the still-valid one-time code.
+            return False
+
+        account_codes.pop(purpose, None)
+        if account_codes:
+            all_codes[key] = account_codes
+        else:
+            all_codes.pop(key, None)
+        if all_codes:
+            data["binding_codes"] = all_codes
+        else:
+            data.pop("binding_codes", None)
+        _save_profiles(data)
+        return bool(matched and not expired)
+
+
+def _clear_persisted_binding_codes(username: str) -> None:
+    key = _account_key(username)
+    if not key:
+        return
+    with PROFILE_LOCK:
+        data = _load_profiles()
+        all_codes = data.get("binding_codes")
+        if not isinstance(all_codes, dict) or key not in all_codes:
+            return
+        all_codes.pop(key, None)
+        if all_codes:
+            data["binding_codes"] = all_codes
+        else:
+            data.pop("binding_codes", None)
+        _save_profiles(data)
+
+
 def _db() -> sqlite3.Connection:
     init_sqlite_schema(database=DB_FILE)
     conn = sqlite3.connect(DB_FILE, timeout=30)
@@ -1606,10 +1698,21 @@ class LocalFeishuBridge:
         if purpose == "group" and not self.profile().get("authorized_open_id"):
             return {"success": False, "message": "请先完成个人绑定"}
         code = f"{secrets.randbelow(1_000_000):06d}"
+        expires_at = time.time() + 600
+        try:
+            _persist_binding_code(
+                self.account_username,
+                purpose,
+                code,
+                expires_at=expires_at,
+            )
+        except Exception as exc:
+            logger.warning("[飞书长连接] 保存绑定码失败: %s", exc)
+            return {"success": False, "message": "绑定码保存失败，请重试"}
         with self._lock:
             self._binding_codes[purpose] = {
                 "code": code,
-                "expires_at": time.time() + 600,
+                "expires_at": expires_at,
             }
         command = f"绑定 {code}" if purpose == "personal" else f"绑定群 {code}"
         return {
@@ -1621,17 +1724,15 @@ class LocalFeishuBridge:
         }
 
     def _consume_binding_code(self, purpose: str, code: str) -> bool:
-        with self._lock:
-            item = self._binding_codes.get(purpose)
-            if not item:
-                return False
-            if float(item.get("expires_at") or 0) < time.time():
+        consumed = _consume_persisted_binding_code(
+            self.account_username,
+            purpose,
+            str(code or ""),
+        )
+        if consumed:
+            with self._lock:
                 self._binding_codes.pop(purpose, None)
-                return False
-            if not secrets.compare_digest(str(item.get("code") or ""), str(code or "")):
-                return False
-            self._binding_codes.pop(purpose, None)
-            return True
+        return consumed
 
     def _remember_message(self, message_id: str) -> bool:
         if not message_id:
@@ -2095,6 +2196,7 @@ def clear_local_feishu_binding() -> Dict[str, Any]:
             "groups": [],
         },
     )
+    _clear_persisted_binding_codes(account)
     return {"success": True}
 
 

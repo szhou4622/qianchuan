@@ -963,6 +963,40 @@ class LocalFeishuBindingTests(unittest.TestCase):
         )
         self.assertEqual("oc_group", bridge._profile_for("tool-user-a")["groups"][0]["chat_id"])
 
+    def test_binding_code_survives_websocket_bridge_restart(self):
+        personal = self.instance.issue_binding_code("personal")
+        self.assertTrue(personal["success"])
+
+        # Saving Feishu settings and reconnecting replaces the bridge object.
+        # The command already shown to the user must remain valid for 10 minutes.
+        self.instance.stop()
+        restarted = bridge.LocalFeishuBridge("tool-user-a")
+        restarted.send_text = lambda chat_id, text: self.sent.append(("chat", chat_id, text))
+        restarted.send_private_text = lambda open_id, text: self.sent.append(("user", open_id, text))
+        restarted._on_message(
+            self.message(
+                message_id="restart-m1",
+                text=personal["command"],
+                open_id="ou_owner",
+                chat_id="oc_personal",
+                chat_type="p2p",
+            )
+        )
+
+        profile = bridge._profile_for("tool-user-a")
+        self.assertEqual("ou_owner", profile["authorized_open_id"])
+        with open(self.profile_path, "r", encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        self.assertNotIn("binding_codes", persisted)
+        self.assertNotIn(personal["code"], json.dumps(persisted, ensure_ascii=False))
+
+    def test_binding_code_typo_does_not_invalidate_valid_code(self):
+        personal = self.instance.issue_binding_code("personal")
+        wrong = "000000" if personal["code"] != "000000" else "999999"
+        self.assertFalse(self.instance._consume_binding_code("personal", wrong))
+        self.assertTrue(self.instance._consume_binding_code("personal", personal["code"]))
+        self.assertFalse(self.instance._consume_binding_code("personal", personal["code"]))
+
     def test_connection_errors_have_user_facing_states(self):
         self.assertEqual(
             "permission_missing",
