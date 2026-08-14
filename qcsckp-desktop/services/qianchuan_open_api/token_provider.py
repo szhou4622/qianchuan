@@ -325,7 +325,7 @@ def _relay_json_request(
             # Cloudflare may challenge urllib's default Python-urllib user agent.
             # Use an explicit desktop-client identity so OAuth session creation and
             # polling follow the same path as other supported HTTP clients.
-            "User-Agent": "QCSCKP-Desktop/0.1.48",
+            "User-Agent": "QCSCKP-Desktop/0.1.49",
         },
     )
     try:
