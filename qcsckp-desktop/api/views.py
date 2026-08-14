@@ -1327,8 +1327,12 @@ class Api:
             from services.qianchuan_open_api.runtime_settings import (
                 enable_execution_for_saved_rules,
             )
+            from services.retargeting_rule_runner import (
+                request_retargeting_rule_evaluation,
+            )
 
             runtime = enable_execution_for_saved_rules(saved)
+            request_retargeting_rule_evaluation("rule_saved")
         out = dict(saved)
         out["success"] = True
         if runtime is not None:

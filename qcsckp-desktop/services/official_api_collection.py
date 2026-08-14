@@ -403,6 +403,16 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         capability_remove_keys=("collection_error_at",),
         db=store,
     )
+    # 计划刚加入监控或本轮数据更新完成后，立刻让规则线程复核；不再让用户
+    # 额外等待下一次 5 分钟轮询。局部导入避免采集模块与调度模块循环加载。
+    try:
+        from services.retargeting_rule_runner import (
+            request_retargeting_rule_evaluation,
+        )
+
+        request_retargeting_rule_evaluation("collection_completed")
+    except Exception:
+        logger.exception("官方 API 采集完成后唤醒追投规则失败 target=%s", target_uid)
     return {
         "success": True,
         "target_uid": target_uid,

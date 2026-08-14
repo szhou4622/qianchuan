@@ -320,6 +320,145 @@ class RetargetConfigTests(unittest.TestCase):
         with patch.object(retargeting_rule_runner, "TEST_MODE", False):
             self.assertTrue(retargeting_rule_runner.auto_execute_allowed_in_current_environment())
 
+    def test_transient_collection_state_keeps_fresh_completed_snapshot_usable(self):
+        fresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stale = (datetime.now() - timedelta(minutes=11)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        self.assertTrue(
+            retargeting_rule_runner.target_has_usable_collection_snapshot(
+                {"last_status": "collecting", "last_sync_at": fresh}
+            )
+        )
+        self.assertTrue(
+            retargeting_rule_runner.target_has_usable_collection_snapshot(
+                {"last_status": "queued", "last_sync_at": fresh}
+            )
+        )
+        self.assertFalse(
+            retargeting_rule_runner.target_has_usable_collection_snapshot(
+                {"last_status": "collecting", "last_sync_at": stale}
+            )
+        )
+        self.assertFalse(
+            retargeting_rule_runner.target_has_usable_collection_snapshot(
+                {"last_status": "queued", "last_sync_at": ""}
+            )
+        )
+
+    def test_rule_runner_wake_request_is_consumed_without_waiting_for_interval(self):
+        while retargeting_rule_runner._wait_for_next_rule_cycle(0.01):
+            pass
+        self.assertTrue(
+            retargeting_rule_runner.request_retargeting_rule_evaluation(
+                "test"
+            )
+        )
+        started = datetime.now()
+        self.assertTrue(
+            retargeting_rule_runner._wait_for_next_rule_cycle(2)
+        )
+        self.assertLess((datetime.now() - started).total_seconds(), 0.5)
+
+    def test_auto_revalidation_allows_collecting_with_fresh_snapshot(self):
+        strategy = {
+            "id": "auto-collecting",
+            "title": "自动追投",
+            "target_uid": "target-live",
+            "trigger_level": "material",
+            "action_mode": "auto_execute",
+            "trigger": {"groups": []},
+            "retargeting": {
+                "method": "volume",
+                "volume": {"total_budget_yuan": 100, "duration_hours": 1},
+            },
+        }
+        cfg = {
+            "enabled": True,
+            "trigger_query_period": "1h",
+            "per_strategy_rate_limit": False,
+            "interval": {"window_seconds": 3600, "max_count": 1},
+            "strategies": [copy.deepcopy(strategy)],
+        }
+        target = {
+            "target_uid": "target-live",
+            "aadvid": "10001",
+            "ad_id": "30001",
+            "promotion_scene": "live",
+            "plan_system": "global",
+            "last_status": "collecting",
+            "last_sync_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "enabled": 1,
+            "monitor_eligible": 1,
+            "retarget_eligible": 1,
+            "capability_json": _retarget_capability_json(
+                target_uid="target-live",
+                aavid="10001",
+                ad_id="30001",
+                scene="live",
+                plan_system="global",
+            ),
+        }
+
+        class FakeStore:
+            def select(self, _table, **_kwargs):
+                return []
+
+        class FakeDashboard:
+            def get_table_data(self, **_kwargs):
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "targetUid": "target-live",
+                            "aadvid": "10001",
+                            "id": "m1",
+                            "periodEndTime": datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                        }
+                    ],
+                }
+
+        with patch(
+            "services.retargeting_rule_runner.current_session_owner",
+            return_value="tool-owner",
+        ), patch(
+            "services.retargeting_rule_runner.automation_session_ready",
+            return_value={"ready": True},
+        ), patch(
+            "services.retargeting_rule_runner.load_rule_retargeting_config",
+            return_value=cfg,
+        ), patch(
+            "services.retargeting_rule_runner.schedulable_promotion_targets",
+            return_value=[target],
+        ), patch(
+            "services.retargeting_rule_runner.DashboardApi",
+            return_value=FakeDashboard(),
+        ), patch(
+            "services.retargeting_rule_runner.evaluate_trigger",
+            return_value=True,
+        ), patch(
+            "services.retargeting_rule_runner.rate_limit_should_skip",
+            return_value=False,
+        ):
+            _, _, current_target = (
+                retargeting_rule_runner._revalidate_auto_retarget_under_lock(
+                    FakeStore(),
+                    original_strategy=strategy,
+                    target_uid="target-live",
+                    aavid="10001",
+                    ad_id="30001",
+                    promotion_scene="live",
+                    plan_system="global",
+                    material_id="m1",
+                    product_id="",
+                )
+            )
+
+        self.assertEqual("collecting", current_target["last_status"])
+
     def test_auto_execute_revalidates_strategy_and_material_under_browser_lock(self):
         strategy = {
             "id": "auto-s1",
@@ -677,7 +816,9 @@ class RetargetConfigTests(unittest.TestCase):
             "plan_name": "商品全域计划",
             "promotion_scene": "product",
             "plan_system": "global",
-            "last_status": "ok",
+            # 模拟官方 API 采集线程正好开始下一轮；上一轮完整快照仍新鲜。
+            "last_status": "collecting",
+            "last_sync_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "enabled": 1,
             "monitor_eligible": 1,
             "retarget_eligible": 1,

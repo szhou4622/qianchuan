@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -72,6 +73,17 @@ _DASHBOARD_PAGE_SIZE = 500_000
 # 多策略并行时，同一 material_id 的限频检查与记次必须互斥，避免竞态超次数
 _material_retouch_locks: Dict[str, asyncio.Lock] = {}
 _material_retouch_locks_guard = asyncio.Lock()
+
+# 规则保存、监控计划首次采集完成后，不应让用户再等待完整的 5 分钟周期。
+# Queue 用于合并连续唤醒，同时避免 Event 在 wait/clear 交界处丢失通知。
+_RUNNER_WAKE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=1)
+_RUNNER_THREAD_LOCK = threading.Lock()
+_RUNNER_THREAD: Optional[threading.Thread] = None
+
+# 官方 API 采集开始/排队时会暂时更新 last_status，但不会清空上一轮已
+# 完成的 last_sync_at。只要该快照仍在 10 分钟新鲜期内，就可以进入规则
+# 复核；真正提交前仍会读取最新指标并再次校验计划和素材。
+_TRANSIENT_COLLECTION_STATUSES = frozenset({"collecting", "queued"})
 
 
 def auto_execute_allowed_in_current_environment() -> bool:
@@ -151,6 +163,71 @@ def _timestamp_is_fresh(
         return False
     age_seconds = (datetime.now() - observed_at).total_seconds()
     return -300 <= age_seconds <= max(1, int(max_age_seconds))
+
+
+def target_has_usable_collection_snapshot(target: Dict[str, Any]) -> bool:
+    """判断目标是否有可用于本轮规则复核的已完成采集快照。"""
+    status = str(target.get("last_status") or "").strip().lower()
+    if status == "ok":
+        return True
+    if status in _TRANSIENT_COLLECTION_STATUSES:
+        return _timestamp_is_fresh(target.get("last_sync_at"))
+    return False
+
+
+def request_retargeting_rule_evaluation(reason: str = "") -> bool:
+    """请求规则线程立即执行一轮；连续请求合并为一次。"""
+    try:
+        _RUNNER_WAKE_QUEUE.put_nowait(str(reason or "manual"))
+        return True
+    except queue.Full:
+        return False
+
+
+def _wait_for_next_rule_cycle(timeout_seconds: int) -> bool:
+    """阻塞等待周期或即时唤醒；返回 True 表示收到唤醒。"""
+    try:
+        _RUNNER_WAKE_QUEUE.get(timeout=max(0.01, float(timeout_seconds)))
+        return True
+    except queue.Empty:
+        return False
+
+
+def ensure_official_api_auto_execution_runtime(
+    cfg: Dict[str, Any],
+) -> bool:
+    """从已保存的自动策略恢复官方 API 写权限，避免重启后只采集不执行。"""
+    import config as runtime_config
+
+    if runtime_config.QIANCHUAN_BACKEND != "official_api":
+        return False
+    if TEST_MODE:
+        return False
+    if not bool(cfg.get("enabled")):
+        return False
+    has_auto_strategy = any(
+        isinstance(item, dict)
+        and str(item.get("action_mode") or "card_confirm").strip().lower()
+        == "auto_execute"
+        for item in (cfg.get("strategies") or [])
+    )
+    if not has_auto_strategy:
+        return False
+
+    from services.qianchuan_open_api.runtime import apply_live_write_permission
+    from services.qianchuan_open_api.runtime_settings import (
+        enable_execution_for_saved_rules,
+        load_runtime_settings,
+    )
+
+    settings = load_runtime_settings()
+    if not bool(settings.get("allow_live_api_writes")):
+        enable_execution_for_saved_rules(cfg)
+    else:
+        # 单例可能早于运行设置加载而创建；启动时把持久选择重新应用一次。
+        runtime_config.ALLOW_LIVE_OFFICIAL_API_WRITES = True
+        apply_live_write_permission(True)
+    return True
 
 
 def _json_dumps(obj: Any) -> str:
@@ -354,7 +431,7 @@ def _revalidate_auto_retarget_under_lock(
         or current_system != normalize_plan_system(plan_system)
     ):
         raise RuntimeError("当前账户、计划、推广场景或计划体系已经变化")
-    if str(target.get("last_status") or "").strip().lower() != "ok":
+    if not target_has_usable_collection_snapshot(target):
         raise RuntimeError("监控计划当前状态异常")
     if not _timestamp_is_fresh(target.get("last_sync_at")):
         raise RuntimeError(
@@ -1374,7 +1451,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 )
                 return
             target_status = str(target.get("last_status") or "").strip().lower()
-            if target_status != "ok":
+            if not target_has_usable_collection_snapshot(target):
                 logger.warning(
                     "%s 策略 %s 对应计划当前不可追投 "
                     "target=%s status=%s，已跳过历史素材",
@@ -2424,6 +2501,17 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 async def main_loop(interval_sec: int = DEFAULT_INTERVAL_SEC) -> None:
     init_sqlite_schema()
     db = SQLiteStore()
+    try:
+        ensure_official_api_auto_execution_runtime(
+            load_rule_retargeting_config()
+        )
+    except Exception:
+        # 运行权限恢复失败时后续真实提交仍会由官方 API 写守卫拒绝；保留
+        # 调度线程继续运行，方便用户修复配置后重新保存策略自愈。
+        logger.exception(
+            "%s 启动时恢复自动追投运行权限失败",
+            retarget_log_tag(scheduler=True),
+        )
     logger.info(
         "%s 启动，间隔 %ss，版本 %s",
         retarget_log_tag(scheduler=True),
@@ -2435,7 +2523,15 @@ async def main_loop(interval_sec: int = DEFAULT_INTERVAL_SEC) -> None:
             await run_one_cycle(db)
         except Exception:
             logger.exception("%s 本轮未捕获异常", retarget_log_tag(scheduler=True))
-        await asyncio.sleep(max(1, int(interval_sec)))
+        woke = await asyncio.to_thread(
+            _wait_for_next_rule_cycle,
+            max(1, int(interval_sec)),
+        )
+        if woke:
+            logger.info(
+                "%s 收到即时复核请求，开始新一轮",
+                retarget_log_tag(scheduler=True),
+            )
 
 
 def _gui_background_target() -> None:
@@ -2451,15 +2547,19 @@ def start_retargeting_rule_runner_background_thread() -> threading.Thread:
     供 gui_app 等调用：启动守护线程，逻辑与 `python -m services.retargeting_rule_runner` 一致。
     `rule_retargeting.json` 未启用 enabled 时每轮仅快速跳过。
     """
-    t = threading.Thread(
-        target=_gui_background_target,
-        name="retargeting-rule-runner",
-        daemon=True,
-    )
-    t.start()
+    global _RUNNER_THREAD
+    with _RUNNER_THREAD_LOCK:
+        if _RUNNER_THREAD is not None and _RUNNER_THREAD.is_alive():
+            return _RUNNER_THREAD
+        _RUNNER_THREAD = threading.Thread(
+            target=_gui_background_target,
+            name="retargeting-rule-runner",
+            daemon=True,
+        )
+        _RUNNER_THREAD.start()
     logger.info(
         "%s 后台线程已启动（GUI，间隔 %ss，可用 RETARGET_RULE_INTERVAL_SEC 覆盖）",
         retarget_log_tag(scheduler=True),
         DEFAULT_INTERVAL_SEC,
     )
-    return t
+    return _RUNNER_THREAD

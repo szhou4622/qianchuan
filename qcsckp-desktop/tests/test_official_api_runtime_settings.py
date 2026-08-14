@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from api.views import Api
+from services import retargeting_rule_runner
 from services.qianchuan_open_api.runtime_settings import (
     enable_execution_for_saved_rules,
     persist_official_api_runtime,
@@ -75,6 +76,31 @@ class OfficialApiRuntimeSettingsTests(unittest.TestCase):
 
         persist.assert_called_once_with(allow_live_writes=True)
         self.assertTrue(result["allow_live_api_writes"])
+
+    def test_saved_auto_rule_restores_write_runtime_after_restart(self):
+        config = {
+            "enabled": True,
+            "strategies": [{"action_mode": "auto_execute"}],
+        }
+        with (
+            patch("config.QIANCHUAN_BACKEND", "official_api"),
+            patch(
+                "services.qianchuan_open_api.runtime_settings.load_runtime_settings",
+                return_value={"backend": "official_api"},
+            ),
+            patch(
+                "services.qianchuan_open_api.runtime_settings.enable_execution_for_saved_rules",
+                return_value={"allow_live_api_writes": True},
+            ) as enable_writes,
+        ):
+            restored = (
+                retargeting_rule_runner.ensure_official_api_auto_execution_runtime(
+                    config
+                )
+            )
+
+        self.assertTrue(restored)
+        enable_writes.assert_called_once_with(config)
 
     def test_retarget_rule_save_restores_monitor_only_after_validation(self):
         api = Api.__new__(Api)
@@ -172,6 +198,64 @@ class OfficialApiRuntimeSettingsTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         enable_target.assert_not_called()
+
+    def test_official_api_rule_save_enables_writes_and_wakes_scheduler(self):
+        api = Api.__new__(Api)
+        api.db = object()
+        merged = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "target_uid": "target-one",
+                    "account_uid": "account-one",
+                    "action_mode": "auto_execute",
+                }
+            ],
+        }
+        target = {
+            "target_uid": "target-one",
+            "account_uid": "account-one",
+            "enabled": True,
+            "account_enabled": True,
+            "retarget_eligible": True,
+        }
+        with (
+            patch("api.views.QIANCHUAN_BACKEND", "official_api"),
+            patch(
+                "api.rule_retargeting_config.preview_merge",
+                return_value=merged,
+            ),
+            patch(
+                "api.rule_retargeting_config.validate_rule_retargeting_config",
+                return_value=(True, ""),
+            ),
+            patch(
+                "api.rule_retargeting_config.validate_strategy_target_compatibility",
+                return_value=(True, ""),
+            ),
+            patch(
+                "api.rule_retargeting_config.merge_and_save",
+                return_value=merged,
+            ),
+            patch(
+                "api.promotion_targets.get_promotion_target",
+                return_value=target,
+            ),
+            patch(
+                "services.qianchuan_open_api.runtime_settings.enable_execution_for_saved_rules",
+                return_value={"allow_live_api_writes": True},
+            ) as enable_writes,
+            patch(
+                "services.retargeting_rule_runner.request_retargeting_rule_evaluation",
+                return_value=True,
+            ) as wake_runner,
+        ):
+            result = api.setRuleRetargetingConfig(merged)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["officialApiWritesEnabled"])
+        enable_writes.assert_called_once_with(merged)
+        wake_runner.assert_called_once_with("rule_saved")
 
 
 if __name__ == "__main__":
