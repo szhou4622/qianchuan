@@ -21,6 +21,8 @@ def get_configuration() -> dict[str, Any]:
     try:
         status = api_configuration_status()
         last_error = ""
+        if status.get("requires_reentry"):
+            last_error = "检测到其他电脑留下的加密配置，请重新输入 App ID 和 App Secret"
         if (
             status["configured"]
             and not status["authorized"]

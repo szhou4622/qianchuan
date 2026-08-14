@@ -447,7 +447,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(status, 201)
         self.assertTrue(result["success"])
-        self.assertEqual(request.get_header("User-agent"), "QCSCKP-Desktop/0.1.46")
+        self.assertEqual(request.get_header("User-agent"), "QCSCKP-Desktop/0.1.47")
         self.assertEqual(request.get_header("Accept"), "application/json")
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
@@ -496,6 +496,30 @@ class OfficialApiBackendTests(unittest.TestCase):
 
             self.assertTrue(status["configured"])
             self.assertTrue(status["app_secret_saved"])
+
+    def test_unreadable_foreign_configuration_returns_reentry_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "format": "qcsckp-oceanengine-token-dpapi-v1",
+                        "ciphertext": "Zm9yZWlnbi1jaXBoZXJ0ZXh0",
+                    },
+                    handle,
+                )
+            with patch(
+                "services.qianchuan_open_api.token_provider._unprotect",
+                side_effect=ValueError("foreign DPAPI ciphertext"),
+            ):
+                status = api_configuration_status(path)
+
+            self.assertFalse(status["configured"])
+            self.assertFalse(status["authorized"])
+            self.assertTrue(status["requires_reentry"])
+            self.assertEqual(
+                "unreadable_local_encryption", status["configuration_error"]
+            )
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)

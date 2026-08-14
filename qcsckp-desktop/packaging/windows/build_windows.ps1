@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.46"
+    [string]$Version = "0.1.47"
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,6 +88,32 @@ foreach ($writableDir in @("data", "logs", "temp")) {
     New-Item -ItemType Directory -Path (Join-Path $releaseDir $writableDir) -Force | Out-Null
 }
 
+# A public package must start with a completely blank local runtime. In
+# particular, never ship another Windows user's DPAPI ciphertext: it cannot be
+# decrypted on the recipient's computer and would make API setup appear broken.
+$runtimeFiles = @()
+foreach ($writableDir in @("data", "logs", "temp")) {
+    $runtimeFiles += @(Get-ChildItem -LiteralPath (Join-Path $releaseDir $writableDir) -File -Recurse -Force)
+}
+if ($runtimeFiles.Count -ne 0) {
+    throw "Release runtime directories are not empty: $($runtimeFiles.FullName -join ', ')"
+}
+
+$forbiddenRuntimeNames = @(
+    "qianchuan_open_api_token.json",
+    "qianchuan.db",
+    "qcookie.json",
+    "local_feishu_config.json",
+    ".env"
+)
+$forbiddenRuntimeFiles = @(
+    Get-ChildItem -LiteralPath $releaseDir -File -Recurse -Force |
+        Where-Object { $forbiddenRuntimeNames -contains $_.Name }
+)
+if ($forbiddenRuntimeFiles.Count -ne 0) {
+    throw "Release contains private runtime files: $($forbiddenRuntimeFiles.FullName -join ', ')"
+}
+
 $repoRoot = Split-Path -Parent $projectRoot
 $commit = (& git -C $repoRoot rev-parse --short HEAD 2>$null)
 $branch = (& git -C $repoRoot branch --show-current 2>$null)
@@ -105,5 +131,23 @@ if (-not (Test-Path -LiteralPath $exePath)) {
     throw "The built executable was not found: $exePath"
 }
 
+$zipPath = Join-Path $outputRoot "$releaseName.zip"
+Push-Location $distRoot
+try {
+    & tar.exe -a -c -f $zipPath $releaseName
+    if ($LASTEXITCODE -ne 0) {
+        throw "ZIP creation failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    Pop-Location
+}
+$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$checksumPath = "$zipPath.sha256.txt"
+Set-Content -LiteralPath $checksumPath -Value "$zipHash  $([System.IO.Path]::GetFileName($zipPath))" -Encoding ASCII
+
 Write-Output "RELEASE_DIR=$releaseDir"
 Write-Output "EXE_PATH=$exePath"
+Write-Output "ZIP_PATH=$zipPath"
+Write-Output "ZIP_SHA256=$zipHash"
+Write-Output "CHECKSUM_PATH=$checksumPath"

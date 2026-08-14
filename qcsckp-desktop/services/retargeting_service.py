@@ -29,14 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config import DATA_DIR, QIANCHUAN_BACKEND
 from api.promotion_targets import extract_target_ids, normalize_scene
-if QIANCHUAN_BACKEND == "browser_legacy":
-    from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
-    from services.fetcher import build_qianchuan_url_by_params
-    from services.product_scene_adapter import (
-        find_visible_exact_text,
-        goto_and_confirm_product_target,
-        validate_exact_product_target_payload,
-    )
+from playwright.async_api import Browser, BrowserContext, Page, Response, async_playwright
+from services.fetcher import build_qianchuan_url_by_params
+from services.product_scene_adapter import (
+    find_visible_exact_text,
+    goto_and_confirm_product_target,
+    validate_exact_product_target_payload,
+)
 from services.plan_system import (
     confirm_live_page_plan_system,
     normalize_plan_system,

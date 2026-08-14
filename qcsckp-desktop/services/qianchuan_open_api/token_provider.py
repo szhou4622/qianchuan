@@ -223,7 +223,23 @@ class DefaultTokenProvider:
 
 def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, Any]:
     """返回可向前端展示的脱敏状态，绝不返回 secret 或 token。"""
-    bundle = _load_saved_bundle(path)
+    try:
+        bundle = _load_saved_bundle(path)
+    except ApiTokenError:
+        # DPAPI 密文只能由创建它的 Windows 用户解密。测试包若曾被连同
+        # data 目录复制到另一台电脑，状态查询必须退回可重新配置状态，
+        # 不能因为旧密文不可读而永久锁死“保存并授权”入口。
+        return {
+            "configured": False,
+            "authorized": False,
+            "app_id": "",
+            "app_secret_saved": False,
+            "authorization_pending": False,
+            "expires_at": 0,
+            "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+            "requires_reentry": True,
+            "configuration_error": "unreadable_local_encryption",
+        }
     if bundle is None:
         return {
             "configured": False,
@@ -233,6 +249,8 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "authorization_pending": False,
             "expires_at": 0,
             "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+            "requires_reentry": False,
+            "configuration_error": "",
         }
     return {
         "configured": bool(bundle.app_id and bundle.app_secret),
@@ -247,6 +265,8 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
         ),
         "expires_at": bundle.expires_at,
         "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+        "requires_reentry": False,
+        "configuration_error": "",
     }
 
 
@@ -305,7 +325,7 @@ def _relay_json_request(
             # Cloudflare may challenge urllib's default Python-urllib user agent.
             # Use an explicit desktop-client identity so OAuth session creation and
             # polling follow the same path as other supported HTTP clients.
-            "User-Agent": "QCSCKP-Desktop/0.1.46",
+            "User-Agent": "QCSCKP-Desktop/0.1.47",
         },
     )
     try:

@@ -97,11 +97,19 @@ class ProductPromotionTests(unittest.TestCase):
         self.db_path = os.path.join(self.tmp.name, "product.db")
         init_sqlite_schema(database=self.db_path)
         self.db = SQLiteStore(database=self.db_path)
+        self.backend_patches = [
+            patch("config.QIANCHUAN_BACKEND", "browser_legacy"),
+            patch("api.views.QIANCHUAN_BACKEND", "browser_legacy"),
+        ]
+        for backend_patch in self.backend_patches:
+            backend_patch.start()
         self.init_patch = patch("api.promotion_targets.init_sqlite_schema")
         self.init_patch.start()
 
     def tearDown(self):
         self.init_patch.stop()
+        for backend_patch in reversed(self.backend_patches):
+            backend_patch.stop()
         self.tmp.cleanup()
 
     def _target(self, index, *, enabled=True, scene="product"):

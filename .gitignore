@@ -18,6 +18,7 @@ qcsckp-desktop/data/
 qcsckp-desktop/logs/
 qcsckp-desktop/output/
 qcsckp-desktop/dev_files/
+qcsckp-desktop/.codex-*.log
 
 # Build output
 **/build/

@@ -609,6 +609,7 @@ class QianchuanSessionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         base = self.temp.name
         self.paths = [
+            patch("config.QIANCHUAN_BACKEND", "browser_legacy"),
             patch.object(
                 qianchuan_session,
                 "SESSION_FILE",
