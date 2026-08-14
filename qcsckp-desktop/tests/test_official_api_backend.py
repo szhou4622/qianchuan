@@ -447,7 +447,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(status, 201)
         self.assertTrue(result["success"])
-        self.assertEqual(request.get_header("User-agent"), "QCSCKP-Desktop/0.1.47")
+        self.assertEqual(request.get_header("User-agent"), "QCSCKP-Desktop/0.1.48")
         self.assertEqual(request.get_header("Accept"), "application/json")
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
