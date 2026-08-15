@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import webbrowser
 from typing import Any
 
 from .runtime import get_official_api_service
@@ -12,6 +11,7 @@ from .token_provider import (
     begin_api_authorization,
     clear_api_configuration,
     exchange_authorization_code,
+    open_oauth_authorization_browser,
     poll_api_authorization,
     save_api_credentials,
 )
@@ -62,15 +62,14 @@ def start_authorization(app_id: Any = None, app_secret: Any = None) -> dict[str,
             save_api_credentials(app_id, app_secret)
         persist_official_api_runtime()
         auth = begin_api_authorization()
-        opened = bool(webbrowser.open(str(auth["url"])))
+        opened = open_oauth_authorization_browser(
+            str(auth["url"]), str(auth["state"])
+        )
         return {
             "success": True,
             "opened": opened,
             "authorization_pending": True,
-            "message": (
-                "已打开千川官方授权页；同意授权后，应用后台登记的公网回调服务"
-                "会把结果转交给本机工具"
-            ),
+            "message": "已打开千川官方授权页；同意授权后工具会自动完成连接",
         }
     except Exception as exc:
         return {"success": False, "message": str(exc)}

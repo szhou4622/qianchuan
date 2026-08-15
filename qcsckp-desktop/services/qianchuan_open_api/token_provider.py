@@ -9,7 +9,6 @@ import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -17,10 +16,6 @@ from urllib.request import Request, urlopen
 
 from config import (
     QIANCHUAN_API_TOKEN_FILE,
-    QIANCHUAN_OAUTH_LOOPBACK_HOST,
-    QIANCHUAN_OAUTH_LOOPBACK_PATH,
-    QIANCHUAN_OAUTH_LOOPBACK_PORT,
-    QIANCHUAN_OAUTH_LOOPBACK_URL,
     QIANCHUAN_OFFICIAL_API_BASE_URL,
 )
 from .errors import ApiTokenError, OfficialApiNotConfigured
@@ -29,98 +24,152 @@ from .errors import ApiTokenError, OfficialApiNotConfigured
 QIANCHUAN_OAUTH_PAGE = "https://qianchuan.jinritemai.com/openapi/qc/audit/oauth.html"
 
 
-_loopback_lock = threading.RLock()
-_loopback_server: Optional[ThreadingHTTPServer] = None
-_loopback_thread: Optional[threading.Thread] = None
-_loopback_callbacks: dict[str, tuple[float, str]] = {}
+_oauth_browser_lock = threading.RLock()
+_oauth_browser_callbacks: dict[str, tuple[float, str]] = {}
+_oauth_browser_errors: dict[str, str] = {}
+_oauth_browser_threads: dict[str, threading.Thread] = {}
+_oauth_browser_cancel: dict[str, threading.Event] = {}
 
 
-def _remember_loopback_callback(state: str, query: str) -> None:
+def _remember_oauth_browser_callback(state: str, query: str) -> None:
     now = time.time()
-    with _loopback_lock:
-        expired = [key for key, item in _loopback_callbacks.items() if now - item[0] > 15 * 60]
+    with _oauth_browser_lock:
+        expired = [
+            key
+            for key, item in _oauth_browser_callbacks.items()
+            if now - item[0] > 15 * 60
+        ]
         for key in expired:
-            _loopback_callbacks.pop(key, None)
-        _loopback_callbacks[state] = (now, query)
+            _oauth_browser_callbacks.pop(key, None)
+        _oauth_browser_callbacks[state] = (now, query)
+        _oauth_browser_errors.pop(state, None)
 
 
-def _peek_loopback_callback(state: str) -> str:
-    with _loopback_lock:
-        item = _loopback_callbacks.get(state)
+def _peek_oauth_browser_callback(state: str) -> str:
+    with _oauth_browser_lock:
+        item = _oauth_browser_callbacks.get(state)
         return item[1] if item else ""
 
 
-def _discard_loopback_callback(state: str) -> None:
-    with _loopback_lock:
-        _loopback_callbacks.pop(state, None)
+def _discard_oauth_browser_callback(state: str) -> None:
+    with _oauth_browser_lock:
+        _oauth_browser_callbacks.pop(state, None)
+        _oauth_browser_errors.pop(state, None)
 
 
-def ensure_oauth_loopback_receiver() -> str:
-    """启动仅监听 127.0.0.1 的 OAuth 回调接收端，并返回本机地址。"""
-    global _loopback_server, _loopback_thread
-    with _loopback_lock:
-        if _loopback_server and _loopback_thread and _loopback_thread.is_alive():
-            return QIANCHUAN_OAUTH_LOOPBACK_URL
+def _oauth_callback_query(expected_state: str, url: str) -> str:
+    """从授权浏览器导航中提取属于本次会话的回调，绝不记录完整 URL。"""
+    parsed = urlparse(str(url or ""))
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    code = str((params.get("auth_code") or [""])[0]).strip()
+    state = str((params.get("state") or [""])[0]).strip()
+    if code and state and secrets.compare_digest(state, expected_state):
+        return parsed.query
+    return ""
 
-        expected_path = QIANCHUAN_OAUTH_LOOPBACK_PATH.rstrip("/") or "/callback"
 
-        class _CallbackHandler(BaseHTTPRequestHandler):
-            server_version = "QCSCKP-OAuth-Loopback/1.0"
+def _remember_oauth_browser_error(state: str, message: str) -> None:
+    # 避免异常对象意外携带一次性回调查询串。
+    safe = str(message or "授权浏览器异常").split("?", 1)[0].strip()
+    with _oauth_browser_lock:
+        _oauth_browser_errors[state] = safe[:300]
 
-            def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
-                parsed = urlparse(self.path)
-                if parsed.path.rstrip("/") != expected_path:
-                    self.send_error(404)
-                    return
-                params = parse_qs(parsed.query, keep_blank_values=True)
-                state = str((params.get("state") or [""])[0]).strip()
-                code = str((params.get("auth_code") or [""])[0]).strip()
-                if not state or not code:
-                    self._reply(400, "授权回调缺少 auth_code 或 state，请返回工具重新授权。")
-                    return
-                _remember_loopback_callback(state, parsed.query)
-                self._reply(200, "授权信息已安全交给千川工具，可以关闭此页面。")
 
-            def _reply(self, status: int, message: str) -> None:
-                body = (
-                    "<!doctype html><meta charset='utf-8'><title>千川工具授权</title>"
-                    "<style>body{font-family:system-ui;padding:48px;line-height:1.8}</style>"
-                    f"<h2>{message}</h2>"
-                ).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+def _peek_oauth_browser_error(state: str) -> str:
+    with _oauth_browser_lock:
+        return str(_oauth_browser_errors.get(state) or "")
 
-            def log_message(self, _format: str, *_args: Any) -> None:
-                # 查询串包含一次性 auth_code，绝不写入终端或日志。
-                return
 
-        class _LoopbackServer(ThreadingHTTPServer):
-            allow_reuse_address = True
-            daemon_threads = True
+def open_oauth_authorization_browser(url: str, state: str) -> bool:
+    """用本机 Chrome 打开授权页并监听导航，不依赖回调转交或本机端口。"""
+    auth_url = str(url or "").strip()
+    expected_state = str(state or "").strip()
+    if not auth_url.startswith("https://") or not expected_state:
+        raise ApiTokenError("千川授权地址或 state 无效")
 
+    with _oauth_browser_lock:
+        existing = _oauth_browser_threads.get(expected_state)
+        if existing and existing.is_alive():
+            return True
+        # 新授权替代旧授权，避免用户继续操作过期窗口。
+        for event in _oauth_browser_cancel.values():
+            event.set()
+        cancel = threading.Event()
+        _oauth_browser_cancel.clear()
+        _oauth_browser_cancel[expected_state] = cancel
+        _oauth_browser_errors.pop(expected_state, None)
+
+    def _worker() -> None:
+        browser = None
+        captured = threading.Event()
         try:
-            server = _LoopbackServer(
-                (QIANCHUAN_OAUTH_LOOPBACK_HOST, QIANCHUAN_OAUTH_LOOPBACK_PORT),
-                _CallbackHandler,
-            )
-        except OSError as exc:
-            raise ApiTokenError(
-                f"本机授权接收端口 {QIANCHUAN_OAUTH_LOOPBACK_PORT} 无法启动；"
-                "请关闭占用该端口的程序后重试"
-            ) from exc
-        thread = threading.Thread(
-            target=server.serve_forever,
-            name="qcsckp-oauth-loopback",
-            daemon=True,
-        )
-        thread.start()
-        _loopback_server = server
-        _loopback_thread = thread
-        return QIANCHUAN_OAUTH_LOOPBACK_URL
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+            from utils.common import require_executable_path
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    executable_path=require_executable_path(),
+                    headless=False,
+                    args=["--start-maximized"],
+                )
+                context = browser.new_context(no_viewport=True)
+
+                def _route(route: Any, request: Any) -> None:
+                    query = _oauth_callback_query(expected_state, request.url)
+                    if query:
+                        _remember_oauth_browser_callback(expected_state, query)
+                        captured.set()
+                        # 已取得一次性授权码，不再把它发送给任何回调服务。
+                        route.abort()
+                        return
+                    route.continue_()
+
+                context.route("**/*", _route)
+                page = context.new_page()
+                try:
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=60_000)
+                except PlaywrightTimeoutError:
+                    # 官方授权页偶尔会被统计资源拖慢。主文档已经出现时继续
+                    # 等待用户授权，不能因为次要资源超时直接关闭授权窗口。
+                    if page.is_closed():
+                        raise
+                deadline = time.time() + 10 * 60
+                while (
+                    time.time() < deadline
+                    and not captured.is_set()
+                    and not cancel.is_set()
+                    and browser.is_connected()
+                ):
+                    # Playwright 的同步事件在 API 调用期间派发。
+                    page.wait_for_timeout(250)
+                if not captured.is_set() and not cancel.is_set():
+                    _remember_oauth_browser_error(
+                        expected_state,
+                        "授权窗口已关闭或等待超时，请重新点击保存并授权",
+                    )
+        except Exception as exc:
+            if not captured.is_set() and not cancel.is_set():
+                _remember_oauth_browser_error(expected_state, str(exc))
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            with _oauth_browser_lock:
+                _oauth_browser_threads.pop(expected_state, None)
+                _oauth_browser_cancel.pop(expected_state, None)
+
+    thread = threading.Thread(
+        target=_worker,
+        name="qcsckp-oauth-browser",
+        daemon=True,
+    )
+    with _oauth_browser_lock:
+        _oauth_browser_threads[expected_state] = thread
+    thread.start()
+    return True
 
 
 @dataclass(frozen=True)
@@ -334,7 +383,7 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "authorization_pending": False,
             "expires_at": 0,
             "oauth_callback_url": "",
-            "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+            "oauth_capture_mode": "browser_navigation",
             "oauth_callback_managed_by_platform": True,
             "requires_reentry": True,
             "configuration_error": "unreadable_local_encryption",
@@ -348,7 +397,7 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "authorization_pending": False,
             "expires_at": 0,
             "oauth_callback_url": "",
-            "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+            "oauth_capture_mode": "browser_navigation",
             "oauth_callback_managed_by_platform": True,
             "requires_reentry": False,
             "configuration_error": "",
@@ -365,7 +414,7 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
         ),
         "expires_at": bundle.expires_at,
         "oauth_callback_url": "",
-        "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+        "oauth_capture_mode": "browser_navigation",
         "oauth_callback_managed_by_platform": True,
         "requires_reentry": False,
         "configuration_error": "",
@@ -469,7 +518,7 @@ def begin_api_authorization(
     poll_secret = ""
     started = time.time()
     if relay_request is not None:
-        # 仅供旧版迁移测试。生产路径使用本机回调接收，不访问任何固定域名。
+        # 仅供旧版迁移测试。生产路径监听授权浏览器导航，不访问固定中转域名。
         poll_secret = secrets.token_urlsafe(32)
         status, relay = relay_request(
             "/oauth/session",
@@ -477,8 +526,6 @@ def begin_api_authorization(
         )
         if status not in {200, 201} or not relay.get("success"):
             raise ApiTokenError(str(relay.get("message") or "创建千川授权会话失败"))
-    else:
-        ensure_oauth_loopback_receiver()
     save_token_bundle(
         AccessTokenBundle(
             access_token=bundle.access_token,
@@ -497,7 +544,7 @@ def begin_api_authorization(
         + "?"
         + urlencode({"app_id": bundle.app_id, "state": state, "material_auth": "1"}),
         "started_at": started,
-        "local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+        "state": state,
     }
 
 
@@ -508,7 +555,7 @@ def poll_api_authorization(
         Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
     ] = None,
 ) -> dict[str, Any]:
-    """领取一次性授权码并在本机换令牌；公网回调永远拿不到应用密钥。"""
+    """领取授权浏览器捕获的一次性授权码，并使用本机密钥换取令牌。"""
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
@@ -537,12 +584,14 @@ def poll_api_authorization(
             raise ApiTokenError("千川授权结果不完整，请重新授权")
         callback = urlencode({"auth_code": auth_code, "state": returned_state})
     else:
-        ensure_oauth_loopback_receiver()
-        callback = _peek_loopback_callback(bundle.oauth_state)
+        browser_error = _peek_oauth_browser_error(bundle.oauth_state)
+        if browser_error:
+            raise ApiTokenError(browser_error)
+        callback = _peek_oauth_browser_callback(bundle.oauth_state)
         if not callback:
             return {"completed": False, "authorized": False}
     exchange_authorization_code(callback, path)
-    _discard_loopback_callback(bundle.oauth_state)
+    _discard_oauth_browser_callback(bundle.oauth_state)
     return {"completed": True, "authorized": True}
 
 

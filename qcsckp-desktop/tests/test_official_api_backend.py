@@ -33,6 +33,7 @@ from services.qianchuan_open_api.token_provider import (
     api_configuration_status,
     begin_api_authorization,
     exchange_authorization_code,
+    _oauth_callback_query,
     _relay_json_request,
     poll_api_authorization,
     save_api_credentials,
@@ -539,45 +540,33 @@ class OfficialApiBackendTests(unittest.TestCase):
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
-    @patch(
-        "services.qianchuan_open_api.token_provider.ensure_oauth_loopback_receiver",
-        return_value="http://127.0.0.1:17658/callback",
-    )
-    def test_default_authorization_uses_local_handoff_without_fixed_relay(
-        self, receiver, _unprotect, _protect
+    def test_default_authorization_uses_browser_capture_without_fixed_relay(
+        self, _unprotect, _protect
     ):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "official-api.json")
             save_api_credentials("1869344049893595", "secret-value", path)
             auth = begin_api_authorization(path)
-            receiver.assert_called_once_with()
-            self.assertEqual(
-                "http://127.0.0.1:17658/callback",
-                auth["local_receiver_url"],
-            )
+            self.assertTrue(auth["state"])
             status = api_configuration_status(path)
             self.assertTrue(status["authorization_pending"])
             self.assertEqual("", status["oauth_callback_url"])
+            self.assertEqual("browser_navigation", status["oauth_capture_mode"])
             self.assertTrue(status["oauth_callback_managed_by_platform"])
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._discard_oauth_browser_callback")
     @patch(
-        "services.qianchuan_open_api.token_provider.ensure_oauth_loopback_receiver",
-        return_value="http://127.0.0.1:17658/callback",
-    )
-    @patch("services.qianchuan_open_api.token_provider._discard_loopback_callback")
-    @patch(
-        "services.qianchuan_open_api.token_provider._peek_loopback_callback",
+        "services.qianchuan_open_api.token_provider._peek_oauth_browser_callback",
         return_value="auth_code=one-time-code&state=state-from-bundle",
     )
     @patch("services.qianchuan_open_api.token_provider.exchange_authorization_code")
-    def test_poll_reads_user_callback_handoff_from_local_receiver(
+    def test_poll_reads_callback_captured_from_authorization_browser(
         self,
         exchange,
         peek,
         discard,
-        _receiver,
         _unprotect,
         _protect,
     ):
@@ -607,6 +596,18 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "auth_code=one-time-code&state=state-from-bundle", path
             )
             discard.assert_called_once_with("state-from-bundle")
+
+    def test_browser_capture_only_accepts_matching_state(self):
+        valid = _oauth_callback_query(
+            "expected-state",
+            "https://user.example/callback?auth_code=one-time-code&state=expected-state",
+        )
+        wrong = _oauth_callback_query(
+            "expected-state",
+            "https://user.example/callback?auth_code=one-time-code&state=wrong-state",
+        )
+        self.assertIn("auth_code=one-time-code", valid)
+        self.assertEqual("", wrong)
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
