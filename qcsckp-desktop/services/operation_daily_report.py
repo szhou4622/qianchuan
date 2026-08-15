@@ -173,45 +173,28 @@ def _store(database: Optional[str] = None) -> SQLiteStore:
     return SQLiteStore(database=path)
 
 
-def list_operation_account_options(database: Optional[str] = None) -> List[Dict[str, str]]:
+def list_operation_account_options(database: Optional[str] = None) -> List[Dict[str, Any]]:
     store = _store(database)
-    from services.qianchuan_accounts import (
-        list_qianchuan_accounts,
-        migrate_existing_qianchuan_accounts,
-    )
+    from services.qianchuan_accounts import list_qianchuan_accounts
 
     owner = current_local_feishu_account() or None
-    migrate_existing_qianchuan_accounts(owner_username=owner, db=store)
     accounts = list_qianchuan_accounts(owner_username=owner, db=store)
-    if accounts:
-        return [
-            {
-                "account_uid": str(item.get("account_uid") or ""),
-                "aavid": str(item.get("aavid") or ""),
-                "account_name": str(item.get("account_name") or ""),
-                "report_enabled": bool(item.get("report_enabled")),
-            }
-            for item in accounts
-        ]
-    rows = store.execute(
-        "SELECT aavid FROM account_operation_event WHERE aavid<>'' "
-        "UNION SELECT aadvid AS aavid FROM pmc_ad_detail_basic WHERE aadvid<>'' "
-        "ORDER BY aavid",
-        fetch=True,
-    ) or []
-    result: List[Dict[str, str]] = []
-    for row in rows:
-        aavid = str(row.get("aavid") or "").strip()
-        latest = store.execute(
-            "SELECT user_info_name FROM pmc_ad_detail_basic "
-            "WHERE aadvid=? AND COALESCE(user_info_name,'')<>'' "
-            "ORDER BY updated_at DESC,id DESC LIMIT 1",
-            (aavid,),
-            fetch=True,
-        ) or []
-        name = str(latest[0].get("user_info_name") or "") if latest else ""
-        result.append({"aavid": aavid, "account_name": name or f"千川账户 {aavid}"})
-    return result
+    # The Feishu report picker is a view of the account directory, not a
+    # second account registry. Historical events/material rows must never
+    # resurrect removed accounts or expose accounts the user did not add.
+    # Report eligibility is account-level, so an enabled account remains
+    # available even when it has zero monitored plans.
+    return [
+        {
+            "account_uid": str(item.get("account_uid") or ""),
+            "aavid": str(item.get("aavid") or ""),
+            "account_name": str(item.get("account_name") or ""),
+            "enabled": True,
+            "report_enabled": bool(item.get("report_enabled")),
+        }
+        for item in accounts
+        if bool(item.get("enabled"))
+    ]
 
 
 def get_operation_daily_report_config(
@@ -235,9 +218,11 @@ def get_operation_daily_report_config(
                 "account_uid": str(item.get("account_uid") or ""),
                 "aavid": str(item.get("aavid") or ""),
                 "account_name": str(item.get("account_name") or ""),
+                "enabled": True,
                 "report_enabled": bool(item.get("report_enabled")),
             }
             for item in account_options
+            if bool(item.get("enabled"))
         ]
     )
     selected = [
@@ -245,8 +230,11 @@ def get_operation_daily_report_config(
         for item in options
         if bool(item.get("report_enabled"))
     ]
-    if options:
-        config["aavids"] = selected
+    # Never retain a stale file selection when the account directory is empty
+    # or an account has since been disabled/removed.
+    config["aavids"] = selected
+    if not options:
+        config["enabled"] = False
     return {
         "success": True,
         "account_username": account,
@@ -263,23 +251,31 @@ def save_operation_daily_report_config(
     if not account:
         return {"success": False, "message": "请先登录工具账号"}
     try:
-        saved = _save_profile_config(account, config if isinstance(config, dict) else {})
+        requested_config = dict(config) if isinstance(config, dict) else {}
         from services.qianchuan_accounts import (
             list_qianchuan_accounts,
-            migrate_existing_qianchuan_accounts,
             save_qianchuan_account_settings,
         )
 
-        selected = set(saved.get("aavids") or [])
         store = _store(database)
-        migrate_existing_qianchuan_accounts(
+        directory_accounts = list_qianchuan_accounts(
             owner_username=account,
-            # 用户在日报配置中明确勾选的账户只获得报表归属；迁移后的
-            # 自动化计划仍保持禁用并等待千川目录精确核验。
-            authorized_aavids=selected,
             db=store,
         )
-        for item in list_qianchuan_accounts(owner_username=account, db=store):
+        eligible_accounts = [item for item in directory_accounts if bool(item.get("enabled"))]
+        eligible_aavids = {
+            str(item.get("aavid") or "") for item in eligible_accounts
+        }
+        requested = set(_normalize_aavids(requested_config.get("aavids")))
+        invalid = sorted(requested - eligible_aavids)
+        if invalid:
+            raise ValueError(
+                "日报账户必须先在千川账户管理中添加并启用：" + ", ".join(invalid)
+            )
+        requested_config["aavids"] = sorted(requested)
+        saved = _save_profile_config(account, requested_config)
+        selected = set(saved.get("aavids") or [])
+        for item in directory_accounts:
             save_qianchuan_account_settings(
                 item["account_uid"],
                 {
@@ -774,11 +770,7 @@ def send_operation_daily_report(
         for item in options
         if bool(item.get("report_enabled"))
     ]
-    aavids = (
-        selected_from_directory
-        if options
-        else (config.get("aavids") or [])
-    )
+    aavids = selected_from_directory
     if not aavids:
         return {"success": False, "message": "尚未勾选需要日报的千川账户"}
     day = _report_date(report_date)
@@ -969,7 +961,14 @@ def run_operation_daily_report_scheduler_once(
     account = current_local_feishu_account()
     if not account:
         return {"success": True, "skipped": True, "reason": "logged_out"}
-    config = _profile_config(account)
+    effective = get_operation_daily_report_config(database=database)
+    config = effective.get("config") or {}
+    if not effective.get("accounts"):
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "no_enabled_report_accounts",
+        }
     if not config.get("enabled"):
         return {"success": True, "skipped": True, "reason": "disabled"}
     if current.strftime("%H:%M") < str(config.get("send_time") or "09:00"):

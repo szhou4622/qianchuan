@@ -269,7 +269,7 @@
           <div class="panel settings-panel">
             <div class="panel-title">账户与日报</div>
             <label class="check"><input type="checkbox" data-field="enabled" ${acc.enabled?'checked':''}>启用此千川账户；关闭后该账户全部自动化暂停</label>
-            <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''}>同步昨日操作日志并纳入09:00日报</label>
+            <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''} ${acc.enabled?'':'disabled'}>同步昨日操作日志并纳入09:00日报</label>
             <div class="field"><label>飞书接收位置</label><select data-field="route_mode"><option value="default" ${acc.route_mode==='default'?'selected':''}>使用管理员默认位置</option><option value="custom" ${acc.route_mode==='custom'?'selected':''}>为此账户单独配置</option></select></div>
             <div data-custom-route style="${acc.route_mode==='custom'?'':'display:none'}">
               <label class="check"><input type="checkbox" data-field="route_send_personal" ${acc.route_send_personal?'checked':''}>发送给已绑定的唯一确认人</label>
@@ -327,6 +327,11 @@
     document.querySelectorAll('[data-field=enabled]').forEach(input=>input.onchange=event=>{
       const card=input.closest('.card');
       card.classList.toggle('off',!input.checked);
+      const reportInput=card.querySelector('[data-field=report_enabled]');
+      if(reportInput){
+        reportInput.disabled=!input.checked;
+        if(!input.checked)reportInput.checked=false;
+      }
       card.querySelectorAll('[data-target]').forEach(planInput=>{
         const canChoose=input.checked&&planInput.dataset.eligible==='1';
         planInput.disabled=!canChoose&&!planInput.checked;
