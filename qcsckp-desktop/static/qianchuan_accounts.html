@@ -16,7 +16,7 @@
     .metric,.card{background:#101b2d;border:1px solid #26364e;border-radius:14px}.metric{padding:14px}
     .metric .label{color:#8295ae;font-size:11px}.metric .value{margin-top:6px;color:#f8fafc;font-weight:700;font-size:17px}.metric .hint{margin-top:5px;color:#71839b;font-size:10px;line-height:1.5}
     .notice{display:none;padding:11px 14px;margin-bottom:14px;border:1px solid #1d4ed866;background:#17255466;color:#bfdbfe;border-radius:10px;font-size:12px}.notice.show{display:block}
-    .api-config{display:none;margin-bottom:14px;padding:16px;background:#101b2d;border:1px solid #1d4ed8;border-radius:14px}.api-config.show{display:block}.api-config-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.api-config h2{margin:0;font-size:15px;color:#f8fafc}.api-config p{margin:6px 0 0;color:#8295ae;font-size:11px;line-height:1.6}.api-state{font-size:11px;color:#fbbf24;white-space:nowrap}.api-state.ok{color:#86efac}.api-config-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.api-field label{display:block;margin-bottom:5px;color:#9fb0c6;font-size:11px}.api-field input{width:100%;min-height:38px;padding:0 11px;border:1px solid #334155;border-radius:8px;background:#08111f;color:#e2e8f0}.api-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}.api-actions .danger-link{margin-left:auto;background:transparent;color:#fda4af}.api-help{margin-top:10px;color:#71839b;font-size:10px;line-height:1.6}
+    .api-config{display:none;margin-bottom:14px;padding:16px;background:#101b2d;border:1px solid #1d4ed8;border-radius:14px}.api-config.show{display:block}.api-config-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.api-config h2{margin:0;font-size:15px;color:#f8fafc}.api-config p{margin:6px 0 0;color:#8295ae;font-size:11px;line-height:1.6}.api-state{font-size:11px;color:#fbbf24;white-space:nowrap}.api-state.ok{color:#86efac}.api-config-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.api-field label{display:block;margin-bottom:5px;color:#9fb0c6;font-size:11px}.api-field input{width:100%;min-height:38px;padding:0 11px;border:1px solid #334155;border-radius:8px;background:#08111f;color:#e2e8f0}.api-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}.api-actions .danger-link{margin-left:auto;background:transparent;color:#fda4af}.api-help{margin-top:10px;color:#71839b;font-size:10px;line-height:1.6}.api-callback{margin-top:8px;color:#93c5fd}.api-callback code{color:#bfdbfe;user-select:all}.api-callback button{margin-left:6px;padding:3px 8px;font-size:10px;background:#1e3a5f}
     .onboarding{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-bottom:14px}.step{padding:10px;border:1px solid #26364e;border-radius:10px;background:#0b1627;color:#8295ae;font-size:11px}.step.done{border-color:#166534;color:#86efac}.step.warn{border-color:#92400e;color:#fbbf24}.step.bad{border-color:#be123c;color:#fda4af}
     .toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.toolbar .spacer{flex:1}.toggle-line{display:flex;align-items:center;gap:8px;color:#a8b6c9;font-size:12px}
     input[type=checkbox]{accent-color:#0ea5e9}.accounts{display:grid;gap:14px}.card{height:620px;padding:17px;display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}.card.off{opacity:.78}
@@ -59,6 +59,7 @@
     </div>
     <div class="api-actions"><button class="primary" id="authorizeApi">保存并授权</button><button class="danger-link" id="clearApiConfig">清除本机配置</button></div>
     <div class="api-help">只需填写 App ID 和 App Secret。点击“保存并授权”后在官方页面同意授权，工具会自动完成连接并显示可添加的千川账户，无需复制回调地址。App Secret 和令牌只加密保存在本机。</div>
+    <div class="api-help api-callback">开放平台的授权回调必须填写工具指定的公网地址，不能填写 127.0.0.1：<code id="oauthCallbackUrl">读取中</code><button type="button" id="copyOauthCallback">复制回调地址</button></div>
   </section>
   <div class="onboarding" id="onboarding"></div>
   <div class="summary">
@@ -93,7 +94,7 @@
   const catalogStatus=x=>({complete:'完整',partial:'不完整',not_synced:'未同步',syncing:'同步中',login_required:'需要重新登录',error:'同步失败'}[x]||x||'未同步');
   const logStatus=x=>({ok:'同步正常',partial:'部分完成',empty:'暂无记录',login_required:'需要重新登录',not_configured:'尚未配置',error:'同步失败'}[x]||x||'尚未配置');
   const groupDefs=[['chengfang','live','乘方 · 推直播'],['chengfang','product','乘方 · 推商品'],['global','live','全域 · 推直播'],['global','product','全域 · 推商品'],['unknown','all','待确认/其他']];
-  let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null,apiAuthTimer=null,apiAuthBusy=false;
+  let latest=null,dirty=false,catalogWatchTimer=null,catalogWatchBusy=false,loadInFlight=null,apiAuthTimer=null,apiAuthBusy=false,apiAuthStarting=false,apiAuthWatchGeneration=0;
   const savingAccounts=new Set();
 
   async function loadApiConfig(){
@@ -107,13 +108,19 @@
     $('oeAppSecret').placeholder=r?.app_secret_saved?'已加密保存；不修改请留空':'请输入 App Secret';
     $('apiState').textContent=!r?.success?('配置读取失败：'+(r?.message||'请清除本机配置后重新填写')):r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
     $('apiState').classList.toggle('ok',!!r?.authorized);
-    $('authorizeApi').textContent=r?.authorized?'重新授权':'保存并授权';
-    $('authorizeApi').disabled=!!apiAuthTimer;
+    $('oauthCallbackUrl').textContent=r?.oauth_callback_url||'暂未读取到回调地址';
+    $('authorizeApi').textContent=r?.authorized?'重新授权':r?.authorization_pending?'重新发起授权':'保存并授权';
+    // 等待官方授权时仍允许用户立即重新发起。官方页被关闭、拦截或上次
+    // 授权残留时，不能把入口锁死到十分钟超时。
+    $('authorizeApi').disabled=!!apiAuthStarting;
     $('addAccount').disabled=!r?.authorized;
     return r;
   }
 
   async function authorizeApi(){
+    if(apiAuthStarting)return;
+    stopApiAuthorizationWatch();
+    apiAuthStarting=true;
     const a=await waitApi();$('authorizeApi').disabled=true;
     let r;
     try{
@@ -126,18 +133,21 @@
       message(r?.message||'打开官方授权页失败',!r?.success);
       if(r?.success)watchApiAuthorization();
     }catch(e){message('启动官方授权失败：'+String(e?.message||e),true)}
-    finally{if(!r?.success)$('authorizeApi').disabled=false;await loadApiConfig()}
+    finally{apiAuthStarting=false;$('authorizeApi').disabled=false;await loadApiConfig()}
   }
 
   function stopApiAuthorizationWatch(){
+    apiAuthWatchGeneration+=1;
     if(apiAuthTimer){clearInterval(apiAuthTimer);apiAuthTimer=null}
     apiAuthBusy=false;
   }
 
   function watchApiAuthorization(){
     stopApiAuthorizationWatch();
+    const generation=apiAuthWatchGeneration;
     const started=Date.now();
     apiAuthTimer=setInterval(async()=>{
+      if(generation!==apiAuthWatchGeneration)return;
       if(apiAuthBusy)return;
       if(Date.now()-started>10*60*1000){
         stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
@@ -147,6 +157,7 @@
       try{
         const a=await waitApi();
         const r=await a.finishQianchuanOfficialApiAuthorization();
+        if(generation!==apiAuthWatchGeneration)return;
         if(!r?.success){
           stopApiAuthorizationWatch();$('authorizeApi').disabled=false;
           message(r?.message||'完成 API 授权失败',true);await loadApiConfig();return;
@@ -562,6 +573,12 @@
   $('relogin').textContent='重新进行API授权';
   $('relogin').onclick=authorizeApi;$('addAccount').onclick=addAccount;$('discover').onclick=()=>discover('',$('discover'));$('refresh').onclick=reloadDisplay;
   $('authorizeApi').onclick=authorizeApi;$('clearApiConfig').onclick=clearApiConfig;
+  $('copyOauthCallback').onclick=async()=>{
+    const value=$('oauthCallbackUrl').textContent.trim();
+    if(!/^https:\/\//i.test(value)){message('尚未读取到有效的公网回调地址',true);return}
+    try{await navigator.clipboard.writeText(value);message('回调地址已复制')}
+    catch(e){message('复制失败，请手动选中回调地址复制',true)}
+  };
   function rerenderCatalogFilter(){
     if(dirty){
       message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);

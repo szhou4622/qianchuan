@@ -29,6 +29,22 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("document.addEventListener('visibilitychange'", self.html)
         self.assertIn("load().then(resumeCatalogWatch)", self.html)
 
+    def test_pending_official_authorization_can_be_restarted_immediately(self):
+        self.assertIn(
+            "r?.authorization_pending?'重新发起授权':'保存并授权'",
+            self.html,
+        )
+        self.assertIn("$('authorizeApi').disabled=!!apiAuthStarting", self.html)
+        self.assertNotIn("$('authorizeApi').disabled=!!apiAuthTimer", self.html)
+        self.assertIn("stopApiAuthorizationWatch();\n    apiAuthStarting=true", self.html)
+        self.assertIn("generation!==apiAuthWatchGeneration", self.html)
+
+    def test_official_api_callback_warning_rejects_loopback_guidance(self):
+        self.assertIn('id="oauthCallbackUrl"', self.html)
+        self.assertIn('id="copyOauthCallback"', self.html)
+        self.assertIn("不能填写 127.0.0.1", self.html)
+        self.assertIn("r?.oauth_callback_url||'暂未读取到回调地址'", self.html)
+
     def test_single_account_refresh_lives_inside_account_card(self):
         self.assertIn('data-refresh-account="${esc(acc.account_uid)}"', self.html)
         self.assertIn("刷新此账户计划", self.html)
