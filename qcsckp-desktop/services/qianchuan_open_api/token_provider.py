@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -16,14 +17,110 @@ from urllib.request import Request, urlopen
 
 from config import (
     QIANCHUAN_API_TOKEN_FILE,
-    QIANCHUAN_OAUTH_CALLBACK_URL,
-    QIANCHUAN_OAUTH_RELAY_BASE_URL,
+    QIANCHUAN_OAUTH_LOOPBACK_HOST,
+    QIANCHUAN_OAUTH_LOOPBACK_PATH,
+    QIANCHUAN_OAUTH_LOOPBACK_PORT,
+    QIANCHUAN_OAUTH_LOOPBACK_URL,
     QIANCHUAN_OFFICIAL_API_BASE_URL,
 )
 from .errors import ApiTokenError, OfficialApiNotConfigured
 
 
 QIANCHUAN_OAUTH_PAGE = "https://qianchuan.jinritemai.com/openapi/qc/audit/oauth.html"
+
+
+_loopback_lock = threading.RLock()
+_loopback_server: Optional[ThreadingHTTPServer] = None
+_loopback_thread: Optional[threading.Thread] = None
+_loopback_callbacks: dict[str, tuple[float, str]] = {}
+
+
+def _remember_loopback_callback(state: str, query: str) -> None:
+    now = time.time()
+    with _loopback_lock:
+        expired = [key for key, item in _loopback_callbacks.items() if now - item[0] > 15 * 60]
+        for key in expired:
+            _loopback_callbacks.pop(key, None)
+        _loopback_callbacks[state] = (now, query)
+
+
+def _peek_loopback_callback(state: str) -> str:
+    with _loopback_lock:
+        item = _loopback_callbacks.get(state)
+        return item[1] if item else ""
+
+
+def _discard_loopback_callback(state: str) -> None:
+    with _loopback_lock:
+        _loopback_callbacks.pop(state, None)
+
+
+def ensure_oauth_loopback_receiver() -> str:
+    """启动仅监听 127.0.0.1 的 OAuth 回调接收端，并返回本机地址。"""
+    global _loopback_server, _loopback_thread
+    with _loopback_lock:
+        if _loopback_server and _loopback_thread and _loopback_thread.is_alive():
+            return QIANCHUAN_OAUTH_LOOPBACK_URL
+
+        expected_path = QIANCHUAN_OAUTH_LOOPBACK_PATH.rstrip("/") or "/callback"
+
+        class _CallbackHandler(BaseHTTPRequestHandler):
+            server_version = "QCSCKP-OAuth-Loopback/1.0"
+
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+                parsed = urlparse(self.path)
+                if parsed.path.rstrip("/") != expected_path:
+                    self.send_error(404)
+                    return
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                state = str((params.get("state") or [""])[0]).strip()
+                code = str((params.get("auth_code") or [""])[0]).strip()
+                if not state or not code:
+                    self._reply(400, "授权回调缺少 auth_code 或 state，请返回工具重新授权。")
+                    return
+                _remember_loopback_callback(state, parsed.query)
+                self._reply(200, "授权信息已安全交给千川工具，可以关闭此页面。")
+
+            def _reply(self, status: int, message: str) -> None:
+                body = (
+                    "<!doctype html><meta charset='utf-8'><title>千川工具授权</title>"
+                    "<style>body{font-family:system-ui;padding:48px;line-height:1.8}</style>"
+                    f"<h2>{message}</h2>"
+                ).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                # 查询串包含一次性 auth_code，绝不写入终端或日志。
+                return
+
+        class _LoopbackServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        try:
+            server = _LoopbackServer(
+                (QIANCHUAN_OAUTH_LOOPBACK_HOST, QIANCHUAN_OAUTH_LOOPBACK_PORT),
+                _CallbackHandler,
+            )
+        except OSError as exc:
+            raise ApiTokenError(
+                f"本机授权接收端口 {QIANCHUAN_OAUTH_LOOPBACK_PORT} 无法启动；"
+                "请关闭占用该端口的程序后重试"
+            ) from exc
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="qcsckp-oauth-loopback",
+            daemon=True,
+        )
+        thread.start()
+        _loopback_server = server
+        _loopback_thread = thread
+        return QIANCHUAN_OAUTH_LOOPBACK_URL
 
 
 @dataclass(frozen=True)
@@ -236,7 +333,9 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "app_secret_saved": False,
             "authorization_pending": False,
             "expires_at": 0,
-            "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+            "oauth_callback_url": "",
+            "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+            "oauth_callback_managed_by_platform": True,
             "requires_reentry": True,
             "configuration_error": "unreadable_local_encryption",
         }
@@ -248,7 +347,9 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
             "app_secret_saved": False,
             "authorization_pending": False,
             "expires_at": 0,
-            "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+            "oauth_callback_url": "",
+            "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+            "oauth_callback_managed_by_platform": True,
             "requires_reentry": False,
             "configuration_error": "",
         }
@@ -260,11 +361,12 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
         "authorization_pending": bool(
             bundle.oauth_state
             and bundle.oauth_started_at
-            and bundle.oauth_poll_secret
             and time.time() - bundle.oauth_started_at <= 10 * 60
         ),
         "expires_at": bundle.expires_at,
-        "oauth_callback_url": QIANCHUAN_OAUTH_CALLBACK_URL,
+        "oauth_callback_url": "",
+        "oauth_local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
+        "oauth_callback_managed_by_platform": True,
         "requires_reentry": False,
         "configuration_error": "",
     }
@@ -312,10 +414,15 @@ def _relay_json_request(
     endpoint: str,
     payload: dict[str, Any],
     *,
+    base_url: str,
     timeout: int = 15,
 ) -> tuple[int, dict[str, Any]]:
+    """旧版中转协议兼容助手；正式授权流程不再使用固定中转地址。"""
+    normalized_base = str(base_url or "").strip().rstrip("/")
+    if not normalized_base.startswith("https://"):
+        raise ValueError("授权中转服务必须使用 HTTPS")
     request = Request(
-        QIANCHUAN_OAUTH_RELAY_BASE_URL + endpoint,
+        normalized_base + endpoint,
         data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         method="POST",
         headers={
@@ -351,20 +458,27 @@ def _relay_json_request(
 def begin_api_authorization(
     path: str = QIANCHUAN_API_TOKEN_FILE,
     *,
-    relay_request: Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]] = _relay_json_request,
+    relay_request: Optional[
+        Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
+    ] = None,
 ) -> dict[str, Any]:
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     state = secrets.token_urlsafe(24)
-    poll_secret = secrets.token_urlsafe(32)
+    poll_secret = ""
     started = time.time()
-    status, relay = relay_request(
-        "/oauth/session",
-        {"state": state, "poll_secret": poll_secret},
-    )
-    if status not in {200, 201} or not relay.get("success"):
-        raise ApiTokenError(str(relay.get("message") or "创建千川授权会话失败"))
+    if relay_request is not None:
+        # 仅供旧版迁移测试。生产路径使用本机回调接收，不访问任何固定域名。
+        poll_secret = secrets.token_urlsafe(32)
+        status, relay = relay_request(
+            "/oauth/session",
+            {"state": state, "poll_secret": poll_secret},
+        )
+        if status not in {200, 201} or not relay.get("success"):
+            raise ApiTokenError(str(relay.get("message") or "创建千川授权会话失败"))
+    else:
+        ensure_oauth_loopback_receiver()
     save_token_bundle(
         AccessTokenBundle(
             access_token=bundle.access_token,
@@ -383,21 +497,23 @@ def begin_api_authorization(
         + "?"
         + urlencode({"app_id": bundle.app_id, "state": state, "material_auth": "1"}),
         "started_at": started,
+        "local_receiver_url": QIANCHUAN_OAUTH_LOOPBACK_URL,
     }
 
 
 def poll_api_authorization(
     path: str = QIANCHUAN_API_TOKEN_FILE,
     *,
-    relay_request: Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]] = _relay_json_request,
+    relay_request: Optional[
+        Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
+    ] = None,
 ) -> dict[str, Any]:
-    """领取一次性授权码并在本机换令牌；中转服务永远拿不到应用密钥。"""
+    """领取一次性授权码并在本机换令牌；公网回调永远拿不到应用密钥。"""
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     if (
         not bundle.oauth_state
-        or not bundle.oauth_poll_secret
         or not bundle.oauth_started_at
     ):
         if bundle.usable():
@@ -405,23 +521,28 @@ def poll_api_authorization(
         raise ApiTokenError("没有等待中的授权，请点击保存并授权")
     if time.time() - bundle.oauth_started_at > 10 * 60:
         raise ApiTokenError("授权请求已过期，请重新点击保存并授权")
-    status, relay = relay_request(
-        "/oauth/result",
-        {"state": bundle.oauth_state, "poll_secret": bundle.oauth_poll_secret},
-    )
-    relay_status = str(relay.get("status") or "").lower()
-    if status == 202 or relay_status == "pending":
-        return {"completed": False, "authorized": False}
-    if status != 200 or not relay.get("success") or relay_status != "ready":
-        raise ApiTokenError(str(relay.get("message") or "读取千川授权结果失败"))
-    auth_code = str(relay.get("auth_code") or "").strip()
-    returned_state = str(relay.get("state") or "").strip()
-    if not auth_code or not returned_state:
-        raise ApiTokenError("千川授权结果不完整，请重新授权")
-    exchange_authorization_code(
-        urlencode({"auth_code": auth_code, "state": returned_state}),
-        path,
-    )
+    if relay_request is not None and bundle.oauth_poll_secret:
+        status, relay = relay_request(
+            "/oauth/result",
+            {"state": bundle.oauth_state, "poll_secret": bundle.oauth_poll_secret},
+        )
+        relay_status = str(relay.get("status") or "").lower()
+        if status == 202 or relay_status == "pending":
+            return {"completed": False, "authorized": False}
+        if status != 200 or not relay.get("success") or relay_status != "ready":
+            raise ApiTokenError(str(relay.get("message") or "读取千川授权结果失败"))
+        auth_code = str(relay.get("auth_code") or "").strip()
+        returned_state = str(relay.get("state") or "").strip()
+        if not auth_code or not returned_state:
+            raise ApiTokenError("千川授权结果不完整，请重新授权")
+        callback = urlencode({"auth_code": auth_code, "state": returned_state})
+    else:
+        ensure_oauth_loopback_receiver()
+        callback = _peek_loopback_callback(bundle.oauth_state)
+        if not callback:
+            return {"completed": False, "authorized": False}
+    exchange_authorization_code(callback, path)
+    _discard_loopback_callback(bundle.oauth_state)
     return {"completed": True, "authorized": True}
 
 
@@ -435,7 +556,7 @@ def exchange_authorization_code(
     code = str((params.get("auth_code") or [""])[0]).strip()
     returned_state = str((params.get("state") or [""])[0]).strip()
     if not code or len(code) < 6 or not returned_state:
-        raise ValueError("请粘贴包含 auth_code 和 state 的完整授权回调地址")
+        raise ValueError("授权回调缺少 auth_code 或 state")
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")

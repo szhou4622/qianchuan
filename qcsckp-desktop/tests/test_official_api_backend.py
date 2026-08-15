@@ -2,6 +2,7 @@ import json
 import asyncio
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from decimal import Decimal
@@ -443,6 +444,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         status, result = _relay_json_request(
             "/oauth/session",
             {"state": "state-value", "poll_secret": "poll-secret"},
+            base_url="https://callback.example.test",
         )
         request = mocked_urlopen.call_args.args[0]
         self.assertEqual(status, 201)
@@ -534,6 +536,77 @@ class OfficialApiBackendTests(unittest.TestCase):
             self.assertIn("material_auth=1", first["url"])
             self.assertNotEqual(first["url"], second["url"])
             self.assertTrue(api_configuration_status(path)["authorization_pending"])
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    @patch(
+        "services.qianchuan_open_api.token_provider.ensure_oauth_loopback_receiver",
+        return_value="http://127.0.0.1:17658/callback",
+    )
+    def test_default_authorization_uses_local_handoff_without_fixed_relay(
+        self, receiver, _unprotect, _protect
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            save_api_credentials("1869344049893595", "secret-value", path)
+            auth = begin_api_authorization(path)
+            receiver.assert_called_once_with()
+            self.assertEqual(
+                "http://127.0.0.1:17658/callback",
+                auth["local_receiver_url"],
+            )
+            status = api_configuration_status(path)
+            self.assertTrue(status["authorization_pending"])
+            self.assertEqual("", status["oauth_callback_url"])
+            self.assertTrue(status["oauth_callback_managed_by_platform"])
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    @patch(
+        "services.qianchuan_open_api.token_provider.ensure_oauth_loopback_receiver",
+        return_value="http://127.0.0.1:17658/callback",
+    )
+    @patch("services.qianchuan_open_api.token_provider._discard_loopback_callback")
+    @patch(
+        "services.qianchuan_open_api.token_provider._peek_loopback_callback",
+        return_value="auth_code=one-time-code&state=state-from-bundle",
+    )
+    @patch("services.qianchuan_open_api.token_provider.exchange_authorization_code")
+    def test_poll_reads_user_callback_handoff_from_local_receiver(
+        self,
+        exchange,
+        peek,
+        discard,
+        _receiver,
+        _unprotect,
+        _protect,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            save_api_credentials("1869344049893595", "secret-value", path)
+            from services.qianchuan_open_api.token_provider import (
+                _load_saved_bundle,
+                save_token_bundle,
+            )
+
+            bundle = _load_saved_bundle(path)
+            save_token_bundle(
+                AccessTokenBundle(
+                    access_token="",
+                    app_id=bundle.app_id,
+                    app_secret=bundle.app_secret,
+                    oauth_state="state-from-bundle",
+                    oauth_started_at=time.time(),
+                ),
+                path,
+            )
+            result = poll_api_authorization(path)
+            self.assertTrue(result["completed"])
+            peek.assert_called_once_with("state-from-bundle")
+            exchange.assert_called_once_with(
+                "auth_code=one-time-code&state=state-from-bundle", path
+            )
+            discard.assert_called_once_with("state-from-bundle")
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)

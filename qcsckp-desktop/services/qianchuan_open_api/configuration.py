@@ -67,7 +67,10 @@ def start_authorization(app_id: Any = None, app_secret: Any = None) -> dict[str,
             "success": True,
             "opened": opened,
             "authorization_pending": True,
-            "message": "已打开千川官方授权页；同意授权后工具会自动完成连接",
+            "message": (
+                "已打开千川官方授权页；同意授权后，应用后台登记的公网回调服务"
+                "会把结果转交给本机工具"
+            ),
         }
     except Exception as exc:
         return {"success": False, "message": str(exc)}
