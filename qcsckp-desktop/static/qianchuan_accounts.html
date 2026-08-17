@@ -59,7 +59,7 @@
     </div>
     <div class="api-actions"><button class="primary" id="authorizeApi">保存并授权</button><button class="danger-link" id="clearApiConfig">清除本机配置</button></div>
     <div class="api-help">只需填写 App ID 和 App Secret。点击“保存并授权”后在官方页面同意授权，工具会自动完成连接并显示可添加的千川账户，无需复制回调地址。App Secret 和令牌只加密保存在本机。</div>
-    <div class="api-help api-callback">开放平台的授权回调必须填写工具指定的公网地址，不能填写 127.0.0.1：<code id="oauthCallbackUrl">读取中</code><button type="button" id="copyOauthCallback">复制回调地址</button></div>
+    <div class="api-help api-callback">只需填写 App ID 和 App Secret，并在工具打开的官方授权窗口中同意授权。工具会自动取得授权结果，不需要填写、复制或转交回调地址。</div>
   </section>
   <div class="onboarding" id="onboarding"></div>
   <div class="summary">
@@ -108,7 +108,6 @@
     $('oeAppSecret').placeholder=r?.app_secret_saved?'已加密保存；不修改请留空':'请输入 App Secret';
     $('apiState').textContent=!r?.success?('配置读取失败：'+(r?.message||'请清除本机配置后重新填写')):r.authorized?'已授权·可读取账户':r.configured?'应用已保存·待授权':'未配置';
     $('apiState').classList.toggle('ok',!!r?.authorized);
-    $('oauthCallbackUrl').textContent=r?.oauth_callback_url||'暂未读取到回调地址';
     $('authorizeApi').textContent=r?.authorized?'重新授权':r?.authorization_pending?'重新发起授权':'保存并授权';
     // 等待官方授权时仍允许用户立即重新发起。官方页被关闭、拦截或上次
     // 授权残留时，不能把入口锁死到十分钟超时。
@@ -270,7 +269,7 @@
           <div class="panel settings-panel">
             <div class="panel-title">账户与日报</div>
             <label class="check"><input type="checkbox" data-field="enabled" ${acc.enabled?'checked':''}>启用此千川账户；关闭后该账户全部自动化暂停</label>
-            <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''}>同步昨日操作日志并纳入09:00日报</label>
+            <label class="check"><input type="checkbox" data-field="report_enabled" ${acc.report_enabled?'checked':''} ${acc.enabled?'':'disabled'}>同步昨日操作日志并纳入09:00日报</label>
             <div class="field"><label>飞书接收位置</label><select data-field="route_mode"><option value="default" ${acc.route_mode==='default'?'selected':''}>使用管理员默认位置</option><option value="custom" ${acc.route_mode==='custom'?'selected':''}>为此账户单独配置</option></select></div>
             <div data-custom-route style="${acc.route_mode==='custom'?'':'display:none'}">
               <label class="check"><input type="checkbox" data-field="route_send_personal" ${acc.route_send_personal?'checked':''}>发送给已绑定的唯一确认人</label>
@@ -328,6 +327,11 @@
     document.querySelectorAll('[data-field=enabled]').forEach(input=>input.onchange=event=>{
       const card=input.closest('.card');
       card.classList.toggle('off',!input.checked);
+      const reportInput=card.querySelector('[data-field=report_enabled]');
+      if(reportInput){
+        reportInput.disabled=!input.checked;
+        if(!input.checked)reportInput.checked=false;
+      }
       card.querySelectorAll('[data-target]').forEach(planInput=>{
         const canChoose=input.checked&&planInput.dataset.eligible==='1';
         planInput.disabled=!canChoose&&!planInput.checked;
@@ -573,12 +577,6 @@
   $('relogin').textContent='重新进行API授权';
   $('relogin').onclick=authorizeApi;$('addAccount').onclick=addAccount;$('discover').onclick=()=>discover('',$('discover'));$('refresh').onclick=reloadDisplay;
   $('authorizeApi').onclick=authorizeApi;$('clearApiConfig').onclick=clearApiConfig;
-  $('copyOauthCallback').onclick=async()=>{
-    const value=$('oauthCallbackUrl').textContent.trim();
-    if(!/^https:\/\//i.test(value)){message('尚未读取到有效的公网回调地址',true);return}
-    try{await navigator.clipboard.writeText(value);message('回调地址已复制')}
-    catch(e){message('复制失败，请手动选中回调地址复制',true)}
-  };
   function rerenderCatalogFilter(){
     if(dirty){
       message('当前有尚未保存的账户或计划选择，请先保存后再筛选，避免丢失修改。',true);

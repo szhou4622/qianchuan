@@ -436,8 +436,16 @@ class MultiQianchuanAccountTests(unittest.TestCase):
                 "account_uid": "account-fast",
                 "aavid": "10001",
                 "account_name": "快速账户",
+                "enabled": True,
                 "report_enabled": True,
-            }
+            },
+            {
+                "account_uid": "account-disabled",
+                "aavid": "10002",
+                "account_name": "未启用账户",
+                "enabled": False,
+                "report_enabled": True,
+            },
         ]
         with patch(
             "services.operation_daily_report.current_local_feishu_account",
@@ -452,6 +460,25 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(["10001"], result["config"]["aavids"])
         self.assertEqual("快速账户", result["accounts"][0]["account_name"])
+        self.assertEqual(1, len(result["accounts"]))
+
+    def test_disabling_account_also_removes_it_from_daily_report(self):
+        account = ensure_qianchuan_account(
+            "10001",
+            owner_username="tool-owner",
+            enabled=True,
+            report_enabled=True,
+            seen=True,
+            db=self.db,
+        )
+        saved = save_qianchuan_account_settings(
+            account["account_uid"],
+            {"enabled": False, "report_enabled": True},
+            owner_username="tool-owner",
+            db=self.db,
+        )
+        self.assertFalse(saved["enabled"])
+        self.assertFalse(saved["report_enabled"])
 
     def test_scheduler_only_returns_current_tool_accounts(self):
         current = self._target("10001", 1)
@@ -602,6 +629,21 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             html,
         )
         self.assertIn("firstRun?'等待首次采集':late?'监控延迟'", html)
+        self.assertIn('data-field="report_enabled"', html)
+        self.assertIn("reportInput.disabled=!input.checked", html)
+        self.assertIn("if(!input.checked)reportInput.checked=false", html)
+
+    def test_feishu_daily_picker_uses_only_explicit_selected_accounts(self):
+        html = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "feishu_binding.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("const checked = selected.includes(aavid)", html)
+        self.assertNotIn("const checked = !selected.length", html)
+        self.assertIn("尚未添加并启用千川账户", html)
+        self.assertIn("ui('dailyEnabled').disabled = !accounts.length", html)
+        self.assertIn("ui('saveDaily').disabled = !accounts.length", html)
 
 
 class QianchuanSessionTests(unittest.TestCase):

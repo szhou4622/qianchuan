@@ -39,11 +39,12 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("stopApiAuthorizationWatch();\n    apiAuthStarting=true", self.html)
         self.assertIn("generation!==apiAuthWatchGeneration", self.html)
 
-    def test_official_api_callback_warning_rejects_loopback_guidance(self):
-        self.assertIn('id="oauthCallbackUrl"', self.html)
-        self.assertIn('id="copyOauthCallback"', self.html)
-        self.assertIn("不能填写 127.0.0.1", self.html)
-        self.assertIn("r?.oauth_callback_url||'暂未读取到回调地址'", self.html)
+    def test_official_api_authorization_needs_no_callback_input_or_handoff(self):
+        self.assertNotIn('id="oauthCallbackUrl"', self.html)
+        self.assertNotIn('id="copyOauthCallback"', self.html)
+        self.assertNotIn('id="oauthLocalReceiverUrl"', self.html)
+        self.assertIn("不需要填写、复制或转交回调地址", self.html)
+        self.assertNotIn("oauth_local_receiver_url", self.html)
 
     def test_single_account_refresh_lives_inside_account_card(self):
         self.assertIn('data-refresh-account="${esc(acc.account_uid)}"', self.html)

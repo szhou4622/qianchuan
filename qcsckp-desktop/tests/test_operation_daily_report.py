@@ -9,6 +9,10 @@ from datetime import datetime
 from unittest.mock import patch
 
 from services import operation_daily_report as daily
+from services.qianchuan_accounts import (
+    ensure_qianchuan_account,
+    save_qianchuan_account_settings,
+)
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
@@ -152,6 +156,20 @@ class OperationDailyReportTests(unittest.TestCase):
         ]
 
     def _save_enabled(self):
+        account = ensure_qianchuan_account(
+            "10001",
+            account_name="测试千川账户",
+            owner_username="tool-user",
+            enabled=True,
+            seen=True,
+            db=self.store,
+        )
+        save_qianchuan_account_settings(
+            account["account_uid"],
+            {"enabled": True, "report_enabled": True},
+            owner_username="tool-user",
+            db=self.store,
+        )
         result = daily.save_operation_daily_report_config(
             {
                 "enabled": True,
@@ -162,6 +180,73 @@ class OperationDailyReportTests(unittest.TestCase):
             database=self.db_path,
         )
         self.assertTrue(result["success"])
+
+    def test_report_options_do_not_fall_back_to_historical_accounts(self):
+        self.assertEqual([], daily.list_operation_account_options(self.db_path))
+
+    def test_enabled_account_without_monitored_plans_is_report_eligible(self):
+        ensure_qianchuan_account(
+            "20002",
+            account_name="仅日报账户",
+            owner_username="tool-user",
+            enabled=True,
+            seen=True,
+            db=self.store,
+        )
+        options = daily.list_operation_account_options(self.db_path)
+        self.assertEqual(["20002"], [item["aavid"] for item in options])
+
+    def test_disabled_account_is_not_report_eligible(self):
+        ensure_qianchuan_account(
+            "20003",
+            account_name="已停用账户",
+            owner_username="tool-user",
+            enabled=False,
+            report_enabled=True,
+            seen=True,
+            db=self.store,
+        )
+        self.assertEqual([], daily.list_operation_account_options(self.db_path))
+
+    def test_daily_config_rejects_account_not_enabled_in_directory(self):
+        result = daily.save_operation_daily_report_config(
+            {
+                "enabled": True,
+                "send_time": "09:00",
+                "aavids": ["10001"],
+                "send_empty": True,
+            },
+            database=self.db_path,
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("添加并启用", result["message"])
+
+    def test_empty_directory_clears_stale_selection_and_blocks_send(self):
+        daily._save_profile_config(
+            "tool-user",
+            {
+                "enabled": True,
+                "send_time": "09:00",
+                "aavids": ["10001"],
+                "send_empty": True,
+            },
+        )
+        config = daily.get_operation_daily_report_config(database=self.db_path)
+        self.assertFalse(config["config"]["enabled"])
+        self.assertEqual([], config["config"]["aavids"])
+        result = daily.send_operation_daily_report(
+            report_date="2026-07-27",
+            mode="manual",
+            database=self.db_path,
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual([], self.sent)
+        scheduled = daily.run_operation_daily_report_scheduler_once(
+            now=datetime(2026, 7, 28, 9, 5),
+            database=self.db_path,
+        )
+        self.assertTrue(scheduled["skipped"])
+        self.assertEqual("no_enabled_report_accounts", scheduled["reason"])
 
     def test_report_is_strictly_isolated_by_account_and_date(self):
         report = daily.build_operation_daily_report(

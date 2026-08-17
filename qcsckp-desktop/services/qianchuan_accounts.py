@@ -92,7 +92,12 @@ def _sync_daily_selected_aavids(
     rows = db.select(
         "qianchuan_account",
         fields="aavid",
-        where={"owner_username": owner, "report_enabled": 1},
+        where={
+            "owner_username": owner,
+            "directory_selected": 1,
+            "enabled": 1,
+            "report_enabled": 1,
+        },
         order_by="aavid ASC",
     )
     try:
@@ -745,10 +750,14 @@ def save_qianchuan_account_settings(
     )
     if route_mode == "custom" and not route_send_personal and not groups:
         raise ValueError("账户单独路由至少选择个人或一个已绑定群")
+    account_enabled = bool(settings.get("enabled", account.get("enabled")))
     values = {
-        "enabled": 1 if bool(settings.get("enabled", account.get("enabled"))) else 0,
+        "enabled": 1 if account_enabled else 0,
         "report_enabled": (
-            1 if bool(settings.get("report_enabled", account.get("report_enabled"))) else 0
+            1
+            if account_enabled
+            and bool(settings.get("report_enabled", account.get("report_enabled")))
+            else 0
         ),
         "route_mode": route_mode,
         "route_send_personal": (
@@ -823,6 +832,8 @@ def save_qianchuan_account_automation_setup(
             )
         ),
     }
+    if not normalized_settings["enabled"]:
+        normalized_settings["report_enabled"] = False
     if normalized_settings["route_mode"] not in {"default", "custom"}:
         raise ValueError("飞书路由模式无效")
     # 账户自动化和飞书通知是两项独立能力。未绑定飞书时仍可启用账户、

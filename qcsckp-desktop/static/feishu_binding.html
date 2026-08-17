@@ -506,15 +506,17 @@
         ui('dailySendEmpty').checked = config.send_empty !== false;
         ui('dailyAccounts').innerHTML = accounts.length ? accounts.map(account => {
             const aavid = String(account.aavid || '');
-            const checked = !selected.length || selected.includes(aavid);
+            const checked = selected.includes(aavid);
             return '<label class="account-option"><input class="daily-account" type="checkbox" value="' +
                 escapeHtml(aavid) + '"' + (checked ? ' checked' : '') + '><span>' +
                 escapeHtml(account.account_name || ('千川账户 ' + aavid)) +
                 '<code>' + escapeHtml(aavid) + '</code></span></label>';
-        }).join('') : '<p class="mini">尚未发现千川账户，请先完成一次采集。</p>';
+        }).join('') : '<p class="mini">尚未添加并启用千川账户，请先到“千川账户管理”添加并启用账户。</p>';
         document.querySelectorAll('.daily-account').forEach(input => {
             input.addEventListener('change', () => { dailyDirty = true; });
         });
+        ui('dailyEnabled').disabled = !accounts.length;
+        ui('saveDaily').disabled = !accounts.length;
         ui('sendDailyNow').disabled = !latest || !latest.connected || !accounts.length;
         dailyLoaded = true;
         dailyDirty = false;

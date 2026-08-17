@@ -117,11 +117,9 @@ if QIANCHUAN_BACKEND not in {"official_api", "browser_legacy"}:
 QIANCHUAN_OFFICIAL_API_BASE_URL = (
     _env_text("QCSCKP_OE_API_BASE_URL") or "https://api.oceanengine.com"
 ).rstrip("/")
-QIANCHUAN_OAUTH_RELAY_BASE_URL = (
-    _env_text("QCSCKP_OE_OAUTH_RELAY_URL")
-    or "https://oceanengine-callback.zjack6173.workers.dev"
-).rstrip("/")
-QIANCHUAN_OAUTH_CALLBACK_URL = QIANCHUAN_OAUTH_RELAY_BASE_URL + "/callback"
+# 官方授权页会按 App ID 使用用户自己在开放平台登记的公网回调地址。
+# 桌面工具既不读取也不写死该地址；授权时只监听由工具启动的 Chrome
+# 导航，从回调跳转中取得一次性 auth_code，并在本机校验随机 state。
 # 真实 API 写入默认关闭。只有受控验收明确设置后才可创建/暂停/结束/调整调控任务。
 if os.getenv("QCSCKP_ALLOW_LIVE_API_WRITES") is not None:
     ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")

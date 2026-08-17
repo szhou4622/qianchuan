@@ -16,8 +16,9 @@ $entry = Join-Path $projectRoot "gui_app.py"
 $icon = Join-Path $projectRoot "logo.ico"
 $staticDir = Join-Path $projectRoot "static"
 $usageFile = Join-Path $scriptDir "README-Windows.txt"
+$privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $usageFile)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $usageFile, $privacyVerifier)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
@@ -91,27 +92,12 @@ foreach ($writableDir in @("data", "logs", "temp")) {
 # A public package must start with a completely blank local runtime. In
 # particular, never ship another Windows user's DPAPI ciphertext: it cannot be
 # decrypted on the recipient's computer and would make API setup appear broken.
-$runtimeFiles = @()
-foreach ($writableDir in @("data", "logs", "temp")) {
-    $runtimeFiles += @(Get-ChildItem -LiteralPath (Join-Path $releaseDir $writableDir) -File -Recurse -Force)
-}
-if ($runtimeFiles.Count -ne 0) {
-    throw "Release runtime directories are not empty: $($runtimeFiles.FullName -join ', ')"
-}
-
-$forbiddenRuntimeNames = @(
-    "qianchuan_open_api_token.json",
-    "qianchuan.db",
-    "qcookie.json",
-    "local_feishu_config.json",
-    ".env"
-)
-$forbiddenRuntimeFiles = @(
-    Get-ChildItem -LiteralPath $releaseDir -File -Recurse -Force |
-        Where-Object { $forbiddenRuntimeNames -contains $_.Name }
-)
-if ($forbiddenRuntimeFiles.Count -ne 0) {
-    throw "Release contains private runtime files: $($forbiddenRuntimeFiles.FullName -join ', ')"
+# Sanitize the fully staged release before zipping. Local Feishu profiles and
+# bindings, DPAPI blobs, tokens, cookies, databases, logs, and history are
+# removed automatically. The command then verifies that none remain.
+& $python $privacyVerifier --sanitize $releaseDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Release privacy cleanup or verification failed with exit code $LASTEXITCODE"
 }
 
 $repoRoot = Split-Path -Parent $projectRoot
