@@ -489,7 +489,19 @@ class PromotionReadOnlyProbe:
                     json.dump(data, handle, ensure_ascii=False, indent=2)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(tmp, self.path)
+                # Windows Defender / search indexers can briefly hold either
+                # the just-flushed temp file or the destination.  The write is
+                # already serialized per destination path; retry only this
+                # transient sharing violation instead of dropping the probe
+                # update (or leaving an orphaned temp file).
+                for attempt in range(6):
+                    try:
+                        os.replace(tmp, self.path)
+                        break
+                    except PermissionError:
+                        if attempt >= 5:
+                            raise
+                        time.sleep(0.01 * (attempt + 1))
                 tmp = ""
                 # v0.1.40 使用的固定临时文件可能在异常退出后留下；它
                 # 不再参与写入，仅在未被占用时尽力清理。
