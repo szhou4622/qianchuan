@@ -1293,15 +1293,35 @@ def _claim_collection_jobs(
             (owner,),
             connection=connection,
         )
-        rows = db.execute(
-            "SELECT * FROM collection_job WHERE owner_username=? "
-            "AND status='queued' AND due_at <= datetime('now', '+8 hours') "
-            "ORDER BY priority DESC, due_at ASC, id ASC LIMIT ?",
-            (owner, max(1, int(limit))),
+        priority_rows = db.execute(
+            "SELECT MAX(priority) AS priority FROM collection_job "
+            "WHERE owner_username=? AND status='queued' "
+            "AND due_at <= datetime('now', '+8 hours')",
+            (owner,),
             fetch=True,
             connection=connection,
         ) or []
-        for raw in rows:
+        highest_priority = (
+            priority_rows[0].get("priority") if priority_rows else None
+        )
+        rows = []
+        if highest_priority is not None:
+            # Select the full due priority band (bounded by the supported
+            # account/plan capacity), then round-robin accounts before leasing.
+            # This prevents one large account from occupying every worker slot.
+            rows = db.execute(
+                "SELECT * FROM collection_job WHERE owner_username=? "
+                "AND status='queued' AND priority=? "
+                "AND due_at <= datetime('now', '+8 hours') "
+                "ORDER BY due_at ASC, id ASC LIMIT 2000",
+                (owner, int(highest_priority)),
+                fetch=True,
+                connection=connection,
+            ) or []
+        fair_rows = _fair_order_targets([dict(raw) for raw in rows])[
+            : max(1, int(limit))
+        ]
+        for raw in fair_rows:
             row = dict(raw)
             changed = db.execute(
                 "UPDATE collection_job SET status='leased', lease_owner=?, "
@@ -1418,6 +1438,7 @@ def _loop(interval_seconds: int) -> None:
     interval = max(30, int(interval_seconds))
     tick = min(COLLECTION_SCHEDULER_TICK_SECONDS, interval)
     while not _STOP.is_set():
+        claimed: list[dict[str, Any]] = []
         try:
             store = SQLiteStore()
             _ensure_collection_schema(store)
@@ -1468,6 +1489,13 @@ def _loop(interval_seconds: int) -> None:
                     _finish_collection_job(job, item, db=store)
         except Exception:
             logger.exception("官方 API 采集轮次异常")
+        if claimed and not _STOP.is_set():
+            # Drain an existing backlog immediately in bounded 3-worker waves.
+            # The API limiter and persisted quota gate still apply, but a
+            # 200-target queue no longer pays an extra five-second scheduler
+            # sleep after every three targets.
+            _STOP.wait(0.2)
+            continue
         _WAKE.wait(tick)
         _WAKE.clear()
 
