@@ -22,6 +22,7 @@ from .rule_retargeting_config import (
     _coerce_float,
     _new_strategy_id,
     _normalize_json_whole_floats,
+    _owner_config_path,
     _read_json,
 )
 
@@ -136,7 +137,7 @@ def _normalize_trigger_roi2(raw: Any) -> Dict[str, Any]:
 
 
 def config_path() -> str:
-    return os.path.join(DATA_DIR, FILENAME)
+    return _owner_config_path(FILENAME)
 
 
 def _default_strategy(index: int = 0) -> Dict[str, Any]:

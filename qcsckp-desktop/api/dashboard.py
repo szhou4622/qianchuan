@@ -583,7 +583,11 @@ class DashboardApi:
         search 非空时按 assist_task_id（字符串包含）与 task_name（子串，不区分大小写）筛选。
         """
         if regulation_full_scan:
-            ps = max(1, min(500_000, int(page_size or 500_000)))
+            # Rule evaluation must stay bounded.  Active monitored targets are
+            # evaluated independently, so a 20k page is enough for the target
+            # scale while preventing a single cycle from materialising half a
+            # million rows in Python memory.
+            ps = max(1, min(20_000, int(page_size or 20_000)))
         else:
             ps = max(1, min(200, int(page_size or 50)))
         try:

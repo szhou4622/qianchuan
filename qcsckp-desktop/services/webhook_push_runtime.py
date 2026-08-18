@@ -23,3 +23,11 @@ def start_webhook_push_background_threads() -> Tuple[threading.Thread | None, th
     t_feishu = start_feishu_webhook_push_background_thread()
     t_dingtalk = start_dingtalk_webhook_push_background_thread()
     return t_feishu, t_dingtalk
+
+
+def stop_webhook_push_background_threads() -> None:
+    from services.dingtalk_webhook_push import stop_dingtalk_webhook_push_background_thread
+    from services.feishu_webhook_push import stop_feishu_webhook_push_background_thread
+
+    stop_feishu_webhook_push_background_thread()
+    stop_dingtalk_webhook_push_background_thread()

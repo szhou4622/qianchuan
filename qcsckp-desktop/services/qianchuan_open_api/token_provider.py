@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -15,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from config import (
+    DATA_DIR,
     QIANCHUAN_API_TOKEN_FILE,
     QIANCHUAN_OFFICIAL_API_BASE_URL,
 )
@@ -29,6 +32,59 @@ _oauth_browser_callbacks: dict[str, tuple[float, str]] = {}
 _oauth_browser_errors: dict[str, str] = {}
 _oauth_browser_threads: dict[str, threading.Thread] = {}
 _oauth_browser_cancel: dict[str, threading.Event] = {}
+_token_path_lock = threading.RLock()
+
+
+def _current_owner() -> str:
+    try:
+        from services.qianchuan_session import current_session_owner
+
+        owner = str(current_session_owner() or "").strip().casefold()
+    except Exception:
+        owner = ""
+    return owner or "local_default"
+
+
+def _owner_token_path() -> str:
+    owner = _current_owner()
+    digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:24]
+    return os.path.join(DATA_DIR, "profiles", digest, "qianchuan_open_api_token.json")
+
+
+def resolve_token_path(path: Optional[str] = None) -> str:
+    """Resolve credentials for the active tool account.
+
+    An explicitly supplied path is kept untouched for tests and recovery tools.
+    The legacy global token is copied once for the first active owner; it is
+    deliberately not deleted so the pre-migration rollback remains complete.
+    """
+    if path:
+        return os.path.abspath(str(path))
+    target = _owner_token_path()
+    if os.path.isfile(target) or not os.path.isfile(QIANCHUAN_API_TOKEN_FILE):
+        return target
+    marker = os.path.join(DATA_DIR, ".qianchuan_token_migrated_owner")
+    with _token_path_lock:
+        if os.path.isfile(target):
+            return target
+        migrated_owner = ""
+        try:
+            with open(marker, "r", encoding="utf-8") as handle:
+                migrated_owner = handle.read().strip().casefold()
+        except OSError:
+            pass
+        owner = _current_owner()
+        if migrated_owner and migrated_owner != owner:
+            return target
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(QIANCHUAN_API_TOKEN_FILE, target)
+        marker_tmp = marker + ".tmp"
+        with open(marker_tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(owner)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(marker_tmp, marker)
+    return target
 
 
 def _remember_oauth_browser_callback(state: str, query: str) -> None:
@@ -235,13 +291,14 @@ def _unprotect(data: bytes) -> bytes:
     return win32crypt.CryptUnprotectData(data, None, None, None, 0)[1]
 
 
-def save_token_bundle(bundle: AccessTokenBundle, path: str = QIANCHUAN_API_TOKEN_FILE) -> None:
+def save_token_bundle(bundle: AccessTokenBundle, path: Optional[str] = None) -> None:
     """为后续 OAuth 界面预留；磁盘上只保存 DPAPI 密文。"""
     payload = json.dumps(asdict(bundle), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     wrapper = {
         "format": "qcsckp-oceanengine-token-dpapi-v1",
         "ciphertext": base64.b64encode(_protect(payload)).decode("ascii"),
     }
+    path = resolve_token_path(path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     temp = path + ".tmp"
     with open(temp, "w", encoding="utf-8") as handle:
@@ -249,7 +306,8 @@ def save_token_bundle(bundle: AccessTokenBundle, path: str = QIANCHUAN_API_TOKEN
     os.replace(temp, path)
 
 
-def _load_saved_bundle(path: str = QIANCHUAN_API_TOKEN_FILE) -> Optional[AccessTokenBundle]:
+def _load_saved_bundle(path: Optional[str] = None) -> Optional[AccessTokenBundle]:
+    path = resolve_token_path(path)
     if not os.path.isfile(path):
         return None
     try:
@@ -274,9 +332,13 @@ def _load_saved_bundle(path: str = QIANCHUAN_API_TOKEN_FILE) -> Optional[AccessT
 
 
 class DpapiTokenProvider:
-    def __init__(self, path: str = QIANCHUAN_API_TOKEN_FILE) -> None:
-        self.path = path
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._explicit_path = path
         self._lock = threading.Lock()
+
+    @property
+    def path(self) -> str:
+        return resolve_token_path(self._explicit_path)
 
     def _refresh(self, bundle: AccessTokenBundle) -> AccessTokenBundle:
         if not bundle.refresh_token or not bundle.app_id or not bundle.app_secret:
@@ -367,7 +429,7 @@ class DefaultTokenProvider:
         return self._dpapi.get_token(force_refresh=force_refresh)
 
 
-def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, Any]:
+def api_configuration_status(path: Optional[str] = None) -> dict[str, Any]:
     """返回可向前端展示的脱敏状态，绝不返回 secret 或 token。"""
     try:
         bundle = _load_saved_bundle(path)
@@ -424,8 +486,9 @@ def api_configuration_status(path: str = QIANCHUAN_API_TOKEN_FILE) -> dict[str, 
 def save_api_credentials(
     app_id: Any,
     app_secret: Any,
-    path: str = QIANCHUAN_API_TOKEN_FILE,
+    path: Optional[str] = None,
 ) -> dict[str, Any]:
+    path = resolve_token_path(path)
     aid = str(app_id or "").strip()
     secret = str(app_secret or "").strip()
     if not aid.isdigit() or len(aid) < 6:
@@ -505,12 +568,13 @@ def _relay_json_request(
 
 
 def begin_api_authorization(
-    path: str = QIANCHUAN_API_TOKEN_FILE,
+    path: Optional[str] = None,
     *,
     relay_request: Optional[
         Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
     ] = None,
 ) -> dict[str, Any]:
+    path = resolve_token_path(path)
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
@@ -549,13 +613,14 @@ def begin_api_authorization(
 
 
 def poll_api_authorization(
-    path: str = QIANCHUAN_API_TOKEN_FILE,
+    path: Optional[str] = None,
     *,
     relay_request: Optional[
         Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
     ] = None,
 ) -> dict[str, Any]:
     """领取授权浏览器捕获的一次性授权码，并使用本机密钥换取令牌。"""
+    path = resolve_token_path(path)
     bundle = _load_saved_bundle(path)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
@@ -597,8 +662,9 @@ def poll_api_authorization(
 
 def exchange_authorization_code(
     authorization_callback: Any,
-    path: str = QIANCHUAN_API_TOKEN_FILE,
+    path: Optional[str] = None,
 ) -> AccessTokenBundle:
+    path = resolve_token_path(path)
     callback = str(authorization_callback or "").strip()
     query = urlparse(callback).query if "://" in callback else callback.lstrip("?")
     params = parse_qs(query, keep_blank_values=True)
@@ -656,7 +722,8 @@ def exchange_authorization_code(
     return authorized
 
 
-def clear_api_configuration(path: str = QIANCHUAN_API_TOKEN_FILE) -> None:
+def clear_api_configuration(path: Optional[str] = None) -> None:
+    path = resolve_token_path(path)
     if os.path.isfile(path):
         os.remove(path)
 

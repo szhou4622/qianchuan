@@ -75,7 +75,7 @@ def _pick_new_exe(payload: Path, target_exe_name: str) -> Optional[Path]:
 
 def run_desktop_update(download_url: str) -> Dict[str, Any]:
     """
-    执行更新：成功启动批处理并退出进程时不返回（os._exit）。
+    执行更新：成功启动批处理后返回重启标记，由运行主管优雅退出。
     失败时返回 {"success": False, "message": "..."}。
     """
     if sys.platform != "win32":
@@ -173,8 +173,11 @@ def run_desktop_update(download_url: str) -> Dict[str, Any]:
             creationflags=creationflags,
             close_fds=True,
         )
-        time.sleep(0.4)
-        os._exit(0)
+        return {
+            "success": True,
+            "message": "更新已准备，工具正在安全退出并安装新版本",
+            "restart_scheduled": True,
+        }
     except zipfile.BadZipFile:
         return {"success": False, "message": "更新包不是有效的 ZIP 文件"}
     except UnicodeDecodeError as e:

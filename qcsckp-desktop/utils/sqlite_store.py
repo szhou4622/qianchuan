@@ -75,6 +75,65 @@ class SQLiteStore:
                 ('idx_material_perf_lead', 'created_at, material_id'),
             ]
         },
+        # 每个计划-素材只保留最新一行。历史快照仍写入
+        # pmc_promotion_material；规则扫描和大屏最新状态读取本表，避免
+        # 随运行时间增长而反复扫描数十万条历史记录。
+        'pmc_promotion_material_latest': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'aadvid': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
+                'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
+                'material_id': 'TEXT NOT NULL',
+                'product_ids_json': 'TEXT',
+                'video_name': 'TEXT',
+                'material_status': 'INTEGER',
+                'show_status': 'INTEGER',
+                'show_status_reason': 'TEXT',
+                'upload_time': 'TEXT',
+                'video_type': 'INTEGER',
+                'video_id': 'TEXT',
+                'aweme_item_id': 'INTEGER',
+                'cover_url': 'TEXT',
+                'cover_width': 'INTEGER',
+                'cover_height': 'INTEGER',
+                'video_duration': 'INTEGER',
+                'video_title': 'TEXT',
+                'lego_source': 'INTEGER',
+                'video_create_time': 'TEXT',
+                'tag_list': 'TEXT',
+                'stat_cost': 'REAL',
+                'order_settle_count_1h': 'INTEGER',
+                'order_settle_amount_1h': 'REAL',
+                'order_settle_rate_1h': 'REAL',
+                'prepay_pay_order_count': 'REAL',
+                'pay_gmv_include_coupon': 'REAL',
+                'prepay_pay_settle_1h': 'REAL',
+                'refund_rate_1h': 'REAL',
+                'overall_order_count': 'INTEGER',
+                'overall_show_count': 'INTEGER',
+                'overall_click_count': 'INTEGER',
+                'overall_ctr': 'REAL',
+                'overall_conversion_rate': 'REAL',
+                'data_source': "TEXT NOT NULL DEFAULT 'browser_legacy'",
+                'api_request_id': 'TEXT',
+                'stat_date': "TEXT NOT NULL DEFAULT (date('now', '+8 hours'))",
+                'collected_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_material_latest_target_time', 'target_uid, collected_at'),
+                ('idx_material_latest_account_time', 'aadvid, collected_at'),
+                ('idx_material_latest_status', 'target_uid, material_status, show_status'),
+                ('idx_material_latest_stat_date', 'stat_date, target_uid'),
+            ],
+            'unique_indexes': [
+                ('uk_material_latest_target_material', 'target_uid, material_id'),
+            ],
+        },
         'pmc_ad_detail_basic': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
@@ -287,6 +346,12 @@ class SQLiteStore:
                 'headless': 'INTEGER NOT NULL DEFAULT 0 CHECK (headless IN (0, 1))',
                 'browser_headless_rule': 'INTEGER CHECK (browser_headless_rule IN (0, 1))',
                 'trigger_source': 'TEXT',
+                # Stable local execution identity used by the persistent
+                # reconciliation worker.  The legacy numeric ``status``
+                # column keeps its historical -1/1 constraint; non-final
+                # state lives here so old databases can migrate additively.
+                'execution_uid': 'TEXT',
+                'execution_state': "TEXT NOT NULL DEFAULT 'final'",
                 'app_version': 'TEXT',
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
@@ -295,6 +360,7 @@ class SQLiteStore:
                 ('idx_pmc_retargeting_run_target_started', 'target_uid, started_at'),
                 ('idx_pmc_retargeting_run_account_material', 'aavid, material_id, started_at'),
                 ('idx_pmc_retargeting_run_status_time', 'status, started_at'),
+                ('idx_pmc_retargeting_run_execution', 'execution_uid, execution_state'),
             ],
         },
         # 规则追投限频（每素材一行；窗口与次数由 rule retargeting.interval 解释，不存库）
@@ -369,6 +435,8 @@ class SQLiteStore:
                 'ended_at': 'TEXT NOT NULL',
                 'duration_ms': 'INTEGER',
                 'status': 'INTEGER NOT NULL CHECK (status IN (-1, 1, 2))',
+                'execution_uid': "TEXT NOT NULL DEFAULT ''",
+                'execution_state': "TEXT NOT NULL DEFAULT 'completed'",
                 'step': 'TEXT',
                 'message': 'TEXT',
                 'detail': 'TEXT',
@@ -386,6 +454,7 @@ class SQLiteStore:
                 ('idx_pmc_regulation_run_target_started', 'target_uid, started_at'),
                 ('idx_pmc_regulation_run_aavid_time', 'aavid, started_at'),
                 ('idx_pmc_regulation_run_status_time', 'status, started_at'),
+                ('idx_pmc_regulation_run_execution', 'execution_uid, execution_state'),
             ],
         },
         # 单账户统一操作流水：工具直执、记录浏览器、平台操作日志统一写入。
@@ -485,6 +554,7 @@ class SQLiteStore:
                 'approved_by': 'TEXT',
                 'claim_token': 'TEXT',
                 'claim_expires_at': 'TEXT',
+                'fencing_token': 'INTEGER NOT NULL DEFAULT 0',
                 'result_message': 'TEXT',
                 'result_detail': 'TEXT',
                 'regulate_task_id': 'TEXT',
@@ -504,6 +574,153 @@ class SQLiteStore:
             'unique_indexes': [
                 ('uk_local_retarget_task_uid', 'task_uid'),
                 ('uk_local_retarget_active_dedupe', 'active_dedupe_key'),
+            ],
+        },
+        # 统一、持久化的采集任务队列。相同 owner/target/kind 只保留一条
+        # 活动任务；进程崩溃后由租约超时恢复。
+        'collection_job': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'job_uid': 'TEXT NOT NULL',
+                'owner_username': "TEXT NOT NULL DEFAULT 'local_default'",
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
+                'aavid': "TEXT NOT NULL DEFAULT ''",
+                'target_uid': "TEXT NOT NULL DEFAULT ''",
+                'job_kind': "TEXT NOT NULL DEFAULT 'hot_collection'",
+                'priority': 'INTEGER NOT NULL DEFAULT 20',
+                'due_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'status': "TEXT NOT NULL DEFAULT 'queued'",
+                'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
+                'lease_owner': 'TEXT',
+                'lease_expires_at': 'TEXT',
+                'fencing_token': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'last_started_at': 'TEXT',
+                'last_finished_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_collection_job_due', 'owner_username, status, due_at, priority'),
+                ('idx_collection_job_account', 'owner_username, aavid, status'),
+                ('idx_collection_job_lease', 'status, lease_expires_at'),
+            ],
+            'unique_indexes': [
+                ('uk_collection_job_uid', 'job_uid'),
+                ('uk_collection_job_target_kind', 'owner_username, target_uid, job_kind'),
+            ],
+        },
+        # 官方 API 应用级及账户级配额/退避状态。重启和休眠恢复后继续
+        # 遵守 Retry-After，避免所有账户同时抢跑。
+        'api_quota_state': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'scope_key': 'TEXT NOT NULL',
+                'owner_username': "TEXT NOT NULL DEFAULT 'local_default'",
+                'scope_type': "TEXT NOT NULL DEFAULT 'account'",
+                'scope_id': "TEXT NOT NULL DEFAULT ''",
+                'backoff_until': 'TEXT',
+                'rate_limit_count': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'last_request_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_api_quota_owner_type', 'owner_username, scope_type, backoff_until'),
+            ],
+            'unique_indexes': [
+                ('uk_api_quota_scope', 'scope_key'),
+            ],
+        },
+        # POST 提交后的最终一致性核验。提交成功不等于平台已生效；核验
+        # 结果会在重启后继续推进，且 fencing_token 防止旧线程回写。
+        'execution_reconciliation': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'reconciliation_uid': 'TEXT NOT NULL',
+                'account_username': "TEXT NOT NULL DEFAULT ''",
+                'task_uid': "TEXT NOT NULL DEFAULT ''",
+                'action_type': "TEXT NOT NULL DEFAULT 'retarget'",
+                'aavid': "TEXT NOT NULL DEFAULT ''",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'control_task_id': "TEXT NOT NULL DEFAULT ''",
+                'request_id': "TEXT NOT NULL DEFAULT ''",
+                'idempotency_key': "TEXT NOT NULL DEFAULT ''",
+                'status': "TEXT NOT NULL DEFAULT 'submitted'",
+                'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
+                'next_attempt_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'lease_owner': 'TEXT',
+                'lease_expires_at': 'TEXT',
+                'fencing_token': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'payload_json': "TEXT NOT NULL DEFAULT '{}'",
+                'card_update_state': "TEXT NOT NULL DEFAULT 'pending'",
+                'confirmed_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_execution_reconcile_due', 'status, next_attempt_at'),
+                ('idx_execution_reconcile_owner_task', 'account_username, task_uid'),
+                ('idx_execution_reconcile_platform_task', 'aavid, control_task_id'),
+            ],
+            'unique_indexes': [
+                ('uk_execution_reconcile_uid', 'reconciliation_uid'),
+                ('uk_execution_reconcile_idempotency', 'account_username, idempotency_key'),
+            ],
+        },
+        # 飞书事件先落 Inbox 再处理；Outbox 保存需要发送/更新的消息，
+        # 失败后退避重试，避免进程退出造成卡片永久停留在旧状态。
+        'feishu_inbox': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'account_username': "TEXT NOT NULL DEFAULT ''",
+                'event_id': 'TEXT NOT NULL',
+                'event_type': "TEXT NOT NULL DEFAULT ''",
+                'payload_json': "TEXT NOT NULL DEFAULT '{}'",
+                'payload_hash': "TEXT NOT NULL DEFAULT ''",
+                'status': "TEXT NOT NULL DEFAULT 'received'",
+                'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'processed_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_feishu_inbox_status', 'account_username, status, created_at'),
+            ],
+            'unique_indexes': [
+                ('uk_feishu_inbox_event', 'account_username, event_id'),
+            ],
+        },
+        'feishu_outbox': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'outbox_uid': 'TEXT NOT NULL',
+                'account_username': "TEXT NOT NULL DEFAULT ''",
+                'operation': "TEXT NOT NULL DEFAULT 'send'",
+                'receive_type': "TEXT NOT NULL DEFAULT ''",
+                'receive_id': "TEXT NOT NULL DEFAULT ''",
+                'message_id': "TEXT NOT NULL DEFAULT ''",
+                'payload_json': "TEXT NOT NULL DEFAULT '{}'",
+                'status': "TEXT NOT NULL DEFAULT 'queued'",
+                'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
+                'next_attempt_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'lease_owner': 'TEXT',
+                'lease_expires_at': 'TEXT',
+                'fencing_token': 'INTEGER NOT NULL DEFAULT 0',
+                'last_error': 'TEXT',
+                'sent_at': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_feishu_outbox_due', 'account_username, status, next_attempt_at'),
+                ('idx_feishu_outbox_lease', 'status, lease_expires_at'),
+            ],
+            'unique_indexes': [
+                ('uk_feishu_outbox_uid', 'outbox_uid'),
             ],
         },
         # 平台操作日志同步状态；每个账户保存覆盖范围、游标和最近错误。

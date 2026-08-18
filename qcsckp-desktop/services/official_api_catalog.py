@@ -471,5 +471,11 @@ def start_official_api_catalog_scheduler(interval_seconds: int = 1800) -> thread
         return _SCHEDULER_THREAD
 
 
-def stop_official_api_catalog_scheduler() -> None:
+def stop_official_api_catalog_scheduler(timeout: float = 5.0) -> None:
+    global _SCHEDULER_THREAD
     _SCHEDULER_STOP.set()
+    thread = _SCHEDULER_THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        _SCHEDULER_THREAD = None

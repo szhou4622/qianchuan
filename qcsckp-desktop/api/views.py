@@ -3,6 +3,8 @@
 统一暴露所有 API 给前端调用
 """
 import sys
+import threading
+import time
 import webbrowser
 from typing import Any
 from urllib.parse import urlparse
@@ -117,10 +119,13 @@ class Api:
             )
             if QIANCHUAN_BACKEND == "official_api":
                 from services.official_api_catalog import official_api_session_status
+                from services.official_api_collection import get_collection_queue_health
 
                 session = official_api_session_status()
+                collection_queue = get_collection_queue_health(db=self.db)
             else:
                 session = session_status()
+                collection_queue = {}
             catalog = catalog_sync_status(
                 db=self.db,
                 accounts_snapshot=accounts,
@@ -183,9 +188,15 @@ class Api:
                 "browser_queue": (
                     {
                         "running": False,
-                        "waiting": 0,
+                        "waiting": int(collection_queue.get("queued") or 0),
+                        "executing": int(collection_queue.get("leased") or 0),
+                        "next_due_at": str(collection_queue.get("next_due_at") or ""),
+                        "backoffs": collection_queue.get("backoffs") or [],
+                        "last_success_at": str(collection_queue.get("last_success_at") or ""),
+                        "oldest_data_age_seconds": collection_queue.get("oldest_data_age_seconds"),
+                        "never_synced": int(collection_queue.get("never_synced") or 0),
                         "backend": "official_api",
-                        "message": "官方 API 调度器；不启动 Chrome",
+                        "message": "官方 API 持久化调度器；不启动 Chrome",
                     }
                     if QIANCHUAN_BACKEND == "official_api"
                     else browser_queue_snapshot()
@@ -1197,18 +1208,48 @@ class Api:
     def perform_app_update(self, download_url: str):
         """
         下载 ZIP 并覆盖当前主程序与 bin（仅 Windows / macOS 打包环境）。
-        成功时会 os._exit，不会返回给前端。
+        成功后先停止后台服务并刷新数据库状态，再关闭桌面窗口。
         """
 
         if sys.platform == "win32":
             from services.update_service_win import run_desktop_update
 
-            return run_desktop_update(download_url)
+            result = run_desktop_update(download_url)
+            if result.get("success") and result.get("restart_scheduled"):
+                self._schedule_graceful_update_exit()
+            return result
         if sys.platform == "darwin":
             from services.update_service_mac import run_desktop_update as run_desktop_update_mac
 
-            return run_desktop_update_mac(download_url)
+            result = run_desktop_update_mac(download_url)
+            if result.get("success") and result.get("restart_scheduled"):
+                self._schedule_graceful_update_exit()
+            return result
         return {"success": False, "message": "当前系统不支持在线更新"}
+
+    @staticmethod
+    def _schedule_graceful_update_exit() -> None:
+        def close_after_response() -> None:
+            # Allow the bridge response to reach the UI before shutdown begins.
+            time.sleep(0.35)
+            try:
+                from services.runtime_supervisor import RUNTIME_SUPERVISOR
+
+                RUNTIME_SUPERVISOR.stop()
+            finally:
+                try:
+                    import webview
+
+                    if webview.windows:
+                        webview.windows[0].destroy()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=close_after_response,
+            name="qcsckp-update-shutdown",
+            daemon=True,
+        ).start()
 
     def open_url_in_browser(self, url: str):
         """

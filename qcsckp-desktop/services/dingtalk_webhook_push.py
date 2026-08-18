@@ -91,13 +91,18 @@ def _hour_key_now() -> Tuple[int, int, int, int]:
     return (t.year, t.month, t.day, t.hour)
 
 
+_STOP = threading.Event()
+_THREAD: threading.Thread | None = None
+
+
 def _hourly_push_loop() -> None:
     global _last_fired_hour_key
     from api.dashboard import DashboardApi
 
     dash = DashboardApi()
-    time.sleep(5)
-    while True:
+    if _STOP.wait(5):
+        return
+    while not _STOP.is_set():
         try:
             now = datetime.now()
             if now.minute == 0 and now.second < 45:
@@ -107,11 +112,25 @@ def _hourly_push_loop() -> None:
                     run_dingtalk_webhook_push_once(dash)
         except Exception as e:
             print(f"[钉钉整点推送] 异常: {e}")
-        time.sleep(10)
+        _STOP.wait(10)
 
 
 def start_dingtalk_webhook_push_background_thread() -> threading.Thread | None:
-    t = threading.Thread(target=_hourly_push_loop, name="dingtalk-webhook-hourly", daemon=True)
-    t.start()
+    global _THREAD
+    if _THREAD and _THREAD.is_alive():
+        return _THREAD
+    _STOP.clear()
+    _THREAD = threading.Thread(target=_hourly_push_loop, name="dingtalk-webhook-hourly", daemon=True)
+    _THREAD.start()
     print("[钉钉整点推送] 后台线程已启动（每整点推送，配置：data/control_panel.json）")
-    return t
+    return _THREAD
+
+
+def stop_dingtalk_webhook_push_background_thread(timeout: float = 3.0) -> None:
+    global _THREAD
+    _STOP.set()
+    thread = _THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        _THREAD = None

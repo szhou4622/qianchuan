@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -38,7 +39,8 @@ def _get_project_root() -> str:
     """
     可写数据根目录（data / temp / logs）：
     - 开发：项目根 = 本文件所在目录
-    - Windows 打包：exe 所在目录
+    - Windows 打包：静态程序根仍为 exe 所在目录；运行数据另存到
+      %LOCALAPPDATA%\\QCSCKP\\official-api-v1
     - macOS 打包：~/.qcsckp/<hash>/（.app 内只读，数据放用户目录）
     """
     if getattr(sys, "frozen", False):
@@ -75,9 +77,32 @@ if _data_dir_override:
     DATA_TEMP_DIR = os.path.join(DATA_DIR, "temp")
     LOGS_DIR = os.path.join(DATA_DIR, "logs")
 else:
-    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-    DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
-    LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+    if getattr(sys, "frozen", False) and sys.platform == "win32":
+        local_root = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+        runtime_root = os.path.join(local_root, "QCSCKP", "official-api-v1")
+        DATA_DIR = os.path.join(runtime_root, "data")
+        DATA_TEMP_DIR = os.path.join(runtime_root, "temp")
+        LOGS_DIR = os.path.join(runtime_root, "logs")
+        # v0.1.52 and earlier stored writable data beside the executable. Copy
+        # it once, never move/delete it, so rollback remains possible and an
+        # installed build no longer needs write access to Program Files.
+        legacy_data_dir = os.path.join(PROJECT_ROOT, "data")
+        if (
+            not os.path.exists(DATA_DIR)
+            and os.path.isdir(legacy_data_dir)
+        ):
+            try:
+                os.makedirs(runtime_root, exist_ok=True)
+                shutil.copytree(legacy_data_dir, DATA_DIR, dirs_exist_ok=False)
+            except (OSError, shutil.Error):
+                # The app can still start with a clean LOCALAPPDATA profile.
+                # Diagnostics will expose missing migrated data without ever
+                # falling back to writing secrets into the install directory.
+                pass
+    else:
+        DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+        DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
+        LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
 QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
@@ -124,9 +149,10 @@ QIANCHUAN_OFFICIAL_API_BASE_URL = (
 if os.getenv("QCSCKP_ALLOW_LIVE_API_WRITES") is not None:
     ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")
 else:
-    ALLOW_LIVE_OFFICIAL_API_WRITES = bool(
-        _QIANCHUAN_RUNTIME_SETTINGS.get("allow_live_api_writes", False)
-    )
+    # Runtime settings are tool-user scoped and are restored only after login
+    # by the rule runner. Never inherit another local account's live-write flag
+    # during module import.
+    ALLOW_LIVE_OFFICIAL_API_WRITES = False
 QIANCHUAN_API_TOKEN_FILE = os.path.join(DATA_DIR, "qianchuan_open_api_token.json")
 
 def _pick_static_dir() -> str:

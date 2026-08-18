@@ -1,221 +1,488 @@
-"""Read-only comparison between the last legacy snapshot and official API.
+"""Persistent final-state reconciliation for official Qianchuan writes.
 
-This is an acceptance aid, not a runtime fallback.  It never launches Chrome,
-never changes monitoring selections, and never writes to Ocean Engine.
+POST success only means that the platform accepted the request.  This worker
+owns the later read-only verification so a process restart cannot turn a
+submitted task into a false success or cause the POST to be repeated.
 """
-
 from __future__ import annotations
 
+import json
+import threading
+import time
+import uuid
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional
 
-from api.promotion_targets import list_promotion_targets
-from services.official_api_collection import MATERIAL_METRICS, _material_snapshot
-from services.qianchuan_accounts import get_qianchuan_account
-from services.qianchuan_open_api.normalizers import text_id
+from services.qianchuan_open_api.audit import OfficialApiAuditStore
 from services.qianchuan_open_api.runtime import get_official_api_service
+from services.qianchuan_session import current_session_owner
+from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
-METRIC_FIELDS = (
-    "stat_cost",
-    "overall_order_count",
-    "pay_gmv_include_coupon",
-    "prepay_pay_settle_1h",
-)
+_STOP = threading.Event()
+_WAKE = threading.Event()
+_LOCK = threading.Lock()
+_THREAD: Optional[threading.Thread] = None
+_LEASE_OWNER = f"reconcile-{uuid.uuid4().hex}"
+_LEASE_SECONDS = 90
+_MAX_ATTEMPTS = 8
 
 
-def _ids(rows: list[Mapping[str, Any]], key: str) -> set[str]:
-    return {text_id(row.get(key)) for row in rows if text_id(row.get(key))}
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _decimal(value: Any) -> Optional[Decimal]:
+def _json(value: Any) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
     try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
+        parsed = json.loads(str(value or "{}"))
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
-def _metric_diff(local: Mapping[str, Any], official: Mapping[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for field in METRIC_FIELDS:
-        left = _decimal(local.get(field))
-        right = _decimal(official.get(field))
-        if left is None or right is None:
-            result[field] = {"local": local.get(field), "official": official.get(field), "comparable": False}
-            continue
-        result[field] = {
-            "local": str(left),
-            "official": str(right),
-            "delta": str(right - left),
-            "comparable": True,
-        }
-    return result
-
-
-def reconcile_account_snapshot(
-    aavid: Any,
+def enqueue_execution_reconciliation(
     *,
+    task_uid: str,
+    action_type: str,
+    aavid: Any,
+    ad_id: Any,
+    control_task_id: Any,
+    request_id: str,
+    request_uid: str,
+    idempotency_key: str,
+    verify_payload: Mapping[str, Any],
     db: Optional[SQLiteStore] = None,
 ) -> dict[str, Any]:
-    """Compare one actively added account and its enabled plans."""
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
-    aid = text_id(aavid)
-    account = get_qianchuan_account(aid, db=store)
-    if not account:
-        raise ValueError("该千川账户尚未添加到本机工具")
-
-    service = get_official_api_service()
-    business_accounts, account_evidence = service.list_business_accounts()
-    official_account = next(
-        (row for row in business_accounts if text_id(row.get("advertiser_id")) == aid),
-        None,
+    owner = str(current_session_owner() or "").strip().casefold()
+    if not owner:
+        raise RuntimeError("工具账号已经退出，不能登记官方 API 对账任务")
+    stable_key = str(idempotency_key or task_uid or request_uid or control_task_id).strip()
+    existing = store.select_one(
+        "execution_reconciliation",
+        where={"account_username": owner, "idempotency_key": stable_key},
     )
-    if not official_account:
-        return {
-            "success": False,
-            "complete": False,
-            "aavid": aid,
-            "error": "该账户不在当前官方 API 授权链中",
-            "account_evidence": account_evidence,
-        }
-
-    official_plans, plan_evidence = service.list_all_plans(aid)
-    local_plans = [
-        row
-        for row in list_promotion_targets(db=store)
-        if text_id(row.get("aadvid")) == aid
-    ]
-    official_by_id = {text_id(row.get("ad_id")): row for row in official_plans if text_id(row.get("ad_id"))}
-    local_by_id = {text_id(row.get("ad_id")): row for row in local_plans if text_id(row.get("ad_id"))}
-    official_ids = set(official_by_id)
-    local_ids = set(local_by_id)
-
-    class_mismatches: list[dict[str, Any]] = []
-    for ad_id in sorted(official_ids & local_ids):
-        local = local_by_id[ad_id]
-        official = official_by_id[ad_id]
-        expected = (str(local.get("plan_system") or ""), str(local.get("promotion_scene") or ""))
-        actual = (str(official.get("plan_system") or ""), str(official.get("promotion_scene") or ""))
-        if expected != actual:
-            class_mismatches.append({"ad_id": ad_id, "local": expected, "official": actual})
-
-    target_results: list[dict[str, Any]] = []
-    end = datetime.now()
-    start_date = (end - timedelta(days=30)).strftime("%Y-%m-%d")
-    end_date = end.strftime("%Y-%m-%d")
-    for target in [row for row in local_plans if bool(row.get("enabled"))]:
-        ad_id = text_id(target.get("ad_id"))
-        goal = "LIVE_PROM_GOODS" if str(target.get("promotion_scene")) == "live" else "VIDEO_PROM_GOODS"
-        units, config_response = service.get_report_config(
-            aid,
-            plan_system=str(target.get("plan_system") or ""),
-            promotion_scene=str(target.get("promotion_scene") or ""),
-        )
-        if not units:
-            raise RuntimeError("官方 API 报表配置未返回字段单位，禁止生成指标对账结论")
-        materials, material_request_ids = service.list_plan_materials(
-            aid,
-            ad_id,
-            start_date=start_date,
-            end_date=end_date,
-            fields=tuple(field for field in MATERIAL_METRICS if field in units),
-        )
-        products, product_request_ids = (
-            service.list_plan_products(
-                aid,
-                ad_id,
-                start_date=start_date,
-                end_date=end_date,
+    if isinstance(existing, dict):
+        if str(existing.get("status") or "") == "submitting":
+            store.execute(
+                "UPDATE execution_reconciliation SET task_uid=?,action_type=?,aavid=?,ad_id=?,"
+                "control_task_id=?,request_id=?,status='submitted',next_attempt_at=?,"
+                "payload_json=?,last_error='',updated_at=? WHERE account_username=? "
+                "AND idempotency_key=? AND status='submitting'",
+                (
+                    str(task_uid or ""),
+                    str(action_type or "retarget"),
+                    str(aavid or ""),
+                    str(ad_id or ""),
+                    str(control_task_id or ""),
+                    str(request_id or ""),
+                    (datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),
+                    _json({**dict(verify_payload), "request_uid": str(request_uid or "")}),
+                    _now(),
+                    owner,
+                    stable_key,
+                ),
             )
-            if str(target.get("promotion_scene")) == "product"
-            else ([], [])
-        )
-        control_start = (end - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00")
-        controls, control_request_ids = service.list_control_tasks(
-            aid,
-            ad_id=ad_id,
-            marketing_goal=goal,
-            start_time=control_start,
-            end_time=(end + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
-        )
-
-        local_materials = store.execute(
-            "SELECT p.* FROM pmc_promotion_material p "
-            "JOIN (SELECT material_id, MAX(id) AS max_id FROM pmc_promotion_material "
-            "WHERE target_uid=? GROUP BY material_id) latest ON latest.max_id=p.id",
-            (str(target.get("target_uid") or ""),),
-            fetch=True,
-        ) or []
-        local_products = store.execute(
-            "SELECT product_id FROM promotion_product WHERE target_uid=?",
-            (str(target.get("target_uid") or ""),),
-            fetch=True,
-        ) or []
-        local_controls = store.execute(
-            "SELECT assist_task_id FROM pmc_roi2_assist_task WHERE target_uid=?",
-            (str(target.get("target_uid") or ""),),
-            fetch=True,
-        ) or []
-        request_id = material_request_ids[-1] if material_request_ids else config_response.request_id
-        official_snapshots = {
-            text_id(item.get("material_id")): _material_snapshot(
-                item,
-                target=target,
-                units=units,
-                request_id=request_id,
-            )
-            for item in materials
-            if text_id(item.get("material_id"))
-        }
-        local_snapshots = {text_id(item.get("material_id")): item for item in local_materials}
-        matched_materials = sorted(set(local_snapshots) & set(official_snapshots))
-        target_results.append(
+            existing = store.select_one(
+                "execution_reconciliation",
+                where={"account_username": owner, "idempotency_key": stable_key},
+            ) or existing
+        _WAKE.set()
+        return existing
+    row = {
+        "reconciliation_uid": uuid.uuid4().hex,
+        "account_username": owner,
+        "task_uid": str(task_uid or ""),
+        "action_type": str(action_type or "retarget"),
+        "aavid": str(aavid or ""),
+        "ad_id": str(ad_id or ""),
+        "control_task_id": str(control_task_id or ""),
+        "request_id": str(request_id or ""),
+        "idempotency_key": stable_key,
+        "status": "submitted",
+        "next_attempt_at": (datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        "payload_json": _json(
             {
-                "target_uid": str(target.get("target_uid") or ""),
-                "ad_id": ad_id,
-                "local_material_count": len(local_snapshots),
-                "official_material_count": len(official_snapshots),
-                "material_only_local": sorted(set(local_snapshots) - set(official_snapshots)),
-                "material_only_official": sorted(set(official_snapshots) - set(local_snapshots)),
-                "local_product_ids": sorted(_ids(local_products, "product_id")),
-                "official_product_ids": sorted(_ids(products, "product_id")),
-                "local_control_task_ids": sorted(_ids(local_controls, "assist_task_id")),
-                "official_control_task_ids": sorted(_ids(controls, "task_id")),
-                "metric_comparison": {
-                    material_id: _metric_diff(local_snapshots[material_id], official_snapshots[material_id])
-                    for material_id in matched_materials
-                },
-                "request_ids": {
-                    "report_config": config_response.request_id,
-                    "materials": material_request_ids,
-                    "products": product_request_ids,
-                    "control_tasks": control_request_ids,
-                },
+                **dict(verify_payload),
+                "request_uid": str(request_uid or ""),
             }
-        )
+        ),
+    }
+    store.insert("execution_reconciliation", row)
+    _WAKE.set()
+    return row
 
-    account_name_local = str(account.get("account_name") or "")
-    account_name_official = str(official_account.get("advertiser_name") or "")
+
+def reserve_execution_intent(
+    *,
+    task_uid: str,
+    action_type: str,
+    aavid: Any,
+    ad_id: Any,
+    idempotency_key: str,
+    verify_payload: Mapping[str, Any],
+    control_task_id: Any = "",
+    db: Optional[SQLiteStore] = None,
+) -> tuple[dict[str, Any], bool]:
+    """Persist an immutable write intent immediately before the POST.
+
+    A crash after this reservation is intentionally fail-closed: on restart
+    the same idempotency key is not submitted again until an operator or the
+    reconciliation flow has resolved the previous attempt.
+    """
+    store = db or SQLiteStore()
+    init_sqlite_schema(database=store.config.get("database"))
+    owner = str(current_session_owner() or "").strip().casefold()
+    if not owner:
+        raise RuntimeError("工具账号已经退出，不能登记官方 API 写入意图")
+    stable_key = str(idempotency_key or task_uid).strip()
+    if not stable_key:
+        raise RuntimeError("写入任务缺少不可变幂等键")
+    existing = store.select_one(
+        "execution_reconciliation",
+        where={"account_username": owner, "idempotency_key": stable_key},
+    )
+    if isinstance(existing, dict):
+        return existing, False
+    row = {
+        "reconciliation_uid": uuid.uuid4().hex,
+        "account_username": owner,
+        "task_uid": str(task_uid or ""),
+        "action_type": str(action_type or "retarget"),
+        "aavid": str(aavid or ""),
+        "ad_id": str(ad_id or ""),
+        "control_task_id": str(control_task_id or ""),
+        "idempotency_key": stable_key,
+        "status": "submitting",
+        "next_attempt_at": _now(),
+        "payload_json": _json(dict(verify_payload)),
+    }
+    try:
+        store.insert("execution_reconciliation", row)
+    except Exception:
+        existing = store.select_one(
+            "execution_reconciliation",
+            where={"account_username": owner, "idempotency_key": stable_key},
+        )
+        if isinstance(existing, dict):
+            return existing, False
+        raise
+    return row, True
+
+
+def finish_execution_intent(
+    idempotency_key: str,
+    *,
+    status: str,
+    error: str = "",
+    db: Optional[SQLiteStore] = None,
+) -> None:
+    store = db or SQLiteStore()
+    owner = str(current_session_owner() or "").strip().casefold()
+    if not owner or not str(idempotency_key or "").strip():
+        return
+    store.execute(
+        "UPDATE execution_reconciliation SET status=?,last_error=?,confirmed_at=?,updated_at=? "
+        "WHERE account_username=? AND idempotency_key=? AND status='submitting'",
+        (
+            str(status or "unknown_requires_review"),
+            str(error or "")[:1000],
+            _now() if str(status or "").startswith("confirmed_") else None,
+            _now(),
+            owner,
+            str(idempotency_key),
+        ),
+    )
+
+
+def _claim_one(store: SQLiteStore, owner: str) -> Optional[dict[str, Any]]:
+    now = _now()
+    lease_until = (datetime.now() + timedelta(seconds=_LEASE_SECONDS)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    with store.transaction() as conn:
+        store.execute(
+            "UPDATE execution_reconciliation SET status='submitted',lease_owner=NULL,"
+            "lease_expires_at=NULL,updated_at=? WHERE account_username=? "
+            "AND status='verifying' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+            (now, owner, now),
+            connection=conn,
+        )
+        rows = store.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? "
+            "AND status='submitted' AND next_attempt_at<=? ORDER BY next_attempt_at,id LIMIT 1",
+            (owner, now),
+            fetch=True,
+            connection=conn,
+        ) or []
+        if not rows:
+            return None
+        row = dict(rows[0])
+        token = int(row.get("fencing_token") or 0) + 1
+        changed = store.execute(
+            "UPDATE execution_reconciliation SET status='verifying',attempt_count=attempt_count+1,"
+            "lease_owner=?,lease_expires_at=?,fencing_token=?,updated_at=? "
+            "WHERE reconciliation_uid=? AND status='submitted' AND fencing_token=?",
+            (
+                _LEASE_OWNER,
+                lease_until,
+                token,
+                now,
+                str(row.get("reconciliation_uid") or ""),
+                int(row.get("fencing_token") or 0),
+            ),
+            connection=conn,
+        )
+        if int(changed or 0) != 1:
+            return None
+        row["fencing_token"] = token
+        row["lease_owner"] = _LEASE_OWNER
+        row["attempt_count"] = int(row.get("attempt_count") or 0) + 1
+        return row
+
+
+def _finish(
+    store: SQLiteStore,
+    row: Mapping[str, Any],
+    *,
+    status: str,
+    error: str = "",
+    verified: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    now = _now()
+    changed = store.execute(
+        "UPDATE execution_reconciliation SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
+        "last_error=?,confirmed_at=?,card_update_state='pending',updated_at=? "
+        "WHERE reconciliation_uid=? AND status='verifying' AND lease_owner=? AND fencing_token=?",
+        (
+            status,
+            str(error or "")[:1000],
+            now if status.startswith("confirmed_") else None,
+            now,
+            str(row.get("reconciliation_uid") or ""),
+            str(row.get("lease_owner") or ""),
+            int(row.get("fencing_token") or 0),
+        ),
+    )
+    if int(changed or 0) != 1:
+        return False
+    data = _payload(row.get("payload_json"))
+    request_uid = str(data.get("request_uid") or "")
+    if request_uid:
+        OfficialApiAuditStore(store).mark_reconciled(
+            request_uid,
+            status=("confirmed" if status == "confirmed_succeeded" else "unresolved"),
+            task_id=row.get("control_task_id"),
+            response=verified or {"verification_error": error},
+        )
+    task_uid = str(row.get("task_uid") or "")
+    run_task_uid = str(data.get("execution_uid") or task_uid)
+    if run_task_uid:
+        succeeded = status == "confirmed_succeeded"
+        is_stop = str(row.get("action_type") or "retarget") == "stop"
+        if is_stop:
+            store.execute(
+                "UPDATE pmc_regulation_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
+                "WHERE execution_uid=? AND execution_state='submitted_verifying'",
+                (
+                    1 if succeeded else -1,
+                    "confirmed_succeeded" if succeeded else status,
+                    "confirmed_succeeded" if succeeded else status,
+                    "官方 API 停投已核验成功" if succeeded else "官方 API 停投核验失败，请人工检查",
+                    str(error or "")[:4000],
+                    now,
+                    run_task_uid,
+                ),
+            )
+        else:
+            store.execute(
+                "UPDATE pmc_retargeting_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
+                "WHERE execution_uid=? AND execution_state='submitted_verifying'",
+                (
+                    1 if succeeded else -1,
+                    "confirmed_succeeded" if succeeded else status,
+                    "confirmed_succeeded" if succeeded else status,
+                    "官方 API 追投已核验成功" if succeeded else "官方 API 追投核验失败，请人工检查",
+                    str(error or "")[:4000],
+                    now,
+                    run_task_uid,
+                ),
+            )
+        store.execute(
+            "UPDATE account_operation_event SET status=?,summary=?,detail=?,updated_at=? "
+            "WHERE cloud_task_id=? AND status='pending'",
+            (
+                "success" if succeeded else "failed",
+                (
+                    "官方 API 停投已核验成功"
+                    if is_stop and succeeded
+                    else "官方 API 追投已核验成功"
+                    if succeeded
+                    else "官方 API 写入核验失败，请人工检查"
+                ),
+                str(error or "")[:4000],
+                now,
+                run_task_uid,
+            ),
+        )
+    if task_uid:
+        siblings = store.execute(
+            "SELECT status FROM execution_reconciliation WHERE account_username=? AND task_uid=?",
+            (str(row.get("account_username") or ""), task_uid),
+            fetch=True,
+        ) or []
+        sibling_statuses = {str(item.get("status") or "") for item in siblings}
+        if sibling_statuses.intersection({"submitted", "verifying"}):
+            return True
+        succeeded = bool(sibling_statuses) and sibling_statuses == {"confirmed_succeeded"}
+        aggregate_status = "confirmed_succeeded" if succeeded else "unknown_requires_review"
+        try:
+            from services.local_feishu_bridge import finalize_reconciled_local_task
+
+            finalize_reconciled_local_task(
+                task_uid,
+                succeeded=succeeded,
+                message=("官方 API 追投已核验成功" if succeeded else "官方 API 追投核验失败，请人工检查"),
+                detail=str(error or ""),
+                regulate_task_id=str(row.get("control_task_id") or ""),
+                result={
+                    "success": succeeded,
+                    "step": aggregate_status,
+                    "regulate_task_id": str(row.get("control_task_id") or ""),
+                    "verification": dict(verified or {}),
+                },
+            )
+        except Exception:
+            logger.exception("官方 API 对账完成后更新飞书任务失败 task=%s", task_uid)
+    return True
+
+
+def _retry(store: SQLiteStore, row: Mapping[str, Any], error: str) -> None:
+    attempts = int(row.get("attempt_count") or 0)
+    if attempts >= _MAX_ATTEMPTS:
+        _finish(store, row, status="unknown_requires_review", error=error)
+        return
+    delay = min(300, 2 ** min(attempts, 8))
+    next_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+    store.execute(
+        "UPDATE execution_reconciliation SET status='submitted',next_attempt_at=?,"
+        "lease_owner=NULL,lease_expires_at=NULL,last_error=?,updated_at=? "
+        "WHERE reconciliation_uid=? AND status='verifying' AND lease_owner=? AND fencing_token=?",
+        (
+            next_at,
+            str(error or "")[:1000],
+            _now(),
+            str(row.get("reconciliation_uid") or ""),
+            str(row.get("lease_owner") or ""),
+            int(row.get("fencing_token") or 0),
+        ),
+    )
+
+
+def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
+    data = _payload(row.get("payload_json"))
+    try:
+        action_type = str(row.get("action_type") or "retarget")
+        if action_type == "retarget":
+            from services.official_api_execution import _verify_control_task
+
+            verified = _verify_control_task(
+                get_official_api_service(),
+                aavid=row.get("aavid"),
+                ad_id=row.get("ad_id"),
+                promotion_scene=data.get("promotion_scene"),
+                task_id=row.get("control_task_id"),
+                material_ids=data.get("material_ids") or [],
+                budget=data.get("budget"),
+                duration=data.get("duration"),
+            )
+        elif action_type == "stop":
+            from services.official_api_execution import _find_control_task
+
+            verified = _find_control_task(
+                get_official_api_service(),
+                aavid=row.get("aavid"),
+                ad_id=row.get("ad_id"),
+                promotion_scene=data.get("promotion_scene"),
+                task_id=row.get("control_task_id"),
+            )
+            if not verified:
+                raise RuntimeError("官方 API 暂未返回待核验的调控任务")
+            expected = str(data.get("expected_status") or "PAUSE").upper()
+            actual = str(verified.get("status") or "").upper()
+            allowed = (
+                {"PAUSE", "PAUSED"}
+                if expected == "PAUSE"
+                else {"DISABLE", "DISABLED", "FINISHED", "ENDED"}
+            )
+            if actual not in allowed:
+                raise RuntimeError(f"平台任务状态尚未变更为 {expected}，当前为 {actual or 'unknown'}")
+        else:
+            raise RuntimeError("暂不支持的对账动作")
+    except Exception as exc:
+        _retry(store, row, str(exc))
+        return
+    _finish(store, row, status="confirmed_succeeded", verified=verified)
+
+
+def _loop() -> None:
+    init_sqlite_schema()
+    store = SQLiteStore()
+    while not _STOP.is_set():
+        owner = str(current_session_owner() or "").strip().casefold()
+        if not owner:
+            _WAKE.wait(2)
+            _WAKE.clear()
+            continue
+        row = _claim_one(store, owner)
+        if row:
+            _verify_one(store, row)
+            continue
+        _WAKE.wait(2)
+        _WAKE.clear()
+
+
+def start_official_api_reconciliation_background_thread() -> threading.Thread:
+    global _THREAD
+    with _LOCK:
+        if _THREAD and _THREAD.is_alive():
+            return _THREAD
+        _STOP.clear()
+        _THREAD = threading.Thread(
+            target=_loop,
+            name="official-api-reconciliation",
+            daemon=True,
+        )
+        _THREAD.start()
+        return _THREAD
+
+
+def stop_official_api_reconciliation_background_thread(timeout: float = 8.0) -> None:
+    _STOP.set()
+    _WAKE.set()
+    thread = _THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+
+
+def get_execution_reconciliation_health(db: Optional[SQLiteStore] = None) -> dict[str, Any]:
+    store = db or SQLiteStore()
+    owner = str(current_session_owner() or "").strip().casefold()
+    rows = store.execute(
+        "SELECT status,COUNT(*) AS count FROM execution_reconciliation "
+        "WHERE account_username=? GROUP BY status",
+        (owner,),
+        fetch=True,
+    ) or []
     return {
-        "success": True,
-        "complete": bool(account_evidence.get("complete") and plan_evidence.get("complete")),
-        "aavid": aid,
-        "account_name": {
-            "local": account_name_local,
-            "official": account_name_official,
-            "matched": account_name_local == account_name_official,
-        },
-        "plans": {
-            "local_count": len(local_ids),
-            "official_count": len(official_ids),
-            "only_local": sorted(local_ids - official_ids),
-            "only_official": sorted(official_ids - local_ids),
-            "class_mismatches": class_mismatches,
-        },
-        "targets": target_results,
-        "account_evidence": account_evidence,
-        "plan_evidence": plan_evidence,
+        "running": bool(_THREAD and _THREAD.is_alive()),
+        "counts": {str(row.get("status")): int(row.get("count") or 0) for row in rows},
     }

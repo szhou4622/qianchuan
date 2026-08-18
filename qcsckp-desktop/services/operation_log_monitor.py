@@ -1628,3 +1628,13 @@ def start_platform_log_sync_background_thread() -> threading.Thread:
     thread = threading.Thread(target=entry, name="platform-log-sync", daemon=True)
     thread.start()
     return thread
+
+
+def stop_platform_log_sync_background_thread(timeout: float = 5.0) -> None:
+    """Stop the selected backend scheduler during a complete application exit."""
+    if QIANCHUAN_BACKEND == "official_api":
+        from services.official_api_operation_logs import (
+            stop_official_operation_log_sync_background_thread,
+        )
+
+        stop_official_operation_log_sync_background_thread(timeout=timeout)

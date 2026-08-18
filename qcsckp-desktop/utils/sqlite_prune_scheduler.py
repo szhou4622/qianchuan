@@ -28,6 +28,10 @@ from utils.log import logger
 from utils.sqlite_store import SQLiteStore
 
 
+_STOP = threading.Event()
+_THREAD: threading.Thread | None = None
+
+
 def _beijing_now() -> datetime:
     """与库表 created_at 一致：UTC+8（无时区对象，仅本地算术）。"""
     return datetime.utcnow() + timedelta(hours=8)
@@ -102,26 +106,27 @@ def run_startup_prune_if_over_trigger() -> None:
 
 
 def _prune_loop() -> None:
-    time.sleep(max(0, SQLITE_PRUNE_START_DELAY_SEC))
+    if _STOP.wait(max(0, SQLITE_PRUNE_START_DELAY_SEC)):
+        return
 
-    while True:
+    while not _STOP.is_set():
         idle_sleep = SQLITE_PRUNE_LOOP_IDLE_SEC
         try:
             if not os.path.exists(DB_FILE):
-                time.sleep(idle_sleep)
+                _STOP.wait(idle_sleep)
                 continue
 
             now_bj = _beijing_now()
 
             if not _in_daily_prune_window(now_bj):
-                time.sleep(idle_sleep)
+                _STOP.wait(idle_sleep)
                 continue
 
             store = SQLiteStore(database=DB_FILE)
             cnt = store.count("pmc_promotion_material")
 
             if cnt <= SQLITE_PRUNE_TRIGGER_ROWS:
-                time.sleep(idle_sleep)
+                _STOP.wait(idle_sleep)
                 continue
 
             deleted = store.prune_table_keep_latest_by_id_limited(
@@ -139,7 +144,7 @@ def _prune_loop() -> None:
         except Exception as e:
             logger.warning(f"[SQLite 裁剪] 失败: {e}")
 
-        time.sleep(SQLITE_PRUNE_CYCLE_INTERVAL_SEC)
+        _STOP.wait(SQLITE_PRUNE_CYCLE_INTERVAL_SEC)
 
 
 def _prune_worker() -> None:
@@ -155,11 +160,15 @@ def start_sqlite_prune_background_thread() -> threading.Thread | None:
 
     启动时若需裁剪，在后台线程执行，避免阻塞 webview 窗口显示。
     """
+    global _THREAD
     if not SQLITE_PRUNE_ENABLED:
         logger.info("SQLite 定期裁剪已关闭（SQLITE_PRUNE_ENABLED=false）")
         return None
-    t = threading.Thread(target=_prune_worker, name="sqlite-prune", daemon=True)
-    t.start()
+    if _THREAD and _THREAD.is_alive():
+        return _THREAD
+    _STOP.clear()
+    _THREAD = threading.Thread(target=_prune_worker, name="sqlite-prune", daemon=True)
+    _THREAD.start()
     _wh = (
         f"{SQLITE_PRUNE_DAILY_START_HOUR}:00–次日{SQLITE_PRUNE_DAILY_END_HOUR}:00"
         if SQLITE_PRUNE_DAILY_START_HOUR > SQLITE_PRUNE_DAILY_END_HOUR
@@ -171,4 +180,14 @@ def start_sqlite_prune_background_thread() -> threading.Thread | None:
         f"每轮≤{SQLITE_PRUNE_MAX_ROWS_PER_CYCLE} 行、间隔 {SQLITE_PRUNE_CYCLE_INTERVAL_SEC}s，"
         f"批 {SQLITE_PRUNE_DELETE_BATCH_SIZE}/间隔 {SQLITE_PRUNE_BATCH_SLEEP_SEC}s"
     )
-    return t
+    return _THREAD
+
+
+def stop_sqlite_prune_background_thread(timeout: float = 3.0) -> None:
+    global _THREAD
+    _STOP.set()
+    thread = _THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        _THREAD = None

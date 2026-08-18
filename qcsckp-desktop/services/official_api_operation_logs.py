@@ -22,6 +22,9 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 _LOCK = threading.Lock()
 _RUNNING: set[str] = set()
+_STOP = threading.Event()
+_THREAD: Optional[threading.Thread] = None
+INCREMENTAL_OVERLAP_MINUTES = 10
 
 
 def _now() -> str:
@@ -124,9 +127,26 @@ def sync_official_operation_logs(
     if not account:
         raise ValueError("该千川账户尚未添加")
     end = datetime.now()
-    start = end - timedelta(days=max(1, min(180, int(days))))
-    start_text = start.strftime("%Y-%m-%d 00:00:00")
+    state = store.select_one(
+        "platform_log_sync_state",
+        where={
+            "account_uid": str(account.get("account_uid") or ""),
+            "aavid": aid,
+        },
+    ) or {}
+    previous_to = str(state.get("coverage_to") or "").strip()
+    try:
+        high_water = datetime.strptime(previous_to, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        high_water = None
+    if high_water is not None:
+        start = min(end, high_water) - timedelta(minutes=INCREMENTAL_OVERLAP_MINUTES)
+        start_text = start.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        start = end - timedelta(days=max(1, min(180, int(days))))
+        start_text = start.strftime("%Y-%m-%d 00:00:00")
     end_text = end.strftime("%Y-%m-%d %H:%M:%S")
+    persisted_coverage_from = str(state.get("coverage_from") or "").strip() or start_text
     _set_state(store, account, status="syncing")
     inserted = 0
     try:
@@ -174,7 +194,7 @@ def sync_official_operation_logs(
             # A complete successful API response with zero operations is still
             # complete coverage, not a sync failure.
             status="ok",
-            coverage_from=start_text,
+            coverage_from=persisted_coverage_from,
             coverage_to=end_text,
             request_evidence={
                 "source": "qianchuan_open_api",
@@ -187,8 +207,9 @@ def sync_official_operation_logs(
             "running": False,
             "backend": "official_api",
             "inserted": inserted,
-            "coverage_from": start_text,
+            "coverage_from": persisted_coverage_from,
             "coverage_to": end_text,
+            "sync_window_from": start_text,
             "message": f"千川官方 API 操作日志同步完成，共处理 {inserted} 条",
         }
     except Exception as exc:
@@ -228,8 +249,13 @@ def request_official_operation_log_sync(aavid: Any, *, db: Optional[SQLiteStore]
 
 
 def start_official_operation_log_sync_background_thread() -> threading.Thread:
+    global _THREAD
+    if _THREAD and _THREAD.is_alive():
+        return _THREAD
+    _STOP.clear()
+
     def loop() -> None:
-        while True:
+        while not _STOP.is_set():
             try:
                 store = SQLiteStore()
                 for account in list_qianchuan_accounts(db=store):
@@ -237,8 +263,16 @@ def start_official_operation_log_sync_background_thread() -> threading.Thread:
                         request_official_operation_log_sync(account.get("aavid"), db=store)
             except Exception:
                 pass
-            time.sleep(5 * 60)
+            _STOP.wait(5 * 60)
 
     thread = threading.Thread(target=loop, name="official-api-operation-log-scheduler", daemon=True)
     thread.start()
+    _THREAD = thread
     return thread
+
+
+def stop_official_operation_log_sync_background_thread(timeout: float = 5.0) -> None:
+    _STOP.set()
+    thread = _THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, float(timeout)))

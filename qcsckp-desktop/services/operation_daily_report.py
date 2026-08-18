@@ -19,6 +19,7 @@ from services.local_feishu_bridge import (
     list_local_feishu_bound_targets,
     send_local_feishu_bound_card,
 )
+from services.qianchuan_session import current_session_owner
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -27,6 +28,8 @@ CONFIG_FILE = os.path.join(DATA_DIR, "operation_daily_report.json")
 CONFIG_LOCK = threading.RLock()
 SCHEDULER_LOCK = threading.Lock()
 SCHEDULER_STARTED = False
+SCHEDULER_STOP = threading.Event()
+SCHEDULER_THREAD: Optional[threading.Thread] = None
 DETAIL_LIMIT = 20
 # 日报只展示实际投放操作：工具执行、千川后台日志，以及已经由千川
 # 后台日志ID核验过的浏览器记录。纯“记录浏览器模式”轨迹不属于日报。
@@ -41,6 +44,17 @@ DEFAULT_CONFIG = {
     "aavids": [],
     "send_empty": False,
 }
+
+
+def _current_tool_owner() -> str:
+    """Use the authenticated tool user as the sole business-data scope."""
+    return (
+        # current_local_feishu_account() first reconciles the bridge with the
+        # device session; it is therefore safe to use while remaining easy to
+        # isolate in unit tests that do not create a real device session.
+        str(current_local_feishu_account() or "").strip().casefold()
+        or str(current_session_owner() or "").strip().casefold()
+    )
 
 SOURCE_LABELS = {
     "tool_direct": "工具操作",
@@ -177,7 +191,7 @@ def list_operation_account_options(database: Optional[str] = None) -> List[Dict[
     store = _store(database)
     from services.qianchuan_accounts import list_qianchuan_accounts
 
-    owner = current_local_feishu_account() or None
+    owner = _current_tool_owner() or None
     accounts = list_qianchuan_accounts(owner_username=owner, db=store)
     # The Feishu report picker is a view of the account directory, not a
     # second account registry. Historical events/material rows must never
@@ -201,7 +215,7 @@ def get_operation_daily_report_config(
     database: Optional[str] = None,
     account_options: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    account = current_local_feishu_account()
+    account = _current_tool_owner()
     if not account:
         return {
             "success": False,
@@ -247,7 +261,7 @@ def save_operation_daily_report_config(
     config: Dict[str, Any],
     database: Optional[str] = None,
 ) -> Dict[str, Any]:
-    account = current_local_feishu_account()
+    account = _current_tool_owner()
     if not account:
         return {"success": False, "message": "请先登录工具账号"}
     try:
@@ -351,7 +365,7 @@ def build_operation_daily_report(
     store = _store(database)
     from services.qianchuan_accounts import migrate_existing_qianchuan_accounts
 
-    owner = current_local_feishu_account() or None
+    owner = _current_tool_owner() or None
     migrate_existing_qianchuan_accounts(owner_username=owner, db=store)
     directory = store.select_one(
         "qianchuan_account",
@@ -387,9 +401,9 @@ def build_operation_daily_report(
     ) or []
     account_rows = store.execute(
         "SELECT user_info_name FROM pmc_ad_detail_basic "
-        "WHERE aadvid=? AND COALESCE(user_info_name,'')<>'' "
+        "WHERE account_uid=? AND aadvid=? AND COALESCE(user_info_name,'')<>'' "
         "ORDER BY updated_at DESC,id DESC LIMIT 1",
-        (aid,),
+        (account_uid, aid),
         fetch=True,
     ) or []
     sync_rows = store.execute(
@@ -754,7 +768,7 @@ def send_operation_daily_report(
     mode: str = "manual",
     database: Optional[str] = None,
 ) -> Dict[str, Any]:
-    account = current_local_feishu_account()
+    account = _current_tool_owner()
     if not account:
         return {"success": False, "message": "请先登录工具账号"}
     feishu = get_local_feishu_status()
@@ -958,7 +972,7 @@ def run_operation_daily_report_scheduler_once(
     database: Optional[str] = None,
 ) -> Dict[str, Any]:
     current = now or datetime.now()
-    account = current_local_feishu_account()
+    account = _current_tool_owner()
     if not account:
         return {"success": True, "skipped": True, "reason": "logged_out"}
     effective = get_operation_daily_report_config(database=database)
@@ -981,16 +995,18 @@ def run_operation_daily_report_scheduler_once(
 
 
 def start_operation_daily_report_background_thread() -> None:
-    global SCHEDULER_STARTED
+    global SCHEDULER_STARTED, SCHEDULER_THREAD
     with SCHEDULER_LOCK:
         if SCHEDULER_STARTED:
             return
         SCHEDULER_STARTED = True
+        SCHEDULER_STOP.clear()
 
     def _loop() -> None:
         logger.info("[操作日报] 后台线程已启动，每30秒检查一次")
-        time.sleep(8)
-        while True:
+        if SCHEDULER_STOP.wait(8):
+            return
+        while not SCHEDULER_STOP.is_set():
             try:
                 result = run_operation_daily_report_scheduler_once()
                 if not result.get("success") and not result.get("skipped"):
@@ -1006,10 +1022,23 @@ def start_operation_daily_report_background_thread() -> None:
                     )
             except Exception as exc:
                 logger.warning("[操作日报] 定时检查失败: %s", exc)
-            time.sleep(30)
+            SCHEDULER_STOP.wait(30)
 
-    threading.Thread(
+    SCHEDULER_THREAD = threading.Thread(
         target=_loop,
         daemon=True,
         name="qcsckp-operation-daily-report",
-    ).start()
+    )
+    SCHEDULER_THREAD.start()
+
+
+def stop_operation_daily_report_background_thread(timeout: float = 5.0) -> None:
+    global SCHEDULER_STARTED, SCHEDULER_THREAD
+    SCHEDULER_STOP.set()
+    thread = SCHEDULER_THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    with SCHEDULER_LOCK:
+        if thread is None or not thread.is_alive():
+            SCHEDULER_THREAD = None
+            SCHEDULER_STARTED = False

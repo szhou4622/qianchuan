@@ -60,7 +60,7 @@ def _apply_bundle_permissions(bundle: Path, macos_exe_basename: str) -> None:
 
 def run_desktop_update(download_url: str) -> Dict[str, Any]:
     """
-    执行更新：成功启动后台 shell 并退出进程时不返回（os._exit）。
+    执行更新：成功启动后台 shell 后返回重启标记，由运行主管优雅退出。
     失败时返回 {"success": False, "message": "..."}。
     """
     if sys.platform != "darwin":
@@ -162,8 +162,11 @@ def run_desktop_update(download_url: str) -> Dict[str, Any]:
             start_new_session=True,
             close_fds=True,
         )
-        time.sleep(0.4)
-        os._exit(0)
+        return {
+            "success": True,
+            "message": "更新已准备，工具正在安全退出并安装新版本",
+            "restart_scheduled": True,
+        }
     except subprocess.CalledProcessError:
         return {"success": False, "message": "更新包解压失败（unzip）"}
     except URLError as e:

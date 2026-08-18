@@ -9,15 +9,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import DATA_DIR
+from services.qianchuan_session import current_session_owner
 
 FILENAME = "rule_retargeting.json"
 _lock = threading.RLock()
@@ -84,8 +87,24 @@ MAX_STRATEGIES = 10
 _STRATEGY_TITLE_MAX_LEN = 32
 
 
+def _owner_config_path(filename: str) -> str:
+    owner = str(current_session_owner() or "").strip().casefold()
+    if not owner:
+        return os.path.join(DATA_DIR, filename)
+    owner_key = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:24]
+    path = os.path.join(DATA_DIR, "profiles", owner_key, filename)
+    legacy_path = os.path.join(DATA_DIR, filename)
+    marker = os.path.join(DATA_DIR, f".{filename}.migrated_owner")
+    if not os.path.isfile(path) and os.path.isfile(legacy_path) and not os.path.exists(marker):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        shutil.copy2(legacy_path, path)
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(owner)
+    return path
+
+
 def config_path() -> str:
-    return os.path.join(DATA_DIR, FILENAME)
+    return _owner_config_path(FILENAME)
 
 
 def _ensure_data_dir() -> None:
@@ -94,6 +113,7 @@ def _ensure_data_dir() -> None:
 
 def _atomic_write(path: str, data: Dict[str, Any]) -> None:
     _ensure_data_dir()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

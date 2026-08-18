@@ -33,20 +33,8 @@ from config import (
     LOCAL_AUTH_USERNAME,
     QIANCHUAN_BACKEND,
 )
-from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread
-from services.webhook_push_runtime import start_webhook_push_background_threads
-from services.regulation_rule_runner import start_regulation_rule_runner_background_thread
-from services.retargeting_rule_runner import start_retargeting_rule_runner_background_thread
-from services.retarget_task_worker import start_retarget_task_worker_background_thread
-from services.operation_log_monitor import start_platform_log_sync_background_thread
-from services.operation_daily_report import start_operation_daily_report_background_thread
 from services.control_panel_config import ensure_all_control_defaults
-from services.official_api_collection import (
-    start_official_api_collection_background_thread,
-)
-from services.official_api_catalog import (
-    start_official_api_catalog_scheduler,
-)
+from services.runtime_supervisor import RUNTIME_SUPERVISOR
 
 
 # ── 打包环境强制 stdout/stderr 使用 UTF-8 ───────────────────────────────
@@ -416,8 +404,6 @@ class TrayApplication:
         if self.icon:
             self.icon.stop()
         self.window.destroy()
-        # 退出进程
-        os._exit(0)
 
     def _setup_tray(self):
         """配置托盘图标"""
@@ -1322,86 +1308,14 @@ def main():
                 name="qcsckp-test-auto-start",
             ).start()
 
-        # ===== SQLite：后台裁剪旧数据（不阻塞窗口；策略见 config / sqlite_prune_scheduler）=====
-        start_sqlite_prune_background_thread()
-
-        # ===== 飞书 / 钉钉 Webhook：每整点推送（见 services/webhook_push_runtime.py）=====
-        start_webhook_push_background_threads()
-
-        # Restore the account-scoped Feishu callback channel before rules can
-        # emit a card. This closes the restart race where the card is visible
-        # a few seconds before its local long connection comes online.
-        try:
-            from services.local_feishu_bridge import (
-                restore_local_feishu_account_from_device_session,
-            )
-
-            restore_local_feishu_account_from_device_session()
-        except Exception as exc:
-            from utils.log import logger as runtime_logger
-
-            runtime_logger.warning("[Feishu WS] startup restore failed: %s", exc)
-
-        # ===== 规则化追投调度（见 services/retargeting_rule_runner.py；enabled 见 rule_retargeting.json）=====
-        start_retargeting_rule_runner_background_thread()
-
-        # ===== 飞书卡片已批准追投：本地任务队列领取、复核与执行 =====
-        start_retarget_task_worker_background_thread()
-
-        # ===== 千川/巨量纵横后台操作日志：已发现页面每5分钟增量同步 =====
-        start_platform_log_sync_background_thread()
-
-        # ===== 飞书昨日账户操作日报：按工具账号、千川账户和接收位置幂等发送 =====
-        start_operation_daily_report_background_thread()
-
-        # ===== 规则化停投调度（见 services/regulation_rule_runner.py；enabled 见 rule_regulation.json，默认 10 分钟一轮）=====
-        start_regulation_rule_runner_background_thread()
-
-        # ===== 授权账户和四类计划目录 =====
-        # Official API 模式不启动 Browser Worker，目录、素材、调控任务和报表
-        # 全部由 API 调度器处理。旧 Chrome 路径只供 Git 整体回滚。
-        if QIANCHUAN_BACKEND == "official_api":
-            start_official_api_catalog_scheduler()
-            start_official_api_collection_background_thread()
-        else:
-            js_api.api.service.start_catalog_scheduler()
-
-        # 已保存并启用的账户/计划在软件重启后自动恢复后台监控。
-        # 目录启动刷新可能仍在占用唯一 Browser Worker，因此由服务层
-        # 等待目录任务结束后再启动，无需用户进入“服务控制”重复操作。
-        def _resume_saved_monitoring() -> None:
-            time.sleep(1.0)
-            from utils.log import logger as runtime_logger
-
-            for attempt in range(1, 4):
-                try:
-                    result = js_api.api.service.start_from_saved_session()
-                    runtime_logger.info(
-                        "[MONITOR] %s",
-                        result.get("message") or result.get("phase"),
-                    )
-                    if result.get("phase") != "tool_login_required":
-                        return
-                except Exception as exc:
-                    runtime_logger.warning(
-                        "[MONITOR] 自动恢复后台监控失败（第%s次）: %s",
-                        attempt,
-                        exc,
-                    )
-                time.sleep(2.0)
-
-        # Browser mode resumes the Browser Worker; official API mode resumes
-        # its catalog and collection schedulers. Both must recover after an app
-        # restart without another user click.
-        threading.Thread(
-            target=_resume_saved_monitoring,
-            name="qianchuan-monitor-resume",
-            daemon=True,
-        ).start()
+        # One owner starts and stops all business workers. Hiding the window to
+        # the tray does not stop it; "complete exit" returns from WebView and
+        # the finally block below drains the runtime.
+        RUNTIME_SUPERVISOR.start(js_api)
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")
-        webview.start(debug=True, http_server=False, private_mode=False, storage_path=storage_path)
+        webview.start(debug=False, http_server=False, private_mode=False, storage_path=storage_path)
 
     except KeyboardInterrupt:
         print("\n用户中断")
@@ -1411,9 +1325,7 @@ def main():
         traceback.print_exc()
     finally:
         try:
-            from services.local_feishu_bridge import deactivate_local_feishu_account
-
-            deactivate_local_feishu_account()
+            RUNTIME_SUPERVISOR.stop()
         except Exception:
             pass
         single_instance_checker.release_runtime_lease()

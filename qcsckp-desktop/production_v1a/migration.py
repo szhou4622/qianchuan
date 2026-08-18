@@ -26,6 +26,13 @@ LEGACY_SIDE_FILES = (
     "rule_regulation.json",
 )
 
+# Discovery runs on the UI-facing migration path.  A full SQLite quick_check
+# over a multi-gigabyte legacy database can block that path for minutes.  Large
+# sources are still opened read-only and their expected tables are counted;
+# the full integrity check is deferred until the user actually selects that
+# source for migration, where progress can be reported as a background job.
+DISCOVERY_QUICK_CHECK_MAX_BYTES = 256 * 1024 * 1024
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -135,10 +142,13 @@ class LegacyMigrationService:
                 result["account_count"] = _count(conn, "qianchuan_account")
                 result["plan_count"] = _count(conn, "promotion_target")
                 result["operation_count"] = _count(conn, "account_operation_event")
-                integrity = str(conn.execute("PRAGMA quick_check").fetchone()[0])
-                if integrity != "ok":
-                    result["status"] = "invalid"
-                    result["inspection_error"] = integrity[:500]
+                if stat.st_size <= DISCOVERY_QUICK_CHECK_MAX_BYTES:
+                    integrity = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+                    if integrity != "ok":
+                        result["status"] = "invalid"
+                        result["inspection_error"] = integrity[:500]
+                else:
+                    result["integrity_check"] = "deferred_large_source"
             finally:
                 conn.close()
         except Exception as exc:
@@ -178,6 +188,7 @@ class LegacyMigrationService:
         if not source or source["status"] != "available":
             raise ValueError("迁移源不存在或不可用")
         legacy_db = Path(str(source["database_path"]))
+        self._validate_selected_source(legacy_db)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         snapshot_dir = self.paths.snapshots_dir / f"migration-{stamp}-{uuid.uuid4().hex[:8]}"
         snapshot_dir.mkdir(parents=True, exist_ok=False)
@@ -259,6 +270,26 @@ class LegacyMigrationService:
                 (type(exc).__name__, str(exc)[:1000], utc_iso(), migration_uid),
             )
             raise
+
+    @staticmethod
+    def _validate_selected_source(path: Path) -> None:
+        """Deep-check the source only after the user selected it for migration.
+
+        Discovery deliberately avoids a full scan for large databases so the
+        UI stays responsive.  Migration is a background job, therefore this is
+        the safe point to pay the full validation cost before creating or
+        changing any production runtime data.
+        """
+        if not path.is_file():
+            raise ValueError("迁移源数据库不存在")
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            result = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+        finally:
+            conn.close()
+        if result != "ok":
+            raise ValueError(f"迁移源数据库完整性校验失败：{result[:500]}")
 
     def _copy_legacy(
         self, tool_user_id: str, legacy_snapshot: Path, snapshot_dir: Path

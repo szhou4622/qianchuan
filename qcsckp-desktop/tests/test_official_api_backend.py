@@ -647,6 +647,12 @@ class OfficialApiBackendTests(unittest.TestCase):
         ), patch(
             "services.official_api_execution._start_control_task_reconciliation",
             reconcile,
+        ), patch(
+            "services.official_api_execution._existing_reconciliation",
+            return_value=None,
+        ), patch(
+            "services.official_api_reconciliation.reserve_execution_intent",
+            return_value=({}, True),
         ):
             result = asyncio.run(
                 runner.run(
@@ -666,13 +672,16 @@ class OfficialApiBackendTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual("1873333931211978", result.regulate_task_id)
-        self.assertEqual("done_pending_verification", result.step)
-        self.assertIn("任务已创建", result.message)
+        self.assertEqual("submitted_verifying", result.step)
+        self.assertIn("正在核验", result.message)
         service.create_material_control_task.assert_called_once()
         reconcile.assert_called_once_with(
             service,
             request_uid="write-uid",
+            request_id="req-create",
             task_id="1873333931211978",
+            task_uid="abdcf523-b1d0-45e5-992e-f023ffdc13e9",
+            idempotency_key="abdcf523-b1d0-45e5-992e-f023ffdc13e9",
             verify_kwargs={
                 "aavid": 1795110974060618,
                 "ad_id": 1859333122962634,
@@ -681,6 +690,7 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "material_ids": ["7643772216392564762"],
                 "budget": Decimal("100"),
                 "duration": Decimal("24"),
+                "execution_uid": "abdcf523-b1d0-45e5-992e-f023ffdc13e9",
             },
         )
 

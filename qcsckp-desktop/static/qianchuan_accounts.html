@@ -66,7 +66,7 @@
     <div class="metric"><div class="label">千川API授权状态</div><div class="value" id="sessionValue">读取中</div><div class="hint" id="sessionHint">—</div></div>
     <div class="metric"><div class="label">监控容量</div><div class="value" id="capacityValue">—</div><div class="hint" id="capacityHint">—</div></div>
     <div class="metric"><div class="label">监控时效</div><div class="value" id="lagValue">—</div><div class="hint">目标5分钟采集；超过10分钟会明确告警</div></div>
-    <div class="metric"><div class="label">官方API后台队列</div><div class="value" id="queueValue">—</div><div class="hint">追投 ＞ 停投 ＞ 采集 ＞ 日志同步</div></div>
+    <div class="metric"><div class="label">官方API后台队列</div><div class="value" id="queueValue">—</div><div class="hint" id="queueHint">追投 ＞ 停投 ＞ 采集 ＞ 日志同步</div></div>
   </div>
   <div class="notice" id="notice"></div>
   <div class="toolbar">
@@ -232,7 +232,15 @@
     $('capacityHint').textContent=`容量只统计已核验且已勾选计划；预计一轮 ${capacity.estimated_cycle_seconds||0} 秒，预算 ${capacity.capacity_window_seconds||540} 秒`;
     $('lagValue').textContent=capacity.delayed_count?`${capacity.delayed_count} 条延迟`:(capacity.active_count||capacity.waiting_count?'时效正常':'暂无可监控计划');
     const queue=data.browser_queue||{};
-    $('queueValue').textContent=queue.active?`执行中 · 等待${queue.waiting_count||0}`:`空闲 · 等待${queue.waiting_count||0}`;
+    const queueExecuting=Number(queue.executing||0);const queueWaiting=Number(queue.waiting||0);
+    $('queueValue').textContent=queueExecuting?`执行中${queueExecuting} · 等待${queueWaiting}`:`空闲 · 等待${queueWaiting}`;
+    const queueDetails=[];
+    if(queue.last_success_at) queueDetails.push(`最近成功 ${queue.last_success_at}`);
+    if(queue.next_due_at) queueDetails.push(`下一轮 ${queue.next_due_at}`);
+    if(queue.oldest_data_age_seconds!==null&&queue.oldest_data_age_seconds!==undefined) queueDetails.push(`最旧数据 ${dataAge(queue.oldest_data_age_seconds)}`);
+    if(Number(queue.never_synced||0)) queueDetails.push(`${queue.never_synced} 条待首次采集`);
+    if((queue.backoffs||[]).length) queueDetails.push(`限流退避 ${(queue.backoffs||[]).length} 项`);
+    $('queueHint').textContent=queueDetails.join(' · ')||queue.message||'追投 ＞ 停投 ＞ 采集 ＞ 日志同步';
     $('autostart').checked=!!data.autostart?.enabled;
     const progress=data.onboarding||{};
     const catalog=data.catalog||{};

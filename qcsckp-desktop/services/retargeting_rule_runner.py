@@ -68,7 +68,7 @@ MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 # 多策略并行上限（同一轮内各策略各起一个浏览器任务）
 MAX_STRATEGY_PARALLEL = 5
 
-_DASHBOARD_PAGE_SIZE = 500_000
+_DASHBOARD_PAGE_SIZE = 20_000
 
 # 多策略并行时，同一 material_id 的限频检查与记次必须互斥，避免竞态超次数
 _material_retouch_locks: Dict[str, asyncio.Lock] = {}
@@ -79,11 +79,40 @@ _material_retouch_locks_guard = asyncio.Lock()
 _RUNNER_WAKE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=1)
 _RUNNER_THREAD_LOCK = threading.Lock()
 _RUNNER_THREAD: Optional[threading.Thread] = None
+_RUNNER_STOP = threading.Event()
 
 # 官方 API 采集开始/排队时会暂时更新 last_status，但不会清空上一轮已
 # 完成的 last_sync_at。只要该快照仍在 10 分钟新鲜期内，就可以进入规则
 # 复核；真正提交前仍会读取最新指标并再次校验计划和素材。
 _TRANSIENT_COLLECTION_STATUSES = frozenset({"collecting", "queued"})
+
+
+def _auto_execution_uid(
+    *,
+    target_uid: str,
+    strategy_id: str,
+    material_ids: List[str],
+    now: Optional[float] = None,
+) -> str:
+    """Stable identity for one 5-minute automatic evaluation window.
+
+    It prevents a scheduler wake-up, process recovery, or concurrent strategy
+    path from submitting the same candidate twice before rate-limit state is
+    committed.  A later 5-minute window remains eligible subject to the user's
+    configured frequency guard.
+    """
+    bucket = int((time.time() if now is None else float(now)) // DEFAULT_INTERVAL_SEC)
+    owner = str(current_session_owner() or "").strip().casefold()
+    source = "|".join(
+        [
+            owner,
+            str(target_uid or ""),
+            str(strategy_id or ""),
+            ",".join(sorted({str(mid) for mid in material_ids if str(mid)})),
+            str(bucket),
+        ]
+    )
+    return "auto-" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
 
 
 def auto_execute_allowed_in_current_environment() -> bool:
@@ -1232,6 +1261,12 @@ def _insert_run(
         "headless": 1 if headless else 0,
         "browser_headless_rule": 1 if browser_headless_rule else 0,
         "trigger_source": (str(trigger_source or "scheduler").strip()[:64] or "scheduler"),
+        "execution_uid": str(cloud_task_id or "").strip() or None,
+        "execution_state": (
+            "submitted_verifying"
+            if str(step or "") == "submitted_verifying"
+            else ("confirmed_succeeded" if status == 1 else "confirmed_failed")
+        ),
         "app_version": CURRENT_VERSION,
     }
     run_id = db.insert(table="pmc_retargeting_run", data=data)
@@ -1262,7 +1297,11 @@ def _insert_run(
                 "product_id": str(product_id or "").strip(),
                 "product_name": str(product_name or "").strip(),
                 "regulate_task_id": _rid,
-                "status": "success" if status == 1 else "failed",
+                "status": (
+                    "pending"
+                    if str(step or "") == "submitted_verifying"
+                    else ("success" if status == 1 else "failed")
+                ),
                 "summary": message or "追投",
                 "detail": detail,
                 "after": {
@@ -1307,6 +1346,15 @@ async def run_one_cycle(db: SQLiteStore) -> None:
     ws, mc = _interval_from_root_cfg(cfg)
     per_strategy_rl = bool(cfg.get("per_strategy_rate_limit"))
 
+    enabled_targets = (
+        schedulable_promotion_targets(db=db)
+        if hasattr(db, "config")
+        else db.select(
+            "promotion_target",
+            where="enabled=1 AND capacity_state='active'",
+            order_by="updated_at DESC, id DESC",
+        )
+    )
     has_material_strategies = any(
         str((item or {}).get("task_action") or "create_retarget")
         != "increase_budget"
@@ -1314,23 +1362,45 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         if isinstance(item, dict)
     )
     dash = DashboardApi()
-    resp = dash.get_table_data(
-        period=period,
-        sort_by="costDiff",
-        sort_order="desc",
-        page=1,
-        page_size=_DASHBOARD_PAGE_SIZE,
-    ) if has_material_strategies else {
-        "success": True,
-        "data": [],
-        "total": 0,
-        "period": period,
-    }
-    if not resp.get("success"):
-        logger.warning("%s get_table_data 失败: %s", _log_sched, resp.get("message"))
-        return
-
-    rows: List[Dict[str, Any]] = resp.get("data") or []
+    rows: List[Dict[str, Any]] = []
+    period_label = period
+    if has_material_strategies:
+        strategy_target_uids = {
+            str(item.get("target_uid") or "").strip()
+            for item in strategies
+            if isinstance(item, dict)
+            and str(item.get("task_action") or "create_retarget")
+            != "increase_budget"
+            and str(item.get("target_uid") or "").strip()
+        }
+        if not strategy_target_uids and len(enabled_targets) == 1:
+            strategy_target_uids = {
+                str(enabled_targets[0].get("target_uid") or "").strip()
+            }
+        # Filter in SQLite by target before material rows reach Python. This
+        # bounds memory by monitored targets instead of the lifetime history of
+        # every account in the local database.
+        for strategy_target_uid in sorted(strategy_target_uids):
+            resp = dash.get_table_data(
+                period=period,
+                sort_by="costDiff",
+                sort_order="desc",
+                page=1,
+                page_size=_DASHBOARD_PAGE_SIZE,
+                target_uid=strategy_target_uid,
+            )
+            if not resp.get("success"):
+                logger.warning(
+                    "%s get_table_data 失败 target=%s: %s",
+                    _log_sched,
+                    strategy_target_uid,
+                    resp.get("message"),
+                )
+                return
+            rows.extend(
+                item for item in (resp.get("data") or []) if isinstance(item, dict)
+            )
+            period_label = str(resp.get("period") or period_label)
     assist_rows: List[Dict[str, Any]] = []
     if any(
         str((item or {}).get("task_action") or "create_retarget")
@@ -1360,7 +1430,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         ]
     account_name = str((dash.get_dashboard_account_label() or {}).get("label") or "").strip()
     query_at = _beijing_now_str()
-    period_label = resp.get("period") or ""
+    period_label = period_label or ""
 
     logger.info(
         "%s 周期=%s 素材总数=%s 策略数=%s 并行上限=%s",
@@ -1373,16 +1443,6 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
     sem = asyncio.Semaphore(MAX_STRATEGY_PARALLEL)
     browser_rule = bool(cfg.get("browser_headless", True))
-    enabled_targets = (
-        schedulable_promotion_targets(db=db)
-        if hasattr(db, "config")
-        else db.select(
-            "promotion_target",
-            where="enabled=1 AND capacity_state='active'",
-            order_by="updated_at DESC, id DESC",
-        )
-    )
-
     async def process_strategy(st: Dict[str, Any]) -> None:
         async with sem:
             trigger = st.get("trigger") or {}
@@ -1923,7 +1983,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     "query_period": period,
                     "period_label": period_label,
                     "query_at": query_at,
-                    "dashboard_total": resp.get("total"),
+                    "dashboard_total": len(rows),
                     "materials": query_material_rows,
                     "target": {
                         "target_uid": target_uid,
@@ -2041,6 +2101,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 t0 = time.time()
                 result = None
                 locked_retargeting = retargeting
+                execution_uid = _auto_execution_uid(
+                    target_uid=target_uid,
+                    strategy_id=strategy_id_for_rl,
+                    material_ids=material_ids,
+                )
                 try:
                     aavid_int = int(aavid)
                     ad_id_int = int(ad_id)
@@ -2080,6 +2145,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             material_ids=material_ids,
                             retargeting=locked_retargeting,
                             strategy_title=st_label,
+                            execution_uid=execution_uid,
+                            reconciliation_task_uid=execution_uid,
                             target_uid=target_uid,
                             promotion_scene=promotion_scene,
                             plan_system=plan_system,
@@ -2164,6 +2231,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     query_snapshot_json=_json_dumps({"materials": batch_rows}),
                     headless=bool(result.headless),
                     browser_headless_rule=browser_rule,
+                    cloud_task_id=execution_uid,
                     materials=[
                         {
                             "material_id": str(row.get("id") or ""),
@@ -2217,7 +2285,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             "query_period": period,
                             "period_label": period_label,
                             "query_at": query_at,
-                            "dashboard_total": resp.get("total"),
+                            "dashboard_total": len(rows),
                             "material_row": row,
                             "target": {
                                 "target_uid": target_uid,
@@ -2352,6 +2420,11 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         started_at = _beijing_now_str()
                         t0 = time.time()
                         rate_recorded_under_lock = False
+                        execution_uid = _auto_execution_uid(
+                            target_uid=target_uid,
+                            strategy_id=strategy_id_for_rl,
+                            material_ids=[material_id],
+                        )
                         try:
                             async with exclusive_browser_operation(
                                 f"追投:{target_uid}:{material_id}",
@@ -2387,6 +2460,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     material_id=material_id,
                                     retargeting=locked_retargeting,
                                     strategy_title=st_label,
+                                    execution_uid=execution_uid,
+                                    reconciliation_task_uid=execution_uid,
                                     target_uid=target_uid,
                                     promotion_scene=promotion_scene,
                                     plan_system=plan_system,
@@ -2472,6 +2547,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             query_snapshot_json=query_snap,
                             headless=bool(result.headless),
                             browser_headless_rule=browser_rule,
+                            cloud_task_id=execution_uid,
                         )
                         if result.success and not rate_recorded_under_lock:
                             if per_strategy_rl:
@@ -2524,7 +2600,7 @@ async def main_loop(interval_sec: int = DEFAULT_INTERVAL_SEC) -> None:
         interval_sec,
         CURRENT_VERSION,
     )
-    while True:
+    while not _RUNNER_STOP.is_set():
         try:
             await run_one_cycle(db)
         except Exception:
@@ -2557,6 +2633,7 @@ def start_retargeting_rule_runner_background_thread() -> threading.Thread:
     with _RUNNER_THREAD_LOCK:
         if _RUNNER_THREAD is not None and _RUNNER_THREAD.is_alive():
             return _RUNNER_THREAD
+        _RUNNER_STOP.clear()
         _RUNNER_THREAD = threading.Thread(
             target=_gui_background_target,
             name="retargeting-rule-runner",
@@ -2569,3 +2646,18 @@ def start_retargeting_rule_runner_background_thread() -> threading.Thread:
         DEFAULT_INTERVAL_SEC,
     )
     return _RUNNER_THREAD
+
+
+def stop_retargeting_rule_runner_background_thread(timeout: float = 8.0) -> None:
+    """Stop taking new rule work and wait for the current short cycle to finish."""
+    global _RUNNER_THREAD
+    _RUNNER_STOP.set()
+    request_retargeting_rule_evaluation("runtime_shutdown")
+    with _RUNNER_THREAD_LOCK:
+        thread = _RUNNER_THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        with _RUNNER_THREAD_LOCK:
+            if _RUNNER_THREAD is thread:
+                _RUNNER_THREAD = None

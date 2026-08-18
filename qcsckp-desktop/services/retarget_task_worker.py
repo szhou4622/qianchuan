@@ -54,6 +54,9 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 # traffic; the official API is only called after a task has been claimed.
 POLL_SECONDS = 1
 MAX_REVALIDATION_AGE_SECONDS = 10 * 60
+_WORKER_LOCK = threading.Lock()
+_WORKER_THREAD: Optional[threading.Thread] = None
+_WORKER_STOP = threading.Event()
 
 
 def _now() -> str:
@@ -446,15 +449,22 @@ async def _execute_grouped_task(
         )
     succeeded_count = sum(1 for result in group_results if result["success"])
     all_succeeded = succeeded_count == len(group_results)
+    pending_verification = any(
+        str((result.get("result") or {}).get("step") or "") == "submitted_verifying"
+        for result in group_results
+    )
     return {
         "success": all_succeeded,
         "message": (
-            f"{len(group_results)}条追投全部创建成功"
+            f"{len(group_results)}条追投已提交，正在核验平台最终状态"
+            if pending_verification
+            else f"{len(group_results)}条追投全部创建成功"
             if all_succeeded
             else f"多组追投完成：成功{succeeded_count}条，失败{len(group_results) - succeeded_count}条"
         ),
         "detail": "" if all_succeeded else _json(group_results),
-        "step": "done" if all_succeeded else "partial_failure",
+        "step": "submitted_verifying" if pending_verification else ("done" if all_succeeded else "partial_failure"),
+        "pending_verification": pending_verification,
         "regulate_task_id": regulate_task_ids[0] if regulate_task_ids else "",
         "regulate_task_ids": regulate_task_ids,
         "group_results": group_results,
@@ -1287,6 +1297,9 @@ async def _execute_task(
                 retargeting=retargeting,
                 strategy_title=strategy_name,
                 execution_uid=task_uid,
+                reconciliation_task_uid=str(
+                    task.get("parent_task_uid") or task_uid
+                ),
                 target_uid=target_uid,
                 promotion_scene=promotion_scene,
                 plan_system=plan_system,
@@ -1353,7 +1366,15 @@ async def _execute_task(
         payload["regulate_task_ids"] = regulate_task_ids
         payload["successful_material_ids"] = successful_material_ids
         payload["results"] = result_payloads
-        if all_succeeded:
+        pending_verification = any(
+            str(getattr(item, "step", "") or "") == "submitted_verifying"
+            for item in results
+        )
+        if pending_verification:
+            payload["message"] = "追投已提交，正在核验平台最终状态"
+            payload["step"] = "submitted_verifying"
+            payload["pending_verification"] = True
+        elif all_succeeded:
             payload["message"] = f"追投成功（{len(materials)}条素材）"
         elif successful_material_ids:
             payload["message"] = (
@@ -1388,7 +1409,9 @@ async def _execute_task(
         started_at=started_at,
         ended_at=ended_at,
         duration_ms=duration,
-        status=1 if payload.get("success") else -1,
+        # pmc_retargeting_run.status is a legacy -1/1 field.  Pending/final
+        # state is stored separately in execution_state.
+        status=(1 if payload.get("success") else -1),
         step=str(payload.get("step") or "done"),
         message=str(payload.get("message") or ""),
         detail=str(payload.get("detail") or ""),
@@ -1433,8 +1456,10 @@ async def _execute_task(
 
 
 async def _heartbeat_lease(task_uid: str, claim_token: str) -> None:
-    while True:
-        await asyncio.sleep(240)
+    while not _WORKER_STOP.is_set():
+        stopped = await asyncio.to_thread(_WORKER_STOP.wait, 240)
+        if stopped:
+            return
         response = await asyncio.to_thread(
             report_retarget_task,
             task_uid,
@@ -1452,7 +1477,7 @@ async def run_worker_loop() -> None:
     db = SQLiteStore()
     last_prune = 0.0
     logger.info("[飞书确认追投] 任务轮询已启动")
-    while True:
+    while not _WORKER_STOP.is_set():
         try:
             if time.time() - last_prune > 6 * 3600:
                 await asyncio.to_thread(prune_operation_events, 180)
@@ -1525,14 +1550,28 @@ async def run_worker_loop() -> None:
                     await heartbeat
                 except asyncio.CancelledError:
                     pass
-            final_status = "succeeded" if result.get("success") else "failed"
+            pending_verification = bool(result.get("pending_verification")) or str(
+                result.get("step") or ""
+            ) == "submitted_verifying"
+            final_status = (
+                "verifying"
+                if pending_verification
+                else ("succeeded" if result.get("success") else "failed")
+            )
             _save_local_task(db, task_uid, final_status, result, task)
             await asyncio.to_thread(
                 report_retarget_task,
                 task_uid,
                 claim_token,
                 final_status,
-                message=str(result.get("message") or ("追投成功" if result.get("success") else "追投失败")),
+                message=str(
+                    result.get("message")
+                    or (
+                        "追投已提交，正在核验平台最终状态"
+                        if pending_verification
+                        else ("追投成功" if result.get("success") else "追投失败")
+                    )
+                ),
                 detail=str(result.get("detail") or ""),
                 regulate_task_id=str(result.get("regulate_task_id") or ""),
                 result=result,
@@ -1543,9 +1582,31 @@ async def run_worker_loop() -> None:
 
 
 def start_retarget_task_worker_background_thread() -> threading.Thread:
+    global _WORKER_THREAD
     def _entry() -> None:
         asyncio.run(run_worker_loop())
 
-    thread = threading.Thread(target=_entry, name="retarget-card-worker", daemon=True)
-    thread.start()
-    return thread
+    with _WORKER_LOCK:
+        if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+            return _WORKER_THREAD
+        _WORKER_STOP.clear()
+        _WORKER_THREAD = threading.Thread(
+            target=_entry,
+            name="retarget-card-worker",
+            daemon=True,
+        )
+        _WORKER_THREAD.start()
+        return _WORKER_THREAD
+
+
+def stop_retarget_task_worker_background_thread(timeout: float = 18.0) -> None:
+    global _WORKER_THREAD
+    _WORKER_STOP.set()
+    with _WORKER_LOCK:
+        thread = _WORKER_THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        with _WORKER_LOCK:
+            if _WORKER_THREAD is thread:
+                _WORKER_THREAD = None

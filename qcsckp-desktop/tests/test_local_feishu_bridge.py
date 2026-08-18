@@ -1237,6 +1237,22 @@ class LocalFeishuSessionRestoreTests(unittest.TestCase):
             self.assertEqual("", manager.account)
             self.assertEqual([], manager.activated)
 
+    def test_device_session_switches_an_already_active_other_account(self):
+        manager = self.Manager()
+        manager.account = "old_user"
+        with (
+            patch.object(bridge, "_MANAGER", manager),
+            patch(
+                "services.cloud_retarget_client.load_device_session",
+                return_value={"username": "new_user", "token": "device-token"},
+            ),
+        ):
+            self.assertTrue(
+                bridge.restore_local_feishu_account_from_device_session()
+            )
+            self.assertEqual("new_user", manager.account)
+            self.assertEqual(["new_user"], manager.activated)
+
 
 if __name__ == "__main__":
     unittest.main()

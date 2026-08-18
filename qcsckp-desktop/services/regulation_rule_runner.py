@@ -42,9 +42,12 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 DEFAULT_INTERVAL_SEC = 600
 MAX_STRATEGY_PARALLEL = 3
-_DASHBOARD_PAGE_SIZE = 500_000
+_DASHBOARD_PAGE_SIZE = 20_000
 # 停投调度拉取调控任务时：仅处理「入库更新时间」近 N 分钟内有变动的行，减少对已停滞数据的重复跳过；0=沿用大屏默认（近 1 天）
 _DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
+_RUNNER_LOCK = threading.Lock()
+_RUNNER_THREAD: Optional[threading.Thread] = None
+_RUNNER_STOP = threading.Event()
 
 
 def _target_assist_sync_ready(
@@ -389,6 +392,8 @@ def _insert_regulation_run(
     headless: bool,
     browser_headless_rule: bool,
     trigger_source: str = "scheduler",
+    execution_uid: str = "",
+    execution_state: str = "completed",
 ) -> None:
     _sn = str(strategy_name or "").strip()[:128]
     if not _sn or _sn == "?":
@@ -420,6 +425,8 @@ def _insert_regulation_run(
         "ended_at": ended_at,
         "duration_ms": duration_ms,
         "status": status,
+        "execution_uid": str(execution_uid or ""),
+        "execution_state": str(execution_state or "completed"),
         "step": step,
         "message": message[:2000] if message else "",
         "detail": detail[:8000] if detail else "",
@@ -453,12 +460,17 @@ def _insert_regulation_run(
                 "object_name": _tn,
                 "plan_id": ad_id,
                 "regulate_task_id": str(assist_task_id or ""),
-                "status": "success" if status in (1, 2) else "failed",
+                "status": (
+                    "pending"
+                    if str(execution_state or "") == "submitted_verifying"
+                    else ("success" if status in (1, 2) else "failed")
+                ),
                 "summary": message or "停投",
                 "detail": detail,
                 "request": {"stop_action": stop_action},
                 "trigger_json": trigger_snapshot_json,
                 "response": {"step": step},
+                "cloud_task_id": str(execution_uid or ""),
                 "occurred_at": ended_at,
             },
             db,
@@ -599,6 +611,7 @@ async def _process_approved_stop_tasks(
                         continue
                     cfg = load_rule_regulation_config()
                     svc = QianChuanRegulationStopService.from_rule_file_dict(cfg)
+                    execution_uid = f"stop-card:{task_uid}"
                     result = await svc.run(
                         aavid=aavid_int,
                         ad_id=ad_id_int,
@@ -614,12 +627,16 @@ async def _process_approved_stop_tasks(
                         ),
                         reuse_session=False,
                         close_session=False,
+                        execution_uid=execution_uid,
+                        reconciliation_task_uid=task_uid,
                     )
                     ended_at = _beijing_now_str()
                     duration_ms = int((time.time() - started) * 1000)
                     run_status = (
                         2
                         if result.step == "done_already_paused"
+                        else -1
+                        if result.step == "submitted_verifying"
                         else 1
                         if result.success
                         else -1
@@ -669,11 +686,21 @@ async def _process_approved_stop_tasks(
                             cfg.get("browser_headless", True)
                         ),
                         trigger_source="feishu_card_confirm",
+                        execution_uid=execution_uid,
+                        execution_state=(
+                            "submitted_verifying"
+                            if result.step == "submitted_verifying"
+                            else ("confirmed_succeeded" if run_status in {1, 2} else "confirmed_failed")
+                        ),
                     )
                     report_local_stop_task(
                         task_uid,
                         claim_token,
-                        "succeeded" if run_status in {1, 2} else "failed",
+                        (
+                            "verifying"
+                            if result.step == "submitted_verifying"
+                            else ("succeeded" if run_status in {1, 2} else "failed")
+                        ),
                         message=result.message,
                         detail=(result.detail or "")[:4000],
                         result={
@@ -1341,6 +1368,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                         "evaluation": eval_snap,
                                     }
                                 )
+                                execution_uid = hashlib.sha256(
+                                    (
+                                        f"{cycle_owner}|{target_uid}|{assist_task_id}|"
+                                        f"{st.get('id') or st_label}|{stop_action}"
+                                    ).encode("utf-8")
+                                ).hexdigest()
                                 result = await svc.run(
                                     aavid=aavid_int,
                                     ad_id=ad_id_int,
@@ -1353,6 +1386,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     source_url=target.get("sanitized_page_url") or None,
                                     reuse_session=False,
                                     close_session=False,
+                                    execution_uid=execution_uid,
+                                    reconciliation_task_uid=execution_uid,
                                 )
                         except Exception:
                             ended_at = _beijing_now_str()
@@ -1390,6 +1425,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         dur = int((time.time() - t0) * 1000)
                         if result.step == "done_already_paused":
                             st_ok = 2
+                        elif result.step == "submitted_verifying":
+                            st_ok = -1
                         elif result.success:
                             st_ok = 1
                         else:
@@ -1423,6 +1460,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             query_snapshot_json=query_snap,
                             headless=bool(result.headless),
                             browser_headless_rule=browser_rule,
+                            execution_uid=execution_uid,
+                            execution_state=(
+                                "submitted_verifying"
+                                if result.step == "submitted_verifying"
+                                else ("confirmed_succeeded" if st_ok in {1, 2} else "confirmed_failed")
+                            ),
                         )
                         logger.info(
                             "%s assist_task_id=%s success=%s step=%s",
@@ -1431,6 +1474,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             result.success,
                             result.step,
                         )
+                        if result.step == "submitted_verifying":
+                            continue
                         try:
                             account_row = db.select_one(
                                 "qianchuan_account",
@@ -1493,7 +1538,7 @@ async def main_loop(interval_sec: Optional[int] = None) -> None:
         CURRENT_VERSION,
     )
     next_rule_cycle_at = 0.0
-    while True:
+    while not _RUNNER_STOP.is_set():
         try:
             if time.monotonic() >= next_rule_cycle_at:
                 await run_one_cycle(db)
@@ -1504,7 +1549,7 @@ async def main_loop(interval_sec: Optional[int] = None) -> None:
                 await _process_approved_stop_tasks(db)
         except Exception:
             logger.exception("%s 本轮未捕获异常", regulation_log_tag(scheduler=True))
-        await asyncio.sleep(3)
+        await asyncio.to_thread(_RUNNER_STOP.wait, 3)
 
 
 def _gui_background_target() -> None:
@@ -1515,18 +1560,36 @@ def _gui_background_target() -> None:
 
 
 def start_regulation_rule_runner_background_thread() -> threading.Thread:
-    t = threading.Thread(
-        target=_gui_background_target,
-        name="regulation-rule-runner",
-        daemon=True,
-    )
-    t.start()
+    global _RUNNER_THREAD
+    with _RUNNER_LOCK:
+        if _RUNNER_THREAD is not None and _RUNNER_THREAD.is_alive():
+            return _RUNNER_THREAD
+        _RUNNER_STOP.clear()
+        _RUNNER_THREAD = threading.Thread(
+            target=_gui_background_target,
+            name="regulation-rule-runner",
+            daemon=True,
+        )
+        _RUNNER_THREAD.start()
     logger.info(
         "%s 后台线程已启动（默认间隔 %ss，环境变量 REGULATION_RULE_INTERVAL_SEC 可覆盖，最低 60s）",
         regulation_log_tag(scheduler=True),
         _interval_sec(),
     )
-    return t
+    return _RUNNER_THREAD
+
+
+def stop_regulation_rule_runner_background_thread(timeout: float = 8.0) -> None:
+    global _RUNNER_THREAD
+    _RUNNER_STOP.set()
+    with _RUNNER_LOCK:
+        thread = _RUNNER_THREAD
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.1, float(timeout)))
+    if thread is None or not thread.is_alive():
+        with _RUNNER_LOCK:
+            if _RUNNER_THREAD is thread:
+                _RUNNER_THREAD = None
 
 
 def main() -> None:
