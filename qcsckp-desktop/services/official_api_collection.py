@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -31,6 +32,7 @@ from services.qianchuan_accounts import (
 from services.qianchuan_open_api.errors import (
     ApiPermissionError,
     ApiRateLimitError,
+    ApiRequestError,
     ApiTokenError,
 )
 from services.qianchuan_open_api.normalizers import (
@@ -43,7 +45,7 @@ from services.qianchuan_open_api.normalizers import (
 )
 from services.qianchuan_open_api.runtime import get_official_api_service
 from utils.log import logger
-from utils.sqlite_store import SQLiteStore
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 MATERIAL_METRICS = (
@@ -69,6 +71,10 @@ _LOCK = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_TARGET_UIDS: set[str] = set()
 _PENDING_TARGET_UIDS: set[str] = set()
+_ACCOUNT_COLLECTION_LOCKS: dict[str, threading.Lock] = {}
+_ACCOUNT_BACKOFF_UNTIL: dict[str, float] = {}
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY_DATABASES: set[str] = set()
 
 # One target is refreshed every five minutes from its own last successful
 # collection.  The scheduler only sleeps for a short tick so a slow account
@@ -76,7 +82,15 @@ _PENDING_TARGET_UIDS: set[str] = set()
 COLLECTION_INTERVAL_SECONDS = 5 * 60
 COLLECTION_SCHEDULER_TICK_SECONDS = 5
 COLLECTION_MAX_WORKERS = CAPACITY_PARALLEL_WORKERS
+COLLECTION_PERIODIC_BATCH_SIZE = COLLECTION_MAX_WORKERS
 COLLECTION_TRANSIENT_RETRY_SECONDS = 60
+REPORT_CONFIG_INTERVAL_SECONDS = 30 * 60
+PRODUCT_CATALOG_INTERVAL_SECONDS = 30 * 60
+ADAPTIVE_RECOVERY_CLEAN_BATCHES = 3
+
+_ADAPTIVE_LOCK = threading.Lock()
+_ADAPTIVE_WORKERS = COLLECTION_MAX_WORKERS
+_ADAPTIVE_CLEAN_BATCHES = 0
 
 
 def _now() -> str:
@@ -91,6 +105,167 @@ def _parse_local_time(value: Any) -> Optional[datetime]:
         return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return None
+
+
+def _target_capability(target: Mapping[str, Any]) -> dict[str, Any]:
+    capability = target.get("capability")
+    if isinstance(capability, Mapping):
+        return dict(capability)
+    raw = target.get("capability_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+    return {}
+
+
+def _phase_is_due(
+    capability: Mapping[str, Any],
+    timestamp_key: str,
+    interval_seconds: int,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    last_run = _parse_local_time(capability.get(timestamp_key))
+    if last_run is None:
+        return True
+    return ((now or datetime.now()) - last_run).total_seconds() >= max(
+        30, int(interval_seconds)
+    )
+
+
+def _collection_phase_plan(
+    target: Mapping[str, Any],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Plan high/low-frequency reads without trusting stale empty caches."""
+    capability = _target_capability(target)
+    cached_units = capability.get("report_metric_units")
+    if not isinstance(cached_units, Mapping):
+        cached_units = {}
+    return {
+        "capability": capability,
+        "cached_units": dict(cached_units),
+        "refresh_report_config": not cached_units
+        or _phase_is_due(
+            capability,
+            "report_config_synced_at",
+            REPORT_CONFIG_INTERVAL_SECONDS,
+            now=now,
+        ),
+        "refresh_products": str(target.get("promotion_scene") or "") == "product"
+        and _phase_is_due(
+            capability,
+            "product_catalog_synced_at",
+            PRODUCT_CATALOG_INTERVAL_SECONDS,
+            now=now,
+        ),
+    }
+
+
+def _fair_order_targets(
+    targets: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Round-robin accounts while preserving oldest-first order per account."""
+    buckets: "OrderedDict[str, deque[Mapping[str, Any]]]" = OrderedDict()
+    for target in targets:
+        account_key = str(
+            target.get("aadvid")
+            or target.get("account_uid")
+            or target.get("target_uid")
+            or "unknown"
+        )
+        buckets.setdefault(account_key, deque()).append(target)
+    ordered: list[Mapping[str, Any]] = []
+    while buckets:
+        exhausted: list[str] = []
+        for account_key, account_targets in buckets.items():
+            ordered.append(account_targets.popleft())
+            if not account_targets:
+                exhausted.append(account_key)
+        for account_key in exhausted:
+            buckets.pop(account_key, None)
+    return ordered
+
+
+def _target_account_key(target: Mapping[str, Any]) -> str:
+    return str(
+        target.get("aadvid")
+        or target.get("account_uid")
+        or target.get("target_uid")
+        or "unknown"
+    )
+
+
+def _account_collection_lock(account_key: str) -> threading.Lock:
+    with _ACTIVE_LOCK:
+        return _ACCOUNT_COLLECTION_LOCKS.setdefault(account_key, threading.Lock())
+
+
+def _account_backoff_remaining(account_key: str) -> int:
+    with _ACTIVE_LOCK:
+        due = float(_ACCOUNT_BACKOFF_UNTIL.get(account_key, 0.0) or 0.0)
+    return max(0, int(round(due - time.monotonic())))
+
+
+def _set_account_backoff(account_key: str, seconds: int) -> None:
+    with _ACTIVE_LOCK:
+        _ACCOUNT_BACKOFF_UNTIL[account_key] = max(
+            float(_ACCOUNT_BACKOFF_UNTIL.get(account_key, 0.0) or 0.0),
+            time.monotonic() + max(30, int(seconds)),
+        )
+
+
+def _ensure_collection_schema(store: SQLiteStore) -> None:
+    """Initialize SQLite once per runtime database, not once per target."""
+    database = str(store.config.get("database") or "").strip()
+    # Separate in-memory databases must not share readiness state.
+    key = f"memory:{id(store)}" if not database or database == ":memory:" else database
+    with _SCHEMA_LOCK:
+        if key in _SCHEMA_READY_DATABASES:
+            return
+        init_sqlite_schema(database=store.config.get("database"))
+        _SCHEMA_READY_DATABASES.add(key)
+
+
+def _adaptive_worker_limit(configured_workers: int) -> int:
+    with _ADAPTIVE_LOCK:
+        return max(1, min(int(configured_workers), int(_ADAPTIVE_WORKERS)))
+
+
+def _observe_collection_results(results: Iterable[Mapping[str, Any]]) -> int:
+    """Back off globally on 429, then recover one lane after clean batches."""
+    global _ADAPTIVE_WORKERS, _ADAPTIVE_CLEAN_BATCHES
+    rows = list(results)
+    with _ADAPTIVE_LOCK:
+        if any(str(row.get("error_kind") or "") == "rate_limit" for row in rows):
+            _ADAPTIVE_WORKERS = max(1, _ADAPTIVE_WORKERS - 1)
+            _ADAPTIVE_CLEAN_BATCHES = 0
+        elif rows and all(bool(row.get("success")) for row in rows):
+            _ADAPTIVE_CLEAN_BATCHES += 1
+            if (
+                _ADAPTIVE_WORKERS < COLLECTION_MAX_WORKERS
+                and _ADAPTIVE_CLEAN_BATCHES >= ADAPTIVE_RECOVERY_CLEAN_BATCHES
+            ):
+                _ADAPTIVE_WORKERS += 1
+                _ADAPTIVE_CLEAN_BATCHES = 0
+        elif rows:
+            _ADAPTIVE_CLEAN_BATCHES = 0
+        return _ADAPTIVE_WORKERS
+
+
+def _reset_adaptive_collection_state_for_tests() -> None:
+    global _ADAPTIVE_WORKERS, _ADAPTIVE_CLEAN_BATCHES
+    with _ADAPTIVE_LOCK:
+        _ADAPTIVE_WORKERS = COLLECTION_MAX_WORKERS
+        _ADAPTIVE_CLEAN_BATCHES = 0
+    with _ACTIVE_LOCK:
+        _ACCOUNT_COLLECTION_LOCKS.clear()
+        _ACCOUNT_BACKOFF_UNTIL.clear()
 
 
 def _target_is_due(
@@ -289,13 +464,15 @@ def _control_snapshot(
 
 def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
+    _ensure_collection_schema(store)
     service = get_official_api_service()
     aavid = text_id(target.get("aadvid"))
     ad_id = text_id(target.get("ad_id"))
     target_uid = str(target.get("target_uid") or "")
     expected_scene = str(target.get("promotion_scene") or "")
     expected_system = normalize_plan_system(target.get("plan_system"))
+    phase_plan = _collection_phase_plan(target)
+    capability = phase_plan["capability"]
 
     detail, detail_response = service.get_plan_detail(aavid, ad_id)
     actual_scene = normalize_promotion_scene(detail.get("marketing_goal"))
@@ -320,11 +497,19 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     )
 
     goal = str(detail.get("marketing_goal") or "")
-    units, config_response = service.get_report_config(
-        aavid,
-        plan_system=expected_system,
-        promotion_scene=expected_scene,
+    report_config_refreshed = bool(phase_plan["refresh_report_config"])
+    report_config_request_id = str(
+        capability.get("report_config_request_id") or ""
     )
+    if report_config_refreshed:
+        units, config_response = service.get_report_config(
+            aavid,
+            plan_system=expected_system,
+            promotion_scene=expected_scene,
+        )
+        report_config_request_id = config_response.request_id
+    else:
+        units = dict(phase_plan["cached_units"])
     if not units:
         raise RuntimeError("官方 API 报表配置未返回字段单位，本轮数据不入库")
 
@@ -350,9 +535,10 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         if text_id(item.get("material_id"))
     ]
 
+    products_refreshed = bool(phase_plan["refresh_products"])
     products: list[dict[str, Any]] = []
     product_request_ids: list[str] = []
-    if expected_scene == "product":
+    if products_refreshed:
         products, product_request_ids = service.list_plan_products(
             aavid,
             ad_id,
@@ -405,24 +591,29 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
                 connection=connection,
             )
 
-    if products:
-        upsert_products(target_uid, products, db=store)
-    current_product_ids = [text_id(item.get("product_id")) for item in products if text_id(item.get("product_id"))]
-    with store.transaction() as connection:
-        if current_product_ids:
-            placeholders = ",".join("?" for _ in current_product_ids)
-            store.execute(
-                "DELETE FROM promotion_product WHERE target_uid=? "
-                f"AND product_id NOT IN ({placeholders})",
-                (target_uid, *current_product_ids),
-                connection=connection,
-            )
-        else:
-            store.execute(
-                "DELETE FROM promotion_product WHERE target_uid=?",
-                (target_uid,),
-                connection=connection,
-            )
+    if products_refreshed:
+        if products:
+            upsert_products(target_uid, products, db=store)
+        current_product_ids = [
+            text_id(item.get("product_id"))
+            for item in products
+            if text_id(item.get("product_id"))
+        ]
+        with store.transaction() as connection:
+            if current_product_ids:
+                placeholders = ",".join("?" for _ in current_product_ids)
+                store.execute(
+                    "DELETE FROM promotion_product WHERE target_uid=? "
+                    f"AND product_id NOT IN ({placeholders})",
+                    (target_uid, *current_product_ids),
+                    connection=connection,
+                )
+            else:
+                store.execute(
+                    "DELETE FROM promotion_product WHERE target_uid=?",
+                    (target_uid,),
+                    connection=connection,
+                )
     product_to_material: dict[str, list[str]] = {}
     for product in products:
         pid = text_id(product.get("product_id"))
@@ -431,36 +622,60 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     for material in materials:
         mid = text_id(material.get("material_id"))
         pids = list(material.get("product_ids") or []) or product_to_material.get(mid, [])
-        replace_material_product_links(
-            target_uid,
-            mid,
-            pids,
-            material_name=str(material.get("material_name") or ""),
-            db=store,
-        )
+        # During a metrics-only cycle, an endpoint that omits product IDs must
+        # not erase the last complete product-material relationship snapshot.
+        if pids or products_refreshed:
+            replace_material_product_links(
+                target_uid,
+                mid,
+                pids,
+                material_name=str(material.get("material_name") or ""),
+                db=store,
+            )
 
+    capability_updates = {
+        "source": "qianchuan_open_api",
+        "material_sync_complete": True,
+        "material_count": len(snapshots),
+        "control_task_sync_complete": True,
+        "control_task_count": len(control_rows),
+        "assist_sync_enabled": True,
+        "assist_sync_in_progress": False,
+        "assist_sync_ok": True,
+        "assist_synced_at": _now(),
+        "material_request_ids": material_request_ids,
+        "control_request_ids": control_request_ids,
+        "collected_at": _now(),
+    }
+    if report_config_refreshed:
+        capability_updates.update(
+            {
+                "report_config_request_id": report_config_request_id,
+                "report_config_synced_at": _now(),
+                "report_metric_units": dict(units),
+            }
+        )
+    if products_refreshed:
+        capability_updates.update(
+            {
+                "product_catalog_synced_at": _now(),
+                "product_sync_complete": True,
+                "product_count": len(products),
+                "product_request_ids": product_request_ids,
+            }
+        )
     patch_target_sync_state(
         target_uid,
         status="ok",
         error="",
         synced=True,
-        capability_updates={
-            "source": "qianchuan_open_api",
-            "material_sync_complete": True,
-            "material_count": len(snapshots),
-            "control_task_sync_complete": True,
-            "control_task_count": len(control_rows),
-            "assist_sync_enabled": True,
-            "assist_sync_in_progress": False,
-            "assist_sync_ok": True,
-            "assist_synced_at": _now(),
-            "report_config_request_id": config_response.request_id,
-            "material_request_ids": material_request_ids,
-            "product_request_ids": product_request_ids,
-            "control_request_ids": control_request_ids,
-            "collected_at": _now(),
-        },
-        capability_remove_keys=("collection_error_at",),
+        capability_updates=capability_updates,
+        capability_remove_keys=(
+            "collection_error_at",
+            "collection_error_kind",
+            "collection_retry_seconds",
+            "collection_consecutive_failures",
+        ),
         db=store,
     )
     # 计划刚加入监控或本轮数据更新完成后，立刻让规则线程复核；不再让用户
@@ -473,11 +688,21 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         request_retargeting_rule_evaluation("collection_completed")
     except Exception:
         logger.exception("官方 API 采集完成后唤醒追投规则失败 target=%s", target_uid)
+    try:
+        cached_product_count = int(capability.get("product_count") or 0)
+    except (TypeError, ValueError):
+        cached_product_count = 0
     return {
         "success": True,
         "target_uid": target_uid,
         "material_count": len(snapshots),
-        "product_count": len(products),
+        "product_count": (
+            len(products)
+            if products_refreshed
+            else cached_product_count
+        ),
+        "product_catalog_refreshed": products_refreshed,
+        "report_config_refreshed": report_config_refreshed,
         "control_task_count": len(control_rows),
     }
 
@@ -500,16 +725,47 @@ def _collect_target_safely(
         _ACTIVE_TARGET_UIDS.add(target_uid)
 
     started = time.monotonic()
+    account_key = _target_account_key(target)
     try:
-        patch_target_sync_state(
-            target_uid,
-            status="collecting",
-            error="",
-            synced=False,
-            capability_updates={"collection_started_at": _now()},
-            db=db,
-        )
-        result = collect_target(target, db=db)
+        # Official API quotas are commonly scoped by advertiser/account.  Do
+        # not let several monitored plans under one advertiser burst in
+        # parallel merely because global worker lanes are available.
+        with _account_collection_lock(account_key):
+            backoff_seconds = _account_backoff_remaining(account_key)
+            if backoff_seconds > 0:
+                patch_target_sync_state(
+                    target_uid,
+                    status="rate_limited",
+                    error="同一千川账户正在限流冷却，工具将自动重试",
+                    synced=False,
+                    capability_updates={
+                        "collection_error_kind": "account_backoff",
+                        "collection_retry_seconds": backoff_seconds,
+                    },
+                    db=db,
+                )
+                _set_retry_due(
+                    target_uid,
+                    delay_seconds=backoff_seconds,
+                    db=db,
+                )
+                return {
+                    "success": False,
+                    "target_uid": target_uid,
+                    "message": "同一千川账户正在限流冷却，工具将自动重试",
+                    "error_kind": "account_backoff",
+                    "retry_seconds": backoff_seconds,
+                    "deferred": True,
+                }
+            patch_target_sync_state(
+                target_uid,
+                status="collecting",
+                error="",
+                synced=False,
+                capability_updates={"collection_started_at": _now()},
+                db=db,
+            )
+            result = collect_target(target, db=db)
         duration_ms = int((time.monotonic() - started) * 1000)
         record_target_duration(
             target_uid,
@@ -532,16 +788,49 @@ def _collect_target_safely(
         return result
     except Exception as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
+        capability = _target_capability(target)
+        try:
+            consecutive_failures = max(
+                1,
+                int(capability.get("collection_consecutive_failures") or 0) + 1,
+            )
+        except (TypeError, ValueError):
+            consecutive_failures = 1
+        error_kind = (
+            "rate_limit"
+            if isinstance(exc, ApiRateLimitError)
+            else "token"
+            if isinstance(exc, ApiTokenError)
+            else "permission"
+            if isinstance(exc, ApiPermissionError)
+            else "network"
+            if isinstance(exc, (TimeoutError, ConnectionError, OSError))
+            else "api"
+            if isinstance(exc, ApiRequestError)
+            else "unknown"
+        )
         # Token and permission failures cannot heal by hammering the API.  API
         # throttling and transient downstream errors get one bounded early
         # retry; either way other accounts continue immediately.
         retry_seconds = (
             interval_seconds
             if isinstance(exc, (ApiTokenError, ApiPermissionError))
-            else COLLECTION_TRANSIENT_RETRY_SECONDS
+            else min(
+                interval_seconds,
+                COLLECTION_TRANSIENT_RETRY_SECONDS
+                * (2 ** min(3, consecutive_failures - 1)),
+            )
         )
         if isinstance(exc, ApiRateLimitError):
-            retry_seconds = max(COLLECTION_TRANSIENT_RETRY_SECONDS, 120)
+            retry_seconds = max(
+                120,
+                min(
+                    interval_seconds,
+                    120 * (2 ** min(2, consecutive_failures - 1)),
+                ),
+            )
+        if error_kind in {"rate_limit", "token", "permission"}:
+            _set_account_backoff(account_key, retry_seconds)
         logger.exception("官方 API 采集失败 target=%s", target_uid)
         patch_target_sync_state(
             target_uid,
@@ -552,8 +841,10 @@ def _collect_target_safely(
                 "source": "qianchuan_open_api",
                 "material_sync_complete": False,
                 "collection_error_at": _now(),
+                "collection_error_kind": error_kind,
                 "collection_duration_ms": duration_ms,
                 "collection_retry_seconds": retry_seconds,
+                "collection_consecutive_failures": consecutive_failures,
             },
             db=db,
         )
@@ -562,6 +853,7 @@ def _collect_target_safely(
             "success": False,
             "target_uid": target_uid,
             "message": str(exc),
+            "error_kind": error_kind,
             "retry_seconds": retry_seconds,
         }
     finally:
@@ -575,6 +867,7 @@ def run_collection_cycle(
     target_uids: Optional[Iterable[str]] = None,
     interval_seconds: int = COLLECTION_INTERVAL_SECONDS,
     max_workers: int = COLLECTION_MAX_WORKERS,
+    max_batch_size: Optional[int] = None,
 ) -> dict[str, Any]:
     """Collect due targets with bounded concurrency and per-target isolation."""
     store = db or SQLiteStore()
@@ -604,9 +897,18 @@ def run_collection_cycle(
         ]
 
     if not targets:
-        return {"success": True, "target_count": 0, "results": []}
+        return {
+            "success": True,
+            "target_count": 0,
+            "adaptive_worker_limit": _adaptive_worker_limit(max_workers),
+            "results": [],
+        }
 
-    worker_count = max(1, min(int(max_workers), len(targets)))
+    targets = list(_fair_order_targets(targets))
+    if not requested and max_batch_size is not None:
+        targets = targets[: max(1, int(max_batch_size))]
+    adaptive_limit = _adaptive_worker_limit(max_workers)
+    worker_count = max(1, min(adaptive_limit, len(targets)))
     ordered_results: list[Optional[dict[str, Any]]] = [None] * len(targets)
     with ThreadPoolExecutor(
         max_workers=worker_count,
@@ -634,6 +936,8 @@ def run_collection_cycle(
                     "message": str(exc),
                 }
     results = [item for item in ordered_results if item is not None]
+    _observe_collection_results(results)
+    next_worker_limit = _adaptive_worker_limit(max_workers)
     try:
         refresh_monitor_capacity(db=store)
     except Exception:
@@ -642,6 +946,11 @@ def run_collection_cycle(
         "success": all(item.get("success") for item in results),
         "target_count": len(results),
         "worker_count": worker_count,
+        "adaptive_worker_limit": next_worker_limit,
+        "rate_limited": any(
+            str(item.get("error_kind") or "") == "rate_limit"
+            for item in results
+        ),
         "results": results,
     }
 
@@ -662,6 +971,9 @@ def _loop(interval_seconds: int) -> None:
             run_collection_cycle(
                 target_uids=pending or None,
                 interval_seconds=interval,
+                max_batch_size=(
+                    None if pending else COLLECTION_PERIODIC_BATCH_SIZE
+                ),
             )
         except Exception:
             logger.exception("官方 API 采集轮次异常")

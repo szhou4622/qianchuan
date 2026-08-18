@@ -1023,7 +1023,7 @@ def refresh_monitor_capacity(
     init_sqlite_schema(database=store.config.get("database"))
     owner = _owner_key(owner_username)
     rows = store.execute(
-        "SELECT t.target_uid,t.enabled,t.monitor_eligible,t.capacity_state,t.last_duration_ms,"
+        "SELECT t.target_uid,t.account_uid,t.enabled,t.monitor_eligible,t.capacity_state,t.last_duration_ms,"
         "a.enabled AS account_enabled "
         "FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -1034,7 +1034,7 @@ def refresh_monitor_capacity(
         fetch=True,
     ) or []
     budget_ms = CAPACITY_WINDOW_SECONDS * 1000
-    lane_loads = [0] * max(1, int(CAPACITY_PARALLEL_WORKERS))
+    account_loads: Dict[str, int] = {}
     active = 0
     waiting = 0
     disabled = 0
@@ -1051,10 +1051,18 @@ def refresh_monitor_capacity(
                 disabled += 1
             else:
                 estimate = _estimate_duration_ms(row)
-                lane = min(range(len(lane_loads)), key=lane_loads.__getitem__)
-                if lane_loads[lane] + estimate <= budget_ms:
+                account_uid = str(row.get("account_uid") or "unknown")
+                candidate_loads = dict(account_loads)
+                candidate_loads[account_uid] = (
+                    candidate_loads.get(account_uid, 0) + estimate
+                )
+                # Targets from the same advertiser are serialized to protect
+                # account-scoped API quota. Admission must therefore model an
+                # account as one serial workload, while different accounts may
+                # occupy the three global lanes concurrently.
+                if _parallel_cycle_ms(candidate_loads.values()) <= budget_ms:
                     state = "active"
-                    lane_loads[lane] += estimate
+                    account_loads = candidate_loads
                     active += 1
                 else:
                     state = "capacity_waiting"
@@ -1072,7 +1080,9 @@ def refresh_monitor_capacity(
         "active_count": active,
         "waiting_count": waiting,
         "disabled_count": disabled,
-        "estimated_cycle_seconds": int(round(max(lane_loads, default=0) / 1000)),
+        "estimated_cycle_seconds": int(
+            round(_parallel_cycle_ms(account_loads.values()) / 1000)
+        ),
         "parallel_workers": CAPACITY_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,
@@ -1180,7 +1190,7 @@ def capacity_snapshot_readonly(
     """
     store = db or SQLiteStore()
     rows = store.execute(
-        "SELECT t.target_uid,t.enabled,t.monitor_eligible,t.capacity_state,"
+        "SELECT t.target_uid,t.account_uid,t.enabled,t.monitor_eligible,t.capacity_state,"
         "t.last_duration_ms,t.last_sync_at,a.enabled AS account_enabled "
         "FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -1191,7 +1201,7 @@ def capacity_snapshot_readonly(
     active = 0
     waiting = 0
     disabled = 0
-    active_durations: List[int] = []
+    active_account_loads: Dict[str, int] = {}
     delayed: List[str] = []
     max_lag = 0
     now = datetime.now()
@@ -1212,7 +1222,10 @@ def capacity_snapshot_readonly(
             disabled += 1
             continue
         active += 1
-        active_durations.append(_estimate_duration_ms(row))
+        account_uid = str(row.get("account_uid") or "unknown")
+        active_account_loads[account_uid] = (
+            active_account_loads.get(account_uid, 0) + _estimate_duration_ms(row)
+        )
         text = str(row.get("last_sync_at") or "").strip()
         try:
             lag = int(
@@ -1229,7 +1242,9 @@ def capacity_snapshot_readonly(
         "active_count": active,
         "waiting_count": waiting,
         "disabled_count": disabled,
-        "estimated_cycle_seconds": int(round(_parallel_cycle_ms(active_durations) / 1000)),
+        "estimated_cycle_seconds": int(
+            round(_parallel_cycle_ms(active_account_loads.values()) / 1000)
+        ),
         "parallel_workers": CAPACITY_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,

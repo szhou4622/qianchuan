@@ -41,8 +41,14 @@ from services.qianchuan_open_api.token_provider import (
 )
 from services.promotion_capability import check_target_capability
 from services.official_api_collection import (
+    _adaptive_worker_limit,
     _collect_target_safely,
+    _collection_phase_plan,
+    _fair_order_targets,
+    _observe_collection_results,
+    _reset_adaptive_collection_state_for_tests,
     _target_is_due,
+    collect_target,
     run_collection_cycle,
     _supported_material_metrics,
     request_official_api_collection,
@@ -55,7 +61,7 @@ from services.official_api_execution import (
     _verify_control_task,
     _verify_control_task_eventually,
 )
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 
 class _PagedClient(QianchuanOpenApiClient):
@@ -106,6 +112,171 @@ class _ReportConfigClient(_CaptureClient):
 
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
+    def test_adaptive_concurrency_backs_off_on_429_and_recovers_gradually(self):
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            self.assertEqual(3, _adaptive_worker_limit(3))
+            self.assertEqual(
+                2,
+                _observe_collection_results(
+                    [{"success": False, "error_kind": "rate_limit"}]
+                ),
+            )
+            for _ in range(2):
+                self.assertEqual(
+                    2,
+                    _observe_collection_results([{"success": True}]),
+                )
+            self.assertEqual(
+                3,
+                _observe_collection_results([{"success": True}]),
+            )
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+    def test_account_fair_order_prevents_one_large_account_from_starving_others(self):
+        targets = [
+            {"target_uid": "a-1", "aadvid": "account-a"},
+            {"target_uid": "a-2", "aadvid": "account-a"},
+            {"target_uid": "a-3", "aadvid": "account-a"},
+            {"target_uid": "b-1", "aadvid": "account-b"},
+            {"target_uid": "c-1", "aadvid": "account-c"},
+            {"target_uid": "c-2", "aadvid": "account-c"},
+        ]
+        self.assertEqual(
+            ["a-1", "b-1", "c-1", "a-2", "c-2", "a-3"],
+            [row["target_uid"] for row in _fair_order_targets(targets)],
+        )
+
+    def test_same_account_targets_are_serialized_while_other_accounts_can_parallelize(self):
+        _reset_adaptive_collection_state_for_tests()
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def collect_one(target, *, db):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.03)
+                return {"success": True, "target_uid": target["target_uid"]}
+            finally:
+                with lock:
+                    active -= 1
+
+        store = Mock(config={"database": ":memory:"})
+        try:
+            with patch(
+                "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+            ), patch(
+                "services.official_api_collection.collect_target",
+                side_effect=collect_one,
+            ), patch(
+                "services.official_api_collection.patch_target_sync_state"
+            ), patch(
+                "services.official_api_collection.record_target_duration"
+            ):
+                threads = [
+                    threading.Thread(
+                        target=_collect_target_safely,
+                        kwargs={
+                            "target": {
+                                "target_uid": f"same-account-{index}",
+                                "aadvid": "account-1",
+                            },
+                            "db": store,
+                            "interval_seconds": 300,
+                        },
+                    )
+                    for index in range(2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+            self.assertEqual(1, max_active)
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+    def test_low_frequency_phase_cache_keeps_five_minute_metrics_lightweight(self):
+        now = datetime(2026, 8, 18, 21, 0, 0)
+        target = {
+            "promotion_scene": "product",
+            "capability": {
+                "report_metric_units": {"stat_cost_for_roi2": "3"},
+                "report_config_synced_at": "2026-08-18 20:45:00",
+                "product_catalog_synced_at": "2026-08-18 20:45:00",
+            },
+        }
+        cached = _collection_phase_plan(target, now=now)
+        self.assertFalse(cached["refresh_report_config"])
+        self.assertFalse(cached["refresh_products"])
+        expired = _collection_phase_plan(
+            target,
+            now=now + timedelta(minutes=16),
+        )
+        self.assertTrue(expired["refresh_report_config"])
+        self.assertTrue(expired["refresh_products"])
+        self.assertFalse(
+            _collection_phase_plan(
+                {**target, "promotion_scene": "live"},
+                now=now + timedelta(hours=1),
+            )["refresh_products"]
+        )
+
+    def test_cached_low_frequency_phases_still_collect_metrics_and_controls(self):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        target = {
+            "target_uid": "target-product",
+            "account_uid": "account-product",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "capability": {
+                "report_metric_units": {"stat_cost_for_roi2": "3"},
+                "report_config_synced_at": now_text,
+                "product_catalog_synced_at": now_text,
+                "product_count": 7,
+            },
+        }
+        service = MagicMock()
+        service.get_plan_detail.return_value = (
+            {
+                "aavid": "1001",
+                "ad_id": "2001",
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "adlab_scene": "UNI_PROJECT",
+                "platform_status": "active",
+            },
+            ApiResponse(data={}, raw={"code": 0}, request_id="detail-request"),
+        )
+        service.list_plan_materials.return_value = ([], ["material-request"])
+        service.list_control_tasks.return_value = ([], ["control-request"])
+        store = MagicMock(config={"database": ":memory:"})
+        store.transaction.return_value.__enter__.return_value = MagicMock()
+        with patch(
+            "services.official_api_collection.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_collection.init_sqlite_schema"
+        ), patch(
+            "services.official_api_collection.update_target_catalog_evidence"
+        ), patch(
+            "services.official_api_collection.patch_target_sync_state"
+        ), patch(
+            "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
+        ):
+            result = collect_target(target, db=store)
+        service.get_report_config.assert_not_called()
+        service.list_plan_products.assert_not_called()
+        service.list_plan_materials.assert_called_once()
+        service.list_control_tasks.assert_called_once()
+        self.assertEqual(7, result["product_count"])
+        self.assertFalse(result["product_catalog_refreshed"])
+
     def test_official_delivery_ok_material_is_writable(self):
         self.assertTrue(
             _material_is_writable(
@@ -322,31 +493,112 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual(1, result["target_count"])
         self.assertEqual("due", collect_one.call_args.args[0]["target_uid"])
 
+    def test_periodic_collection_uses_one_wave_batches_for_prompt_new_work(self):
+        targets = [
+            {"target_uid": "account-a-1", "aadvid": "account-a"},
+            {"target_uid": "account-a-2", "aadvid": "account-a"},
+            {"target_uid": "account-a-3", "aadvid": "account-a"},
+            {"target_uid": "account-b-1", "aadvid": "account-b"},
+            {"target_uid": "account-c-1", "aadvid": "account-c"},
+        ]
+        with patch(
+            "services.official_api_collection.schedulable_promotion_targets",
+            return_value=targets,
+        ), patch(
+            "services.official_api_collection._target_is_due",
+            return_value=True,
+        ), patch(
+            "services.official_api_collection._collect_target_safely",
+            side_effect=lambda target, **_: {
+                "success": True,
+                "target_uid": target["target_uid"],
+            },
+        ) as collect_one, patch(
+            "services.official_api_collection.refresh_monitor_capacity"
+        ):
+            result = run_collection_cycle(
+                db=Mock(config={"database": ":memory:"}),
+                max_workers=3,
+                max_batch_size=3,
+            )
+        self.assertEqual(3, result["target_count"])
+        self.assertEqual(3, collect_one.call_count)
+        self.assertEqual(
+            ["account-a-1", "account-b-1", "account-c-1"],
+            [row["target_uid"] for row in result["results"]],
+        )
+
     def test_rate_limit_failure_is_isolated_and_retried_early(self):
         store = Mock()
-        with patch(
-            "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
-        ), patch(
-            "services.official_api_collection.collect_target",
-            side_effect=ApiRateLimitError("rate limited"),
-        ), patch(
-            "services.official_api_collection.patch_target_sync_state"
-        ) as patch_state, patch(
-            "services.official_api_collection._set_retry_due"
-        ) as set_retry:
-            result = _collect_target_safely(
-                {"target_uid": "rate-limited-target"},
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            with patch(
+                "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+            ), patch(
+                "services.official_api_collection.collect_target",
+                side_effect=ApiRateLimitError("rate limited"),
+            ) as collect_one, patch(
+                "services.official_api_collection.patch_target_sync_state"
+            ) as patch_state, patch(
+                "services.official_api_collection._set_retry_due"
+            ) as set_retry:
+                result = _collect_target_safely(
+                    {
+                        "target_uid": "rate-limited-target",
+                        "aadvid": "account-rate-limited",
+                    },
+                    db=store,
+                    interval_seconds=300,
+                )
+                deferred = _collect_target_safely(
+                    {
+                        "target_uid": "same-account-next-target",
+                        "aadvid": "account-rate-limited",
+                    },
+                    db=store,
+                    interval_seconds=300,
+                )
+            self.assertFalse(result["success"])
+            self.assertEqual(120, result["retry_seconds"])
+            self.assertEqual("error", patch_state.call_args_list[1].kwargs["status"])
+            self.assertTrue(deferred["deferred"])
+            self.assertEqual("account_backoff", deferred["error_kind"])
+            self.assertEqual(1, collect_one.call_count)
+            self.assertEqual(2, set_retry.call_count)
+            set_retry.assert_any_call(
+                "rate-limited-target",
+                delay_seconds=120,
                 db=store,
-                interval_seconds=300,
             )
-        self.assertFalse(result["success"])
-        self.assertEqual(120, result["retry_seconds"])
-        self.assertEqual("error", patch_state.call_args_list[-1].kwargs["status"])
-        set_retry.assert_called_once_with(
-            "rate-limited-target",
-            delay_seconds=120,
-            db=store,
-        )
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+    def test_repeated_rate_limit_uses_exponential_account_backoff(self):
+        store = Mock()
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            with patch(
+                "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+            ), patch(
+                "services.official_api_collection.collect_target",
+                side_effect=ApiRateLimitError("rate limited again"),
+            ), patch(
+                "services.official_api_collection.patch_target_sync_state"
+            ), patch(
+                "services.official_api_collection._set_retry_due"
+            ):
+                result = _collect_target_safely(
+                    {
+                        "target_uid": "repeated-rate-limit",
+                        "aadvid": "account-repeated-rate-limit",
+                        "capability": {"collection_consecutive_failures": 1},
+                    },
+                    db=store,
+                    interval_seconds=300,
+                )
+            self.assertEqual(240, result["retry_seconds"])
+        finally:
+            _reset_adaptive_collection_state_for_tests()
 
 
 class _PublicInfoClient(_CaptureClient):

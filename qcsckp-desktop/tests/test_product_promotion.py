@@ -1538,17 +1538,17 @@ class ProductPromotionTests(unittest.TestCase):
                 "?aavid=1782685702496260&adId=1855536108315875&token=secret"
             ),
         )
-    def test_enabled_targets_use_dynamic_capacity_instead_of_fixed_ten_limit(self):
+    def test_enabled_targets_use_account_serial_capacity_instead_of_fixed_ten_limit(self):
         for i in range(13):
             self._target(i)
         rows = list_promotion_targets(enabled=True, db=self.db)
         self.assertEqual(13, len(rows))
         self.assertEqual(
-            13,
+            12,
             sum(1 for item in rows if item.get("capacity_state") == "active"),
         )
         self.assertEqual(
-            0,
+            1,
             sum(
                 1
                 for item in rows

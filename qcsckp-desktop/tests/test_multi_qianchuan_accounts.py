@@ -404,10 +404,24 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         for index in range(37):
             self._target("10001", index)
         snapshot = capacity_snapshot(db=self.db)
-        self.assertEqual(36, snapshot["active_count"])
-        self.assertEqual(1, snapshot["waiting_count"])
+        # One advertiser is intentionally serialized to protect its API quota:
+        # 12 default 45-second plans fit in the nine-minute freshness budget.
+        self.assertEqual(12, snapshot["active_count"])
+        self.assertEqual(25, snapshot["waiting_count"])
         self.assertEqual(3, snapshot["parallel_workers"])
         self.assertLessEqual(snapshot["estimated_cycle_seconds"], 9 * 60)
+
+    def test_capacity_uses_parallel_lanes_across_different_accounts(self):
+        for account_index in range(3):
+            for plan_index in range(12):
+                self._target(
+                    str(11000 + account_index),
+                    account_index * 100 + plan_index,
+                )
+        snapshot = capacity_snapshot(db=self.db)
+        self.assertEqual(36, snapshot["active_count"])
+        self.assertEqual(0, snapshot["waiting_count"])
+        self.assertEqual(9 * 60, snapshot["estimated_cycle_seconds"])
 
     def test_target_health_recomputes_data_age_on_every_read(self):
         old = (datetime.now() - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S")
@@ -428,6 +442,24 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         )
         self.assertEqual("delayed", row["collection_health"])
         self.assertGreaterEqual(row["last_lag_seconds"], 11 * 60)
+
+    def test_rate_limited_target_has_explicit_backoff_health(self):
+        row = _target_row(
+            {
+                "target_uid": "limited-target",
+                "enabled": 1,
+                "account_enabled": 1,
+                "monitor_eligible": 1,
+                "retarget_eligible": 1,
+                "stop_eligible": 1,
+                "capacity_state": "active",
+                "last_status": "rate_limited",
+                "last_sync_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "capability_json": "{}",
+                "product_ids_json": "[]",
+            }
+        )
+        self.assertEqual("backoff", row["collection_health"])
 
     def test_readonly_capacity_snapshot_never_mutates_target_lag(self):
         target = self._target("10001", 1)

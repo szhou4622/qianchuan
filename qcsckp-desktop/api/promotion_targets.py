@@ -489,6 +489,8 @@ def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     active = str(out.get("capacity_state") or "") == "active"
     if not selected or not active:
         health = "inactive"
+    elif status == "rate_limited":
+        health = "backoff"
     elif status in {"error", "failed"}:
         health = "error"
     elif status == "collecting":
