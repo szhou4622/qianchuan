@@ -9,13 +9,14 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QCSCKP_QIANCHUAN_BACKEND", "browser_legacy")
 
 from api.views import Api
-from api.promotion_targets import upsert_promotion_target
+from api.promotion_targets import _target_row, upsert_promotion_target
 from api.promotion_targets import list_promotion_targets
 from api.operation_events import upsert_operation_event
 from services import promotion_browser_lock, qianchuan_session, rc23_rollback
@@ -400,12 +401,33 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertEqual(0, saved["last_lag_seconds"])
 
     def test_dynamic_capacity_marks_excess_targets_waiting(self):
-        for index in range(13):
+        for index in range(37):
             self._target("10001", index)
         snapshot = capacity_snapshot(db=self.db)
-        self.assertEqual(12, snapshot["active_count"])
+        self.assertEqual(36, snapshot["active_count"])
         self.assertEqual(1, snapshot["waiting_count"])
+        self.assertEqual(3, snapshot["parallel_workers"])
         self.assertLessEqual(snapshot["estimated_cycle_seconds"], 9 * 60)
+
+    def test_target_health_recomputes_data_age_on_every_read(self):
+        old = (datetime.now() - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S")
+        row = _target_row(
+            {
+                "target_uid": "old-target",
+                "enabled": 1,
+                "account_enabled": 1,
+                "monitor_eligible": 1,
+                "retarget_eligible": 1,
+                "stop_eligible": 1,
+                "capacity_state": "active",
+                "last_status": "ok",
+                "last_sync_at": old,
+                "capability_json": "{}",
+                "product_ids_json": "[]",
+            }
+        )
+        self.assertEqual("delayed", row["collection_health"])
+        self.assertGreaterEqual(row["last_lag_seconds"], 11 * 60)
 
     def test_readonly_capacity_snapshot_never_mutates_target_lag(self):
         target = self._target("10001", 1)
@@ -624,11 +646,10 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn('id="catalogActionStatus"', html)
         self.assertIn("已排队，等待采集结束", html)
         self.assertIn("刷新任务已进入官方API后台队列", html)
-        self.assertIn(
-            "const late=selected&&accountEnabled&&state==='active'&&!!p.last_sync_at",
-            html,
-        )
+        self.assertIn("const collectionHealth=String(p.collection_health||'').toLowerCase()", html)
+        self.assertIn("collectionFailed?'采集失败，自动重试中'", html)
         self.assertIn("firstRun?'等待首次采集':late?'监控延迟'", html)
+        self.assertIn("数据年龄：${esc(dataAge(p.last_lag_seconds))}", html)
         self.assertIn('data-field="report_enabled"', html)
         self.assertIn("reportInput.disabled=!input.checked", html)
         self.assertIn("if(!input.checked)reportInput.checked=false", html)

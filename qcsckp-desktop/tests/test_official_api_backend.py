@@ -2,9 +2,10 @@ import json
 import asyncio
 import os
 import tempfile
+import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from urllib.error import URLError
 from unittest.mock import patch
@@ -40,6 +41,9 @@ from services.qianchuan_open_api.token_provider import (
 )
 from services.promotion_capability import check_target_capability
 from services.official_api_collection import (
+    _collect_target_safely,
+    _target_is_due,
+    run_collection_cycle,
     _supported_material_metrics,
     request_official_api_collection,
 )
@@ -192,14 +196,18 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
 
     def test_immediate_collection_request_is_deduplicated_and_starts_now(self):
         store = Mock()
+        pending = set()
+        wake = Mock()
         with patch(
             "services.official_api_collection.start_official_api_collection_background_thread"
         ), patch(
             "services.official_api_collection.patch_target_sync_state"
         ) as patch_state, patch(
-            "services.official_api_collection.threading.Thread"
-        ) as worker, patch(
             "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+        ), patch(
+            "services.official_api_collection._PENDING_TARGET_UIDS", pending
+        ), patch(
+            "services.official_api_collection._WAKE", wake
         ):
             result = request_official_api_collection(
                 ["target-1", "target-1", ""],
@@ -208,8 +216,9 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual(0, result["queued_count"])
         self.assertEqual(1, result["started_count"])
         self.assertEqual(["target-1"], result["target_uids"])
+        self.assertEqual({"target-1"}, pending)
         patch_state.assert_called_once()
-        worker.return_value.start.assert_called_once_with()
+        wake.set.assert_called_once_with()
 
     def test_immediate_collection_does_not_duplicate_active_target(self):
         with patch(
@@ -217,15 +226,127 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         ), patch(
             "services.official_api_collection.patch_target_sync_state"
         ) as patch_state, patch(
-            "services.official_api_collection.threading.Thread"
-        ) as worker, patch(
             "services.official_api_collection._ACTIVE_TARGET_UIDS", {"target-1"}
+        ), patch(
+            "services.official_api_collection._PENDING_TARGET_UIDS", set()
         ):
             result = request_official_api_collection(["target-1"], db=Mock())
         self.assertEqual(0, result["started_count"])
         self.assertEqual(1, result["already_collecting_count"])
         patch_state.assert_not_called()
-        worker.assert_not_called()
+
+    def test_target_due_time_is_per_target_not_per_whole_cycle(self):
+        now = datetime.now().replace(microsecond=0)
+        self.assertTrue(
+            _target_is_due(
+                {"next_due_at": (now - timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")},
+                now=now,
+            )
+        )
+        self.assertFalse(
+            _target_is_due(
+                {"next_due_at": (now + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")},
+                now=now,
+            )
+        )
+
+    def test_collection_cycle_runs_accounts_concurrently_and_contains_failure(self):
+        targets = [{"target_uid": f"target-{index}"} for index in range(4)]
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def collect_one(target, *, db, interval_seconds):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.03)
+                if target["target_uid"] == "target-2":
+                    raise RuntimeError("isolated target failure")
+                return {"success": True, "target_uid": target["target_uid"]}
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch(
+            "services.official_api_collection.schedulable_promotion_targets",
+            return_value=targets,
+        ), patch(
+            "services.official_api_collection._collect_target_safely",
+            side_effect=collect_one,
+        ), patch(
+            "services.official_api_collection.refresh_monitor_capacity"
+        ):
+            result = run_collection_cycle(
+                db=Mock(config={"database": ":memory:"}),
+                target_uids=[row["target_uid"] for row in targets],
+                max_workers=2,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(4, result["target_count"])
+        self.assertEqual(2, result["worker_count"])
+        self.assertEqual(2, max_active)
+        self.assertEqual(
+            {"target-0", "target-1", "target-2", "target-3"},
+            {row["target_uid"] for row in result["results"]},
+        )
+
+    def test_periodic_collection_submits_only_due_targets(self):
+        now = datetime.now().replace(microsecond=0)
+        targets = [
+            {
+                "target_uid": "due",
+                "next_due_at": (now - timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            {
+                "target_uid": "later",
+                "next_due_at": (now + timedelta(minutes=4)).strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        ]
+        with patch(
+            "services.official_api_collection.schedulable_promotion_targets",
+            return_value=targets,
+        ), patch(
+            "services.official_api_collection._collect_target_safely",
+            return_value={"success": True, "target_uid": "due"},
+        ) as collect_one, patch(
+            "services.official_api_collection.refresh_monitor_capacity"
+        ):
+            result = run_collection_cycle(
+                db=Mock(config={"database": ":memory:"}),
+                max_workers=3,
+            )
+        self.assertEqual(1, result["target_count"])
+        self.assertEqual("due", collect_one.call_args.args[0]["target_uid"])
+
+    def test_rate_limit_failure_is_isolated_and_retried_early(self):
+        store = Mock()
+        with patch(
+            "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+        ), patch(
+            "services.official_api_collection.collect_target",
+            side_effect=ApiRateLimitError("rate limited"),
+        ), patch(
+            "services.official_api_collection.patch_target_sync_state"
+        ) as patch_state, patch(
+            "services.official_api_collection._set_retry_due"
+        ) as set_retry:
+            result = _collect_target_safely(
+                {"target_uid": "rate-limited-target"},
+                db=store,
+                interval_seconds=300,
+            )
+        self.assertFalse(result["success"])
+        self.assertEqual(120, result["retry_seconds"])
+        self.assertEqual("error", patch_state.call_args_list[-1].kwargs["status"])
+        set_retry.assert_called_once_with(
+            "rate-limited-target",
+            delay_seconds=120,
+            db=store,
+        )
 
 
 class _PublicInfoClient(_CaptureClient):

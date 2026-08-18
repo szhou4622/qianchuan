@@ -17,6 +17,7 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 DEFAULT_OWNER = "local_default"
 CAPACITY_WINDOW_SECONDS = 9 * 60
 CAPACITY_STALE_SECONDS = 10 * 60
+CAPACITY_PARALLEL_WORKERS = 3
 DEFAULT_TARGET_DURATION_MS = 45_000
 MIN_TARGET_DURATION_MS = 5_000
 MAX_TARGET_DURATION_MS = 30 * 60_000
@@ -998,6 +999,20 @@ def _estimate_duration_ms(row: Dict[str, Any]) -> int:
     return max(MIN_TARGET_DURATION_MS, min(MAX_TARGET_DURATION_MS, value))
 
 
+def _parallel_cycle_ms(durations: Iterable[int]) -> int:
+    """Estimate wall-clock cycle time using the same bounded worker count.
+
+    Assigning each target to the currently least-loaded lane mirrors the
+    scheduler closely enough for admission without pretending three concurrent
+    API requests take the sum of all their durations.
+    """
+    lanes = [0] * max(1, int(CAPACITY_PARALLEL_WORKERS))
+    for duration in durations:
+        lane = min(range(len(lanes)), key=lanes.__getitem__)
+        lanes[lane] += max(0, int(duration))
+    return max(lanes, default=0)
+
+
 def refresh_monitor_capacity(
     *,
     owner_username: Any = None,
@@ -1019,7 +1034,7 @@ def refresh_monitor_capacity(
         fetch=True,
     ) or []
     budget_ms = CAPACITY_WINDOW_SECONDS * 1000
-    used_ms = 0
+    lane_loads = [0] * max(1, int(CAPACITY_PARALLEL_WORKERS))
     active = 0
     waiting = 0
     disabled = 0
@@ -1036,9 +1051,10 @@ def refresh_monitor_capacity(
                 disabled += 1
             else:
                 estimate = _estimate_duration_ms(row)
-                if used_ms + estimate <= budget_ms:
+                lane = min(range(len(lane_loads)), key=lane_loads.__getitem__)
+                if lane_loads[lane] + estimate <= budget_ms:
                     state = "active"
-                    used_ms += estimate
+                    lane_loads[lane] += estimate
                     active += 1
                 else:
                     state = "capacity_waiting"
@@ -1056,7 +1072,8 @@ def refresh_monitor_capacity(
         "active_count": active,
         "waiting_count": waiting,
         "disabled_count": disabled,
-        "estimated_cycle_seconds": int(round(used_ms / 1000)),
+        "estimated_cycle_seconds": int(round(max(lane_loads, default=0) / 1000)),
+        "parallel_workers": CAPACITY_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,
         "healthy": waiting == 0,
@@ -1067,6 +1084,8 @@ def record_target_duration(
     target_uid: Any,
     duration_ms: Any,
     *,
+    interval_seconds: int = 5 * 60,
+    refresh_capacity: bool = True,
     db: Optional[SQLiteStore] = None,
 ) -> None:
     store = db or SQLiteStore()
@@ -1093,13 +1112,14 @@ def record_target_duration(
         {
             "last_duration_ms": smoothed,
             "next_due_at": datetime.fromtimestamp(
-                datetime.now().timestamp() + 5 * 60
+                datetime.now().timestamp() + max(30, int(interval_seconds))
             ).strftime("%Y-%m-%d %H:%M:%S"),
             "last_lag_seconds": 0,
         },
         where={"target_uid": str(target_uid or "").strip()},
     )
-    refresh_monitor_capacity(db=store)
+    if refresh_capacity:
+        refresh_monitor_capacity(db=store)
 
 
 def capacity_snapshot(
@@ -1171,7 +1191,7 @@ def capacity_snapshot_readonly(
     active = 0
     waiting = 0
     disabled = 0
-    used_ms = 0
+    active_durations: List[int] = []
     delayed: List[str] = []
     max_lag = 0
     now = datetime.now()
@@ -1192,7 +1212,7 @@ def capacity_snapshot_readonly(
             disabled += 1
             continue
         active += 1
-        used_ms += _estimate_duration_ms(row)
+        active_durations.append(_estimate_duration_ms(row))
         text = str(row.get("last_sync_at") or "").strip()
         try:
             lag = int(
@@ -1209,7 +1229,8 @@ def capacity_snapshot_readonly(
         "active_count": active,
         "waiting_count": waiting,
         "disabled_count": disabled,
-        "estimated_cycle_seconds": int(round(used_ms / 1000)),
+        "estimated_cycle_seconds": int(round(_parallel_cycle_ms(active_durations) / 1000)),
+        "parallel_workers": CAPACITY_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,
         "delayed_count": len(delayed),
@@ -1222,13 +1243,15 @@ def capacity_snapshot_readonly(
 def schedulable_promotion_targets(
     *,
     owner_username: Any = None,
+    refresh_capacity: bool = True,
     db: Optional[SQLiteStore] = None,
 ) -> List[Dict[str, Any]]:
     from api.promotion_targets import _target_row
 
     store = db or SQLiteStore()
     owner = _owner_key(owner_username)
-    refresh_monitor_capacity(owner_username=owner, db=store)
+    if refresh_capacity:
+        refresh_monitor_capacity(owner_username=owner, db=store)
     rows = store.execute(
         "SELECT t.* FROM promotion_target t "
         "JOIN qianchuan_account a ON a.account_uid=t.account_uid "

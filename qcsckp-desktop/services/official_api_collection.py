@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional
@@ -21,7 +22,17 @@ from api.promotion_targets import (
     upsert_products,
 )
 from services.plan_system import normalize_plan_system
-from services.qianchuan_accounts import schedulable_promotion_targets
+from services.qianchuan_accounts import (
+    CAPACITY_PARALLEL_WORKERS,
+    record_target_duration,
+    refresh_monitor_capacity,
+    schedulable_promotion_targets,
+)
+from services.qianchuan_open_api.errors import (
+    ApiPermissionError,
+    ApiRateLimitError,
+    ApiTokenError,
+)
 from services.qianchuan_open_api.normalizers import (
     first,
     normalize_metric_value,
@@ -32,7 +43,7 @@ from services.qianchuan_open_api.normalizers import (
 )
 from services.qianchuan_open_api.runtime import get_official_api_service
 from utils.log import logger
-from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+from utils.sqlite_store import SQLiteStore
 
 
 MATERIAL_METRICS = (
@@ -57,10 +68,59 @@ _THREAD: Optional[threading.Thread] = None
 _LOCK = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_TARGET_UIDS: set[str] = set()
+_PENDING_TARGET_UIDS: set[str] = set()
+
+# One target is refreshed every five minutes from its own last successful
+# collection.  The scheduler only sleeps for a short tick so a slow account
+# never adds another five minutes to every account behind it.
+COLLECTION_INTERVAL_SECONDS = 5 * 60
+COLLECTION_SCHEDULER_TICK_SECONDS = 5
+COLLECTION_MAX_WORKERS = CAPACITY_PARALLEL_WORKERS
+COLLECTION_TRANSIENT_RETRY_SECONDS = 60
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_local_time(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _target_is_due(
+    target: Mapping[str, Any],
+    *,
+    now: Optional[datetime] = None,
+    interval_seconds: int = COLLECTION_INTERVAL_SECONDS,
+) -> bool:
+    current = now or datetime.now()
+    due_at = _parse_local_time(target.get("next_due_at"))
+    if due_at is not None:
+        return due_at <= current
+    last_sync = _parse_local_time(target.get("last_sync_at"))
+    if last_sync is None:
+        return True
+    return (current - last_sync).total_seconds() >= max(30, int(interval_seconds))
+
+
+def _set_retry_due(
+    target_uid: str,
+    *,
+    delay_seconds: int,
+    db: SQLiteStore,
+) -> None:
+    retry_at = datetime.now() + timedelta(seconds=max(30, int(delay_seconds)))
+    db.update(
+        "promotion_target",
+        {"next_due_at": retry_at.strftime("%Y-%m-%d %H:%M:%S")},
+        where={"target_uid": target_uid},
+    )
 
 
 def _date_window(days: int = 0) -> tuple[str, str]:
@@ -422,91 +482,196 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     }
 
 
+def _collect_target_safely(
+    target: Mapping[str, Any],
+    *,
+    db: SQLiteStore,
+    interval_seconds: int,
+) -> dict[str, Any]:
+    """Collect one target and contain every failure to that target."""
+    target_uid = str(target.get("target_uid") or "").strip()
+    with _ACTIVE_LOCK:
+        if target_uid in _ACTIVE_TARGET_UIDS:
+            return {
+                "success": True,
+                "target_uid": target_uid,
+                "already_collecting": True,
+            }
+        _ACTIVE_TARGET_UIDS.add(target_uid)
+
+    started = time.monotonic()
+    try:
+        patch_target_sync_state(
+            target_uid,
+            status="collecting",
+            error="",
+            synced=False,
+            capability_updates={"collection_started_at": _now()},
+            db=db,
+        )
+        result = collect_target(target, db=db)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        record_target_duration(
+            target_uid,
+            duration_ms,
+            interval_seconds=interval_seconds,
+            refresh_capacity=False,
+            db=db,
+        )
+        patch_target_sync_state(
+            target_uid,
+            status=None,
+            error="",
+            synced=False,
+            capability_updates={
+                "collection_duration_ms": duration_ms,
+                "collection_finished_at": _now(),
+            },
+            db=db,
+        )
+        return result
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        # Token and permission failures cannot heal by hammering the API.  API
+        # throttling and transient downstream errors get one bounded early
+        # retry; either way other accounts continue immediately.
+        retry_seconds = (
+            interval_seconds
+            if isinstance(exc, (ApiTokenError, ApiPermissionError))
+            else COLLECTION_TRANSIENT_RETRY_SECONDS
+        )
+        if isinstance(exc, ApiRateLimitError):
+            retry_seconds = max(COLLECTION_TRANSIENT_RETRY_SECONDS, 120)
+        logger.exception("官方 API 采集失败 target=%s", target_uid)
+        patch_target_sync_state(
+            target_uid,
+            status="error",
+            error=str(exc),
+            synced=False,
+            capability_updates={
+                "source": "qianchuan_open_api",
+                "material_sync_complete": False,
+                "collection_error_at": _now(),
+                "collection_duration_ms": duration_ms,
+                "collection_retry_seconds": retry_seconds,
+            },
+            db=db,
+        )
+        _set_retry_due(target_uid, delay_seconds=retry_seconds, db=db)
+        return {
+            "success": False,
+            "target_uid": target_uid,
+            "message": str(exc),
+            "retry_seconds": retry_seconds,
+        }
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_TARGET_UIDS.discard(target_uid)
+
+
 def run_collection_cycle(
     *,
     db: Optional[SQLiteStore] = None,
     target_uids: Optional[Iterable[str]] = None,
+    interval_seconds: int = COLLECTION_INTERVAL_SECONDS,
+    max_workers: int = COLLECTION_MAX_WORKERS,
 ) -> dict[str, Any]:
+    """Collect due targets with bounded concurrency and per-target isolation."""
     store = db or SQLiteStore()
-    results: list[dict[str, Any]] = []
     requested = {
-        str(item or "").strip() for item in (target_uids or ()) if str(item or "").strip()
+        str(item or "").strip()
+        for item in (target_uids or ())
+        if str(item or "").strip()
     }
-    targets = schedulable_promotion_targets(db=store)
+    # Capacity is recalculated on settings/evidence changes and after each
+    # completed batch.  Do not rewrite every target row on the five-second
+    # scheduler tick when no target is due.
+    targets = schedulable_promotion_targets(db=store, refresh_capacity=False)
     if requested:
+        # Explicitly requested targets are collected immediately regardless of
+        # their next periodic due time.
         targets = [
             target
             for target in targets
             if str(target.get("target_uid") or "") in requested
         ]
-    for target in targets:
-        target_uid = str(target.get("target_uid") or "").strip()
-        with _ACTIVE_LOCK:
-            if target_uid in _ACTIVE_TARGET_UIDS:
-                results.append(
-                    {
-                        "success": True,
-                        "target_uid": target_uid,
-                        "already_collecting": True,
-                    }
-                )
-                continue
-            _ACTIVE_TARGET_UIDS.add(target_uid)
-        try:
-            patch_target_sync_state(
-                target_uid,
-                status="collecting",
-                error="",
-                synced=False,
-                capability_updates={"collection_started_at": _now()},
+    else:
+        now = datetime.now()
+        targets = [
+            target
+            for target in targets
+            if _target_is_due(target, now=now, interval_seconds=interval_seconds)
+        ]
+
+    if not targets:
+        return {"success": True, "target_count": 0, "results": []}
+
+    worker_count = max(1, min(int(max_workers), len(targets)))
+    ordered_results: list[Optional[dict[str, Any]]] = [None] * len(targets)
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="qianchuan-api-collect",
+    ) as pool:
+        futures = {
+            pool.submit(
+                _collect_target_safely,
+                target,
                 db=store,
-            )
-            results.append(collect_target(target, db=store))
-        except Exception as exc:
-            logger.exception("官方 API 采集失败 target=%s", target.get("target_uid"))
-            patch_target_sync_state(
-                target.get("target_uid"),
-                status="error",
-                error=str(exc),
-                synced=False,
-                capability_updates={
-                    "source": "qianchuan_open_api",
-                    "material_sync_complete": False,
-                    "collection_error_at": _now(),
-                },
-                db=store,
-            )
-            results.append({"success": False, "target_uid": target.get("target_uid"), "message": str(exc)})
-        finally:
-            with _ACTIVE_LOCK:
-                _ACTIVE_TARGET_UIDS.discard(target_uid)
+                interval_seconds=max(30, int(interval_seconds)),
+            ): index
+            for index, target in enumerate(targets)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                ordered_results[index] = future.result()
+            except Exception as exc:  # defensive: worker must never kill loop
+                target_uid = str(targets[index].get("target_uid") or "")
+                logger.exception("官方 API 采集线程异常 target=%s", target_uid)
+                ordered_results[index] = {
+                    "success": False,
+                    "target_uid": target_uid,
+                    "message": str(exc),
+                }
+    results = [item for item in ordered_results if item is not None]
+    try:
+        refresh_monitor_capacity(db=store)
+    except Exception:
+        logger.exception("官方 API 采集后刷新监控容量失败")
     return {
-        "success": all(item.get("success") for item in results) if results else True,
+        "success": all(item.get("success") for item in results),
         "target_count": len(results),
+        "worker_count": worker_count,
         "results": results,
     }
 
 
+def _take_pending_targets() -> set[str]:
+    with _ACTIVE_LOCK:
+        pending = set(_PENDING_TARGET_UIDS)
+        _PENDING_TARGET_UIDS.clear()
+    return pending
+
+
 def _loop(interval_seconds: int) -> None:
     interval = max(30, int(interval_seconds))
+    tick = min(COLLECTION_SCHEDULER_TICK_SECONDS, interval)
     while not _STOP.is_set():
         try:
-            run_collection_cycle()
+            pending = _take_pending_targets()
+            run_collection_cycle(
+                target_uids=pending or None,
+                interval_seconds=interval,
+            )
         except Exception:
             logger.exception("官方 API 采集轮次异常")
-        _WAKE.wait(interval)
+        _WAKE.wait(tick)
         _WAKE.clear()
 
 
-def _run_immediate_target(target_uid: str) -> None:
-    """Collect one newly enabled target without waiting for the periodic cycle."""
-    try:
-        run_collection_cycle(target_uids=(target_uid,))
-    except Exception:
-        logger.exception("官方 API 立即采集异常 target=%s", target_uid)
-
-
-def start_official_api_collection_background_thread(interval_seconds: int = 300) -> threading.Thread:
+def start_official_api_collection_background_thread(
+    interval_seconds: int = COLLECTION_INTERVAL_SECONDS,
+) -> threading.Thread:
     global _THREAD
     with _LOCK:
         if _THREAD and _THREAD.is_alive():
@@ -543,7 +708,10 @@ def request_official_api_collection(
     started: list[str] = []
     with _ACTIVE_LOCK:
         already_collecting = requested.intersection(_ACTIVE_TARGET_UIDS)
-    to_start = requested.difference(already_collecting)
+        already_queued = requested.intersection(_PENDING_TARGET_UIDS)
+        to_start = requested.difference(already_collecting).difference(already_queued)
+        _PENDING_TARGET_UIDS.update(to_start)
+    valid_to_start: set[str] = set()
     for target_uid in to_start:
         try:
             patch_target_sync_state(
@@ -554,26 +722,22 @@ def request_official_api_collection(
                 capability_updates={"collection_queued_at": _now()},
                 db=store,
             )
+            valid_to_start.add(target_uid)
         except ValueError:
             # The scheduler will ignore targets that were removed between save
             # and queueing.  Do not let one stale UI row block other targets.
+            with _ACTIVE_LOCK:
+                _PENDING_TARGET_UIDS.discard(target_uid)
             continue
     start_official_api_collection_background_thread()
-    for target_uid in sorted(to_start):
-        thread = threading.Thread(
-            target=_run_immediate_target,
-            args=(target_uid,),
-            name=f"qianchuan-api-immediate-{target_uid[-8:]}",
-            daemon=True,
-        )
-        thread.start()
-        started.append(target_uid)
+    _WAKE.set()
+    started.extend(sorted(valid_to_start))
     return {
         "success": True,
         "running": True,
         "queued_count": 0,
         "started_count": len(started),
-        "already_collecting_count": len(already_collecting),
+        "already_collecting_count": len(already_collecting) + len(already_queued),
         "target_uids": started,
         "message": "设置已保存，官方 API 已开始采集新监控计划",
     }

@@ -468,6 +468,40 @@ def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 out[key[:-5]] = {}
         else:
             out[key[:-5]] = {}
+    # Freshness is a property of the current time, not a cached value written
+    # by an occasional health job.  Recompute it on every read so a target
+    # cannot remain labelled healthy after collection has silently stopped.
+    last_sync_text = str(out.get("last_sync_at") or "").strip()
+    last_sync = None
+    if last_sync_text:
+        try:
+            last_sync = datetime.strptime(last_sync_text, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            last_sync = None
+    lag_seconds = (
+        max(0, int((datetime.now() - last_sync).total_seconds()))
+        if last_sync is not None
+        else None
+    )
+    out["last_lag_seconds"] = lag_seconds
+    status = str(out.get("last_status") or "").strip().lower()
+    selected = bool(out.get("enabled")) and bool(out.get("account_enabled", True))
+    active = str(out.get("capacity_state") or "") == "active"
+    if not selected or not active:
+        health = "inactive"
+    elif status in {"error", "failed"}:
+        health = "error"
+    elif status == "collecting":
+        health = "collecting"
+    elif status == "queued":
+        health = "queued"
+    elif lag_seconds is None:
+        health = "pending"
+    elif lag_seconds > 10 * 60:
+        health = "delayed"
+    else:
+        health = "healthy"
+    out["collection_health"] = health
     return out
 
 
