@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,6 +11,8 @@ from utils.dashboard_storage_maintenance import (
     backfill_latest_from_legacy,
     backfill_recent_metric_snapshots,
     prune_migrated_official_history,
+    prune_hourly_metrics,
+    prune_removed_material_latest,
     rollup_old_metric_snapshots,
 )
 from services.official_api_collection import _metric_values_changed
@@ -152,6 +155,17 @@ class DashboardOptimizationTests(unittest.TestCase):
             {row["target_uid"] for row in result["plans"]},
         )
 
+    def test_scope_options_expose_capacity_waiting_warning_count(self):
+        self.db.update(
+            "promotion_target",
+            {"capacity_state": "capacity_waiting"},
+            where={"target_uid": "target-2"},
+        )
+        result = self.queries.get_scope_options()
+        self.assertEqual(1, result["capacityWaitingCount"])
+        target = next(row for row in result["plans"] if row["target_uid"] == "target-2")
+        self.assertEqual("capacity_waiting", target["capacity_state"])
+
     def test_summary_and_top20_respect_scope(self):
         total = self.queries.get_latest_cost_sum()
         account = self.queries.get_latest_cost_sum(aavid="1001")
@@ -212,6 +226,32 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertFalse(_metric_values_changed(previous, same))
         self.assertTrue(_metric_values_changed(previous, changed))
 
+    def test_verified_flag_never_prunes_history_without_compact_replacement(self):
+        self.db.insert(
+            "pmc_promotion_material",
+            {
+                "aadvid": "1001",
+                "target_uid": "legacy_unscoped",
+                "ad_id": "",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "material_id": "unbackfilled-material",
+                "data_source": "qianchuan_open_api",
+            },
+        )
+        deleted = prune_migrated_official_history(
+            db=self.db,
+            delete_limit=10,
+            migration_verified=True,
+        )
+        self.assertEqual(0, deleted)
+        self.assertIsNotNone(
+            self.db.select_one(
+                "pmc_promotion_material",
+                where={"material_id": "unbackfilled-material"},
+            )
+        )
+
     def test_snapshots_older_than_48_hours_roll_up_to_hourly(self):
         old = self.now - timedelta(days=3)
         self.db.insert(
@@ -238,6 +278,92 @@ class DashboardOptimizationTests(unittest.TestCase):
         )
         self.assertIsNotNone(hourly)
         self.assertEqual(42.5, hourly["stat_cost"])
+
+    def test_hourly_and_soft_removed_retention_are_bounded(self):
+        old = self.now - timedelta(days=200)
+        self.db.insert(
+            "pmc_material_metric_hourly",
+            {
+                "account_username": "dashboard-owner",
+                "account_uid": "account-1",
+                "aadvid": "1001",
+                "target_uid": "target-1",
+                "ad_id": "2001",
+                "material_id": "old-hourly",
+                "hour_key": old.strftime("%Y-%m-%d %H:00:00"),
+                "collected_at": old.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        self.db.insert(
+            "pmc_promotion_material_latest",
+            {
+                "aadvid": "1001",
+                "target_uid": "target-1",
+                "ad_id": "2001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "material_id": "old-removed",
+                "delivery_state": "removed",
+                "last_seen_at": old.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+        self.assertEqual(1, prune_hourly_metrics(db=self.db))
+        self.assertEqual(1, prune_removed_material_latest(db=self.db))
+
+    def test_insert_many_keeps_columns_introduced_by_later_rows(self):
+        self.db.insert_many(
+            "pmc_promotion_material_latest",
+            [
+                {
+                    "aadvid": "1001",
+                    "target_uid": "target-1",
+                    "material_id": "union-1",
+                },
+                {
+                    "aadvid": "1001",
+                    "target_uid": "target-1",
+                    "material_id": "union-2",
+                    "video_name": "第二行新列",
+                },
+            ],
+        )
+        saved = self.db.select_one(
+            "pmc_promotion_material_latest", where={"material_id": "union-2"}
+        )
+        self.assertEqual("第二行新列", saved["video_name"])
+
+    def test_concurrent_upsert_keeps_one_unique_latest_row(self):
+        errors = []
+
+        def write(index):
+            try:
+                self.db.insert_or_update(
+                    "pmc_promotion_material_latest",
+                    {
+                        "aadvid": "1001",
+                        "target_uid": "target-1",
+                        "material_id": "concurrent-material",
+                        "stat_cost": float(index),
+                    },
+                    unique_fields=["target_uid", "material_id"],
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(index,)) for index in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual([], errors)
+        rows = self.db.select(
+            "pmc_promotion_material_latest",
+            where={
+                "target_uid": "target-1",
+                "material_id": "concurrent-material",
+            },
+        )
+        self.assertEqual(1, len(rows))
 
 
 if __name__ == "__main__":

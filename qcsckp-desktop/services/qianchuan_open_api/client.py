@@ -148,6 +148,8 @@ class QianchuanOpenApiClient:
     @staticmethod
     def _is_token_error(code: str, message: str) -> bool:
         text = f"{code} {message}".lower()
+        if str(code or "").strip().startswith("5"):
+            return True
         return any(word in text for word in ("access_token", "access token", "token expired", "token失效", "token过期"))
 
     @staticmethod
@@ -205,9 +207,11 @@ class QianchuanOpenApiClient:
             or "请求频繁" in message
         ):
             raise ApiRateLimitError(message, **kwargs)
+        if http_status == 401:
+            raise ApiTokenError(message, **kwargs)
         if self._is_token_error(code, message):
             raise ApiTokenError(message, **kwargs)
-        if http_status in {401, 403} or self._is_permission_error(code, message):
+        if http_status == 403 or self._is_permission_error(code, message):
             raise ApiPermissionError("千川官方 API 权限未开通或账户未授权", **kwargs)
         raise ApiRequestError(message, **kwargs)
 
@@ -450,11 +454,18 @@ class QianchuanOpenApiClient:
         return []
 
     @staticmethod
-    def _has_more(data: Any, *, page: int, page_size: int, item_count: int) -> bool:
+    def _has_more(
+        data: Any, *, page: int, page_size: int, item_count: int
+    ) -> Optional[bool]:
         if isinstance(data, Mapping):
             for key in ("page_info", "pageInfo", "pagination"):
                 info = data.get(key)
                 if isinstance(info, Mapping):
+                    echoed_size = info.get("page_size") or info.get("pageSize")
+                    if echoed_size not in (None, "") and int(echoed_size) != int(page_size):
+                        raise ApiRequestError(
+                            "千川官方 API 回显分页大小与请求不一致，结果已标记为不完整"
+                        )
                     if "has_more" in info:
                         return bool(info.get("has_more"))
                     total_page = info.get("total_page") or info.get("total_pages")
@@ -465,7 +476,10 @@ class QianchuanOpenApiClient:
                         return page * page_size < int(total)
             if "has_more" in data:
                 return bool(data.get("has_more"))
-        return item_count >= page_size
+        # A short first page is not proof of completion when the endpoint
+        # omits pagination metadata or silently caps page_size. Fail closed so
+        # callers retain the last complete snapshot.
+        return None
 
     def get_all_pages(
         self,
@@ -484,12 +498,19 @@ class QianchuanOpenApiClient:
         first_query["page_size"] = page_size
         first_response = self.get(endpoint, first_query, advertiser_id=advertiser_id)
         first_items = self.extract_items(first_response.data)
-        if not self._has_more(
+        first_has_more = self._has_more(
             first_response.data,
             page=1,
             page_size=page_size,
             item_count=len(first_items),
-        ):
+        )
+        if first_has_more is None:
+            raise ApiRequestError(
+                "千川官方 API 未返回可验证的分页信息，结果已标记为不完整",
+                endpoint=endpoint,
+                request_id=first_response.request_id,
+            )
+        if not first_has_more:
             return first_items, ([first_response.request_id] if first_response.request_id else [])
 
         total_pages = 0
@@ -572,7 +593,19 @@ class QianchuanOpenApiClient:
             rows.extend(items)
             if response.request_id:
                 request_ids.append(response.request_id)
-            if not self._has_more(response.data, page=page, page_size=page_size, item_count=len(items)):
+            has_more = self._has_more(
+                response.data,
+                page=page,
+                page_size=page_size,
+                item_count=len(items),
+            )
+            if has_more is None:
+                raise ApiRequestError(
+                    "千川官方 API 未返回可验证的分页信息，结果已标记为不完整",
+                    endpoint=endpoint,
+                    request_id=response.request_id,
+                )
+            if not has_more:
                 return rows, request_ids
             if not items:
                 raise ApiRequestError(

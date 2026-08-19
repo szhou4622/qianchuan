@@ -29,6 +29,7 @@ from api.promotion_targets import (
 from services.plan_system import normalize_plan_system
 from services.qianchuan_accounts import (
     CAPACITY_PARALLEL_WORKERS,
+    _owner_key,
     record_target_duration,
     refresh_monitor_capacity,
     schedulable_promotion_targets,
@@ -48,7 +49,6 @@ from services.qianchuan_open_api.normalizers import (
     text_id,
 )
 from services.qianchuan_open_api.runtime import get_official_api_service
-from services.qianchuan_session import current_session_owner
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -67,6 +67,10 @@ MATERIAL_METRICS = (
     "live_watch_count_for_roi2_v2",
     "live_cvr_rate_for_roi2_v2",
     "live_convert_rate_for_roi2_v2",
+    "product_show_count_for_roi2",
+    "product_click_count_for_roi2",
+    "product_cvr_rate_for_roi2",
+    "product_convert_rate_for_roi2",
 )
 
 _STOP = threading.Event()
@@ -78,6 +82,7 @@ _ACTIVE_TARGET_UIDS: set[str] = set()
 _PENDING_TARGET_UIDS: set[str] = set()
 _ACCOUNT_COLLECTION_LOCKS: dict[str, threading.Lock] = {}
 _ACCOUNT_BACKOFF_UNTIL: dict[str, float] = {}
+_RATE_LIMIT_ACCOUNT_EVENTS: dict[str, float] = {}
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY_DATABASES: set[str] = set()
 
@@ -138,7 +143,7 @@ def _metric_snapshot_row(
     observed_at: str,
 ) -> dict[str, Any]:
     snapshot = {
-        "account_username": current_session_owner(),
+        "account_username": _owner_key(),
         "account_uid": str(target.get("account_uid") or ""),
         "aadvid": str(row.get("aadvid") or target.get("aadvid") or ""),
         "target_uid": str(row.get("target_uid") or target.get("target_uid") or ""),
@@ -168,8 +173,10 @@ def _metric_values_changed(
     for field in _METRIC_SNAPSHOT_FIELDS:
         old = previous.get(field)
         new = current.get(field)
+        if new is None:
+            continue
         try:
-            if round(float(old or 0), 8) != round(float(new or 0), 8):
+            if old is None or round(float(old), 8) != round(float(new), 8):
                 return True
         except (TypeError, ValueError):
             if str(old or "") != str(new or ""):
@@ -410,7 +417,7 @@ def _account_backoff_remaining(
     remaining = max(0, int(round(due - time.monotonic())))
     if db is None:
         return remaining
-    owner = current_session_owner()
+    owner = _owner_key()
     return max(
         remaining,
         _persistent_backoff_remaining(
@@ -435,7 +442,7 @@ def _set_account_backoff(
             time.monotonic() + max(30, int(seconds)),
         )
     if db is not None:
-        owner = current_session_owner()
+        owner = _owner_key()
         _persist_quota_backoff(
             owner=owner,
             scope_type="account",
@@ -451,6 +458,29 @@ def _set_account_backoff(
                 seconds=seconds,
                 db=db,
             )
+
+
+def _should_escalate_application_backoff(
+    account_key: str,
+    *,
+    now_monotonic: Optional[float] = None,
+    window_seconds: int = 60,
+    distinct_account_threshold: int = 2,
+) -> bool:
+    """Escalate only when several advertisers are throttled together."""
+    observed = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    cutoff = observed - max(10, int(window_seconds))
+    with _ACTIVE_LOCK:
+        stale = [
+            key for key, timestamp in _RATE_LIMIT_ACCOUNT_EVENTS.items()
+            if float(timestamp or 0.0) < cutoff
+        ]
+        for key in stale:
+            _RATE_LIMIT_ACCOUNT_EVENTS.pop(key, None)
+        _RATE_LIMIT_ACCOUNT_EVENTS[str(account_key or "unknown")] = observed
+        return len(_RATE_LIMIT_ACCOUNT_EVENTS) >= max(
+            2, int(distinct_account_threshold)
+        )
 
 
 def _ensure_collection_schema(store: SQLiteStore) -> None:
@@ -485,7 +515,10 @@ def _observe_collection_results(results: Iterable[Mapping[str, Any]]) -> int:
         if any(str(row.get("error_kind") or "") == "rate_limit" for row in rows):
             _ADAPTIVE_WORKERS = max(1, _ADAPTIVE_WORKERS - 1)
             _ADAPTIVE_CLEAN_BATCHES = 0
-        elif rows and all(bool(row.get("success")) for row in rows):
+        elif rows:
+            # Token/permission/network failures are isolated to their target.
+            # They must not prevent global concurrency recovering after the
+            # rate-limit window has cleared.
             _ADAPTIVE_CLEAN_BATCHES += 1
             if (
                 _ADAPTIVE_WORKERS < COLLECTION_MAX_WORKERS
@@ -493,8 +526,6 @@ def _observe_collection_results(results: Iterable[Mapping[str, Any]]) -> int:
             ):
                 _ADAPTIVE_WORKERS += 1
                 _ADAPTIVE_CLEAN_BATCHES = 0
-        elif rows:
-            _ADAPTIVE_CLEAN_BATCHES = 0
         return _ADAPTIVE_WORKERS
 
 
@@ -506,6 +537,7 @@ def _reset_adaptive_collection_state_for_tests() -> None:
     with _ACTIVE_LOCK:
         _ACCOUNT_COLLECTION_LOCKS.clear()
         _ACCOUNT_BACKOFF_UNTIL.clear()
+        _RATE_LIMIT_ACCOUNT_EVENTS.clear()
 
 
 def _target_is_due(
@@ -563,8 +595,10 @@ def _metric(
     stats: Mapping[str, Any],
     units: Mapping[str, str],
     *names: str,
-) -> float:
+) -> Optional[float]:
     raw, inline_unit = _metric_block(stats, *names)
+    if raw is None:
+        return None
     unit = inline_unit
     if unit in (None, ""):
         for name in names:
@@ -581,7 +615,10 @@ def _supported_material_metrics(units: Mapping[str, Any]) -> tuple[str, ...]:
 
 def _status_number(value: Any) -> int:
     raw = str(value or "").strip().upper()
-    if raw in {"ENABLE", "ENABLED", "ACTIVE", "DELIVERY", "DELIVERING", "RUNNING", "SUCCESS"}:
+    if raw in {
+        "ENABLE", "ENABLED", "ACTIVE", "DELIVERY", "DELIVERING",
+        "DELIVERY_OK", "RUNNING", "SUCCESS",
+    }:
         return 1
     if raw in {"PAUSE", "PAUSED", "DISABLE", "DISABLED", "DELETED", "FAILED", "REJECTED"}:
         return 0
@@ -639,10 +676,26 @@ def _material_snapshot(
         "prepay_pay_settle_1h": _metric(stats, units, "total_prepay_and_pay_settle_roi2_1h", "totalPrepayAndPaySettleRoi21H"),
         "refund_rate_1h": _metric(stats, units, "total_refund_order_gmv_for_roi2_1h_rate", "totalRefundOrderGmvForRoi21HRate"),
         "overall_order_count": _metric(stats, units, "total_pay_order_count_for_roi2", "totalPayOrderCountForRoi2"),
-        "overall_show_count": _metric(stats, units, "live_show_count_for_roi2_v2", "liveShowCountForRoi2V2"),
-        "overall_click_count": _metric(stats, units, "live_watch_count_for_roi2_v2", "liveWatchCountForRoi2V2"),
-        "overall_ctr": _metric(stats, units, "live_cvr_rate_for_roi2_v2", "liveCvrRateForRoi2V2"),
-        "overall_conversion_rate": _metric(stats, units, "live_convert_rate_for_roi2_v2", "liveConvertRateForRoi2V2"),
+        "overall_show_count": _metric(
+            stats, units,
+            "live_show_count_for_roi2_v2", "liveShowCountForRoi2V2",
+            "product_show_count_for_roi2", "productShowCountForRoi2",
+        ),
+        "overall_click_count": _metric(
+            stats, units,
+            "live_watch_count_for_roi2_v2", "liveWatchCountForRoi2V2",
+            "product_click_count_for_roi2", "productClickCountForRoi2",
+        ),
+        "overall_ctr": _metric(
+            stats, units,
+            "live_cvr_rate_for_roi2_v2", "liveCvrRateForRoi2V2",
+            "product_cvr_rate_for_roi2", "productCvrRateForRoi2",
+        ),
+        "overall_conversion_rate": _metric(
+            stats, units,
+            "live_convert_rate_for_roi2_v2", "liveConvertRateForRoi2V2",
+            "product_convert_rate_for_roi2", "productConvertRateForRoi2",
+        ),
         "data_source": "qianchuan_open_api",
         "api_request_id": str(request_id or "")[:256],
         "stat_date": datetime.now().strftime("%Y-%m-%d"),
@@ -835,6 +888,10 @@ def collect_target(
     # config is the source of truth for the current plan class, so only request
     # metrics that the platform explicitly exposes for this topic.
     supported_material_metrics = _supported_material_metrics(units)
+    if not supported_material_metrics:
+        raise RuntimeError(
+            "官方 API 报表字段已变化，未找到可用素材指标，本轮数据不入库"
+        )
     materials, material_request_ids = service.list_plan_materials(
         aavid,
         ad_id,
@@ -848,6 +905,56 @@ def collect_target(
         for item in materials
         if text_id(item.get("material_id"))
     ]
+
+    # If the computer was closed across a date boundary, recover yesterday's
+    # final cumulative metrics once into history. They never replace today's
+    # latest state and never participate in today's rule evaluation.
+    recovery_snapshots: list[dict[str, Any]] = []
+    recovery_completed = False
+    recovery_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    last_sync = _parse_local_time(target.get("last_sync_at"))
+    recovery_needed = bool(
+        last_sync
+        and last_sync.date() < datetime.now().date()
+        and str(capability.get("recovery_backfill_date") or "") != recovery_date
+    )
+    if recovery_needed:
+        try:
+            recovery_materials, recovery_request_ids = service.list_plan_materials(
+                aavid,
+                ad_id,
+                start_date=recovery_date,
+                end_date=recovery_date,
+                fields=supported_material_metrics,
+            )
+            recovery_request_id = (
+                recovery_request_ids[-1] if recovery_request_ids else ""
+            )
+            recovery_snapshots = [
+                {
+                    **_material_snapshot(
+                        item,
+                        target=target,
+                        units=units,
+                        request_id=recovery_request_id,
+                    ),
+                    "stat_date": recovery_date,
+                }
+                for item in recovery_materials
+                if text_id(item.get("material_id"))
+            ]
+            recovery_completed = True
+        except (ApiTokenError, ApiPermissionError):
+            raise
+        except (
+            ApiRateLimitError,
+            ApiRequestError,
+            RuntimeError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as exc:
+            maintenance_errors.append(f"recovery_backfill:{exc}")
 
     products_refreshed = bool(phase_plan["refresh_products"]) and (
         not rotate_maintenance or maintenance_phase == "products"
@@ -936,7 +1043,7 @@ def collect_target(
             units=units,
         )
         for item in control_tasks
-        if str(item.get("scene") or "").upper() == "MATERIAL_ADD_BUDGET"
+        if str(item.get("scene") or "").upper() in {"", "MATERIAL_ADD_BUDGET"}
         and text_id(item.get("task_id"))
     ]
 
@@ -974,14 +1081,53 @@ def collect_target(
         for item in previous_latest_rows
         if str(item.get("material_id") or "")
     }
+    previous_control_rows = store.select(
+        "pmc_roi2_assist_task", where={"target_uid": target_uid}
+    ) or []
+    previous_control_by_task = {
+        str(item.get("assist_task_id") or ""): item
+        for item in previous_control_rows
+        if str(item.get("assist_task_id") or "")
+    }
     with store.transaction() as connection:
+        recovery_observed_at = f"{recovery_date} 23:59:59"
+        for recovery_row in recovery_snapshots:
+            store.insert_or_update(
+                "pmc_material_metric_snapshot",
+                _metric_snapshot_row(
+                    recovery_row,
+                    target=target,
+                    observed_at=recovery_observed_at,
+                ),
+                unique_fields=[
+                    "account_username",
+                    "target_uid",
+                    "material_id",
+                    "bucket_key",
+                ],
+                connection=connection,
+            )
         for row in snapshots:
             material_id = str(row.get("material_id") or "")
+            previous_latest = previous_latest_by_material.get(material_id) or {}
+            effective_row = dict(row)
+            for field in _METRIC_SNAPSHOT_FIELDS:
+                if (
+                    effective_row.get(field) is None
+                    and previous_latest.get(field) is not None
+                ):
+                    effective_row[field] = previous_latest.get(field)
             metrics_changed = _metric_values_changed(
-                previous_latest_by_material.get(material_id), row
+                previous_latest, effective_row
             )
-            latest_row = dict(row)
+            latest_row = dict(effective_row)
             latest_row["collected_at"] = cycle_observed_at
+            latest_row["last_seen_at"] = cycle_observed_at
+            latest_row["delivery_state"] = (
+                "delivering"
+                if int(row.get("material_status") or -1) == 1
+                else "paused"
+            )
             store.insert_or_update(
                 "pmc_promotion_material_latest",
                 latest_row,
@@ -992,7 +1138,7 @@ def collect_target(
                 store.insert_or_update(
                     "pmc_material_metric_snapshot",
                     _metric_snapshot_row(
-                        row,
+                        effective_row,
                         target=target,
                         observed_at=cycle_observed_at,
                     ),
@@ -1008,21 +1154,39 @@ def collect_target(
             current_material_ids = [str(row["material_id"]) for row in snapshots]
             placeholders = ",".join("?" for _ in current_material_ids)
             store.execute(
-                "DELETE FROM pmc_promotion_material_latest WHERE target_uid=? "
+                "UPDATE pmc_promotion_material_latest SET delivery_state='removed', "
+                "updated_at=datetime('now', '+8 hours') WHERE target_uid=? "
                 f"AND material_id NOT IN ({placeholders})",
                 (target_uid, *current_material_ids),
                 connection=connection,
             )
         elif not material_suspicious:
             store.execute(
-                "DELETE FROM pmc_promotion_material_latest WHERE target_uid=?",
+                "UPDATE pmc_promotion_material_latest SET delivery_state='removed', "
+                "updated_at=datetime('now', '+8 hours') WHERE target_uid=?",
                 (target_uid,),
                 connection=connection,
             )
         for row in control_rows:
+            task_id = str(row.get("assist_task_id") or "")
+            effective_control = dict(row)
+            previous_control = previous_control_by_task.get(task_id) or {}
+            for field in (
+                "stat_cost_for_roi2_assist",
+                "total_pay_order_count_for_roi2_assist",
+                "total_pay_order_gmv_include_coupon_for_roi2_assist",
+                "total_prepay_and_pay_order_roi2_assist",
+                "total_order_settle_amount_for_roi2_1h_assist",
+                "total_prepay_and_pay_settle_roi2_1h_assist",
+            ):
+                if (
+                    effective_control.get(field) is None
+                    and previous_control.get(field) is not None
+                ):
+                    effective_control[field] = previous_control.get(field)
             store.insert_or_update(
                 "pmc_roi2_assist_task",
-                row,
+                effective_control,
                 unique_fields=["target_uid", "assist_task_id"],
                 connection=connection,
             )
@@ -1132,6 +1296,13 @@ def collect_target(
             {
                 "maintenance_last_phase": maintenance_phase,
                 "maintenance_last_attempted_at": _now(),
+            }
+        )
+    if recovery_completed:
+        capability_updates.update(
+            {
+                "recovery_backfill_date": recovery_date,
+                "recovery_backfill_count": len(recovery_snapshots),
             }
         )
     if maintenance_errors:
@@ -1357,7 +1528,10 @@ def _collect_target_safely(
                 account_key,
                 retry_seconds,
                 db=db,
-                include_application=(error_kind == "rate_limit"),
+                include_application=(
+                    error_kind == "rate_limit"
+                    and _should_escalate_application_backoff(account_key)
+                ),
             )
         logger.exception("官方 API 采集失败 target=%s", target_uid)
         patch_target_sync_state(
@@ -1504,7 +1678,7 @@ def _enqueue_collection_jobs(
     kind: str = "hot_collection",
 ) -> int:
     _ensure_collection_schema(db)
-    owner = current_session_owner()
+    owner = _owner_key()
     due_text = (due_at or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     count = 0
     for target_uid in {str(v or "").strip() for v in target_uids if str(v or "").strip()}:
@@ -1532,22 +1706,31 @@ def _enqueue_collection_jobs(
             if existing_due is not None
             else requested_due
         )
+        payload = {
+            "job_uid": _collection_job_uid(owner, target_uid, kind),
+            "owner_username": owner,
+            "account_uid": str(target.get("account_uid") or ""),
+            "aavid": str(target.get("aadvid") or ""),
+            "target_uid": target_uid,
+            "job_kind": kind,
+            "priority": max(int(existing.get("priority") or 0), int(priority)),
+            "due_at": effective_due.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # A refresh request arriving while the job is executing may bring the
+        # due time forward and raise priority, but must never revoke the live
+        # lease. The current worker's fencing CAS then remains valid.
+        if str(existing.get("status") or "") != "leased":
+            payload.update(
+                {
+                    "status": "queued",
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": "",
+                }
+            )
         db.insert_or_update(
             "collection_job",
-            {
-                "job_uid": _collection_job_uid(owner, target_uid, kind),
-                "owner_username": owner,
-                "account_uid": str(target.get("account_uid") or ""),
-                "aavid": str(target.get("aadvid") or ""),
-                "target_uid": target_uid,
-                "job_kind": kind,
-                "priority": max(int(existing.get("priority") or 0), int(priority)),
-                "due_at": effective_due.strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "queued",
-                "lease_owner": None,
-                "lease_expires_at": None,
-                "last_error": "",
-            },
+            payload,
             unique_fields=["owner_username", "target_uid", "job_kind"],
         )
         count += 1
@@ -1558,7 +1741,7 @@ def _claim_collection_jobs(
     *, db: SQLiteStore, limit: int
 ) -> list[dict[str, Any]]:
     _ensure_collection_schema(db)
-    owner = current_session_owner()
+    owner = _owner_key()
     worker = f"{threading.current_thread().name}:{uuid.uuid4().hex[:8]}"
     lease_until = datetime.now() + timedelta(seconds=COLLECTION_JOB_LEASE_SECONDS)
     claimed: list[dict[str, Any]] = []
@@ -1571,34 +1754,29 @@ def _claim_collection_jobs(
             (owner,),
             connection=connection,
         )
-        priority_rows = db.execute(
-            "SELECT MAX(priority) AS priority FROM collection_job "
-            "WHERE owner_username=? AND status='queued' "
-            "AND due_at <= datetime('now', '+8 hours')",
+        rows = db.execute(
+            "SELECT * FROM collection_job WHERE owner_username=? "
+            "AND status='queued' AND due_at <= datetime('now', '+8 hours') "
+            "ORDER BY priority DESC,due_at ASC,id ASC LIMIT 2000",
             (owner,),
             fetch=True,
             connection=connection,
         ) or []
-        highest_priority = (
-            priority_rows[0].get("priority") if priority_rows else None
+        # Preserve strict priority between bands while retaining account
+        # round-robin fairness inside each band.
+        fair_rows: list[dict[str, Any]] = []
+        priorities = sorted(
+            {int(raw.get("priority") or 0) for raw in rows}, reverse=True
         )
-        rows = []
-        if highest_priority is not None:
-            # Select the full due priority band (bounded by the supported
-            # account/plan capacity), then round-robin accounts before leasing.
-            # This prevents one large account from occupying every worker slot.
-            rows = db.execute(
-                "SELECT * FROM collection_job WHERE owner_username=? "
-                "AND status='queued' AND priority=? "
-                "AND due_at <= datetime('now', '+8 hours') "
-                "ORDER BY due_at ASC, id ASC LIMIT 2000",
-                (owner, int(highest_priority)),
-                fetch=True,
-                connection=connection,
-            ) or []
-        fair_rows = _fair_order_targets([dict(raw) for raw in rows])[
-            : max(1, int(limit))
-        ]
+        for priority in priorities:
+            band = [
+                dict(raw) for raw in rows
+                if int(raw.get("priority") or 0) == priority
+            ]
+            fair_rows.extend(_fair_order_targets(band))
+            if len(fair_rows) >= max(1, int(limit)):
+                break
+        fair_rows = fair_rows[: max(1, int(limit))]
         for raw in fair_rows:
             row = dict(raw)
             changed = db.execute(
@@ -1641,13 +1819,20 @@ def _finish_collection_job(
         next_due = datetime.now() + timedelta(seconds=max(5, delay))
     # The lease owner and fencing token are both part of the CAS. An expired
     # worker can never overwrite a task re-leased after process recovery.
+    claimed_priority = int(job.get("priority") or 0)
+    immediate_due = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute(
-        "UPDATE collection_job SET status='queued', priority=20, due_at=?, "
+        "UPDATE collection_job SET status='queued', "
+        "priority=CASE WHEN priority>? THEN priority ELSE 20 END, "
+        "due_at=CASE WHEN priority>? THEN MIN(due_at,?) ELSE ? END, "
         "lease_owner=NULL, lease_expires_at=NULL, last_error=?, "
         "last_finished_at=datetime('now', '+8 hours'), "
         "updated_at=datetime('now', '+8 hours') "
         "WHERE id=? AND status='leased' AND lease_owner=? AND fencing_token=?",
         (
+            claimed_priority,
+            claimed_priority,
+            immediate_due,
             next_due.strftime("%Y-%m-%d %H:%M:%S"),
             "" if success else str(result.get("message") or "采集失败")[:500],
             int(job.get("id") or 0),
@@ -1660,7 +1845,7 @@ def _finish_collection_job(
 def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
     store = db or SQLiteStore()
     _ensure_collection_schema(store)
-    owner = current_session_owner()
+    owner = _owner_key()
     rows = store.execute(
         "SELECT status, COUNT(1) AS count, MIN(due_at) AS next_due_at "
         "FROM collection_job WHERE owner_username=? GROUP BY status",
@@ -1746,7 +1931,7 @@ def _loop(interval_seconds: int) -> None:
                 limit=max(1, _adaptive_worker_limit(COLLECTION_MAX_WORKERS)),
             )
             if claimed:
-                owner_at_claim = current_session_owner()
+                owner_at_claim = _owner_key()
                 result = run_collection_cycle(
                     db=store,
                     target_uids=[str(job.get("target_uid") or "") for job in claimed],
@@ -1756,7 +1941,7 @@ def _loop(interval_seconds: int) -> None:
                     str(item.get("target_uid") or ""): item
                     for item in result.get("results") or []
                 }
-                owner_changed = current_session_owner() != owner_at_claim
+                owner_changed = _owner_key() != owner_at_claim
                 for job in claimed:
                     target_uid = str(job.get("target_uid") or "")
                     item = by_target.get(target_uid) or {

@@ -186,6 +186,53 @@ class MultiAccountCollectionQueueStressTests(unittest.TestCase):
         finished = self.db.select_one("collection_job", where={"id": first["id"]})
         self.assertEqual("queued", finished["status"])
 
+    def test_refresh_during_live_lease_never_revokes_worker_ownership(self):
+        target_uid = self._seed_20_accounts_with_10_targets_each()[0]
+        _enqueue_collection_jobs(
+            [target_uid],
+            db=self.db,
+            priority=20,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        leased = _claim_collection_jobs(db=self.db, limit=1)[0]
+        _enqueue_collection_jobs(
+            [target_uid],
+            db=self.db,
+            priority=100,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        saved = self.db.select_one("collection_job", where={"id": leased["id"]})
+        self.assertEqual("leased", saved["status"])
+        self.assertEqual(leased["lease_owner"], saved["lease_owner"])
+        self.assertEqual(100, saved["priority"])
+        _finish_collection_job(leased, {"success": True}, db=self.db)
+        rerun = self.db.select_one("collection_job", where={"id": leased["id"]})
+        self.assertEqual("queued", rerun["status"])
+        self.assertEqual(100, rerun["priority"])
+        self.assertLessEqual(
+            datetime.strptime(rerun["due_at"], "%Y-%m-%d %H:%M:%S"),
+            datetime.now(),
+        )
+
+    def test_claim_fills_capacity_across_priority_bands(self):
+        target_uids = self._seed_20_accounts_with_10_targets_each()
+        _enqueue_collection_jobs(
+            [target_uids[0]],
+            db=self.db,
+            priority=100,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        _enqueue_collection_jobs(
+            target_uids[10:13],
+            db=self.db,
+            priority=20,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        claimed = _claim_collection_jobs(db=self.db, limit=3)
+        self.assertEqual(3, len(claimed))
+        self.assertEqual(100, claimed[0]["priority"])
+        self.assertEqual([20, 20], [row["priority"] for row in claimed[1:]])
+
 
 if __name__ == "__main__":
     unittest.main()

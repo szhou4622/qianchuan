@@ -239,10 +239,14 @@ class AccessTokenBundle:
     oauth_started_at: float = 0.0
     oauth_poll_secret: str = ""
 
-    def usable(self, skew_seconds: int = 120) -> bool:
+    def usable(
+        self, skew_seconds: int = 120, *, allow_non_expiring: bool = False
+    ) -> bool:
         if not self.access_token:
             return False
-        return not self.expires_at or self.expires_at > time.time() + skew_seconds
+        if self.expires_at <= 0:
+            return bool(allow_non_expiring)
+        return self.expires_at > time.time() + skew_seconds
 
 
 class TokenProvider(Protocol):
@@ -262,10 +266,10 @@ class InjectedTokenProvider:
         self._lock = threading.Lock()
 
     def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
-        if self._bundle.usable() and not force_refresh:
+        if self._bundle.usable(allow_non_expiring=True) and not force_refresh:
             return self._bundle
         with self._lock:
-            if self._bundle.usable() and not force_refresh:
+            if self._bundle.usable(allow_non_expiring=True) and not force_refresh:
                 return self._bundle
             if not self._refresh_callback:
                 if self._bundle.access_token and not self._bundle.expires_at:

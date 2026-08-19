@@ -67,6 +67,7 @@ CREATE TABLE `pmc_promotion_material` (
   KEY `idx_pmc_created_at` (`created_at`),
   KEY `idx_pmc_created_material` (`created_at`,`material_id`),
   KEY `idx_pmc_user_stat` (`user_id`,`stat_date`),
+  UNIQUE KEY `uk_pmc_backup_row` (`user_id`,`aadvid`,`material_id`,`stat_date`,`created_at`),
   CONSTRAINT `fk_pmc_user` FOREIGN KEY (`user_id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 COMMENT='千川素材数据云端备份'
@@ -120,6 +121,28 @@ function ensure_pmc_promotion_material_schema(PDO $pdo): void
 {
     ensure_pmc_promotion_material_table($pdo);
     pmc_ensure_overall_metric_columns($pdo);
+    $dbName = $pdo->query('SELECT DATABASE()')->fetchColumn();
+    if (!is_string($dbName) || $dbName === '') {
+        throw new RuntimeException('无法识别当前数据库');
+    }
+    $st = $pdo->prepare(
+        'SELECT COUNT(*) FROM information_schema.STATISTICS '
+        . 'WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME=?'
+    );
+    $st->execute([$dbName, 'pmc_promotion_material', 'uk_pmc_backup_row']);
+    if ((int) $st->fetchColumn() === 0) {
+        $pdo->exec(
+            'DELETE older FROM pmc_promotion_material older '
+            . 'INNER JOIN pmc_promotion_material newer ON '
+            . 'newer.user_id=older.user_id AND newer.aadvid=older.aadvid '
+            . 'AND newer.material_id=older.material_id AND newer.stat_date=older.stat_date '
+            . 'AND newer.created_at=older.created_at AND newer.id>older.id'
+        );
+        $pdo->exec(
+            'ALTER TABLE `pmc_promotion_material` ADD UNIQUE KEY `uk_pmc_backup_row` '
+            . '(`user_id`,`aadvid`,`material_id`,`stat_date`,`created_at`)'
+        );
+    }
 }
 
 /**
@@ -252,7 +275,12 @@ $raw = file_get_contents('php://input');
 $input = [];
 if ($raw !== '' && $raw !== false) {
     $decoded = json_decode($raw, true);
-    $input = is_array($decoded) ? $decoded : [];
+    if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'message' => '请求 JSON 无效或已被服务器截断'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $input = $decoded;
 }
 
 $username = trim((string) ($input['username'] ?? $_POST['username'] ?? ''));
@@ -368,6 +396,24 @@ INSERT INTO `pmc_promotion_material` (
 )
 SQL;
 
+$upsertAssignments = [
+    'video_name', 'material_status', 'show_status', 'show_status_reason',
+    'upload_time', 'video_type', 'video_id', 'aweme_item_id', 'cover_url',
+    'cover_width', 'cover_height', 'video_duration', 'video_title',
+    'lego_source', 'video_create_time', 'tag_list', 'stat_cost',
+    'order_settle_count_1h', 'order_settle_amount_1h', 'order_settle_rate_1h',
+    'prepay_pay_order_count', 'pay_gmv_include_coupon',
+    'prepay_pay_settle_1h', 'refund_rate_1h', 'overall_order_count',
+    'overall_show_count', 'overall_click_count', 'overall_ctr',
+    'overall_conversion_rate', 'updated_at',
+];
+$upsertSql = implode(', ', array_map(
+    static fn(string $column): string => "`$column`=VALUES(`$column`)",
+    $upsertAssignments
+));
+$sqlDefaultTs .= "\nON DUPLICATE KEY UPDATE " . $upsertSql;
+$sqlWithTs .= "\nON DUPLICATE KEY UPDATE " . $upsertSql;
+
 /**
  * @param \PDOStatement $ins
  * @param array<string,mixed> $n
@@ -410,20 +456,26 @@ function pmc_bind_row_params(\PDOStatement $ins, int $userId, array $n): void
 }
 
 $inserted = 0;
+$rejected = [];
 try {
     $pdo->beginTransaction();
     $insDefault = $pdo->prepare($sqlDefaultTs);
     $insWithTs = $pdo->prepare($sqlWithTs);
     foreach ($rows as $idx => $item) {
-        if (!is_array($item)) {
-            throw new InvalidArgumentException('rows[' . $idx . '] 不是对象');
-        }
-        $n = pmc_normalize_row($item);
-        if ($n['aadvid'] === '' || $n['material_id'] === '' || $n['stat_date'] === '') {
-            throw new InvalidArgumentException('rows[' . $idx . '] 缺少 aadvid、material_id 或 stat_date');
-        }
-        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $n['stat_date'])) {
-            throw new InvalidArgumentException('rows[' . $idx . '] stat_date 须为 YYYY-MM-DD');
+        try {
+            if (!is_array($item)) {
+                throw new InvalidArgumentException('rows[' . $idx . '] 不是对象');
+            }
+            $n = pmc_normalize_row($item);
+            if ($n['aadvid'] === '' || $n['material_id'] === '' || $n['stat_date'] === '') {
+                throw new InvalidArgumentException('rows[' . $idx . '] 缺少 aadvid、material_id 或 stat_date');
+            }
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $n['stat_date'])) {
+                throw new InvalidArgumentException('rows[' . $idx . '] stat_date 须为 YYYY-MM-DD');
+            }
+        } catch (InvalidArgumentException $e) {
+            $rejected[] = ['index' => $idx, 'message' => $e->getMessage()];
+            continue;
         }
 
         $wantTs = $n['created_at'] !== null || $n['updated_at'] !== null;
@@ -460,6 +512,8 @@ echo json_encode([
     'success' => true,
     'data' => [
         'inserted' => $inserted,
+        'rejected' => count($rejected),
+        'rejected_rows' => array_slice($rejected, 0, 50),
         'user_id' => $userId,
     ],
 ], JSON_UNESCAPED_UNICODE);

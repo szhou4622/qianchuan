@@ -30,6 +30,7 @@ from services.qianchuan_accounts import (
     remove_qianchuan_account,
     resolve_account_feishu_targets,
     record_target_duration,
+    refresh_monitor_capacity,
     save_qianchuan_account_settings,
     schedulable_promotion_targets,
     upsert_authorized_accounts,
@@ -404,10 +405,10 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         for index in range(37):
             self._target("10001", index)
         snapshot = capacity_snapshot(db=self.db)
-        # One advertiser is intentionally serialized to protect its API quota:
-        # Six default 45-second plans fit in one advertiser's five-minute lane.
-        self.assertEqual(6, snapshot["active_count"])
-        self.assertEqual(31, snapshot["waiting_count"])
+        # New targets use an optimistic five-second probe estimate so they can
+        # all receive a first real measurement instead of starving forever.
+        self.assertEqual(37, snapshot["active_count"])
+        self.assertEqual(0, snapshot["waiting_count"])
         self.assertEqual(3, snapshot["parallel_workers"])
         self.assertLessEqual(snapshot["estimated_cycle_seconds"], 5 * 60)
 
@@ -419,9 +420,21 @@ class MultiQianchuanAccountTests(unittest.TestCase):
                     account_index * 100 + plan_index,
                 )
         snapshot = capacity_snapshot(db=self.db)
-        self.assertEqual(18, snapshot["active_count"])
-        self.assertEqual(18, snapshot["waiting_count"])
-        self.assertEqual(6 * 45, snapshot["estimated_cycle_seconds"])
+        self.assertEqual(36, snapshot["active_count"])
+        self.assertEqual(0, snapshot["waiting_count"])
+        self.assertEqual(12 * 5, snapshot["estimated_cycle_seconds"])
+
+    def test_ten_accounts_with_ten_new_targets_have_no_admission_starvation(self):
+        for account_index in range(10):
+            for plan_index in range(10):
+                self._target(
+                    str(12000 + account_index),
+                    account_index * 100 + plan_index,
+                )
+        snapshot = refresh_monitor_capacity(db=self.db)
+        self.assertEqual(100, snapshot["active_count"])
+        self.assertEqual(0, snapshot["waiting_count"])
+        self.assertTrue(snapshot["healthy"])
 
     def test_target_health_recomputes_data_age_on_every_read(self):
         old = (datetime.now() - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S")
@@ -612,6 +625,36 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         snapshot = capacity_snapshot(db=self.db)
         self.assertEqual(0, snapshot["active_count"])
         self.assertEqual(1, snapshot["waiting_count"])
+
+    def test_waiting_target_is_returned_as_bounded_capacity_probe(self):
+        target = self._target("10001", 1)
+        record_target_duration(
+            target["target_uid"],
+            11 * 60_000,
+            refresh_capacity=True,
+            db=self.db,
+        )
+        scheduled = schedulable_promotion_targets(db=self.db)
+        self.assertEqual([target["target_uid"]], [row["target_uid"] for row in scheduled])
+        self.assertTrue(scheduled[0]["capacity_probe"])
+
+    def test_fast_measurements_smooth_a_previous_slow_estimate_downward(self):
+        target = self._target("10001", 1)
+        self.db.update(
+            "promotion_target",
+            {"last_duration_ms": 45_000},
+            where={"target_uid": target["target_uid"]},
+        )
+        record_target_duration(
+            target["target_uid"],
+            5_000,
+            refresh_capacity=False,
+            db=self.db,
+        )
+        saved = self.db.select_one(
+            "promotion_target", where={"target_uid": target["target_uid"]}
+        )
+        self.assertEqual(33_000, saved["last_duration_ms"])
 
     def test_recorded_duration_keeps_five_minute_start_to_start_cadence(self):
         target = self._target("10001", 1)

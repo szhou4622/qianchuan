@@ -25,6 +25,7 @@ _RUNNING: set[str] = set()
 _STOP = threading.Event()
 _THREAD: Optional[threading.Thread] = None
 INCREMENTAL_OVERLAP_MINUTES = 10
+MAX_SYNC_WINDOW_HOURS = 24
 
 
 def _now() -> str:
@@ -143,9 +144,12 @@ def sync_official_operation_logs(
         start = min(end, high_water) - timedelta(minutes=INCREMENTAL_OVERLAP_MINUTES)
         start_text = start.strftime("%Y-%m-%d %H:%M:%S")
     else:
-        start = end - timedelta(days=max(1, min(180, int(days))))
-        start_text = start.strftime("%Y-%m-%d 00:00:00")
-    end_text = end.strftime("%Y-%m-%d %H:%M:%S")
+        start = (end - timedelta(days=max(1, min(180, int(days))))).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        start_text = start.strftime("%Y-%m-%d %H:%M:%S")
+    window_end = min(end, start + timedelta(hours=MAX_SYNC_WINDOW_HOURS))
+    end_text = window_end.strftime("%Y-%m-%d %H:%M:%S")
     persisted_coverage_from = str(state.get("coverage_from") or "").strip() or start_text
     _set_state(store, account, status="syncing")
     inserted = 0
@@ -193,7 +197,7 @@ def sync_official_operation_logs(
             account,
             # A complete successful API response with zero operations is still
             # complete coverage, not a sync failure.
-            status="ok",
+            status=("ok" if window_end >= end else "backfilling"),
             coverage_from=persisted_coverage_from,
             coverage_to=end_text,
             request_evidence={
@@ -210,6 +214,7 @@ def sync_official_operation_logs(
             "coverage_from": persisted_coverage_from,
             "coverage_to": end_text,
             "sync_window_from": start_text,
+            "backfill_remaining": window_end < end,
             "message": f"千川官方 API 操作日志同步完成，共处理 {inserted} 条",
         }
     except Exception as exc:
@@ -262,7 +267,9 @@ def start_official_operation_log_sync_background_thread() -> threading.Thread:
                     if account.get("enabled") and account.get("directory_selected"):
                         request_official_operation_log_sync(account.get("aavid"), db=store)
             except Exception:
-                pass
+                from utils.log import logger
+
+                logger.exception("千川官方 API 操作日志调度失败")
             _STOP.wait(5 * 60)
 
     thread = threading.Thread(target=loop, name="official-api-operation-log-scheduler", daemon=True)

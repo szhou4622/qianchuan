@@ -325,9 +325,14 @@
                 <select id="dashboardPlanFilter" class="min-w-[14rem] max-w-[22rem] flex-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none">
                     <option value="">全部已监控计划</option>
                 </select>
+                <label class="flex items-center gap-1 text-[11px] text-slate-400 shrink-0 cursor-pointer">
+                    <input id="dashboardShowPaused" type="checkbox" checked class="accent-sky-500" />
+                    显示已暂停素材
+                </label>
                 <span id="dashboardScopeSummary" class="text-[11px] text-slate-500 tabular-nums shrink-0">0个账户 · 0条计划</span>
                 <span id="dashboardFreshness" class="ml-auto text-[11px] text-slate-500 tabular-nums shrink-0">等待数据</span>
             </div>
+            <div id="dashboardCapacityWarning" class="hidden flex-none border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300"></div>
             <!-- 列表顶部栏 -->
             <div class="flex-none p-3 border-b border-slate-700/50 flex items-center gap-3 bg-slate-800/30">
                 <h2 class="text-lg font-semibold text-white flex items-center gap-2 shrink-0">
@@ -1082,6 +1087,7 @@
                 dashboardScopeOptions = {
                     accounts: Array.isArray(result.accounts) ? result.accounts : [],
                     plans: Array.isArray(result.plans) ? result.plans : [],
+                    capacityWaitingCount: Number(result.capacityWaitingCount || 0),
                 };
                 const accountSelect = document.getElementById('dashboardAccountFilter');
                 setSelectOptions(
@@ -1093,6 +1099,14 @@
                 );
                 accountSelect.value = selectedDashboardAavid;
                 rebuildDashboardPlanOptions();
+                const warning = document.getElementById('dashboardCapacityWarning');
+                if (warning) {
+                    const waiting = dashboardScopeOptions.capacityWaitingCount || 0;
+                    warning.classList.toggle('hidden', waiting <= 0);
+                    warning.textContent = waiting > 0
+                        ? `${waiting}条计划当前超出5分钟容量，已进入轮换探测；工具会持续重测并自动恢复，不会再静默停止采集。`
+                        : '';
+                }
             } catch (error) {
                 console.error('加载大屏账户与计划范围失败', error);
             }
@@ -1135,6 +1149,14 @@
         function bindDashboardScopeEvents() {
             const accountSelect = document.getElementById('dashboardAccountFilter');
             const planSelect = document.getElementById('dashboardPlanFilter');
+            const showPaused = document.getElementById('dashboardShowPaused');
+            if (showPaused) {
+                showPaused.checked = showPausedMaterials;
+                showPaused.addEventListener('change', function () {
+                    showPausedMaterials = Boolean(this.checked);
+                    renderTable(processData());
+                });
+            }
             if (accountSelect) accountSelect.addEventListener('change', async function () {
                 selectedDashboardAavid = String(this.value || '');
                 selectedDashboardTargetUid = '';
@@ -1990,6 +2012,7 @@
                             overallClickCount: Number(mat.overallClickCount ?? mat.overall_click_count ?? 0) || 0,
                             overallCtr: Number(mat.overallCtr ?? mat.overall_ctr ?? 0) || 0,
                             overallConversionRate: Number(mat.overallConversionRate ?? mat.overall_conversion_rate ?? 0) || 0,
+                            deliveryState: String(mat.deliveryState ?? mat.delivery_state ?? 'delivering'),
                             estimatedEcpm: (mat.estimatedEcpm !== undefined && mat.estimatedEcpm !== null)
                                 ? Number(mat.estimatedEcpm)
                                 : null,
@@ -2198,11 +2221,14 @@
         let materials = [];
         let selectedMaterial = null;
         let isLoadingData = true; 
+        let showPausedMaterials = true;
 
         // 计算并排序数据（后端已按请求的排序字段返回数据，前端直接使用）
         function processData() {
             // 后端已按 currentSortBy 和 currentSortOrder 排序，无需前端再排序
-            return materials;
+            return showPausedMaterials
+                ? materials
+                : materials.filter(item => item.deliveryState !== 'paused');
         }
 
         // 渲染表格
@@ -2246,6 +2272,9 @@
                 const displayTitle = getMaterialDisplayTitle(item);
                 const titleAttr = escapeHtml(displayTitle);
                 const displayTitleHtml = escapeHtml(displayTitle);
+                const pausedTag = item.deliveryState === 'paused'
+                    ? '<span class="ml-1 rounded border border-amber-500/40 bg-amber-500/10 px-1 py-0.5 text-[9px] text-amber-300">已暂停</span>'
+                    : '';
                 const scopeLabel = escapeHtml(
                     [item.accountName, item.planName].filter(Boolean).join(' · ')
                 );
@@ -2254,7 +2283,7 @@
                     <td class="${materialCellClass}" data-col="material">
                         <div class="flex flex-col max-w-[140px] xl:max-w-[200px]">
                             <div class="text-white font-medium text-xs truncate" title="${titleAttr}">
-                                ${displayTitleHtml}
+                                ${displayTitleHtml}${pausedTag}
                             </div>
                             ${scopeLabel ? `<div class="text-[10px] text-sky-400/70 truncate" title="${scopeLabel}">${scopeLabel}</div>` : ''}
                             <div class="text-[10px] text-slate-500 font-mono truncate flex items-center gap-1">

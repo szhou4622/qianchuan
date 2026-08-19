@@ -16,6 +16,8 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 SNAPSHOT_RETENTION_HOURS = 48
 API_AUDIT_RETENTION_DAYS = 30
+HOURLY_RETENTION_DAYS = 180
+REMOVED_MATERIAL_RETENTION_DAYS = 7
 COMPACT_MIGRATION_VERSION = "1"
 
 METRIC_COLUMNS = (
@@ -298,6 +300,42 @@ def prune_api_audit(
     )
 
 
+def prune_hourly_metrics(
+    *, db: Optional[SQLiteStore] = None, retention_days: int = HOURLY_RETENTION_DAYS
+) -> int:
+    store = db or SQLiteStore()
+    cutoff = (datetime.now() - timedelta(days=max(1, int(retention_days)))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    return int(
+        store.execute(
+            "DELETE FROM pmc_material_metric_hourly WHERE collected_at<?",
+            (cutoff,),
+        )
+        or 0
+    )
+
+
+def prune_removed_material_latest(
+    *,
+    db: Optional[SQLiteStore] = None,
+    retention_days: int = REMOVED_MATERIAL_RETENTION_DAYS,
+) -> int:
+    store = db or SQLiteStore()
+    cutoff = (datetime.now() - timedelta(days=max(1, int(retention_days)))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    return int(
+        store.execute(
+            "DELETE FROM pmc_promotion_material_latest "
+            "WHERE delivery_state='removed' AND last_seen_at IS NOT NULL "
+            "AND last_seen_at<?",
+            (cutoff,),
+        )
+        or 0
+    )
+
+
 def prune_migrated_official_history(
     *,
     db: Optional[SQLiteStore] = None,
@@ -306,16 +344,11 @@ def prune_migrated_official_history(
 ) -> int:
     """Delete only rows whose compact replacement is already verified present."""
     store = db or SQLiteStore()
-    if migration_verified:
-        return int(
-            store.execute(
-                "DELETE FROM pmc_promotion_material WHERE id IN ("
-                "SELECT id FROM pmc_promotion_material "
-                "WHERE data_source='qianchuan_open_api' ORDER BY id ASC LIMIT ?)",
-                (max(1, int(delete_limit)),),
-            )
-            or 0
-        )
+    # Keep the compatibility argument, but never bypass replacement checks.
+    # The production path previously marked migration complete immediately
+    # before pruning, making the safe branch unreachable and deleting rows
+    # from removed/unscoped targets without a compact replacement.
+    _ = migration_verified
     return int(
         store.execute(
             f"""
@@ -371,9 +404,11 @@ def run_dashboard_storage_maintenance(
         _mark_migration_completed(store, owner_username)
     rolled = rollup_old_metric_snapshots(db=store)
     audit = prune_api_audit(db=store)
+    hourly = prune_hourly_metrics(db=store)
+    removed_latest = prune_removed_material_latest(db=store)
     legacy = prune_migrated_official_history(
         db=store,
-        migration_verified=_migration_completed(store, owner_username),
+        migration_verified=False,
     )
     return {
         "latest_backfilled": latest,
@@ -382,5 +417,7 @@ def run_dashboard_storage_maintenance(
         "hourly_rolled": rolled["rolled"],
         "snapshots_deleted": rolled["deleted"],
         "audit_deleted": audit,
+        "hourly_deleted": hourly,
+        "removed_latest_deleted": removed_latest,
         "legacy_rows_deleted": legacy,
     }

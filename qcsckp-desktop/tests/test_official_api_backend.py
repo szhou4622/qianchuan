@@ -47,9 +47,13 @@ from services.official_api_collection import (
     _control_snapshot,
     _fair_order_targets,
     _fixed_cadence_due,
+    _material_snapshot,
+    _metric,
+    _metric_values_changed,
     _observe_collection_results,
     _reset_adaptive_collection_state_for_tests,
     _rotating_maintenance_phase,
+    _should_escalate_application_backoff,
     _target_is_due,
     collect_target,
     run_collection_cycle,
@@ -65,6 +69,7 @@ from services.official_api_execution import (
     _verify_control_task_eventually,
 )
 from unittest.mock import MagicMock, Mock
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class _PagedClient(QianchuanOpenApiClient):
@@ -182,6 +187,48 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual(3.778, row["total_prepay_and_pay_order_roi2_assist"])
         self.assertEqual(0, row["ad_delivery_type"])
 
+    def test_product_material_metrics_use_product_report_fields(self):
+        row = _material_snapshot(
+            {
+                "material_id": "3001",
+                "material_name": "商品素材",
+                "material_status": "DELIVERY_OK",
+                "stats_info": {
+                    "product_show_count_for_roi2": "1200",
+                    "product_click_count_for_roi2": "36",
+                    "product_cvr_rate_for_roi2": "0.03",
+                    "product_convert_rate_for_roi2": "0.12",
+                },
+            },
+            target={
+                "target_uid": "target-product",
+                "aadvid": "1001",
+                "ad_id": "2001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+            },
+            units={
+                "product_show_count_for_roi2": "4",
+                "product_click_count_for_roi2": "4",
+                "product_cvr_rate_for_roi2": "3",
+                "product_convert_rate_for_roi2": "3",
+            },
+            request_id="req-product",
+        )
+        self.assertEqual(1200.0, row["overall_show_count"])
+        self.assertEqual(36.0, row["overall_click_count"])
+        self.assertEqual(0.03, row["overall_ctr"])
+        self.assertEqual(0.12, row["overall_conversion_rate"])
+
+    def test_missing_metric_is_none_and_does_not_overwrite_previous_value(self):
+        self.assertIsNone(_metric({}, {"stat_cost_for_roi2": "3"}, "stat_cost_for_roi2"))
+        self.assertFalse(
+            _metric_values_changed(
+                {"stat_cost": 88.5},
+                {"stat_cost": None},
+            )
+        )
+
     def test_adaptive_concurrency_backs_off_on_429_and_recovers_gradually(self):
         _reset_adaptive_collection_state_for_tests()
         try:
@@ -200,6 +247,52 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             self.assertEqual(
                 3,
                 _observe_collection_results([{"success": True}]),
+            )
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+    def test_non_rate_limit_failures_do_not_block_concurrency_recovery(self):
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            self.assertEqual(
+                2,
+                _observe_collection_results(
+                    [{"success": False, "error_kind": "rate_limit"}]
+                ),
+            )
+            for _ in range(2):
+                self.assertEqual(
+                    2,
+                    _observe_collection_results(
+                        [{"success": False, "error_kind": "permission"}]
+                    ),
+                )
+            self.assertEqual(
+                3,
+                _observe_collection_results(
+                    [{"success": False, "error_kind": "network"}]
+                ),
+            )
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+    def test_application_backoff_requires_distinct_rate_limited_accounts(self):
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            self.assertFalse(
+                _should_escalate_application_backoff(
+                    "account-a", now_monotonic=100.0
+                )
+            )
+            self.assertFalse(
+                _should_escalate_application_backoff(
+                    "account-a", now_monotonic=101.0
+                )
+            )
+            self.assertTrue(
+                _should_escalate_application_backoff(
+                    "account-b", now_monotonic=102.0
+                )
             )
         finally:
             _reset_adaptive_collection_state_for_tests()
@@ -380,7 +473,6 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             [
                 {
                     "task_id": "4001",
-                    "scene": "MATERIAL_ADD_BUDGET",
                     "status": "ENABLE",
                     "material_ids": ["3001"],
                     "raw": {
@@ -416,6 +508,166 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             "products:catalog timeout",
             state_kwargs["capability_updates"]["maintenance_error"],
         )
+
+    def test_missing_material_is_soft_removed_and_paused_history_is_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "soft-delete.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            store.insert(
+                "promotion_target",
+                {
+                    "target_uid": "target-soft-delete",
+                    "aadvid": "1001",
+                    "ad_id": "2001",
+                    "promotion_scene": "product",
+                    "plan_system": "global",
+                    "platform_status": "active",
+                    "verification_state": "verified",
+                    "monitor_eligible": 1,
+                    "enabled": 1,
+                    "capability_json": json.dumps(
+                        {
+                            "marketing_goal": "VIDEO_PROM_GOODS",
+                            "report_metric_units": {"stat_cost_for_roi2": "3"},
+                            "report_config_synced_at": now_text,
+                            "plan_detail_synced_at": now_text,
+                            "product_catalog_synced_at": now_text,
+                            "control_history_synced_at": now_text,
+                        }
+                    ),
+                },
+            )
+            store.insert(
+                "pmc_promotion_material_latest",
+                {
+                    "aadvid": "1001",
+                    "target_uid": "target-soft-delete",
+                    "ad_id": "2001",
+                    "promotion_scene": "product",
+                    "plan_system": "global",
+                    "material_id": "old-paused-material",
+                    "stat_cost": 88.5,
+                    "delivery_state": "delivering",
+                },
+            )
+            service = MagicMock()
+            service.list_plan_materials.return_value = (
+                [
+                    {
+                        "material_id": "current-material",
+                        "material_name": "当前素材",
+                        "material_status": "DELIVERY_OK",
+                        "stats_info": {"stat_cost_for_roi2": "12.5"},
+                    }
+                ],
+                ["material-request"],
+            )
+            service.list_control_tasks.return_value = ([], ["control-request"])
+            target = store.select_one(
+                "promotion_target", where={"target_uid": "target-soft-delete"}
+            )
+            target["capability"] = json.loads(target["capability_json"])
+            with patch(
+                "services.official_api_collection.get_official_api_service",
+                return_value=service,
+            ), patch(
+                "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
+            ):
+                result = collect_target(target, db=store)
+            self.assertTrue(result["success"])
+            old_row = store.select_one(
+                "pmc_promotion_material_latest",
+                where={
+                    "target_uid": "target-soft-delete",
+                    "material_id": "old-paused-material",
+                },
+            )
+            current_row = store.select_one(
+                "pmc_promotion_material_latest",
+                where={
+                    "target_uid": "target-soft-delete",
+                    "material_id": "current-material",
+                },
+            )
+            self.assertEqual("removed", old_row["delivery_state"])
+            self.assertEqual(88.5, old_row["stat_cost"])
+            self.assertEqual("delivering", current_row["delivery_state"])
+
+    def test_cross_day_restart_backfills_yesterday_without_replacing_latest(self):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        target = {
+            "target_uid": "target-recovery",
+            "account_uid": "account-recovery",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "platform_status": "active",
+            "last_sync_at": (datetime.now() - timedelta(days=2)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "capability": {
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "report_metric_units": {"stat_cost_for_roi2": "3"},
+                "report_config_synced_at": now_text,
+                "plan_detail_synced_at": now_text,
+                "product_catalog_synced_at": now_text,
+                "control_history_synced_at": now_text,
+            },
+        }
+        service = MagicMock()
+        service.list_plan_materials.side_effect = [
+            (
+                [
+                    {
+                        "material_id": "today-material",
+                        "material_status": "DELIVERY_OK",
+                        "stats_info": {"stat_cost_for_roi2": "10"},
+                    }
+                ],
+                ["today-request"],
+            ),
+            (
+                [
+                    {
+                        "material_id": "yesterday-material",
+                        "material_status": "PAUSED",
+                        "stats_info": {"stat_cost_for_roi2": "80"},
+                    }
+                ],
+                ["yesterday-request"],
+            ),
+        ]
+        service.list_control_tasks.return_value = ([], ["control-request"])
+        store = MagicMock(config={"database": ":memory:"})
+        store.select.return_value = []
+        store.transaction.return_value.__enter__.return_value = MagicMock()
+        with patch(
+            "services.official_api_collection.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_collection._count_rows", return_value=0
+        ), patch(
+            "services.official_api_collection.patch_target_sync_state"
+        ) as patch_state, patch(
+            "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
+        ):
+            result = collect_target(target, db=store)
+        self.assertTrue(result["success"])
+        self.assertEqual(2, service.list_plan_materials.call_count)
+        state = patch_state.call_args.kwargs["capability_updates"]
+        self.assertEqual(yesterday, state["recovery_backfill_date"])
+        self.assertEqual(1, state["recovery_backfill_count"])
+        recovery_calls = [
+            call for call in store.insert_or_update.call_args_list
+            if call.args and call.args[0] == "pmc_material_metric_snapshot"
+            and call.args[1].get("stat_date") == yesterday
+        ]
+        self.assertEqual(1, len(recovery_calls))
+        self.assertEqual(yesterday, recovery_calls[0].args[1]["stat_date"])
 
     def test_official_delivery_ok_material_is_writable(self):
         self.assertTrue(
@@ -504,6 +756,40 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             ("stat_cost_for_roi2",),
             _supported_material_metrics({"stat_cost_for_roi2": "0", "other": "0"}),
         )
+
+    def test_material_list_uses_all_statuses_and_serial_pagination(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        service.list_plan_materials(
+            "1001",
+            "2001",
+            start_date="2026-08-19",
+            end_date="2026-08-19",
+            fields=["stat_cost_for_roi2"],
+        )
+        _, query, kwargs = client.last_pages
+        self.assertNotIn("material_status", query["filtering"])
+        self.assertEqual(1, kwargs["parallel_workers"])
+
+    def test_report_topic_without_supported_metrics_fails_closed(self):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        target = {
+            "target_uid": "target-unsupported",
+            "account_uid": "account-unsupported",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "platform_status": "active",
+            "capability": {
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "report_metric_units": {"renamed_metric": "3"},
+                "report_config_synced_at": now_text,
+                "plan_detail_synced_at": now_text,
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "未找到可用素材指标"):
+            collect_target(target, db=MagicMock(config={"database": ":memory:"}))
 
     def test_immediate_collection_request_is_deduplicated_and_starts_now(self):
         store = Mock()
@@ -757,6 +1043,11 @@ class _PublicInfoClient(_CaptureClient):
 
 
 class OfficialApiBackendTests(unittest.TestCase):
+    def test_persisted_token_without_expiry_is_not_trusted_forever(self):
+        bundle = AccessTokenBundle(access_token="token", expires_at=0)
+        self.assertFalse(bundle.usable())
+        self.assertTrue(bundle.usable(allow_non_expiring=True))
+
     def test_successful_create_is_not_reported_failed_when_list_reconciliation_lags(self):
         service = Mock()
         service.list_plan_materials.return_value = (
@@ -1840,6 +2131,31 @@ class OfficialApiBackendTests(unittest.TestCase):
         with self.assertRaises(ApiRequestError):
             client.get_all_pages("/open_api/v1.0/test/", {}, page_size=1)
 
+    def test_pagination_without_completion_evidence_fails_closed(self):
+        page = ApiResponse(
+            data={"list": [{"id": "1"}]},
+            raw={},
+            request_id="r-no-page-info",
+        )
+        with self.assertRaisesRegex(ApiRequestError, "未返回可验证的分页信息"):
+            _PagedClient([page]).get_all_pages(
+                "/open_api/v1.0/test/", {}, page_size=100
+            )
+
+    def test_pagination_rejects_server_page_size_mismatch(self):
+        page = ApiResponse(
+            data={
+                "list": [{"id": "1"}],
+                "page_info": {"has_more": False, "page_size": 20},
+            },
+            raw={},
+            request_id="r-size-mismatch",
+        )
+        with self.assertRaisesRegex(ApiRequestError, "分页大小与请求不一致"):
+            _PagedClient([page]).get_all_pages(
+                "/open_api/v1.0/test/", {}, page_size=100
+            )
+
     def test_parallel_pagination_preserves_page_order_and_completeness(self):
         class _ParallelClient(QianchuanOpenApiClient):
             def __init__(self):
@@ -1916,6 +2232,39 @@ class OfficialApiBackendTests(unittest.TestCase):
             response = client.get("/open_api/v1.0/test/")
         self.assertEqual(response.data["id"], "1")
         self.assertEqual(mocked.call_count, 2)
+
+    def test_get_structured_5xxxx_business_error_is_retried(self):
+        class _Response:
+            status = 200
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            max_get_attempts=2,
+            sleep=lambda _: None,
+        )
+        with patch(
+            "services.qianchuan_open_api.client.urlopen",
+            side_effect=[
+                _Response({"code": 50000, "message": "temporary"}),
+                _Response({"code": 0, "message": "OK", "data": {"id": "1"}}),
+            ],
+        ) as mocked:
+            response = client.get("/open_api/v1.0/test/")
+        self.assertEqual("1", response.data["id"])
+        self.assertEqual(2, mocked.call_count)
 
     def test_post_transient_business_error_is_not_retried(self):
         class _Response:

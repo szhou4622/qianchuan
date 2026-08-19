@@ -21,9 +21,13 @@ DEFAULT_OWNER = "local_default"
 CAPACITY_WINDOW_SECONDS = 5 * 60
 CAPACITY_STALE_SECONDS = 10 * 60
 CAPACITY_PARALLEL_WORKERS = 3
-DEFAULT_TARGET_DURATION_MS = 45_000
+# New targets must be admitted optimistically so their real API duration can
+# be measured.  A pessimistic 45-second seed caused capacity_waiting targets
+# to starve forever without ever receiving a first collection.
+DEFAULT_TARGET_DURATION_MS = 5_000
 MIN_TARGET_DURATION_MS = 5_000
 MAX_TARGET_DURATION_MS = 30 * 60_000
+CAPACITY_PROBE_TARGETS_PER_CYCLE = 2
 DAILY_CONFIG_FILE = os.path.join(DATA_DIR, "operation_daily_report.json")
 _ACCOUNT_DIRECTORY_LOCK = threading.RLock()
 
@@ -1021,7 +1025,7 @@ def refresh_monitor_capacity(
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
-    """按最近耗时准入计划；超出九分钟预算的目标进入等待容量。"""
+    """按最近耗时准入计划；超出五分钟预算的目标进入等待容量。"""
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
     owner = _owner_key(owner_username)
@@ -1118,9 +1122,16 @@ def record_target_duration(
     except (TypeError, ValueError):
         return
     old = int(target.get("last_duration_ms") or measured)
-    # 变慢时立即按真实耗时收紧容量，变快时再平滑恢复，不能把超时计划
-    # 截断成“正常”后继续接纳更多计划。
-    smoothed = max(measured, int(round(old * 0.7 + measured * 0.3)))
+    # Slow samples tighten admission immediately. Fast samples recover through
+    # EWMA instead of being permanently pinned to an old slow/429 sample.
+    smoothed = (
+        measured
+        if measured >= old
+        else max(
+            MIN_TARGET_DURATION_MS,
+            int(round(old * 0.7 + measured * 0.3)),
+        )
+    )
     # The five-minute SLA is start-to-start.  Scheduling from the finish time
     # silently turns a 164-second collection into a 7m44s cycle.  Anchor the
     # next run to the cycle start; when a cycle itself overruns, retry promptly
@@ -1288,7 +1299,36 @@ def schedulable_promotion_targets(
         (owner,),
         fetch=True,
     ) or []
-    return [_target_row(row) for row in rows]
+    result = [_target_row(row) for row in rows]
+
+    # Always reserve a tiny probe quota for the oldest capacity-waiting
+    # targets. Otherwise a target that started with a pessimistic estimate (or
+    # suffered one slow sample) can never be measured again and can never
+    # recover. Probes still obey due_at, per-account serialization and API
+    # backoff in the collector.
+    waiting_rows = store.execute(
+        "SELECT t.* FROM promotion_target t "
+        "JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "WHERE t.enabled=1 AND t.monitor_eligible=1 "
+        "AND t.capacity_state='capacity_waiting' AND a.enabled=1 "
+        "AND a.owner_username=? "
+        "ORDER BY CASE WHEN COALESCE(t.last_sync_at,'')='' THEN 0 ELSE 1 END,"
+        "COALESCE(t.last_sync_at,t.created_at) ASC,t.created_at ASC,t.id ASC",
+        (owner,),
+        fetch=True,
+    ) or []
+    probe_accounts: set[str] = set()
+    for row in waiting_rows:
+        account_uid = str(row.get("account_uid") or "")
+        if account_uid in probe_accounts:
+            continue
+        probe = _target_row(row)
+        probe["capacity_probe"] = True
+        result.append(probe)
+        probe_accounts.add(account_uid)
+        if len(probe_accounts) >= CAPACITY_PROBE_TARGETS_PER_CYCLE:
+            break
+    return result
 
 
 def resolve_account_feishu_targets(

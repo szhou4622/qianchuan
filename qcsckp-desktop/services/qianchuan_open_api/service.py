@@ -367,11 +367,6 @@ class QianchuanOfficialApiService:
                     "start_date": start_date,
                     "end_date": end_date,
                     "material_select_type": "ALL",
-                    # Monitoring and strategy candidates only use materials
-                    # that the platform currently marks as deliverable.  The
-                    # ALL catalog can contain years of paused/deleted rows and
-                    # is retained only in historical local snapshots.
-                    "material_status": "DELIVERY_OK",
                 },
                 "fields": list(fields or []),
                 "order_type": "DESC",
@@ -379,7 +374,9 @@ class QianchuanOfficialApiService:
             },
             advertiser_id=aid,
             page_size=100,
-            parallel_workers=4,
+            # The list is dynamically sorted by spend. Parallel pages can
+            # move rows between pages and silently miss materials.
+            parallel_workers=1,
         )
         materials = [normalize_material(row) for row in rows]
         materials = [item for item in materials if item["material_id"] not in {"", "-2"} and item["material_type"] == "VIDEO"]

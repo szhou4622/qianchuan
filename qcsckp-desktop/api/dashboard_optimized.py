@@ -32,7 +32,12 @@ class OptimizedDashboardQueries:
 
     @staticmethod
     def _scope_where(aavid: Any = "", target_uid: Any = "") -> tuple[str, list[Any]]:
-        clauses = ["a.owner_username=?", "a.enabled=1", "t.enabled=1"]
+        clauses = [
+            "a.owner_username=?",
+            "a.enabled=1",
+            "t.enabled=1",
+            "COALESCE(l.delivery_state,'delivering')!='removed'",
+        ]
         params: list[Any] = []
         account_id = str(aavid or "").strip()
         target_id = str(target_uid or "").strip()
@@ -61,7 +66,7 @@ class OptimizedDashboardQueries:
         plans = self.db.execute(
             "SELECT t.target_uid,t.account_uid,t.aadvid AS aavid,t.ad_id,t.plan_name,"
             "t.promotion_scene,t.plan_system,t.platform_status,t.last_sync_at,"
-            "t.last_status,t.last_error,a.account_name "
+            "t.last_status,t.last_error,t.capacity_state,a.account_name "
             "FROM promotion_target t INNER JOIN qianchuan_account a "
             "ON a.account_uid=t.account_uid "
             "WHERE a.owner_username=? AND a.enabled=1 AND t.enabled=1 "
@@ -72,10 +77,16 @@ class OptimizedDashboardQueries:
         newest = max(
             [str(item.get("last_sync_at") or "") for item in plans] or [""]
         )
+        waiting_count = sum(
+            1
+            for item in plans
+            if str(item.get("capacity_state") or "") == "capacity_waiting"
+        )
         return {
             "success": True,
             "accounts": [dict(item) for item in accounts],
             "plans": [dict(item) for item in plans],
+            "capacityWaitingCount": waiting_count,
             "dataVersion": newest,
         }
 
@@ -238,6 +249,7 @@ class OptimizedDashboardQueries:
                     "productIds": [str(v) for v in product_ids if str(v or "").strip()],
                     "title": str(row.get("video_name") or "未命名"),
                     "materialStatus": row.get("material_status"),
+                    "deliveryState": str(row.get("delivery_state") or "delivering"),
                     "showStatus": row.get("show_status"),
                     "videoType": row.get("video_type"),
                     "videoId": str(row.get("video_id") or ""),

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from config import QIANCHUAN_BACKEND
 from utils.log import logger
@@ -21,6 +21,7 @@ class BackgroundRuntimeSupervisor:
         self._started = False
         self._stop = threading.Event()
         self._resume_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     def start(self, js_api: Any) -> None:
         with self._lock:
@@ -66,6 +67,15 @@ class BackgroundRuntimeSupervisor:
         start_regulation_rule_runner_background_thread()
         start_official_api_reconciliation_background_thread()
 
+        critical_starters: list[tuple[str, Callable[[], Any]]] = [
+            ("追投规则", start_retargeting_rule_runner_background_thread),
+            ("停投规则", start_regulation_rule_runner_background_thread),
+            ("追投任务", start_retarget_task_worker_background_thread),
+            ("操作日志", start_platform_log_sync_background_thread),
+            ("日报", start_operation_daily_report_background_thread),
+            ("写入对账", start_official_api_reconciliation_background_thread),
+        ]
+
         if QIANCHUAN_BACKEND == "official_api":
             from services.official_api_catalog import start_official_api_catalog_scheduler
             from services.official_api_collection import (
@@ -74,6 +84,12 @@ class BackgroundRuntimeSupervisor:
 
             start_official_api_catalog_scheduler()
             start_official_api_collection_background_thread()
+            critical_starters.extend(
+                [
+                    ("账户目录", start_official_api_catalog_scheduler),
+                    ("官方API采集", start_official_api_collection_background_thread),
+                ]
+            )
         else:
             js_api.api.service.start_catalog_scheduler()
 
@@ -98,6 +114,25 @@ class BackgroundRuntimeSupervisor:
             daemon=True,
         )
         self._resume_thread.start()
+
+        def _watchdog() -> None:
+            while not self._stop.wait(30.0):
+                for name, starter in critical_starters:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        thread = starter()
+                        if isinstance(thread, threading.Thread) and not thread.is_alive():
+                            logger.warning("[运行主管] %s线程未存活，已请求重启", name)
+                    except Exception as exc:
+                        logger.exception("[运行主管] %s看门狗重启失败: %s", name, exc)
+
+        self._watchdog_thread = threading.Thread(
+            target=_watchdog,
+            name="qcsckp-runtime-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
         logger.info("[运行主管] 后台服务已统一启动")
 
     def stop(self) -> None:
@@ -177,6 +212,10 @@ class BackgroundRuntimeSupervisor:
         self._resume_thread = None
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=3.0)
+        watchdog = self._watchdog_thread
+        self._watchdog_thread = None
+        if watchdog and watchdog.is_alive() and watchdog is not threading.current_thread():
+            watchdog.join(timeout=3.0)
         logger.info("[运行主管] 后台服务已停止")
 
 

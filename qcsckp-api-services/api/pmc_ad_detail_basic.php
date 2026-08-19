@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 /**
  * 桌面端广告详情基础信息 → 云端 MySQL（表 pmc_ad_detail_basic）
- * POST JSON：username、password、rows（对象数组，字段与表一致；aadvid 唯一，存在则更新）
+ * POST JSON：username、password、rows（对象数组，字段与表一致；aadvid + ad_id 唯一）
  * 表须已在数据库中建好（本接口不再自动 CREATE TABLE）。
  */
 
@@ -19,6 +19,49 @@ function pad_table_exists(PDO $pdo): bool
     $check = $pdo->query("SHOW TABLES LIKE 'pmc_ad_detail_basic'");
 
     return $check !== false && $check->fetch() !== false;
+}
+
+function pad_ensure_account_plan_unique(PDO $pdo): void
+{
+    $dbName = $pdo->query('SELECT DATABASE()')->fetchColumn();
+    if (!is_string($dbName) || $dbName === '') {
+        throw new RuntimeException('无法识别当前数据库');
+    }
+    $st = $pdo->prepare(
+        'SELECT INDEX_NAME,COLUMN_NAME,SEQ_IN_INDEX FROM information_schema.STATISTICS '
+        . 'WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND NON_UNIQUE=0 '
+        . 'ORDER BY INDEX_NAME,SEQ_IN_INDEX'
+    );
+    $st->execute([$dbName, 'pmc_ad_detail_basic']);
+    $indexes = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $name = (string) ($row['INDEX_NAME'] ?? '');
+        if ($name !== 'PRIMARY') {
+            $indexes[$name][] = (string) ($row['COLUMN_NAME'] ?? '');
+        }
+    }
+    foreach ($indexes as $columns) {
+        if ($columns === ['aadvid', 'ad_id']) {
+            return;
+        }
+    }
+    foreach ($indexes as $name => $columns) {
+        if ($columns === ['aadvid']) {
+            $safeName = str_replace('`', '``', (string) $name);
+            $pdo->exec("ALTER TABLE `pmc_ad_detail_basic` DROP INDEX `$safeName`");
+        }
+    }
+    // The table is a latest-value table. Remove exact duplicate account-plan
+    // rows before adding the correct idempotency key.
+    $pdo->exec(
+        'DELETE older FROM pmc_ad_detail_basic older '
+        . 'INNER JOIN pmc_ad_detail_basic newer '
+        . 'ON newer.aadvid=older.aadvid AND newer.ad_id=older.ad_id AND newer.id>older.id'
+    );
+    $pdo->exec(
+        'ALTER TABLE `pmc_ad_detail_basic` ADD UNIQUE KEY '
+        . '`uk_pmc_ad_detail_basic_account_plan` (`aadvid`,`ad_id`)'
+    );
 }
 
 /**
@@ -141,7 +184,12 @@ $raw = file_get_contents('php://input');
 $input = [];
 if ($raw !== '' && $raw !== false) {
     $decoded = json_decode($raw, true);
-    $input = is_array($decoded) ? $decoded : [];
+    if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'message' => '请求 JSON 无效或已被服务器截断'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $input = $decoded;
 }
 
 $username = trim((string) ($input['username'] ?? $_POST['username'] ?? ''));
@@ -192,6 +240,13 @@ $userId = (int) $acc['id'];
 if (!pad_table_exists($pdo)) {
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => '数据库中不存在表 pmc_ad_detail_basic，请先在库中创建该表'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+try {
+    pad_ensure_account_plan_unique($pdo);
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => '广告详情表唯一键修复失败'], JSON_UNESCAPED_UNICODE);
     exit;
 }
 

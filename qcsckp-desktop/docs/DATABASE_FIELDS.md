@@ -8,15 +8,17 @@
 
 | 项目 | 说明 |
 |------|------|
-| **实际写入的 SQLite 表** | 仅 **`pmc_promotion_material`**（见 `utils/sqlite_store.py` 中 `TABLE_SCHEMAS`） |
-| **写入入口** | `services/fetcher.py` → `_save_to_database()` → `SQLiteStore.insert(...)` |
-| **行数据清洗** | `utils/clean_promotion.py` → `clean_pmc_promotion_row()` / `clean_pmc_promotion_data()` |
-| **数据来源** | 浏览器拦截千川接口响应 JSON：`statsData.rows[]`，每条含 `dimensions`、`metrics`（见下文章节 3） |
-| **未在运行时代码使用的定义** | `clean_basic_info()` 与 **`pmc_account_info` 表**仅在 `utils/clean_promotion.py` 注释示例中出现，**当前工程无任何调用与建表**，线上若需要账号维度可单独扩展 |
+| **当前主数据表** | `pmc_promotion_material_latest`（计划-素材最新状态）、`pmc_material_metric_snapshot`（5分钟变化快照）、`pmc_material_metric_hourly`（历史小时点） |
+| **追投任务数据** | `pmc_roi2_assist_task`，活动追投任务的消耗、订单、成交金额、ROI、预算、时长和状态与素材一起每5分钟采集 |
+| **写入入口** | `services/official_api_collection.py` 通过千川官方 Open API 分页读取后事务写入 SQLite |
+| **数据来源** | 默认 `qianchuan_open_api`；`services/fetcher.py` 的浏览器拦截链路仅作 `browser_legacy` 回滚通道 |
+| **素材状态** | `delivery_state=delivering/paused/removed`；暂停或移除不会立即物理删除当日消耗 |
 
 ---
 
-## 2. 表 `pmc_promotion_material`：列定义与写入方式
+> 下文 `pmc_promotion_material` 字段表为旧版全量历史/云备份兼容说明，不再是官方 API 高频采集的主读模型。
+
+## 2. 表 `pmc_promotion_material`：兼容列定义与写入方式
 
 表结构以 `utils/sqlite_store.py` 中 `TABLE_SCHEMAS['pmc_promotion_material']` 为准。
 

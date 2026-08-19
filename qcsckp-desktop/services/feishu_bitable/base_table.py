@@ -420,7 +420,7 @@ class FeishuBaseOperator:
         """
         self.rebuild_headers(field_names, keep_original_fields=True)
 
-    def add_rows(self, data: List[Dict[str, Any]]):
+    def add_rows(self, data: List[Dict[str, Any]]) -> bool:
         """
         批量添加新行（记录）。
         :param data: key 须为飞书表「列显示名」。若数据来源为 SQLite ``pmc_promotion_material``（英文列名），
@@ -429,13 +429,12 @@ class FeishuBaseOperator:
         """
         if not data:
             logger.warning("未提供要新增的数据。")
-            return
+            return True
 
         logger.info(f"--- 正在新增 {len(data)} 行 ---")
         field_map, _, primary_name, field_types = self._load_field_map_and_primary()
         if not field_map:
-            logger.error("无法获取字段映射，中止新增行。")
-            return
+            raise RuntimeError("无法获取字段映射，中止新增行")
 
         records_to_create = []
         for row in data:
@@ -448,22 +447,28 @@ class FeishuBaseOperator:
             self._fill_primary_field(fields, field_map, primary_name, row, field_types)
             records_to_create.append(_BatchCreateRecordBody(fields))
 
-        try:
-            body = BatchCreateAppTableRecordRequestBody.builder().records(records_to_create).build()
-            req = BatchCreateAppTableRecordRequest.builder() \
-                .table_id(self.table_id) \
-                .request_body(body) \
-                .build()
-            res = self.client.base.v1.app_table_record.batch_create(req)
-            if res.success():
-                logger.info(f"已成功新增 {len(res.data.records)} 行。")
-            else:
-                raise Exception(res.msg)
-        except Exception as e:
-            logger.error(f"新增行出错: {e}")
+        batch_size = 500
+        for index in range(0, len(records_to_create), batch_size):
+            chunk = records_to_create[index : index + batch_size]
+            try:
+                body = BatchCreateAppTableRecordRequestBody.builder().records(chunk).build()
+                req = BatchCreateAppTableRecordRequest.builder() \
+                    .table_id(self.table_id) \
+                    .request_body(body) \
+                    .build()
+                res = self.client.base.v1.app_table_record.batch_create(req)
+                if not res.success():
+                    raise RuntimeError(str(getattr(res, "msg", "批量新增失败")))
+                logger.info(
+                    f"已成功新增 {len(chunk)} 行（第 {index // batch_size + 1} 批）。"
+                )
+            except Exception as exc:
+                logger.error(f"新增行出错（第 {index // batch_size + 1} 批）: {exc}")
+                raise
         logger.info("--- 新增行结束 ---\n")
+        return True
 
-    def update_rows(self, data: List[Dict[str, Any]]):
+    def update_rows(self, data: List[Dict[str, Any]]) -> bool:
         """
         批量更新行（记录）。
         :param data: 每行需含 'record_id'；其余 key 为**列显示名**（与 add_rows 一致）。
@@ -471,23 +476,24 @@ class FeishuBaseOperator:
         """
         if not data:
             logger.warning("未提供要更新的数据。")
-            return
+            return True
 
         logger.info(f"--- 正在更新 {len(data)} 行 ---")
         field_map, _, _, field_types = self._load_field_map_and_primary()
         if not field_map:
-            logger.error("无法获取字段映射，中止更新行。")
-            return
+            raise RuntimeError("无法获取字段映射，中止更新行")
         
         records_to_update = []
         for row in data:
-            record_id = row.pop('record_id', None)
+            record_id = row.get('record_id')
             if not record_id:
                 logger.warning(f"警告：某行数据缺少「record_id」，已跳过: {row}")
                 continue
             
             fields = {}
             for field_name, value in row.items():
+                if field_name == 'record_id':
+                    continue
                 if field_name in field_map:
                     fields[field_name] = self._coerce_cell_value(field_name, value, field_types)
                 else:
@@ -495,20 +501,26 @@ class FeishuBaseOperator:
             
             records_to_update.append(_BatchUpdateRecordBody(record_id, fields))
 
-        try:
-            body = BatchUpdateAppTableRecordRequestBody.builder().records(records_to_update).build()
-            req = BatchUpdateAppTableRecordRequest.builder() \
-                .table_id(self.table_id) \
-                .request_body(body) \
-                .build()
-            res = self.client.base.v1.app_table_record.batch_update(req)
-            if res.success():
-                logger.info(f"已成功处理 {len(res.data.records)} 条记录的更新。")
-            else:
-                raise Exception(res.msg)
-        except Exception as e:
-            logger.error(f"更新行出错: {e}")
+        batch_size = 500
+        for index in range(0, len(records_to_update), batch_size):
+            chunk = records_to_update[index : index + batch_size]
+            try:
+                body = BatchUpdateAppTableRecordRequestBody.builder().records(chunk).build()
+                req = BatchUpdateAppTableRecordRequest.builder() \
+                    .table_id(self.table_id) \
+                    .request_body(body) \
+                    .build()
+                res = self.client.base.v1.app_table_record.batch_update(req)
+                if not res.success():
+                    raise RuntimeError(str(getattr(res, "msg", "批量更新失败")))
+                logger.info(
+                    f"已成功处理 {len(chunk)} 条更新（第 {index // batch_size + 1} 批）。"
+                )
+            except Exception as exc:
+                logger.error(f"更新行出错（第 {index // batch_size + 1} 批）: {exc}")
+                raise
         logger.info("--- 更新行结束 ---\n")
+        return True
         
     def get_all_records(self, fields_to_id_map: Dict[str, str] = None) -> List[Dict[str, Any]]:
         """

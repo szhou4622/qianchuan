@@ -13,6 +13,9 @@ from .log import logger
 from config import DB_FILE, SQLITE_BUSY_TIMEOUT_SEC, SQLITE_JOURNAL_MODE_WAL
 
 
+_sqlite_upsert_lock = threading.RLock()
+
+
 class SQLiteStore:
     """SQLite 数据库操作类"""
 
@@ -121,6 +124,8 @@ class SQLiteStore:
                 'api_request_id': 'TEXT',
                 'stat_date': "TEXT NOT NULL DEFAULT (date('now', '+8 hours'))",
                 'collected_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'delivery_state': "TEXT NOT NULL DEFAULT 'delivering'",
+                'last_seen_at': 'TEXT',
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
@@ -1461,8 +1466,15 @@ class SQLiteStore:
         if not filtered_list:
             return 0
 
-        # 使用第一个数据项的键构建 SQL
+        # Build a stable union of all row keys. Using only the first row
+        # silently discarded valid columns that appeared in later rows.
         columns = list(filtered_list[0].keys())
+        seen_columns = set(columns)
+        for item in filtered_list[1:]:
+            for column in item.keys():
+                if column not in seen_columns:
+                    columns.append(column)
+                    seen_columns.add(column)
         columns_str = ', '.join(columns)
         placeholders = ', '.join(['?' for _ in columns])
         sql = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
@@ -1524,6 +1536,7 @@ class SQLiteStore:
         sql = f"SELECT 1 FROM {table} WHERE {where_clause} LIMIT 1"
         conn = connection or self._get_connection()
 
+        _sqlite_upsert_lock.acquire()
         try:
             with self._get_cursor(conn) as cursor:
                 cursor.execute(sql, where_values)
@@ -1571,6 +1584,7 @@ class SQLiteStore:
         finally:
             if not connection:
                 self._close_connection(conn)
+            _sqlite_upsert_lock.release()
 
     def select(
         self,

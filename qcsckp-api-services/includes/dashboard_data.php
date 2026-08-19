@@ -304,11 +304,11 @@ function dashboard_get_material_history(PDO $pdo, int $userId, string $aadvid, s
         $sql = 'SELECT created_at, stat_cost, prepay_pay_order_count, pay_gmv_include_coupon
              FROM pmc_promotion_material
              WHERE user_id = ? AND aadvid = ? AND material_id = ? AND created_at > ?
-             ORDER BY created_at ASC
+             ORDER BY created_at DESC
              LIMIT ' . $lim;
         $st = $pdo->prepare($sql);
         $st->execute([$userId, $aadvid, $materialId, $startStr]);
-        $dbRows = $st->fetchAll(PDO::FETCH_ASSOC);
+        $dbRows = array_reverse($st->fetchAll(PDO::FETCH_ASSOC));
         $result = [];
         foreach ($dbRows as $r) {
             $createdAt = $r['created_at'] ?? null;

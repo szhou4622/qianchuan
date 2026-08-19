@@ -31,9 +31,9 @@ class BitableTable:
         return self._op
 
     # --- Create ---
-    def insert(self, rows: List[Dict[str, Any]]) -> None:
+    def insert(self, rows: List[Dict[str, Any]]) -> bool:
         """新增多行，每行 key 为列显示名。"""
-        self._op.add_rows(rows)
+        return self._op.add_rows(rows)
 
     def insert_pmc_material_rows(
         self,
@@ -42,7 +42,7 @@ class BitableTable:
         local_to_feishu: Optional[Dict[str, str]] = None,
         drop_none: bool = True,
         drop_id: bool = True,
-    ) -> None:
+    ) -> bool:
         """
         将 SQLite 表 ``pmc_promotion_material`` 风格的行（英文列名）映射为飞书列名后插入。
         默认映射见 ``pmc_row_mapping.DEFAULT_PMC_MATERIAL_TO_FEISHU``，可用 ``local_to_feishu`` 覆盖。
@@ -55,7 +55,7 @@ class BitableTable:
         # 每次插入前：按列顺序把首列（锁定主键，默认「文本」）对齐为「创建时间」，并创建缺失列
         self._op.ensure_headers(pmc_feishu_column_headers(local_to_feishu))
 
-        self.insert(
+        return self.insert(
             [
                 map_pmc_material_row_to_feishu(
                     r,
@@ -81,9 +81,9 @@ class BitableTable:
         return self._op.get_records_by_ids(record_ids)
 
     # --- Update ---
-    def update(self, rows: List[Dict[str, Any]]) -> None:
+    def update(self, rows: List[Dict[str, Any]]) -> bool:
         """批量更新；每行须含 ``record_id``，其余 key 为列显示名。"""
-        self._op.update_rows(rows)
+        return self._op.update_rows(rows)
 
     # --- Delete ---
     def delete_by_ids(self, record_ids: List[str]) -> bool:
