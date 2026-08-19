@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.52"
+    [string]$Version = "0.1.53"
 )
 
 $ErrorActionPreference = "Stop"
