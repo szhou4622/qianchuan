@@ -1544,11 +1544,11 @@ class ProductPromotionTests(unittest.TestCase):
         rows = list_promotion_targets(enabled=True, db=self.db)
         self.assertEqual(13, len(rows))
         self.assertEqual(
-            12,
+            6,
             sum(1 for item in rows if item.get("capacity_state") == "active"),
         )
         self.assertEqual(
-            1,
+            7,
             sum(
                 1
                 for item in rows
