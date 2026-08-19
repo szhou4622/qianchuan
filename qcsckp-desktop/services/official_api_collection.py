@@ -80,9 +80,9 @@ _ACCOUNT_BACKOFF_UNTIL: dict[str, float] = {}
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY_DATABASES: set[str] = set()
 
-# One target is refreshed every five minutes from its own last successful
-# collection.  The scheduler only sleeps for a short tick so a slow account
-# never adds another five minutes to every account behind it.
+# One target is refreshed on a fixed five-minute start-to-start cadence.  The
+# scheduler only sleeps for a short tick so a slow account never adds another
+# five minutes to every account behind it.
 COLLECTION_INTERVAL_SECONDS = 5 * 60
 COLLECTION_SCHEDULER_TICK_SECONDS = 5
 COLLECTION_MAX_WORKERS = CAPACITY_PARALLEL_WORKERS
@@ -185,6 +185,55 @@ def _collection_phase_plan(
             now=now,
         ),
     }
+
+
+def _rotating_maintenance_phase(phase_plan: Mapping[str, Any]) -> str:
+    """Choose at most one optional low-frequency phase for a hot cycle.
+
+    Core material metrics and active control tasks are always collected.  The
+    heavier, lower-frequency reads rotate so a coincident 20/30/60 minute
+    boundary cannot make every plan perform all expensive pagination at once.
+    """
+    phases = (
+        # Product relations and historical control rows are both optional for
+        # the core metrics pass and occur after the material request.  Refresh
+        # them first so cached detail/config reads cannot delay fresh metrics.
+        ("products", "refresh_products"),
+        ("control_history", "refresh_control_history"),
+        ("plan_detail", "refresh_plan_detail"),
+        ("report_config", "refresh_report_config"),
+    )
+    capability = phase_plan.get("capability")
+    last_phase = (
+        str(capability.get("maintenance_last_phase") or "")
+        if isinstance(capability, Mapping)
+        else ""
+    )
+    names = [name for name, _ in phases]
+    if last_phase in names:
+        pivot = names.index(last_phase) + 1
+        phases = phases[pivot:] + phases[:pivot]
+    for name, key in phases:
+        if bool(phase_plan.get(key)):
+            return name
+    return ""
+
+
+def _fixed_cadence_due(
+    started_at: Any,
+    interval_seconds: int,
+    *,
+    now: Optional[datetime] = None,
+) -> datetime:
+    """Return the next start-to-start deadline for a completed hot cycle."""
+    current = now or datetime.now()
+    started = (
+        started_at
+        if isinstance(started_at, datetime)
+        else _parse_local_time(started_at)
+    ) or current
+    due = started + timedelta(seconds=max(30, int(interval_seconds)))
+    return due if due > current else current + timedelta(seconds=5)
 
 
 def _fair_order_targets(
@@ -533,6 +582,7 @@ def _control_snapshot(
     *,
     target: Mapping[str, Any],
     request_id: str,
+    units: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     raw = _mapping(task.get("raw"))
     stats = _mapping(first(raw, "stats_info", "statsInfo", "stats", "metrics", default={}))
@@ -540,8 +590,10 @@ def _control_snapshot(
     materials = [{"material_id": item, "title": ""} for item in material_ids]
 
     def raw_metric(*names: str) -> Any:
-        value, _ = _metric_block(stats, *names)
-        return value
+        # Control-task metrics follow the same unit contract as material
+        # reports.  Converting here prevents cents/ratio fields from entering
+        # stop rules with a different scale than the dashboard.
+        return _metric(stats, units or {}, *names)
 
     status = str(task.get("status") or "").upper()
     active = status in {"ENABLE", "ENABLED", "ACTIVE", "RUNNING", "DELIVERING"}
@@ -609,7 +661,12 @@ def _empty_is_suspicious(
     return streak < 2, streak
 
 
-def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
+def collect_target(
+    target: Mapping[str, Any],
+    *,
+    rotate_maintenance: bool = False,
+    db: Optional[SQLiteStore] = None,
+) -> dict[str, Any]:
     store = db or SQLiteStore()
     _ensure_collection_schema(store)
     service = get_official_api_service()
@@ -620,47 +677,81 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
     expected_system = normalize_plan_system(target.get("plan_system"))
     phase_plan = _collection_phase_plan(target)
     capability = phase_plan["capability"]
+    maintenance_phase = (
+        _rotating_maintenance_phase(phase_plan) if rotate_maintenance else "all"
+    )
+    maintenance_errors: list[str] = []
 
-    refresh_plan_detail = bool(phase_plan["refresh_plan_detail"])
     goal = str(capability.get("marketing_goal") or "")
+    refresh_plan_detail = bool(phase_plan["refresh_plan_detail"]) and (
+        not rotate_maintenance or maintenance_phase == "plan_detail"
+    )
     detail_request_id = str(capability.get("plan_detail_request_id") or "")
     detail_status = str(target.get("platform_status") or "")
     if refresh_plan_detail or not goal:
-        detail, detail_response = service.get_plan_detail(aavid, ad_id)
-        actual_scene = normalize_promotion_scene(detail.get("marketing_goal"))
-        actual_system = normalize_api_plan_system(detail.get("adlab_scene"))
-        if detail.get("aavid") != aavid or detail.get("ad_id") != ad_id:
-            raise RuntimeError("官方 API 计划详情与监控账户或计划不一致")
-        if actual_scene != expected_scene or actual_system != expected_system:
-            raise RuntimeError("官方 API 计划详情的推广方式或计划体系已变化")
-        detail_status = str(detail.get("platform_status") or "")
-        if detail_status not in {"active", "learning", "waiting_live"}:
-            raise RuntimeError("官方 API 返回的计划当前不可投放")
-        goal = str(detail.get("marketing_goal") or "")
-        detail_request_id = str(detail_response.request_id or "")
-        # A selected live plan may move between waiting for broadcast and live
-        # while the hot collector is running. Persist verified transitions.
-        update_target_catalog_evidence(
-            target_uid,
-            platform_status=detail_status,
-            verification_state="verified",
-            plan_system=expected_system,
-            promotion_scene=expected_scene,
-            db=store,
-        )
-    report_config_refreshed = bool(phase_plan["refresh_report_config"])
+        try:
+            detail, detail_response = service.get_plan_detail(aavid, ad_id)
+            actual_scene = normalize_promotion_scene(detail.get("marketing_goal"))
+            actual_system = normalize_api_plan_system(detail.get("adlab_scene"))
+            if detail.get("aavid") != aavid or detail.get("ad_id") != ad_id:
+                raise RuntimeError("官方 API 计划详情与监控账户或计划不一致")
+            if actual_scene != expected_scene or actual_system != expected_system:
+                raise RuntimeError("官方 API 计划详情的推广方式或计划体系已变化")
+            detail_status = str(detail.get("platform_status") or "")
+            if detail_status not in {"active", "learning", "waiting_live"}:
+                raise RuntimeError("官方 API 返回的计划当前不可投放")
+            goal = str(detail.get("marketing_goal") or "")
+            detail_request_id = str(detail_response.request_id or "")
+            # A selected live plan may move between waiting for broadcast and
+            # live while the hot collector is running.
+            update_target_catalog_evidence(
+                target_uid,
+                platform_status=detail_status,
+                verification_state="verified",
+                plan_system=expected_system,
+                promotion_scene=expected_scene,
+                db=store,
+            )
+        except (ApiTokenError, ApiPermissionError):
+            raise
+        except (ApiRateLimitError, ApiRequestError, TimeoutError, ConnectionError, OSError) as exc:
+            if not goal:
+                raise
+            refresh_plan_detail = False
+            maintenance_errors.append(f"plan_detail:{exc}")
+            logger.warning(
+                "计划详情低频刷新失败，继续使用已验证证据 target=%s error=%s",
+                target_uid,
+                exc,
+            )
+    report_config_refreshed = bool(phase_plan["refresh_report_config"]) and (
+        not rotate_maintenance or maintenance_phase == "report_config"
+    )
     report_config_request_id = str(
         capability.get("report_config_request_id") or ""
     )
-    if report_config_refreshed:
-        units, config_response = service.get_report_config(
-            aavid,
-            plan_system=expected_system,
-            promotion_scene=expected_scene,
-        )
-        report_config_request_id = config_response.request_id
-    else:
-        units = dict(phase_plan["cached_units"])
+    units = dict(phase_plan["cached_units"])
+    if report_config_refreshed or not units:
+        try:
+            units, config_response = service.get_report_config(
+                aavid,
+                plan_system=expected_system,
+                promotion_scene=expected_scene,
+            )
+            report_config_request_id = config_response.request_id
+            report_config_refreshed = True
+        except (ApiTokenError, ApiPermissionError):
+            raise
+        except (ApiRateLimitError, ApiRequestError, TimeoutError, ConnectionError, OSError) as exc:
+            if not units:
+                raise
+            report_config_refreshed = False
+            maintenance_errors.append(f"report_config:{exc}")
+            logger.warning(
+                "报表字段配置低频刷新失败，继续使用已验证单位 target=%s error=%s",
+                target_uid,
+                exc,
+            )
     if not units:
         raise RuntimeError("官方 API 报表配置未返回字段单位，本轮数据不入库")
 
@@ -686,30 +777,92 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         if text_id(item.get("material_id"))
     ]
 
-    products_refreshed = bool(phase_plan["refresh_products"])
+    products_refreshed = bool(phase_plan["refresh_products"]) and (
+        not rotate_maintenance or maintenance_phase == "products"
+    )
     products: list[dict[str, Any]] = []
     product_request_ids: list[str] = []
     if products_refreshed:
-        products, product_request_ids = service.list_plan_products(
-            aavid,
-            ad_id,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        try:
+            products, product_request_ids = service.list_plan_products(
+                aavid,
+                ad_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except (ApiTokenError, ApiPermissionError):
+            raise
+        except (
+            ApiRateLimitError,
+            ApiRequestError,
+            RuntimeError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as exc:
+            if not rotate_maintenance:
+                raise
+            products_refreshed = False
+            maintenance_errors.append(f"products:{exc}")
+            logger.warning(
+                "商品目录低频刷新失败，不影响本轮核心指标 target=%s error=%s",
+                target_uid,
+                exc,
+            )
 
     now = datetime.now()
-    refresh_control_history = bool(phase_plan["refresh_control_history"])
-    control_days = 179 if refresh_control_history else CONTROL_HOT_WINDOW_DAYS
-    control_tasks, control_request_ids = service.list_control_tasks(
-        aavid,
-        ad_id=ad_id,
-        marketing_goal=goal,
-        start_time=(now - timedelta(days=control_days)).strftime("%Y-%m-%d 00:00:00"),
-        end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+    refresh_control_history = bool(phase_plan["refresh_control_history"]) and (
+        not rotate_maintenance or maintenance_phase == "control_history"
     )
+
+    def fetch_controls(days: int) -> tuple[list[dict[str, Any]], list[str]]:
+        return service.list_control_tasks(
+            aavid,
+            ad_id=ad_id,
+            marketing_goal=goal,
+            start_time=(now - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00"),
+            end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+        )
+
+    # Active retarget task metrics (spend/orders/GMV/ROI/status/budget/duration)
+    # are part of every five-minute hot cycle.  Hourly 179-day history is an
+    # optional supplement and may never prevent the hot seven-day read.
+    if rotate_maintenance:
+        control_tasks, control_request_ids = fetch_controls(
+            CONTROL_HOT_WINDOW_DAYS
+        )
+        if refresh_control_history:
+            try:
+                control_tasks, control_request_ids = fetch_controls(179)
+            except (ApiTokenError, ApiPermissionError):
+                raise
+            except (
+                ApiRateLimitError,
+                ApiRequestError,
+                RuntimeError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+            ) as exc:
+                refresh_control_history = False
+                maintenance_errors.append(f"control_history:{exc}")
+                logger.warning(
+                    "追投任务历史补录失败，已保留本轮活动任务数据 target=%s error=%s",
+                    target_uid,
+                    exc,
+                )
+    else:
+        control_tasks, control_request_ids = fetch_controls(
+            179 if refresh_control_history else CONTROL_HOT_WINDOW_DAYS
+        )
     control_request_id = control_request_ids[-1] if control_request_ids else ""
     control_rows = [
-        _control_snapshot(item, target=target, request_id=control_request_id)
+        _control_snapshot(
+            item,
+            target=target,
+            request_id=control_request_id,
+            units=units,
+        )
         for item in control_tasks
         if str(item.get("scene") or "").upper() == "MATERIAL_ADD_BUDGET"
         and text_id(item.get("task_id"))
@@ -739,11 +892,12 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         streak_key="product_empty_streak",
     ) if products_refreshed else (False, int(capability.get("product_empty_streak") or 0))
 
+    cycle_observed_at = _now()
     with store.transaction() as connection:
         for row in snapshots:
             store.insert("pmc_promotion_material", row, connection=connection)
             latest_row = dict(row)
-            latest_row["collected_at"] = _now()
+            latest_row["collected_at"] = cycle_observed_at
             store.insert_or_update(
                 "pmc_promotion_material_latest",
                 latest_row,
@@ -865,11 +1019,28 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
         "assist_sync_enabled": True,
         "assist_sync_in_progress": False,
         "assist_sync_ok": True,
-        "assist_synced_at": _now(),
+        "assist_synced_at": cycle_observed_at,
         "material_request_ids": material_request_ids,
         "control_request_ids": control_request_ids,
-        "collected_at": _now(),
+        "collected_at": cycle_observed_at,
+        "collection_window_start": start_date,
+        "collection_window_end": end_date,
+        "collection_scope": "materials_and_active_retarget_metrics",
     }
+    if rotate_maintenance and maintenance_phase:
+        capability_updates.update(
+            {
+                "maintenance_last_phase": maintenance_phase,
+                "maintenance_last_attempted_at": _now(),
+            }
+        )
+    if maintenance_errors:
+        capability_updates.update(
+            {
+                "maintenance_error_at": _now(),
+                "maintenance_error": "; ".join(maintenance_errors)[:1000],
+            }
+        )
     if refresh_plan_detail:
         capability_updates.update(
             {
@@ -915,6 +1086,11 @@ def collect_target(target: Mapping[str, Any], *, db: Optional[SQLiteStore] = Non
             "collection_error_kind",
             "collection_retry_seconds",
             "collection_consecutive_failures",
+            *(
+                ()
+                if maintenance_errors
+                else ("maintenance_error_at", "maintenance_error")
+            ),
         ),
         db=store,
     )
@@ -969,6 +1145,7 @@ def _collect_target_safely(
             }
         _ACTIVE_TARGET_UIDS.add(target_uid)
 
+    cycle_started_at = datetime.now()
     started = time.monotonic()
     account_key = _target_account_key(target)
     try:
@@ -1010,12 +1187,13 @@ def _collect_target_safely(
                 capability_updates={"collection_started_at": _now()},
                 db=db,
             )
-            result = collect_target(target, db=db)
+            result = collect_target(target, rotate_maintenance=True, db=db)
         duration_ms = int((time.monotonic() - started) * 1000)
         record_target_duration(
             target_uid,
             duration_ms,
             interval_seconds=interval_seconds,
+            cycle_started_at=cycle_started_at,
             refresh_capacity=False,
             db=db,
         )
@@ -1352,10 +1530,15 @@ def _finish_collection_job(
     job: Mapping[str, Any], result: Mapping[str, Any], *, db: SQLiteStore
 ) -> None:
     success = bool(result.get("success"))
-    delay = COLLECTION_INTERVAL_SECONDS if success else int(
-        result.get("retry_seconds") or (15 if result.get("deferred") else 60)
-    )
-    next_due = datetime.now() + timedelta(seconds=max(5, delay))
+    if success:
+        next_due = _fixed_cadence_due(
+            job.get("last_started_at"), COLLECTION_INTERVAL_SECONDS
+        )
+    else:
+        delay = int(
+            result.get("retry_seconds") or (15 if result.get("deferred") else 60)
+        )
+        next_due = datetime.now() + timedelta(seconds=max(5, delay))
     # The lease owner and fencing token are both part of the CAS. An expired
     # worker can never overwrite a task re-leased after process recovery.
     db.execute(
