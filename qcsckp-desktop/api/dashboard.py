@@ -24,6 +24,18 @@ class DashboardApi:
 
         from utils.sqlite_store import SQLiteStore
         self.db = SQLiteStore()
+        from api.dashboard_optimized import OptimizedDashboardQueries
+        self.optimized = OptimizedDashboardQueries(self.db)
+
+    def get_scope_options(self) -> Dict[str, Any]:
+        return self.optimized.get_scope_options()
+
+    def get_refresh_state(
+        self, aavid: Any = "", target_uid: Any = ""
+    ) -> Dict[str, Any]:
+        return self.optimized.get_refresh_state(
+            aavid=aavid, target_uid=target_uid
+        )
 
     def get_material_history_recent(
         self,
@@ -42,6 +54,9 @@ class DashboardApi:
               "total": 0
             }
         """
+        return self.optimized.get_material_history(
+            material_id, target_uid=target_uid or "", limit=limit
+        )
         try:
             limit = int(limit) if limit else 200
             if limit <= 0 or limit > 200:
@@ -105,6 +120,7 @@ class DashboardApi:
         page: int = 1,
         page_size: int = 50,
         target_uid: Optional[str] = None,
+        aavid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         获取表格数据 - 按周期查询素材的首尾差值
@@ -130,6 +146,15 @@ class DashboardApi:
                 "totalPages": 1
             }
         """
+        return self.optimized.get_table_data(
+            period,
+            sort_by,
+            sort_order,
+            page,
+            page_size,
+            aavid=aavid or "",
+            target_uid=target_uid or "",
+        )
         try:
             # 解析周期字符串
             period = period.strip().lower()
@@ -360,7 +385,12 @@ class DashboardApi:
             traceback.print_exc()
             return {"success": False, "data": [], "total": 0, "message": str(e)}
 
-    def get_top20_by_cost(self, hours: int = 1) -> Dict[str, Any]:
+    def get_top20_by_cost(
+        self,
+        hours: int = 1,
+        aavid: Optional[str] = None,
+        target_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         获取最近 N 小时内每个素材最新的一条数据，按整体消耗排序取 Top 20
 
@@ -374,6 +404,9 @@ class DashboardApi:
                 "total": 0
             }
         """
+        return self.optimized.get_top20_by_cost(
+            aavid=aavid or "", target_uid=target_uid or ""
+        )
         try:
             time_str = f"-{hours} hours"
 
@@ -445,7 +478,12 @@ class DashboardApi:
             traceback.print_exc()
             return {"success": False, "data": [], "total": 0, "message": str(e)}
 
-    def get_latest_crawl_cost_sum(self, hours: int = 1) -> Dict[str, Any]:
+    def get_latest_crawl_cost_sum(
+        self,
+        hours: int = 1,
+        aavid: Optional[str] = None,
+        target_uid: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         在「与 Top20 相同」的最近 N 小时时间窗内，按 material_id 分组，
         每个素材只取 created_at 最新的一条记录，再对这些记录的 stat_cost 求和。
@@ -460,6 +498,9 @@ class DashboardApi:
               "latestCreatedAt": str | None  # 上述「最新一条」里较晚的入库时间
             }
         """
+        return self.optimized.get_latest_cost_sum(
+            aavid=aavid or "", target_uid=target_uid or ""
+        )
         try:
             hours = int(hours) if hours else 1
             if hours <= 0:

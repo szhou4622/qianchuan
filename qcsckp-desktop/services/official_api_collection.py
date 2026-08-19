@@ -1,8 +1,9 @@
-"""Official API collector that feeds the existing v0.1.46 read models.
+"""Official API collector that feeds the production read models.
 
-The UI and rule engine continue to read ``pmc_promotion_material`` and
-``pmc_roi2_assist_task``.  This module is the only production writer of those
-tables when ``QCSCKP_QIANCHUAN_BACKEND=official_api``.
+Current material state is upserted into ``pmc_promotion_material_latest``;
+changed numeric metrics use the narrow snapshot table, while retarget control
+tasks continue to use ``pmc_roi2_assist_task``.  The legacy full-row history is
+no longer expanded by every five-minute official API cycle.
 """
 
 from __future__ import annotations
@@ -96,6 +97,22 @@ CONTROL_HOT_WINDOW_DAYS = 7
 COLLECTION_JOB_LEASE_SECONDS = 10 * 60
 ADAPTIVE_RECOVERY_CLEAN_BATCHES = 3
 
+_METRIC_SNAPSHOT_FIELDS = (
+    "stat_cost",
+    "order_settle_count_1h",
+    "order_settle_amount_1h",
+    "order_settle_rate_1h",
+    "prepay_pay_order_count",
+    "pay_gmv_include_coupon",
+    "prepay_pay_settle_1h",
+    "refund_rate_1h",
+    "overall_order_count",
+    "overall_show_count",
+    "overall_click_count",
+    "overall_ctr",
+    "overall_conversion_rate",
+)
+
 _ADAPTIVE_LOCK = threading.Lock()
 _ADAPTIVE_WORKERS = COLLECTION_MAX_WORKERS
 _ADAPTIVE_CLEAN_BATCHES = 0
@@ -103,6 +120,61 @@ _ADAPTIVE_CLEAN_BATCHES = 0
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _five_minute_bucket(value: Any = None) -> str:
+    observed = _parse_local_time(value) if value is not None else None
+    observed = observed or datetime.now()
+    minute = observed.minute - (observed.minute % 5)
+    return observed.replace(minute=minute, second=0, microsecond=0).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _metric_snapshot_row(
+    row: Mapping[str, Any],
+    *,
+    target: Mapping[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    snapshot = {
+        "account_username": current_session_owner(),
+        "account_uid": str(target.get("account_uid") or ""),
+        "aadvid": str(row.get("aadvid") or target.get("aadvid") or ""),
+        "target_uid": str(row.get("target_uid") or target.get("target_uid") or ""),
+        "ad_id": str(row.get("ad_id") or target.get("ad_id") or ""),
+        "material_id": str(row.get("material_id") or ""),
+        "bucket_key": _five_minute_bucket(observed_at),
+        "collected_at": observed_at,
+        "stat_date": str(row.get("stat_date") or observed_at[:10]),
+        "api_request_id": str(row.get("api_request_id") or ""),
+    }
+    for field in _METRIC_SNAPSHOT_FIELDS:
+        snapshot[field] = row.get(field)
+    return snapshot
+
+
+def _metric_values_changed(
+    previous: Optional[Mapping[str, Any]], current: Mapping[str, Any]
+) -> bool:
+    """Store history only when a business metric changes.
+
+    ``pmc_promotion_material_latest`` is still refreshed every successful
+    cycle, so skipping an unchanged history point does not reduce freshness or
+    rule accuracy.  It only removes thousands of identical five-minute rows.
+    """
+    if not previous:
+        return True
+    for field in _METRIC_SNAPSHOT_FIELDS:
+        old = previous.get(field)
+        new = current.get(field)
+        try:
+            if round(float(old or 0), 8) != round(float(new or 0), 8):
+                return True
+        except (TypeError, ValueError):
+            if str(old or "") != str(new or ""):
+                return True
+    return False
 
 
 def _parse_local_time(value: Any) -> Optional[datetime]:
@@ -893,9 +965,21 @@ def collect_target(
     ) if products_refreshed else (False, int(capability.get("product_empty_streak") or 0))
 
     cycle_observed_at = _now()
+    previous_latest_rows = store.select(
+        "pmc_promotion_material_latest",
+        where={"target_uid": target_uid},
+    ) or []
+    previous_latest_by_material = {
+        str(item.get("material_id") or ""): item
+        for item in previous_latest_rows
+        if str(item.get("material_id") or "")
+    }
     with store.transaction() as connection:
         for row in snapshots:
-            store.insert("pmc_promotion_material", row, connection=connection)
+            material_id = str(row.get("material_id") or "")
+            metrics_changed = _metric_values_changed(
+                previous_latest_by_material.get(material_id), row
+            )
             latest_row = dict(row)
             latest_row["collected_at"] = cycle_observed_at
             store.insert_or_update(
@@ -904,6 +988,22 @@ def collect_target(
                 unique_fields=["target_uid", "material_id"],
                 connection=connection,
             )
+            if metrics_changed:
+                store.insert_or_update(
+                    "pmc_material_metric_snapshot",
+                    _metric_snapshot_row(
+                        row,
+                        target=target,
+                        observed_at=cycle_observed_at,
+                    ),
+                    unique_fields=[
+                        "account_username",
+                        "target_uid",
+                        "material_id",
+                        "bucket_key",
+                    ],
+                    connection=connection,
+                )
         if snapshots:
             current_material_ids = [str(row["material_id"]) for row in snapshots]
             placeholders = ",".join("?" for _ in current_material_ids)

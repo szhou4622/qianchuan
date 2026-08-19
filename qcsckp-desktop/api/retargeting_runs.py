@@ -101,8 +101,8 @@ def _lookup_latest_material(db: SQLiteStore, material_id: str) -> Optional[Dict[
     if not mid:
         return None
     rows = db.execute(
-        "SELECT aadvid, video_name FROM pmc_promotion_material WHERE material_id = ? "
-        "ORDER BY created_at DESC LIMIT 1",
+        "SELECT aadvid, video_name FROM pmc_promotion_material_latest WHERE material_id = ? "
+        "ORDER BY collected_at DESC LIMIT 1",
         (mid,),
         fetch=True,
     )
@@ -114,21 +114,21 @@ def _lookup_latest_material_full(
     material_id: str,
     target_uid: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """pmc_promotion_material 该素材最新一条（与采集入库字段一致），用于即刻追投 query_snapshot。"""
+    """素材最新状态（与采集入库字段一致），用于即刻追投 query_snapshot。"""
     mid = str(material_id).strip()
     if not mid:
         return None
     uid = str(target_uid or "").strip()
     if uid:
         rows = db.execute(
-            "SELECT * FROM pmc_promotion_material WHERE target_uid = ? AND material_id = ? "
-            "ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM pmc_promotion_material_latest WHERE target_uid = ? AND material_id = ? "
+            "ORDER BY collected_at DESC LIMIT 1",
             (uid, mid),
             fetch=True,
         )
     else:
         rows = db.execute(
-            "SELECT * FROM pmc_promotion_material WHERE material_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM pmc_promotion_material_latest WHERE material_id = ? ORDER BY collected_at DESC LIMIT 1",
             (mid,),
             fetch=True,
         )
@@ -560,13 +560,13 @@ def query_pmc_retargeting_runs_page(
     q：模糊匹配 material_id、material_name；retargeting_method：精确匹配。
     """
     tbl = "pmc_retargeting_run"
-    # video_type：取 pmc_promotion_material 中与流水同素材+同广告主最新一条（与大盘素材类型口径一致）
+    # video_type：取最新状态表中与流水同素材+同广告主的一条（与大盘口径一致）
     fields = (
         "id, aavid, ad_id, material_id, material_name, strategy_name, started_at, ended_at, duration_ms, status, step, message, "
         "retargeting_method, optimization_goal, regulate_task_id, trigger_source, created_at, "
-        "(SELECT m.video_type FROM pmc_promotion_material m "
+        "(SELECT m.video_type FROM pmc_promotion_material_latest m "
         "WHERE m.material_id = pmc_retargeting_run.material_id AND m.aadvid = pmc_retargeting_run.aavid "
-        "ORDER BY m.created_at DESC LIMIT 1) AS video_type"
+        "ORDER BY m.collected_at DESC LIMIT 1) AS video_type"
     )
     where_parts: List[str] = []
     params: List[Any] = []
@@ -632,9 +632,9 @@ def get_pmc_retargeting_run_by_id(run_id: Any) -> Optional[Dict[str, Any]]:
     db = _store()
     rows = db.execute(
         "SELECT r.*, "
-        "(SELECT m.video_type FROM pmc_promotion_material m "
+        "(SELECT m.video_type FROM pmc_promotion_material_latest m "
         "WHERE m.material_id = r.material_id AND m.aadvid = r.aavid "
-        "ORDER BY m.created_at DESC LIMIT 1) AS video_type "
+        "ORDER BY m.collected_at DESC LIMIT 1) AS video_type "
         "FROM pmc_retargeting_run r WHERE r.id = ?",
         (rid,),
         fetch=True,
