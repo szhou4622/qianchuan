@@ -59,6 +59,18 @@ def run_startup_prune_if_over_trigger() -> None:
         return
     try:
         store = SQLiteStore(database=DB_FILE)
+        try:
+            from utils.dashboard_storage_maintenance import (
+                run_dashboard_storage_maintenance,
+            )
+
+            maintenance = run_dashboard_storage_maintenance(db=store)
+            if any(int(value or 0) for value in maintenance.values()):
+                logger.info("[大屏存储] 启动迁移/裁剪完成: %s", maintenance)
+        except Exception as exc:
+            # Compact-storage migration is retryable and must never prevent the
+            # desktop UI or the legacy row-count guard from starting.
+            logger.warning("[大屏存储] 启动迁移暂未完成，将在夜间重试: %s", exc)
         cnt0 = store.count("pmc_promotion_material")
         if cnt0 <= SQLITE_PRUNE_TRIGGER_ROWS:
             return
@@ -71,6 +83,16 @@ def run_startup_prune_if_over_trigger() -> None:
         round_no = 0
         while True:
             store = SQLiteStore(database=DB_FILE)
+            try:
+                from utils.dashboard_storage_maintenance import (
+                    run_dashboard_storage_maintenance,
+                )
+
+                maintenance = run_dashboard_storage_maintenance(db=store)
+                if any(int(value or 0) for value in maintenance.values()):
+                    logger.info("[大屏存储] 夜间迁移/裁剪完成: %s", maintenance)
+            except Exception as exc:
+                logger.warning("[大屏存储] 夜间迁移失败，稍后重试: %s", exc)
             cnt = store.count("pmc_promotion_material")
             if cnt <= SQLITE_PRUNE_MAX_ROWS:
                 break

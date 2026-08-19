@@ -44,9 +44,12 @@ from services.official_api_collection import (
     _adaptive_worker_limit,
     _collect_target_safely,
     _collection_phase_plan,
+    _control_snapshot,
     _fair_order_targets,
+    _fixed_cadence_due,
     _observe_collection_results,
     _reset_adaptive_collection_state_for_tests,
+    _rotating_maintenance_phase,
     _target_is_due,
     collect_target,
     run_collection_cycle,
@@ -112,6 +115,73 @@ class _ReportConfigClient(_CaptureClient):
 
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
+    def test_five_minute_deadline_is_anchored_to_cycle_start(self):
+        started = datetime(2026, 8, 19, 12, 0, 0)
+        finished = started + timedelta(seconds=164)
+        self.assertEqual(
+            datetime(2026, 8, 19, 12, 5, 0),
+            _fixed_cadence_due(started, 300, now=finished),
+        )
+        overrun = started + timedelta(seconds=350)
+        self.assertEqual(
+            overrun + timedelta(seconds=5),
+            _fixed_cadence_due(started, 300, now=overrun),
+        )
+
+    def test_hot_cycle_rotates_only_one_low_frequency_phase(self):
+        self.assertEqual(
+            "products",
+            _rotating_maintenance_phase(
+                {
+                    "refresh_plan_detail": True,
+                    "refresh_report_config": True,
+                    "refresh_products": True,
+                    "refresh_control_history": True,
+                }
+            ),
+        )
+
+    def test_retarget_task_hot_snapshot_keeps_spend_and_conversion_metrics(self):
+        row = _control_snapshot(
+            {
+                "task_id": "1873507215275220",
+                "status": "ENABLE",
+                "budget": "100",
+                "duration": "24",
+                "material_ids": ["7643772216392564762"],
+                "raw": {
+                    "stats_info": {
+                        "stat_cost_for_roi2_assist": "23.45",
+                        "total_pay_order_count_for_roi2_assist": "3",
+                        "total_pay_order_gmv_include_coupon_for_roi2_assist": "88.60",
+                        "total_prepay_and_pay_order_roi2_assist": "3.778",
+                    }
+                },
+            },
+            target={
+                "target_uid": "target-1",
+                "account_uid": "account-1",
+                "aadvid": "1001",
+                "ad_id": "2001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+            },
+            request_id="control-hot-request",
+            units={
+                "stat_cost_for_roi2_assist": "3",
+                "total_pay_order_count_for_roi2_assist": "4",
+                "total_pay_order_gmv_include_coupon_for_roi2_assist": "3",
+                "total_prepay_and_pay_order_roi2_assist": "3",
+            },
+        )
+        self.assertEqual(23.45, row["stat_cost_for_roi2_assist"])
+        self.assertEqual(3.0, row["total_pay_order_count_for_roi2_assist"])
+        self.assertEqual(
+            88.60, row["total_pay_order_gmv_include_coupon_for_roi2_assist"]
+        )
+        self.assertEqual(3.778, row["total_prepay_and_pay_order_roi2_assist"])
+        self.assertEqual(0, row["ad_delivery_type"])
+
     def test_adaptive_concurrency_backs_off_on_429_and_recovers_gradually(self):
         _reset_adaptive_collection_state_for_tests()
         try:
@@ -154,7 +224,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         max_active = 0
         lock = threading.Lock()
 
-        def collect_one(target, *, db):
+        def collect_one(target, *, db, **_kwargs):
             nonlocal active, max_active
             with lock:
                 active += 1
@@ -276,6 +346,76 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         service.list_control_tasks.assert_called_once()
         self.assertEqual(7, result["product_count"])
         self.assertFalse(result["product_catalog_refreshed"])
+
+    def test_optional_catalog_failure_does_not_discard_five_minute_metrics(self):
+        target = {
+            "target_uid": "target-product",
+            "account_uid": "account-product",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "platform_status": "active",
+            "capability": {
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "report_metric_units": {
+                    "stat_cost_for_roi2": "3",
+                    "stat_cost_for_roi2_assist": "3",
+                },
+            },
+        }
+        service = MagicMock()
+        service.list_plan_materials.return_value = (
+            [
+                {
+                    "material_id": "3001",
+                    "material_name": "素材1",
+                    "raw": {"stats_info": {"stat_cost_for_roi2": "12.50"}},
+                }
+            ],
+            ["material-hot-request"],
+        )
+        service.list_plan_products.side_effect = RuntimeError("catalog timeout")
+        service.list_control_tasks.return_value = (
+            [
+                {
+                    "task_id": "4001",
+                    "scene": "MATERIAL_ADD_BUDGET",
+                    "status": "ENABLE",
+                    "material_ids": ["3001"],
+                    "raw": {
+                        "stats_info": {"stat_cost_for_roi2_assist": "8.25"}
+                    },
+                }
+            ],
+            ["control-hot-request"],
+        )
+        store = MagicMock(config={"database": ":memory:"})
+        store.transaction.return_value.__enter__.return_value = MagicMock()
+        with patch(
+            "services.official_api_collection.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_collection.init_sqlite_schema"
+        ), patch(
+            "services.official_api_collection._count_rows", return_value=0
+        ), patch(
+            "services.official_api_collection.patch_target_sync_state"
+        ) as patch_state, patch(
+            "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
+        ):
+            result = collect_target(target, rotate_maintenance=True, db=store)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(1, result["material_count"])
+        self.assertEqual(1, result["control_task_count"])
+        self.assertFalse(result["product_catalog_refreshed"])
+        state_kwargs = patch_state.call_args.kwargs
+        self.assertEqual("ok", state_kwargs["status"])
+        self.assertIn(
+            "products:catalog timeout",
+            state_kwargs["capability_updates"]["maintenance_error"],
+        )
 
     def test_official_delivery_ok_material_is_writable(self):
         self.assertTrue(

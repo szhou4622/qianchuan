@@ -8,10 +8,8 @@
     <script src="js/lucide.js"></script>
     <script src="js/echarts.min.js"></script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
         body {
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            font-family: 'Segoe UI', 'Microsoft YaHei UI', system-ui, -apple-system, sans-serif;
             background-color: #0B1120;
             color: #E2E8F0;
         }
@@ -317,6 +315,19 @@
             <button type="button" id="assistPanelToggle" class="absolute right-0 top-1/2 z-[45] -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50" title="全屏查看调控数据" aria-label="打开调控数据" aria-expanded="false" aria-controls="assistDataPanel">
                 <span class="assist-tab-label" aria-hidden="true"><span>调</span><span>控</span></span>
             </button>
+            <!-- 大屏范围：默认汇总所有已启用账户，可下钻到账户或单计划 -->
+            <div class="flex-none px-3 py-2 border-b border-slate-700/50 bg-slate-900/45 flex flex-wrap items-center gap-2">
+                <label for="dashboardAccountFilter" class="text-xs text-slate-500 shrink-0">千川账户</label>
+                <select id="dashboardAccountFilter" class="min-w-[12rem] max-w-[18rem] rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none">
+                    <option value="">全部已启用账户</option>
+                </select>
+                <label for="dashboardPlanFilter" class="text-xs text-slate-500 shrink-0 ml-1">监控计划</label>
+                <select id="dashboardPlanFilter" class="min-w-[14rem] max-w-[22rem] flex-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none">
+                    <option value="">全部已监控计划</option>
+                </select>
+                <span id="dashboardScopeSummary" class="text-[11px] text-slate-500 tabular-nums shrink-0">0个账户 · 0条计划</span>
+                <span id="dashboardFreshness" class="ml-auto text-[11px] text-slate-500 tabular-nums shrink-0">等待数据</span>
+            </div>
             <!-- 列表顶部栏 -->
             <div class="flex-none p-3 border-b border-slate-700/50 flex items-center gap-3 bg-slate-800/30">
                 <h2 class="text-lg font-semibold text-white flex items-center gap-2 shrink-0">
@@ -932,6 +943,15 @@
             return maskMaterialNames ? maskMaterialTitle(item.title) : item.title;
         }
 
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         function updateMaskToggleUi() {
             const btn = document.getElementById('toggleMaskNames');
             if (!btn) return;
@@ -1010,6 +1030,136 @@
             return null;
         }
 
+        function setSelectOptions(select, rows, placeholder, valueKey, labelBuilder) {
+            if (!select) return;
+            const selected = select.value;
+            select.replaceChildren();
+            const empty = document.createElement('option');
+            empty.value = '';
+            empty.textContent = placeholder;
+            select.appendChild(empty);
+            rows.forEach(row => {
+                const option = document.createElement('option');
+                option.value = String(row[valueKey] || '');
+                option.textContent = labelBuilder(row);
+                select.appendChild(option);
+            });
+            if ([...select.options].some(option => option.value === selected)) {
+                select.value = selected;
+            }
+        }
+
+        function rebuildDashboardPlanOptions() {
+            const planSelect = document.getElementById('dashboardPlanFilter');
+            const plans = (dashboardScopeOptions.plans || []).filter(plan => (
+                !selectedDashboardAavid || String(plan.aavid || '') === selectedDashboardAavid
+            ));
+            setSelectOptions(
+                planSelect,
+                plans,
+                '全部已监控计划',
+                'target_uid',
+                plan => `${plan.account_name || plan.aavid || '未命名账户'} · ${plan.plan_name || plan.ad_id || '未命名计划'}`
+            );
+            if (![...planSelect.options].some(option => option.value === selectedDashboardTargetUid)) {
+                selectedDashboardTargetUid = '';
+                planSelect.value = '';
+            } else {
+                planSelect.value = selectedDashboardTargetUid;
+            }
+            const summary = document.getElementById('dashboardScopeSummary');
+            if (summary) {
+                summary.textContent = `${(dashboardScopeOptions.accounts || []).length}个账户 · ${plans.length}条计划`;
+            }
+        }
+
+        async function loadDashboardScopeOptions() {
+            const api = await waitForAPI();
+            if (!api || !api.getDashboardScopeOptions) return;
+            try {
+                const result = await api.getDashboardScopeOptions();
+                if (!result || !result.success) return;
+                dashboardScopeOptions = {
+                    accounts: Array.isArray(result.accounts) ? result.accounts : [],
+                    plans: Array.isArray(result.plans) ? result.plans : [],
+                };
+                const accountSelect = document.getElementById('dashboardAccountFilter');
+                setSelectOptions(
+                    accountSelect,
+                    dashboardScopeOptions.accounts,
+                    '全部已启用账户',
+                    'aavid',
+                    account => `${account.account_name || '未命名账户'} (${account.aavid || '-'})`
+                );
+                accountSelect.value = selectedDashboardAavid;
+                rebuildDashboardPlanOptions();
+            } catch (error) {
+                console.error('加载大屏账户与计划范围失败', error);
+            }
+        }
+
+        function formatFreshness(state) {
+            const age = Number(state && state.dataAgeSeconds);
+            if (!state || !state.newestAt) return { text: '尚无采集数据', cls: 'text-slate-500' };
+            if (!Number.isFinite(age)) return { text: `最后采集 ${state.newestAt}`, cls: 'text-slate-400' };
+            if (age <= 5 * 60) return { text: `数据正常 · ${Math.max(0, Math.floor(age / 60))}分钟前`, cls: 'text-emerald-400' };
+            if (age <= 10 * 60) return { text: `等待下一轮 · ${Math.floor(age / 60)}分钟前`, cls: 'text-amber-400' };
+            return { text: `数据延迟 · ${Math.floor(age / 60)}分钟前`, cls: 'text-rose-400' };
+        }
+
+        async function checkDashboardDataVersion(force = false) {
+            const api = await waitForAPI();
+            if (!api || !api.getDashboardRefreshState) return;
+            try {
+                const state = await api.getDashboardRefreshState(
+                    selectedDashboardAavid || null,
+                    selectedDashboardTargetUid || null
+                );
+                const freshness = formatFreshness(state);
+                const element = document.getElementById('dashboardFreshness');
+                if (element) {
+                    element.className = `ml-auto text-[11px] tabular-nums shrink-0 ${freshness.cls}`;
+                    element.textContent = freshness.text;
+                    element.title = state && state.newestAt ? `最后成功采集：${state.newestAt}` : '';
+                }
+                const version = String((state && state.dataVersion) || '');
+                if (force || version !== dashboardDataVersion) {
+                    dashboardDataVersion = version;
+                    await queryAndUpdateData(true);
+                }
+            } catch (error) {
+                console.error('检查大屏数据版本失败', error);
+            }
+        }
+
+        function bindDashboardScopeEvents() {
+            const accountSelect = document.getElementById('dashboardAccountFilter');
+            const planSelect = document.getElementById('dashboardPlanFilter');
+            if (accountSelect) accountSelect.addEventListener('change', async function () {
+                selectedDashboardAavid = String(this.value || '');
+                selectedDashboardTargetUid = '';
+                currentPage = 1;
+                rebuildDashboardPlanOptions();
+                clearSelectionAndCharts();
+                await checkDashboardDataVersion(true);
+            });
+            if (planSelect) planSelect.addEventListener('change', async function () {
+                selectedDashboardTargetUid = String(this.value || '');
+                const selectedPlan = (dashboardScopeOptions.plans || []).find(
+                    plan => String(plan.target_uid || '') === selectedDashboardTargetUid
+                );
+                if (selectedPlan && !selectedDashboardAavid) {
+                    selectedDashboardAavid = String(selectedPlan.aavid || '');
+                    if (accountSelect) accountSelect.value = selectedDashboardAavid;
+                    rebuildDashboardPlanOptions();
+                    planSelect.value = selectedDashboardTargetUid;
+                }
+                currentPage = 1;
+                clearSelectionAndCharts();
+                await checkDashboardDataVersion(true);
+            });
+        }
+
         async function refreshAccountLabelFromBackend() {
             const api = await waitForAPI();
             if (!api || !api.getDashboardAccountLabel) {
@@ -1030,6 +1180,11 @@
 
         // 当前周期设置，默认 1h
         let currentPeriod = "1h";
+        let dashboardScopeOptions = { accounts: [], plans: [] };
+        let selectedDashboardAavid = '';
+        let selectedDashboardTargetUid = '';
+        let dashboardDataVersion = '';
+        let dashboardRefreshInFlight = false;
 
         // 排序和分页状态
         let currentSortBy = "costDiff";
@@ -1043,7 +1198,9 @@
         // - 表格数据刷新（getTableData）
         // - Top20 饼图刷新（随表格渲染）
         // - 折线图轮询刷新（getMaterialHistoryRecent）
-        const REFRESH_MS = 10000;
+        // 底层官方 API 以五分钟为核心周期。前端每15秒只检查轻量版本号，
+        // 仅在数据版本变化时重查表格和图表，避免反复扫描同一批数据。
+        const REFRESH_MS = 15000;
 
         // 流速颜色配置
         const VELOCITY_CONFIG = {
@@ -1544,7 +1701,15 @@
                 }
                 const q = assistSearchQuery ? assistSearchQuery : null;
                 const adDeliveryType = assistFilterRegulating ? 0 : null;
-                const r = await api.getRoi2AssistTableData(null, assistSortBy, assistSortOrder, assistPage, assistPageSize, q, adDeliveryType);
+                const r = await api.getRoi2AssistTableData(
+                    selectedDashboardAavid || null,
+                    assistSortBy,
+                    assistSortOrder,
+                    assistPage,
+                    assistPageSize,
+                    q,
+                    adDeliveryType
+                );
                 if (r && r.success && Array.isArray(r.data)) {
                     assistRows = r.data;
                     assistTotal = r.total != null ? r.total : r.data.length;
@@ -1755,8 +1920,17 @@
                     return [];
                 }
                 // 调用 Python 端的 getTableData 方法（后端分页）
-                const result = await api.getTableData(currentPeriod, currentSortBy, currentSortOrder, currentPage, currentPageSize);
+                const result = await api.getTableData(
+                    currentPeriod,
+                    currentSortBy,
+                    currentSortOrder,
+                    currentPage,
+                    currentPageSize,
+                    selectedDashboardTargetUid || null,
+                    selectedDashboardAavid || null
+                );
                 if (result.success && result.data) {
+                    if (result.dataVersion) dashboardDataVersion = String(result.dataVersion);
                     // 更新分页信息
                     window.totalDataCount = result.total || 0;
                     totalPages = result.totalPages || 1;
@@ -1792,6 +1966,10 @@
 
                         return {
                             id,
+                            targetUid: String(mat.targetUid ?? mat.target_uid ?? ''),
+                            aadvid: String(mat.aadvid ?? ''),
+                            accountName: String(mat.accountName ?? mat.account_name ?? ''),
+                            planName: String(mat.planName ?? mat.plan_name ?? ''),
                             title,
                             isAigc,
                             videoType,
@@ -1815,6 +1993,7 @@
                             estimatedEcpm: (mat.estimatedEcpm !== undefined && mat.estimatedEcpm !== null)
                                 ? Number(mat.estimatedEcpm)
                                 : null,
+                            collectedAt: String(mat.collectedAt ?? mat.collected_at ?? ''),
                             historyData: Array.isArray(mat.historyData) ? mat.historyData : [],
                         };
                     });
@@ -1834,7 +2013,11 @@
                     console.error('pywebview API 或 getTop20ByCost 方法未就绪');
                     return [];
                 }
-                const result = await api.getTop20ByCost(hours);
+                const result = await api.getTop20ByCost(
+                    hours,
+                    selectedDashboardAavid || null,
+                    selectedDashboardTargetUid || null
+                );
                 if (result.success && result.data) {
                     return result.data.map(mat => ({
                         id: mat.id ?? mat.material_id,
@@ -1857,7 +2040,11 @@
                     console.error('pywebview API 或 getLatestCrawlCostSum 未就绪');
                     return null;
                 }
-                const result = await api.getLatestCrawlCostSum(hours);
+                const result = await api.getLatestCrawlCostSum(
+                    hours,
+                    selectedDashboardAavid || null,
+                    selectedDashboardTargetUid || null
+                );
                 if (result && result.success) {
                     return {
                         totalCost: Number(result.totalCost ?? 0) || 0,
@@ -2057,14 +2244,19 @@
 
                 const materialCellClass = `p-2 border-b border-slate-800/50 ${isSelected ? 'border-l-2 border-l-blue-500' : ''}`;
                 const displayTitle = getMaterialDisplayTitle(item);
-                const titleAttr = displayTitle.replace(/"/g, '&quot;');
+                const titleAttr = escapeHtml(displayTitle);
+                const displayTitleHtml = escapeHtml(displayTitle);
+                const scopeLabel = escapeHtml(
+                    [item.accountName, item.planName].filter(Boolean).join(' · ')
+                );
 
                 row.innerHTML = `
                     <td class="${materialCellClass}" data-col="material">
                         <div class="flex flex-col max-w-[140px] xl:max-w-[200px]">
                             <div class="text-white font-medium text-xs truncate" title="${titleAttr}">
-                                ${displayTitle}
+                                ${displayTitleHtml}
                             </div>
+                            ${scopeLabel ? `<div class="text-[10px] text-sky-400/70 truncate" title="${scopeLabel}">${scopeLabel}</div>` : ''}
                             <div class="text-[10px] text-slate-500 font-mono truncate flex items-center gap-1">
                                 <span class="cursor-pointer hover:text-blue-400 transition-colors font-mono text-[10px]" onclick="copyToClipboard('${item.id}')" title="点击复制ID">${item.id}</span>
                                 ${tagStr}
@@ -2190,7 +2382,7 @@
         let historyActiveMaterialId = null;
         let historyRequestToken = 0;
         const HISTORY_LIMIT = 200;
-        const HISTORY_POLL_MS = REFRESH_MS;
+        const HISTORY_POLL_MS = 60000;
 
         function selectMaterial(item) {
             selectedMaterial = item;
@@ -2198,7 +2390,7 @@
             document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${item.id}`;
             document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${item.id}`;
             renderTable(processData()); // 重新渲染表格以更新选中状态
-            startHistoryPolling(item.id);
+            startHistoryPolling(item.id, item.targetUid);
         }
 
         function stopHistoryPolling() {
@@ -2210,12 +2402,13 @@
             historyRequestToken++;
         }
 
-        function startHistoryPolling(materialId) {
+        function startHistoryPolling(materialId, targetUid = '') {
             if (!materialId) return;
-            if (historyActiveMaterialId === materialId && historyPollTimer) return;
+            const historyKey = `${targetUid || ''}:${materialId}`;
+            if (historyActiveMaterialId === historyKey && historyPollTimer) return;
 
             stopHistoryPolling();
-            historyActiveMaterialId = materialId;
+            historyActiveMaterialId = historyKey;
 
             // 立即拉一次
             refreshHistoryOnce(materialId);
@@ -2233,7 +2426,13 @@
                 if (!api || !api.getMaterialHistoryRecent) {
                     return;
                 }
-                const res = await api.getMaterialHistoryRecent(materialId, HISTORY_LIMIT);
+                const res = await api.getMaterialHistoryRecent(
+                    materialId,
+                    HISTORY_LIMIT,
+                    selectedMaterial && selectedMaterial.targetUid
+                        ? selectedMaterial.targetUid
+                        : (selectedDashboardTargetUid || null)
+                );
                 if (token !== historyRequestToken) return; // 已切换素材/停止
                 if (res && res.success && Array.isArray(res.data)) {
                     const historyData = res.data;
@@ -2655,12 +2854,14 @@
             initAssistPanelUi();
             initColumnConfig();
             updateSortIcons();
+            bindDashboardScopeEvents();
 
             // 显示加载状态
             showMaterialTableLoadingPlaceholder();
 
             // 等待页面完全加载 + pywebview 注入
             await new Promise(r => setTimeout(r, 500));
+            await loadDashboardScopeOptions();
 
             // 从 API 获取数据
             console.log('[dashboard] calling getTableData...');
@@ -2678,25 +2879,29 @@
             renderTable(sortedData);
             // 初始化默认选中第一条：同时启动折线图查询/轮询
             if (selectedMaterial && selectedMaterial.id) {
-                startHistoryPolling(selectedMaterial.id);
+                startHistoryPolling(selectedMaterial.id, selectedMaterial.targetUid);
             }
             // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
             await renderPieChart();
             if (assistPanelOpen) await fetchAssistRows();
+            await checkDashboardDataVersion(false);
         }
 
         // ================= 数据查询与计算逻辑 =================
         // 表格数据由后端 getTableData 直接返回，这里不再做本地模拟/二次计算
 
         // 主查询逻辑：异步重新从 API 获取数据
-        async function queryAndUpdateData() {
-            if (isLoadingData) return;
+        async function queryAndUpdateData(force = false) {
+            if (isLoadingData || dashboardRefreshInFlight) return;
+            dashboardRefreshInFlight = true;
+            try {
 
             // 从 API 重新获取数据
             const newMaterials = await fetchMaterials();
 
             // 保持选中状态
             const selectedId = selectedMaterial ? selectedMaterial.id : null;
+            const selectedTarget = selectedMaterial ? selectedMaterial.targetUid : null;
 
             // 合并数据（保留历史数据）
             materials = newMaterials;
@@ -2705,10 +2910,14 @@
 
             // 恢复选中状态
             if (selectedId) {
-                const found = sortedData.find(m => m.id === selectedId);
+                const found = sortedData.find(m => (
+                    m.id === selectedId && (!selectedTarget || m.targetUid === selectedTarget)
+                ));
                 if (found) {
                     selectedMaterial = found;
                     document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+                } else {
+                    clearSelectionAndCharts();
                 }
             } else if (sortedData.length > 0) {
                 selectedMaterial = sortedData[0];
@@ -2721,10 +2930,13 @@
             // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
             await renderPieChart();
             if (assistPanelOpen) await fetchAssistRows();
+            } finally {
+                dashboardRefreshInFlight = false;
+            }
         }
 
-        // 每 N 秒自动刷新；手动按钮在轮询失效时可兜底
-        setInterval(queryAndUpdateData, REFRESH_MS);
+        // 每 N 秒只检查数据版本，发生新一轮采集后才重绘大屏。
+        setInterval(() => checkDashboardDataVersion(false), REFRESH_MS);
 
         (function setupManualDashboardRefresh() {
             const btn = document.getElementById('dashboardManualRefreshBtn');
@@ -2736,7 +2948,8 @@
                     await Promise.all([
                         runRefreshIconSpin180(btn),
                         (async () => {
-                            await queryAndUpdateData();
+                            await loadDashboardScopeOptions();
+                            await queryAndUpdateData(true);
                             if (selectedMaterial && selectedMaterial.id) {
                                 await refreshHistoryOnce(selectedMaterial.id);
                             }

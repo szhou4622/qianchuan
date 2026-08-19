@@ -591,17 +591,34 @@ class JSApi:
             print(f"警告：rc23升级快照创建失败：{exc}")
         self.api = Api()
 
-    def getTableData(self, period="1h", sortBy="costDiff", sortOrder="desc", page=1, pageSize=50):
-        return self.api.get_table_data(period, sortBy, sortOrder, page, pageSize)
+    def getTableData(
+        self,
+        period="1h",
+        sortBy="costDiff",
+        sortOrder="desc",
+        page=1,
+        pageSize=50,
+        targetUid=None,
+        aavid=None,
+    ):
+        return self.api.get_table_data(
+            period, sortBy, sortOrder, page, pageSize, targetUid, aavid
+        )
 
-    def getTop20ByCost(self, hours=1):
-        return self.api.get_top20_by_cost(hours)
+    def getTop20ByCost(self, hours=1, aavid=None, targetUid=None):
+        return self.api.get_top20_by_cost(hours, aavid, targetUid)
 
-    def getLatestCrawlCostSum(self, hours=1):
-        return self.api.get_latest_crawl_cost_sum(hours)
+    def getLatestCrawlCostSum(self, hours=1, aavid=None, targetUid=None):
+        return self.api.get_latest_crawl_cost_sum(hours, aavid, targetUid)
 
-    def getMaterialHistoryRecent(self, material_id, limit=200):
-        return self.api.get_material_history_recent(material_id, limit)
+    def getMaterialHistoryRecent(self, material_id, limit=200, targetUid=None):
+        return self.api.get_material_history_recent(material_id, limit, targetUid)
+
+    def getDashboardScopeOptions(self):
+        return self.api.get_dashboard_scope_options()
+
+    def getDashboardRefreshState(self, aavid=None, targetUid=None):
+        return self.api.get_dashboard_refresh_state(aavid, targetUid)
 
     def getDashboardAccountLabel(self):
         return self.api.get_dashboard_account_label()

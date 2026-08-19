@@ -53,6 +53,12 @@ class Api:
 
     # ========== 大屏相关 API ==========
 
+    def get_dashboard_scope_options(self):
+        return self.dashboard.get_scope_options()
+
+    def get_dashboard_refresh_state(self, aavid: str = None, target_uid: str = None):
+        return self.dashboard.get_refresh_state(aavid or "", target_uid or "")
+
     def get_material_history_recent(
         self,
         material_id: str,
@@ -63,7 +69,8 @@ class Api:
         return self.dashboard.get_material_history_recent(material_id, limit, target_uid)
 
     def get_table_data(self, period: str = "1h", sort_by: str = "costDiff", sort_order: str = "desc",
-                      page: int = 1, page_size: int = 50, target_uid: str = None):
+                      page: int = 1, page_size: int = 50, target_uid: str = None,
+                      aavid: str = None):
         """
         获取表格数据（按周期查询素材首尾差值）
 
@@ -84,6 +91,7 @@ class Api:
             page,
             page_size,
             target_uid,
+            aavid,
         )
 
     # ========== 直播 / 商品全域监控计划 ==========
@@ -808,7 +816,9 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
-    def get_top20_by_cost(self, hours: int = 1):
+    def get_top20_by_cost(
+        self, hours: int = 1, aavid: str = None, target_uid: str = None
+    ):
         """
         获取最近 N 小时内每个素材最新的一条数据，按整体消耗排序取 Top 20
 
@@ -818,11 +828,13 @@ class Api:
         Returns:
             Top 20 素材列表，按 stat_cost 降序
         """
-        return self.dashboard.get_top20_by_cost(hours)
+        return self.dashboard.get_top20_by_cost(hours, aavid, target_uid)
 
-    def get_latest_crawl_cost_sum(self, hours: int = 1):
+    def get_latest_crawl_cost_sum(
+        self, hours: int = 1, aavid: str = None, target_uid: str = None
+    ):
         """周期内（最近 N 小时）最晚一批入库记录的消耗总和，与 Top20 时间窗一致。"""
-        return self.dashboard.get_latest_crawl_cost_sum(hours)
+        return self.dashboard.get_latest_crawl_cost_sum(hours, aavid, target_uid)
 
     def get_dashboard_account_label(self):
         """大屏账户标注（存 data/dashboard_account_label.json）。"""

@@ -229,7 +229,7 @@
     $('sessionHint').textContent=officialApiSession?('App Secret与令牌使用Windows DPAPI加密保存在本机'+(session.last_error?' · '+session.last_error:'')):((session.encrypted?'Cookie已用Windows DPAPI加密':'尚未完成加密迁移')+(session.updated_at?' · '+session.updated_at:'')+(session.last_error?' · '+session.last_error:''));
     const capacity=data.capacity||{};
     $('capacityValue').textContent=`${capacity.active_count||0} 正常 / ${capacity.waiting_count||0} 容量等待 / ${capacity.disabled_count||0} 未启用或不可用`;
-    $('capacityHint').textContent=`容量只统计已核验且已勾选计划；预计一轮 ${capacity.estimated_cycle_seconds||0} 秒，预算 ${capacity.capacity_window_seconds||540} 秒`;
+    $('capacityHint').textContent=`容量只统计已核验且已勾选计划；预计一轮 ${capacity.estimated_cycle_seconds||0} 秒，5分钟预算 ${capacity.capacity_window_seconds||300} 秒`;
     $('lagValue').textContent=capacity.delayed_count?`${capacity.delayed_count} 条延迟`:(capacity.active_count||capacity.waiting_count?'时效正常':'暂无可监控计划');
     const queue=data.browser_queue||{};
     const queueExecuting=Number(queue.executing||0);const queueWaiting=Number(queue.waiting||0);

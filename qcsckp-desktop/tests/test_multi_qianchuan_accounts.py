@@ -405,11 +405,11 @@ class MultiQianchuanAccountTests(unittest.TestCase):
             self._target("10001", index)
         snapshot = capacity_snapshot(db=self.db)
         # One advertiser is intentionally serialized to protect its API quota:
-        # 12 default 45-second plans fit in the nine-minute freshness budget.
-        self.assertEqual(12, snapshot["active_count"])
-        self.assertEqual(25, snapshot["waiting_count"])
+        # Six default 45-second plans fit in one advertiser's five-minute lane.
+        self.assertEqual(6, snapshot["active_count"])
+        self.assertEqual(31, snapshot["waiting_count"])
         self.assertEqual(3, snapshot["parallel_workers"])
-        self.assertLessEqual(snapshot["estimated_cycle_seconds"], 9 * 60)
+        self.assertLessEqual(snapshot["estimated_cycle_seconds"], 5 * 60)
 
     def test_capacity_uses_parallel_lanes_across_different_accounts(self):
         for account_index in range(3):
@@ -419,9 +419,9 @@ class MultiQianchuanAccountTests(unittest.TestCase):
                     account_index * 100 + plan_index,
                 )
         snapshot = capacity_snapshot(db=self.db)
-        self.assertEqual(36, snapshot["active_count"])
-        self.assertEqual(0, snapshot["waiting_count"])
-        self.assertEqual(9 * 60, snapshot["estimated_cycle_seconds"])
+        self.assertEqual(18, snapshot["active_count"])
+        self.assertEqual(18, snapshot["waiting_count"])
+        self.assertEqual(6 * 45, snapshot["estimated_cycle_seconds"])
 
     def test_target_health_recomputes_data_age_on_every_read(self):
         old = (datetime.now() - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S")
@@ -612,6 +612,26 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         snapshot = capacity_snapshot(db=self.db)
         self.assertEqual(0, snapshot["active_count"])
         self.assertEqual(1, snapshot["waiting_count"])
+
+    def test_recorded_duration_keeps_five_minute_start_to_start_cadence(self):
+        target = self._target("10001", 1)
+        started_at = datetime.now() - timedelta(seconds=164)
+        before = datetime.now()
+        record_target_duration(
+            target["target_uid"],
+            164_000,
+            interval_seconds=300,
+            cycle_started_at=started_at,
+            refresh_capacity=False,
+            db=self.db,
+        )
+        row = self.db.select_one(
+            "promotion_target", where={"target_uid": target["target_uid"]}
+        )
+        due = datetime.strptime(str(row["next_due_at"]), "%Y-%m-%d %H:%M:%S")
+        remaining = (due - before).total_seconds()
+        self.assertGreaterEqual(remaining, 130)
+        self.assertLessEqual(remaining, 140)
 
     def test_account_specific_feishu_route_only_uses_selected_bound_targets(self):
         account = ensure_qianchuan_account("10001", db=self.db)

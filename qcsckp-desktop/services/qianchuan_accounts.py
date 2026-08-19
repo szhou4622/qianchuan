@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config import DATA_DIR, DB_FILE
@@ -15,7 +15,10 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 DEFAULT_OWNER = "local_default"
-CAPACITY_WINDOW_SECONDS = 9 * 60
+# A target marked as actively monitored must fit the same five-minute SLA as
+# the hot collector.  Overflow targets remain saved but are explicitly placed
+# in capacity_waiting instead of silently delivering 6-9 minute-old metrics.
+CAPACITY_WINDOW_SECONDS = 5 * 60
 CAPACITY_STALE_SECONDS = 10 * 60
 CAPACITY_PARALLEL_WORKERS = 3
 DEFAULT_TARGET_DURATION_MS = 45_000
@@ -1095,6 +1098,7 @@ def record_target_duration(
     duration_ms: Any,
     *,
     interval_seconds: int = 5 * 60,
+    cycle_started_at: Optional[datetime] = None,
     refresh_capacity: bool = True,
     db: Optional[SQLiteStore] = None,
 ) -> None:
@@ -1117,13 +1121,20 @@ def record_target_duration(
     # 变慢时立即按真实耗时收紧容量，变快时再平滑恢复，不能把超时计划
     # 截断成“正常”后继续接纳更多计划。
     smoothed = max(measured, int(round(old * 0.7 + measured * 0.3)))
+    # The five-minute SLA is start-to-start.  Scheduling from the finish time
+    # silently turns a 164-second collection into a 7m44s cycle.  Anchor the
+    # next run to the cycle start; when a cycle itself overruns, retry promptly
+    # without spinning in a zero-delay loop.
+    now = datetime.now()
+    cadence_start = cycle_started_at or now
+    next_due = cadence_start + timedelta(seconds=max(30, int(interval_seconds)))
+    if next_due <= now:
+        next_due = now + timedelta(seconds=5)
     store.update(
         "promotion_target",
         {
             "last_duration_ms": smoothed,
-            "next_due_at": datetime.fromtimestamp(
-                datetime.now().timestamp() + max(30, int(interval_seconds))
-            ).strftime("%Y-%m-%d %H:%M:%S"),
+            "next_due_at": next_due.strftime("%Y-%m-%d %H:%M:%S"),
             "last_lag_seconds": 0,
         },
         where={"target_uid": str(target_uid or "").strip()},

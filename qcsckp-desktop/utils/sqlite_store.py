@@ -75,9 +75,9 @@ class SQLiteStore:
                 ('idx_material_perf_lead', 'created_at, material_id'),
             ]
         },
-        # 每个计划-素材只保留最新一行。历史快照仍写入
-        # pmc_promotion_material；规则扫描和大屏最新状态读取本表，避免
-        # 随运行时间增长而反复扫描数十万条历史记录。
+        # 每个计划-素材只保留最新一行。官方 API 的高频历史指标写入下方
+        # 精简快照表，不再把素材名称、封面等固定字段每五分钟重复写入
+        # pmc_promotion_material。
         'pmc_promotion_material_latest': {
             'columns': {
                 'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
@@ -132,6 +132,97 @@ class SQLiteStore:
             ],
             'unique_indexes': [
                 ('uk_material_latest_target_material', 'target_uid, material_id'),
+            ],
+        },
+        # 五分钟核心指标快照。固定素材资料只在 latest 表保存一份，避免
+        # 大量重复文本和九组历史索引把数据库推到 GB 级。
+        'pmc_material_metric_snapshot': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'account_username': "TEXT NOT NULL DEFAULT 'local_default'",
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
+                'aadvid': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'material_id': 'TEXT NOT NULL',
+                'bucket_key': 'TEXT NOT NULL',
+                'collected_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'stat_date': "TEXT NOT NULL DEFAULT (date('now', '+8 hours'))",
+                'stat_cost': 'REAL',
+                'order_settle_count_1h': 'INTEGER',
+                'order_settle_amount_1h': 'REAL',
+                'order_settle_rate_1h': 'REAL',
+                'prepay_pay_order_count': 'REAL',
+                'pay_gmv_include_coupon': 'REAL',
+                'prepay_pay_settle_1h': 'REAL',
+                'refund_rate_1h': 'REAL',
+                'overall_order_count': 'INTEGER',
+                'overall_show_count': 'INTEGER',
+                'overall_click_count': 'INTEGER',
+                'overall_ctr': 'REAL',
+                'overall_conversion_rate': 'REAL',
+                'api_request_id': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_metric_snapshot_owner_time', 'account_username, collected_at'),
+                ('idx_metric_snapshot_account_time', 'account_username, aadvid, collected_at'),
+                ('idx_metric_snapshot_target_time', 'target_uid, collected_at'),
+                ('idx_metric_snapshot_material_time', 'target_uid, material_id, collected_at'),
+            ],
+            'unique_indexes': [
+                ('uk_metric_snapshot_bucket', 'account_username, target_uid, material_id, bucket_key'),
+            ],
+        },
+        # 超过48小时的五分钟快照按小时保留最后一个可信点，供长期曲线和
+        # 对账使用；大屏最近一小时仍读取精确的五分钟快照。
+        'pmc_material_metric_hourly': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'account_username': "TEXT NOT NULL DEFAULT 'local_default'",
+                'account_uid': "TEXT NOT NULL DEFAULT ''",
+                'aadvid': 'TEXT NOT NULL',
+                'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+                'ad_id': "TEXT NOT NULL DEFAULT ''",
+                'material_id': 'TEXT NOT NULL',
+                'hour_key': 'TEXT NOT NULL',
+                'collected_at': 'TEXT NOT NULL',
+                'stat_cost': 'REAL',
+                'order_settle_count_1h': 'INTEGER',
+                'order_settle_amount_1h': 'REAL',
+                'order_settle_rate_1h': 'REAL',
+                'prepay_pay_order_count': 'REAL',
+                'pay_gmv_include_coupon': 'REAL',
+                'prepay_pay_settle_1h': 'REAL',
+                'refund_rate_1h': 'REAL',
+                'overall_order_count': 'INTEGER',
+                'overall_show_count': 'INTEGER',
+                'overall_click_count': 'INTEGER',
+                'overall_ctr': 'REAL',
+                'overall_conversion_rate': 'REAL',
+                'api_request_id': 'TEXT',
+                'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'indexes': [
+                ('idx_metric_hourly_owner_time', 'account_username, hour_key'),
+                ('idx_metric_hourly_target_time', 'target_uid, hour_key'),
+                ('idx_metric_hourly_material_time', 'target_uid, material_id, hour_key'),
+            ],
+            'unique_indexes': [
+                ('uk_metric_hourly_point', 'account_username, target_uid, material_id, hour_key'),
+            ],
+        },
+        'dashboard_storage_state': {
+            'columns': {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'state_key': 'TEXT NOT NULL',
+                'state_value': "TEXT NOT NULL DEFAULT ''",
+                'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
+            },
+            'unique_indexes': [
+                ('uk_dashboard_storage_state_key', 'state_key'),
             ],
         },
         'pmc_ad_detail_basic': {
