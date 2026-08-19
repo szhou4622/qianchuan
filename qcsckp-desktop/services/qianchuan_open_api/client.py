@@ -468,10 +468,18 @@ class QianchuanOpenApiClient:
                         )
                     if "has_more" in info:
                         return bool(info.get("has_more"))
-                    total_page = info.get("total_page") or info.get("total_pages")
+                    total_page = info.get("total_page")
+                    if total_page is None:
+                        total_page = info.get("total_pages")
                     if total_page is not None:
-                        return page < int(total_page)
-                    total = info.get("total_number") or info.get("total") or info.get("count")
+                        return page < max(0, int(total_page))
+                    total = info.get("total_number")
+                    if total is None:
+                        total = info.get("total_num")
+                    if total is None:
+                        total = info.get("total")
+                    if total is None:
+                        total = info.get("count")
                     if total is not None:
                         return page * page_size < int(total)
             if "has_more" in data:
@@ -518,7 +526,9 @@ class QianchuanOpenApiClient:
             for key in ("page_info", "pageInfo", "pagination"):
                 info = first_response.data.get(key)
                 if isinstance(info, Mapping):
-                    raw_total = info.get("total_page") or info.get("total_pages")
+                    raw_total = info.get("total_page")
+                    if raw_total is None:
+                        raw_total = info.get("total_pages")
                     if raw_total not in (None, ""):
                         total_pages = int(raw_total)
                     break

@@ -2142,6 +2142,28 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "/open_api/v1.0/test/", {}, page_size=100
             )
 
+    def test_zero_page_and_total_num_zero_is_complete_empty_result(self):
+        page = ApiResponse(
+            data={
+                "page_info": {
+                    "page": 1,
+                    "page_size": 100,
+                    "total_num": 0,
+                    "total_page": 0,
+                },
+                "ad_list": [],
+            },
+            raw={"code": 0},
+            request_id="r-empty-complete",
+        )
+        rows, request_ids = _PagedClient([page]).get_all_pages(
+            "/open_api/v1.0/qianchuan/uni_promotion/ad/get/",
+            {},
+            page_size=100,
+        )
+        self.assertEqual([], rows)
+        self.assertEqual(["r-empty-complete"], request_ids)
+
     def test_pagination_rejects_server_page_size_mismatch(self):
         page = ApiResponse(
             data={
