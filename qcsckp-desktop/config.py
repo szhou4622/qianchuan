@@ -56,7 +56,7 @@ def _get_project_root() -> str:
 PROJECT_ROOT = _get_project_root()
 
 
-CURRENT_VERSION = "0.1.53"
+CURRENT_VERSION = "0.1.54"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -223,10 +223,10 @@ REMOTE_SERVICES_ENABLED = AUTH_MODE == "remote" and bool(API_BASE_URL)
 # 随安装包交付的本地工具账号。密码只保存 PBKDF2-HMAC-SHA256 结果，
 # 不在源码、日志和本地数据文件中保存明文。
 LOCAL_AUTH_USERNAME = _env_text("QCSCKP_LOCAL_AUTH_USERNAME") or "qcsckp_local"
-LOCAL_AUTH_PASSWORD_SALT = "5c8a04f47e6d2ab047f3a9cc05cd9e6c"
+LOCAL_AUTH_PASSWORD_SALT = "02bf85930127b25792e90d37d9ad5f1a"
 LOCAL_AUTH_PASSWORD_HASH = (
     _env_text("QCSCKP_LOCAL_AUTH_PASSWORD_HASH")
-    or "b31e77ae460ffdc5a09d6388d596194c9f22c0d8ccfe67f0d1fa40e781c060b4"
+    or "d1327b751246cf6611e3d31f6856478c7a2c7999cc956b26f315cc9c21482135"
 )
 LOCAL_AUTH_PBKDF2_ITERATIONS = 240_000
 
