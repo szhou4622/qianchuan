@@ -675,7 +675,7 @@ class JSApi:
             }
         result = manager.startup_check()
         try:
-            result["machine_code"] = manager.store.get_or_create_machine_code()
+            result["machine_code"] = manager.store.get_or_create_device_code()
         except Exception:
             result["machine_code"] = ""
         if int(result.get("http_status") or 0) == 401:
@@ -692,7 +692,7 @@ class JSApi:
             }
         result = manager.activate(activationCode)
         try:
-            result["machine_code"] = manager.store.get_or_create_machine_code()
+            result["machine_code"] = manager.store.get_or_create_device_code()
         except Exception:
             result["machine_code"] = ""
         return result

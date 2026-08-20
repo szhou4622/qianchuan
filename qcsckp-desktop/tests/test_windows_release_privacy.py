@@ -64,12 +64,13 @@ class WindowsReleasePrivacyTests(unittest.TestCase):
             (root / "bin").mkdir()
             for name in (
                 "license_credentials.dpapi",
+                "license_device_code.dpapi",
                 "license_machine_code.dpapi",
                 "license_metadata.json",
             ):
                 (root / "bin" / name).write_text("private", encoding="utf-8")
             violations = privacy.privacy_violations(root)
-            self.assertEqual(3, len(violations))
+            self.assertEqual(4, len(violations))
 
     def test_dependency_source_names_are_not_false_positives(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -16,10 +16,17 @@ from services.license_client import (
 )
 from services.license_manager import LicenseManager
 from services.license_storage import LicenseSecureStore
+from services.device_identity import generate_device_code, validate_device_code
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPIRES_AT = "2027-08-20T12:00:00+08:00"
+TEST_DEVICE_CODE = generate_device_code(
+    {
+        "BOARD_UUID": "11111111-2222-3333-4444-555555555555",
+        "WINDOWS_MACHINE_GUID": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    }
+)
 
 
 def license_payload(license_type="monthly", **overrides):
@@ -61,12 +68,13 @@ def status_payload(license_type="monthly", **overrides):
 
 
 class FakeStore:
-    def __init__(self, machine="machine_stable_12345678"):
+    def __init__(self, machine="machine_stable_12345678", device_code=TEST_DEVICE_CODE):
         self.credentials = None
         self.activation_context = {}
         self.license_snapshot = {}
         self.metadata = {}
         self.machine = machine
+        self.device_code = device_code
         self.clear_count = 0
 
     def load_credentials(self):
@@ -96,6 +104,9 @@ class FakeStore:
 
     def get_or_create_machine_code(self):
         return self.machine
+
+    def get_or_create_device_code(self):
+        return self.device_code
 
     def load_metadata(self):
         return dict(self.metadata)
@@ -203,10 +214,10 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual("月卡", state["license"]["license_type_label"])
         self.assertEqual(EXPIRES_AT, state["license"]["expires_at"])
         self.assertEqual(30, state["license"]["duration_days"])
-        self.assertEqual([("MONTH-TEST", store.machine)], client.activate_calls)
+        self.assertEqual([("MONTH-TEST", store.device_code)], client.activate_calls)
         self.assertEqual("MONTH-TEST", store.activation_context["activation_code"])
         self.assertEqual("code-test-001", store.activation_context["code_id"])
-        self.assertEqual(store.machine, store.activation_context["machine_code"])
+        self.assertEqual(store.device_code, store.activation_context["machine_code"])
         public_json = json.dumps(state, ensure_ascii=False)
         self.assertNotIn("session-sensitive-value", public_json)
         self.assertNotIn("credential-sensitive-value", public_json)
@@ -274,7 +285,7 @@ class OnlineLicenseManagerTests(unittest.TestCase):
     def test_unknown_server_type_keeps_issued_credentials_without_authorizing(self):
         store = FakeStore()
         payload = license_payload("future_server_type")
-        payload["machine_code"] = store.machine
+        payload["machine_code"] = store.device_code
         manager = LicenseManager(
             client=FakeClient(activation=payload),
             store=store,
@@ -451,8 +462,8 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         LicenseManager(client=first_client, store=store).activate("FIRST")
         second_client = FakeClient()
         LicenseManager(client=second_client, store=store).activate("SECOND")
-        self.assertEqual("machine_upgrade_stable", first_client.activate_calls[0][1])
-        self.assertEqual("machine_upgrade_stable", second_client.activate_calls[0][1])
+        self.assertEqual(TEST_DEVICE_CODE, first_client.activate_calls[0][1])
+        self.assertEqual(TEST_DEVICE_CODE, second_client.activate_calls[0][1])
 
     def test_active_code_on_other_device_keeps_exact_server_409_message(self):
         message = "该激活码已绑定其他设备，请先在原设备解绑"
@@ -1013,6 +1024,7 @@ class WindowsLicenseStorageTests(unittest.TestCase):
             store = LicenseSecureStore(
                 credential_file=str(Path(root) / "credentials.dpapi"),
                 machine_code_file=str(Path(root) / "machine.dpapi"),
+                device_code_file=str(Path(root) / "device-code.dpapi"),
                 metadata_file=str(Path(root) / "metadata.json"),
                 platform_name="win32",
             )
@@ -1049,7 +1061,7 @@ class WindowsLicenseStorageTests(unittest.TestCase):
             first = store.get_or_create_machine_code()
             second = store.get_or_create_machine_code()
             self.assertEqual(first, second)
-            self.assertTrue(first.startswith("machine_"))
+            self.assertTrue(validate_device_code(first))
             self.assertEqual(
                 "ORIGINAL-CODE-MUST-NOT-APPEAR",
                 store.load_activation_context()["activation_code"],

@@ -11,13 +11,13 @@ import json
 import os
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from config import (
     LICENSE_APP_NAME,
     LICENSE_CREDENTIAL_FILE,
+    LICENSE_DEVICE_CODE_FILE,
     LICENSE_MACHINE_CODE_FILE,
     LICENSE_METADATA_FILE,
 )
@@ -26,6 +26,7 @@ from config import (
 _KEYCHAIN_SERVICE = f"com.dadaozixun.{LICENSE_APP_NAME.lower()}.license-v2"
 _CREDENTIAL_ACCOUNT = "device-credentials"
 _MACHINE_ACCOUNT = "machine-code"
+_DEVICE_CODE_ACCOUNT = "device-code-mc1"
 _WINDOWS_DESCRIPTION = f"{LICENSE_APP_NAME} License Protocol v2"
 _LICENSE_SNAPSHOT_FIELDS = {
     "app_name",
@@ -126,11 +127,13 @@ class LicenseSecureStore:
         *,
         credential_file: str = LICENSE_CREDENTIAL_FILE,
         machine_code_file: str = LICENSE_MACHINE_CODE_FILE,
+        device_code_file: str = LICENSE_DEVICE_CODE_FILE,
         metadata_file: str = LICENSE_METADATA_FILE,
         platform_name: Optional[str] = None,
     ) -> None:
         self.credential_file = credential_file
         self.machine_code_file = machine_code_file
+        self.device_code_file = device_code_file
         self.metadata_file = metadata_file
         self.platform_name = platform_name or sys.platform
 
@@ -276,12 +279,18 @@ class LicenseSecureStore:
             raise LicenseStorageError("无法清除本机授权凭证") from exc
 
     def get_or_create_machine_code(self) -> str:
+        """Return the server binding identifier, preserving existing bindings.
+
+        Older releases issued a random encrypted ``machine_*`` value.  It must
+        remain usable until that device is explicitly unbound; new installs
+        use the deterministic MC1 device code.
+        """
         if self._is_macos:
             keyring = _mac_keyring()
             value = keyring.get_password(_KEYCHAIN_SERVICE, _MACHINE_ACCOUNT)
             if value:
                 return str(value)
-            value = f"machine_{uuid.uuid4().hex}"
+            value = self.get_or_create_device_code()
             keyring.set_password(_KEYCHAIN_SERVICE, _MACHINE_ACCOUNT, value)
             return value
 
@@ -290,8 +299,35 @@ class LicenseSecureStore:
             value = _dpapi_unprotect(path.read_text(encoding="ascii").strip())
             if value:
                 return value
-        value = f"machine_{uuid.uuid4().hex}"
+        value = self.get_or_create_device_code()
         _atomic_write_text(self.machine_code_file, _dpapi_protect(value))
+        return value
+
+    def get_or_create_device_code(self) -> str:
+        from services.device_identity import (
+            get_authorization_device_fingerprint,
+            validate_device_code,
+        )
+
+        if self._is_macos:
+            keyring = _mac_keyring()
+            value = str(
+                keyring.get_password(_KEYCHAIN_SERVICE, _DEVICE_CODE_ACCOUNT)
+                or ""
+            ).strip().upper()
+            if validate_device_code(value):
+                return value
+            value = get_authorization_device_fingerprint()
+            keyring.set_password(_KEYCHAIN_SERVICE, _DEVICE_CODE_ACCOUNT, value)
+            return value
+
+        path = Path(self.device_code_file)
+        if path.is_file():
+            value = _dpapi_unprotect(path.read_text(encoding="ascii").strip())
+            if validate_device_code(value):
+                return value.upper()
+        value = get_authorization_device_fingerprint()
+        _atomic_write_text(self.device_code_file, _dpapi_protect(value))
         return value
 
     def load_metadata(self) -> dict[str, Any]:

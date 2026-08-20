@@ -25,6 +25,7 @@ FORBIDDEN_NAMES = {
     "feishu_webhook_push.json",
     "last_crawl_target.json",
     "license_credentials.dpapi",
+    "license_device_code.dpapi",
     "license_machine_code.dpapi",
     "license_metadata.json",
     "live_retarget_consumed.json",

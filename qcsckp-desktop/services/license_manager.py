@@ -244,6 +244,7 @@ class LicenseManager:
         data: Mapping[str, Any],
         *,
         require_credentials: bool,
+        expected_machine_code: str = "",
     ) -> tuple[dict[str, Any], Optional[dict[str, str]]]:
         returned_app_name = str(data.get("app_name") or LICENSE_APP_NAME).strip()
         if returned_app_name != LICENSE_APP_NAME:
@@ -307,7 +308,9 @@ class LicenseManager:
             "license_status": license_status,
             "last_verified_at": _now_text(),
         }
-        machine_code = self.store.get_or_create_machine_code()
+        machine_code = str(expected_machine_code or "").strip()
+        if not machine_code:
+            machine_code = self.store.get_or_create_machine_code()
         returned_machine = str(data.get("machine_code") or "").strip()
         if returned_machine and returned_machine.casefold() != machine_code.casefold():
             raise LicenseServiceError(
@@ -330,6 +333,7 @@ class LicenseManager:
         self,
         data: Mapping[str, Any],
         activation_code: str,
+        machine_code: str,
     ) -> bool:
         """Keep a newly issued device credential if display normalization fails.
 
@@ -347,7 +351,7 @@ class LicenseManager:
             if str(data.get("binding_status") or "").strip().lower() != "active":
                 return False
             returned_machine = str(data.get("machine_code") or "").strip()
-            local_machine = self.store.get_or_create_machine_code()
+            local_machine = str(machine_code or "").strip()
             if returned_machine and returned_machine.casefold() != local_machine.casefold():
                 return False
             credentials = {
@@ -495,8 +499,10 @@ class LicenseManager:
                 else:
                     state = self._inactive_state()
             else:
-                machine_code = self.store.get_or_create_machine_code()
                 context = self.store.load_activation_context()
+                machine_code = str(context.get("machine_code") or "").strip()
+                if not machine_code:
+                    machine_code = self.store.get_or_create_machine_code()
                 saved = self.store.load_metadata()
                 encrypted_snapshot = self.store.load_license_snapshot()
                 code_id = str(
@@ -560,6 +566,7 @@ class LicenseManager:
                 metadata, _ = self._normalize_license(
                     response,
                     require_credentials=False,
+                    expected_machine_code=machine_code,
                 )
                 if not self._is_server_active(metadata):
                     self.store.save_metadata(metadata)
@@ -680,11 +687,20 @@ class LicenseManager:
                 LicenseServiceError("activation_in_progress", "正在激活，请勿重复点击")
             )
         response: Mapping[str, Any] = {}
+        machine_code = ""
         try:
-            machine_code = self.store.get_or_create_machine_code()
             existing_credentials = self.store.load_credentials()
             saved = self.store.load_metadata()
             context = self.store.load_activation_context()
+            context_machine = str(context.get("machine_code") or "").strip()
+            if str(saved.get("binding_status") or "").strip().lower() == "unbound":
+                machine_code = self.store.get_or_create_device_code()
+            elif context_machine:
+                machine_code = context_machine
+            elif existing_credentials:
+                machine_code = self.store.get_or_create_machine_code()
+            else:
+                machine_code = self.store.get_or_create_device_code()
             current_code_id = str(
                 context.get("code_id") or saved.get("code_id") or ""
             ).strip()
@@ -710,6 +726,7 @@ class LicenseManager:
             metadata, credentials = self._normalize_license(
                 response,
                 require_credentials=True,
+                expected_machine_code=machine_code,
             )
             if not self._is_server_active(metadata):
                 raise LicenseServiceError(
@@ -739,7 +756,7 @@ class LicenseManager:
                 "unsupported_license_type",
                 "invalid_response",
             }:
-                self._preserve_recoverable_binding(response, code)
+                self._preserve_recoverable_binding(response, code, machine_code)
             state = self._error_state(exc)
             with self._lock:
                 self._authorized = False
@@ -773,8 +790,10 @@ class LicenseManager:
                     "license_not_activated",
                     "本机没有可解绑的设备授权",
                 )
-            machine_code = self.store.get_or_create_machine_code()
             context = self.store.load_activation_context()
+            machine_code = str(context.get("machine_code") or "").strip()
+            if not machine_code:
+                machine_code = self.store.get_or_create_machine_code()
             metadata = self.store.load_metadata()
             code_id = str(
                 context.get("code_id") or metadata.get("code_id") or ""

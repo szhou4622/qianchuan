@@ -116,6 +116,7 @@ DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 CONTACT_CONFIG_CACHE_FILE = os.path.join(DATA_DIR, "contact_config_cache.json")
 LICENSE_CREDENTIAL_FILE = os.path.join(DATA_DIR, "license_credentials.dpapi")
 LICENSE_MACHINE_CODE_FILE = os.path.join(DATA_DIR, "license_machine_code.dpapi")
+LICENSE_DEVICE_CODE_FILE = os.path.join(DATA_DIR, "license_device_code.dpapi")
 LICENSE_METADATA_FILE = os.path.join(DATA_DIR, "license_metadata.json")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
 QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
