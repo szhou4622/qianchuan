@@ -145,7 +145,7 @@ class LicenseHttpClient:
                     error_payload = {}
                 status = int(getattr(exc, "code", 0) or 0)
                 if status == 401:
-                    message = "设备授权已失效，请重新激活或联系管理员"
+                    message = "当前设备授权已失效，请重新激活"
                 else:
                     message = _message_from_payload(
                         error_payload,
@@ -186,19 +186,30 @@ class LicenseHttpClient:
             return _data_from_payload(envelope)
         raise LicenseNetworkError()
 
-    def activate(self, activation_code: str, machine_code: str) -> dict[str, Any]:
+    def activate(
+        self,
+        activation_code: str,
+        machine_code: str,
+        *,
+        current_code_id: str = "",
+        credential_refresh: bool = False,
+    ) -> dict[str, Any]:
         # POST is deliberately not retried.  If the response is unknown, the
         # user can retry manually with the same code and stable machine code.
+        body: dict[str, Any] = {
+            "app_name": LICENSE_APP_NAME,
+            "activation_code": activation_code,
+            "machine_code": machine_code,
+            "client_version": CURRENT_VERSION,
+            "license_protocol_version": LICENSE_PROTOCOL_VERSION,
+        }
+        if credential_refresh:
+            body["current_code_id"] = str(current_code_id or "").strip()
+            body["credential_refresh"] = True
         return self._request(
             "POST",
             "/activate",
-            body={
-                "app_name": LICENSE_APP_NAME,
-                "activation_code": activation_code,
-                "machine_code": machine_code,
-                "client_version": CURRENT_VERSION,
-                "license_protocol_version": LICENSE_PROTOCOL_VERSION,
-            },
+            body=body,
             attempts=1,
         )
 

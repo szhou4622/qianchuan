@@ -90,7 +90,7 @@
                     <button class="primary" id="activateButton" type="submit">立即激活</button>
                     <button id="retryButton" type="button">重新验证</button>
                 </div>
-                <p class="hint">软件只需激活码，不需要账号密码。激活码仅提交给授权服务器验证，不会保存在本机、浏览器或普通日志中。</p>
+                <p class="hint">软件只需激活码，不需要账号密码。原激活码仅提交给授权服务器，并使用 Windows DPAPI 或 macOS Keychain 加密保存在本机；不会写入浏览器、明文配置或普通日志。</p>
             </form>
             <div class="license-summary" id="licenseSummary"></div>
         </main>
@@ -145,7 +145,7 @@
 
         async function enterApplication(state) {
             showLicenseInfo(state && state.license);
-            setStatus('授权有效，正在进入软件…', 'ok');
+            setStatus((state && state.message ? state.message : '授权有效') + '，正在进入软件…', 'ok');
             const entered = await api.enterLicensedApplication();
             if (!entered || !entered.success) {
                 throw new Error((entered && entered.message) || '主程序启动失败');

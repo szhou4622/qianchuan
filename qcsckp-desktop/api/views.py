@@ -922,6 +922,34 @@ class Api:
             "data": {"owner_username": owner, "auth_mode": "license"},
         }
 
+    def clear_license_cloud_sessions(self):
+        """Stop reusing paid/cloud sessions after product-license loss."""
+        errors = []
+        try:
+            from services.cloud_retarget_client import clear_local_device_session_cache
+
+            clear_local_device_session_cache()
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            from services.qianchuan_open_api.token_provider import (
+                clear_api_tokens_keep_credentials,
+            )
+
+            clear_api_tokens_keep_credentials()
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            from services.local_feishu_bridge import deactivate_local_feishu_account
+
+            deactivate_local_feishu_account()
+        except Exception as exc:
+            errors.append(str(exc))
+        return {
+            "success": not errors,
+            "message": "云端会话已清理" if not errors else "部分云端会话清理失败",
+        }
+
     def stopService(self):
         return self.service.stop()
 

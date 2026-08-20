@@ -100,6 +100,14 @@ def clear_device_session() -> Dict[str, Any]:
     return result
 
 
+def clear_local_device_session_cache() -> None:
+    """Remove only the local legacy cloud-session cache without network I/O."""
+    try:
+        os.remove(SESSION_FILE)
+    except FileNotFoundError:
+        pass
+
+
 def register_device_session(username: str, password: str) -> Dict[str, Any]:
     if AUTH_MODE == "local":
         _atomic_save(

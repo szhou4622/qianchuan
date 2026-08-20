@@ -1,7 +1,7 @@
 """Secure, per-device storage for the license protocol v2 client.
 
-Only opaque device credentials and a random machine code are stored in the
-platform credential facility.  Activation codes are never persisted.
+Opaque device credentials, the original activation code, and the stable random
+machine code are stored only in the platform credential facility.
 """
 
 from __future__ import annotations
@@ -129,6 +129,17 @@ class LicenseSecureStore:
         return self.platform_name == "darwin"
 
     def load_credentials(self) -> Optional[dict[str, str]]:
+        payload = self._load_secret_payload()
+        session = str(payload.get("device_session") or "").strip()
+        credential = str(payload.get("device_credential") or "").strip()
+        if not session or not credential:
+            return None
+        return {
+            "device_session": session,
+            "device_credential": credential,
+        }
+
+    def _load_secret_payload(self) -> dict[str, Any]:
         try:
             if self._is_macos:
                 raw = _mac_keyring().get_password(
@@ -138,36 +149,30 @@ class LicenseSecureStore:
             else:
                 path = Path(self.credential_file)
                 if not path.is_file():
-                    return None
+                    return {}
                 raw = _dpapi_unprotect(path.read_text(encoding="ascii").strip())
             if not raw:
-                return None
+                return {}
             payload = json.loads(raw)
             if not isinstance(payload, Mapping):
-                return None
-            session = str(payload.get("device_session") or "").strip()
-            credential = str(payload.get("device_credential") or "").strip()
-            if not session or not credential:
-                return None
-            return {
-                "device_session": session,
-                "device_credential": credential,
-            }
+                return {}
+            return dict(payload)
         except LicenseStorageError:
             raise
         except (OSError, ValueError, TypeError) as exc:
             raise LicenseStorageError("本机授权凭证读取失败") from exc
 
-    def save_credentials(self, payload: Mapping[str, Any]) -> None:
-        session = str(payload.get("device_session") or "").strip()
-        credential = str(payload.get("device_credential") or "").strip()
-        if not session or not credential:
-            raise LicenseStorageError("授权服务未返回完整设备凭证")
+    def load_activation_context(self) -> dict[str, str]:
+        payload = self._load_secret_payload()
+        return {
+            "activation_code": str(payload.get("activation_code") or "").strip(),
+            "code_id": str(payload.get("code_id") or "").strip(),
+            "machine_code": str(payload.get("machine_code") or "").strip(),
+        }
+
+    def _save_secret_payload(self, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(
-            {
-                "device_session": session,
-                "device_credential": credential,
-            },
+            dict(payload),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -185,7 +190,36 @@ class LicenseSecureStore:
             return
         _atomic_write_text(self.credential_file, _dpapi_protect(raw))
 
+    def save_credentials(self, payload: Mapping[str, Any]) -> None:
+        session = str(payload.get("device_session") or "").strip()
+        credential = str(payload.get("device_credential") or "").strip()
+        if not session or not credential:
+            raise LicenseStorageError("授权服务未返回完整设备凭证")
+        existing = self._load_secret_payload()
+        existing.update(
+            {
+                "device_session": session,
+                "device_credential": credential,
+            }
+        )
+        for name in ("activation_code", "code_id", "machine_code"):
+            value = str(payload.get(name) or "").strip()
+            if value:
+                existing[name] = value
+        self._save_secret_payload(existing)
+
     def clear_credentials(self) -> None:
+        existing = self._load_secret_payload()
+        existing.pop("device_session", None)
+        existing.pop("device_credential", None)
+        preserved = {
+            key: existing.get(key)
+            for key in ("activation_code", "code_id", "machine_code")
+            if str(existing.get(key) or "").strip()
+        }
+        if preserved:
+            self._save_secret_payload(preserved)
+            return
         if self._is_macos:
             try:
                 _mac_keyring().delete_password(
@@ -241,6 +275,11 @@ class LicenseSecureStore:
             "remaining_days",
             "is_permanent",
             "transfer_count",
+            "self_transfers_used_30d",
+            "self_transfers_remaining_30d",
+            "remaining_credits",
+            "action",
+            "grant_score",
             "current_device",
             "license_status",
             "last_verified_at",

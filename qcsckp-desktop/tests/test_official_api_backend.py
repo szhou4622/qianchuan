@@ -33,11 +33,14 @@ from services.qianchuan_open_api.token_provider import (
     InjectedTokenProvider,
     api_configuration_status,
     begin_api_authorization,
+    clear_api_tokens_keep_credentials,
     exchange_authorization_code,
+    _load_saved_bundle,
     _oauth_callback_query,
     _relay_json_request,
     poll_api_authorization,
     save_api_credentials,
+    save_token_bundle,
 )
 from services.promotion_capability import check_target_capability
 from services.official_api_collection import (
@@ -1281,6 +1284,28 @@ class OfficialApiBackendTests(unittest.TestCase):
             self.assertNotIn("secret-value", stored)
             self.assertNotIn("1869344049893595", stored)
             self.assertNotIn("app_secret", stored)
+
+    @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
+    @patch("services.qianchuan_open_api.token_provider._unprotect", side_effect=lambda raw: raw)
+    def test_license_loss_clears_tokens_but_keeps_app_credentials(self, _unprotect, _protect):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "official-api.json")
+            save_token_bundle(
+                AccessTokenBundle(
+                    access_token="access-sensitive",
+                    refresh_token="refresh-sensitive",
+                    app_id="1869344049893595",
+                    app_secret="secret-value",
+                    expires_at=time.time() + 3600,
+                ),
+                path,
+            )
+            clear_api_tokens_keep_credentials(path)
+            bundle = _load_saved_bundle(path)
+            self.assertEqual("", bundle.access_token)
+            self.assertEqual("", bundle.refresh_token)
+            self.assertEqual("1869344049893595", bundle.app_id)
+            self.assertEqual("secret-value", bundle.app_secret)
 
     @patch("services.qianchuan_open_api.token_provider._protect", side_effect=lambda raw: raw)
     def test_new_secret_can_replace_configuration_that_current_user_cannot_decrypt(

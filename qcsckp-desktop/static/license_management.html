@@ -42,7 +42,9 @@
         const fields = [
             ['software_name','软件中文名'],['license_type_label','授权类型'],['binding_status','授权状态'],
             ['activated_at','激活时间'],['expires_at','到期时间'],['remaining_days','剩余天数'],
-            ['current_device','当前绑定设备'],['code_id','授权编号'],['transfer_count','换机次数']
+            ['remaining_credits','剩余权益'],['current_device','当前绑定设备'],['code_id','授权编号'],
+            ['transfer_count','换机次数'],['self_transfers_used_30d','近30天已自助换机'],
+            ['self_transfers_remaining_30d','近30天剩余自助换机']
         ];
         function waitApi(){return new Promise(resolve=>{let n=0;const t=setInterval(()=>{const a=window.top&&window.top.pywebviewAPI;if(a&&typeof a.getLicenseManagementInfo==='function'){clearInterval(t);resolve(a)}else if(++n>150){clearInterval(t);resolve(null)}},100)})}
         function render(state){
@@ -55,6 +57,7 @@
                 const labelEl=document.createElement('div'); labelEl.className='label'; labelEl.textContent=label;
                 const valueEl=document.createElement('div'); valueEl.className='value';
                 let value=key==='software_name'?(state.software_name||'千川素材看盘工具'):license[key];
+                if(key==='binding_status')value=({active:'已绑定',unbound:'已解绑',invalid:'已失效'}[String(value||'')]||value);
                 if(key==='expires_at'&&license.is_permanent)value='永久有效';
                 if(key==='remaining_days'&&license.is_permanent)value='永久';
                 else if(key==='remaining_days'&&value!==undefined&&value!==null)value=String(value)+' 天';
@@ -71,7 +74,7 @@
         }
         refreshButton.addEventListener('click',load);
         unbindButton.addEventListener('click',async()=>{
-            if(!confirm('确认解绑当前设备？解绑后本机将不能继续使用。'))return;
+            if(!confirm('解绑后，本机将立即失去云端服务权限。你可以在新电脑输入原激活码，继续使用剩余权益。本地文件不会被删除。'))return;
             if(!confirm('请再次确认：立即解绑本机设备并停止所有后台任务？'))return;
             refreshButton.disabled=true;unbindButton.disabled=true;status.textContent='正在解绑当前设备…';
             try{const state=await api.unbindCurrentLicense();render(state);if(state.success&&!state.authorized){alert(state.message||'当前设备已解绑');window.top.location.replace('license.html')}}

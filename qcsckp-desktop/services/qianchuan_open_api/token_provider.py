@@ -732,6 +732,27 @@ def clear_api_configuration(path: Optional[str] = None) -> None:
         os.remove(path)
 
 
+def clear_api_tokens_keep_credentials(path: Optional[str] = None) -> None:
+    """Invalidate cached OceanEngine tokens without deleting App credentials."""
+    path = resolve_token_path(path)
+    bundle = _load_saved_bundle(path)
+    if bundle is None:
+        return
+    save_token_bundle(
+        AccessTokenBundle(
+            access_token="",
+            refresh_token="",
+            app_id=bundle.app_id,
+            app_secret=bundle.app_secret,
+            expires_at=0,
+            oauth_state="",
+            oauth_started_at=0,
+            oauth_poll_secret="",
+        ),
+        path,
+    )
+
+
 _DEFAULT_PROVIDER: Optional[DefaultTokenProvider] = None
 _DEFAULT_LOCK = threading.Lock()
 

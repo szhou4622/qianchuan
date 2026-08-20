@@ -105,6 +105,25 @@ def _optional_int_field(
     return _int_field(data, name, minimum=minimum)
 
 
+def _optional_number_field(data: Mapping[str, Any], name: str) -> Optional[float]:
+    value = data.get(name)
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise LicenseServiceError(
+            "invalid_response",
+            f"授权服务器返回的 {name} 无效",
+        ) from exc
+    if number < 0:
+        raise LicenseServiceError(
+            "invalid_response",
+            f"授权服务器返回的 {name} 无效",
+        )
+    return int(number) if number.is_integer() else number
+
+
 def _license_type_label(value: Any, duration_days: Optional[int]) -> tuple[str, str]:
     normalized = str(value or "").strip().lower()
     if normalized in _PERMANENT_TYPES:
@@ -231,6 +250,13 @@ class LicenseManager:
             )
         binding_status = _required_text(data, "binding_status").lower()
         license_status = str(data.get("license_status") or data.get("status") or "active").strip().lower()
+        action = str(data.get("action") or "").strip().lower()
+        grant_score = _optional_number_field(data, "grant_score")
+        if action == "rebound" and grant_score not in (None, 0):
+            raise LicenseServiceError(
+                "invalid_response",
+                "换机绑定响应异常：服务器不得重新发放初始权益",
+            )
         expires_at = str(data.get("expires_at") or "").strip()
         remaining_days = _optional_int_field(data, "remaining_days", minimum=0)
         if not is_permanent:
@@ -256,10 +282,25 @@ class LicenseManager:
             "remaining_days": None if is_permanent else remaining_days,
             "is_permanent": is_permanent,
             "transfer_count": _int_field(data, "transfer_count", minimum=0),
+            "self_transfers_used_30d": _optional_int_field(
+                data, "self_transfers_used_30d", minimum=0
+            ),
+            "self_transfers_remaining_30d": _optional_int_field(
+                data, "self_transfers_remaining_30d", minimum=0
+            ),
+            "remaining_credits": _optional_number_field(data, "remaining_credits"),
+            "action": action,
+            "grant_score": 0 if action == "rebound" else grant_score,
             "license_status": license_status,
             "last_verified_at": _now_text(),
         }
         machine_code = self.store.get_or_create_machine_code()
+        returned_machine = str(data.get("machine_code") or "").strip()
+        if returned_machine and returned_machine.casefold() != machine_code.casefold():
+            raise LicenseServiceError(
+                "machine_code_mismatch",
+                "授权结果不属于当前设备",
+            )
         metadata["current_device"] = (
             str(data.get("device_name") or "").strip()
             or f"本机设备 · {machine_code[-8:]}"
@@ -272,7 +313,11 @@ class LicenseManager:
             }
         return metadata, credentials
 
-    def _preserve_recoverable_binding(self, data: Mapping[str, Any]) -> bool:
+    def _preserve_recoverable_binding(
+        self,
+        data: Mapping[str, Any],
+        activation_code: str,
+    ) -> bool:
         """Keep a newly issued device credential if display normalization fails.
 
         Activation is state-changing on the server.  If a newer server license
@@ -295,6 +340,9 @@ class LicenseManager:
             credentials = {
                 "device_session": _required_text(data, "device_session"),
                 "device_credential": _required_text(data, "device_credential"),
+                "activation_code": str(activation_code or "").strip(),
+                "code_id": _required_text(data, "code_id"),
+                "machine_code": local_machine,
             }
             metadata = {
                 "app_name": LICENSE_APP_NAME,
@@ -327,6 +375,7 @@ class LicenseManager:
 
     @staticmethod
     def _public_active_state(metadata: Mapping[str, Any]) -> dict[str, Any]:
+        action = str(metadata.get("action") or "").strip().lower()
         return {
             "success": True,
             "authorized": True,
@@ -334,7 +383,7 @@ class LicenseManager:
             "network_error": False,
             "software_name": SOFTWARE_CHINESE_NAME,
             "app_name": LICENSE_APP_NAME,
-            "message": "授权有效",
+            "message": "换机绑定成功" if action == "rebound" else "授权有效",
             "license": dict(metadata),
         }
 
@@ -348,7 +397,21 @@ class LicenseManager:
         try:
             credentials = self.store.load_credentials()
             if not credentials:
-                state = self._inactive_state()
+                saved = self.store.load_metadata()
+                context = self.store.load_activation_context()
+                if str(saved.get("binding_status") or "").lower() == "unbound":
+                    state = self._inactive_state(
+                        "已解绑，请输入原激活码重新绑定"
+                    )
+                    state["license"] = saved
+                elif saved.get("code_id") and context.get("activation_code"):
+                    state = self._inactive_state(
+                        "检测到旧版授权，请重新输入原激活码刷新设备凭证"
+                    )
+                    state["credential_refresh_required"] = True
+                    state["license"] = saved
+                else:
+                    state = self._inactive_state()
             else:
                 response = self.client.device_status(credentials)
                 if str(response.get("binding_status") or "").strip().lower() == "unbound":
@@ -400,7 +463,28 @@ class LicenseManager:
                     with self._lock:
                         self._authorized = True
         except Exception as exc:
-            state = self._error_state(exc)
+            if isinstance(exc, LicenseServiceError) and exc.http_status == 401:
+                try:
+                    self.store.clear_credentials()
+                    metadata = self.store.load_metadata()
+                    metadata.update(
+                        {
+                            "binding_status": "invalid",
+                            "last_verified_at": _now_text(),
+                        }
+                    )
+                    self.store.save_metadata(metadata)
+                except Exception:
+                    metadata = {}
+                state = self._inactive_state(
+                    "当前设备授权已失效，请重新激活"
+                )
+                state["success"] = False
+                state["code"] = exc.code
+                state["http_status"] = 401
+                state["license"] = metadata or None
+            else:
+                state = self._error_state(exc)
         with self._lock:
             self._last_public_state = dict(state)
         return state
@@ -426,7 +510,21 @@ class LicenseManager:
         response: Mapping[str, Any] = {}
         try:
             machine_code = self.store.get_or_create_machine_code()
-            response = self.client.activate(code, machine_code)
+            existing_credentials = self.store.load_credentials()
+            saved = self.store.load_metadata()
+            context = self.store.load_activation_context()
+            refresh_credentials = bool(
+                not existing_credentials
+                and str(saved.get("binding_status") or "").strip().lower() == "active"
+                and str(saved.get("code_id") or "").strip()
+                and str(context.get("activation_code") or "").strip() == code
+            )
+            response = self.client.activate(
+                code,
+                machine_code,
+                current_code_id=str(saved.get("code_id") or "").strip(),
+                credential_refresh=refresh_credentials,
+            )
             metadata, credentials = self._normalize_license(
                 response,
                 require_credentials=True,
@@ -436,7 +534,15 @@ class LicenseManager:
                     "license_not_active",
                     str(response.get("message") or "授权未处于可用状态"),
                 )
-            self.store.save_credentials(credentials or {})
+            credential_payload = dict(credentials or {})
+            credential_payload.update(
+                {
+                    "activation_code": code,
+                    "code_id": metadata["code_id"],
+                    "machine_code": machine_code,
+                }
+            )
+            self.store.save_credentials(credential_payload)
             self.store.save_metadata(metadata)
             state = self._public_active_state(metadata)
             with self._lock:
@@ -448,7 +554,7 @@ class LicenseManager:
                 "unsupported_license_type",
                 "invalid_response",
             }:
-                self._preserve_recoverable_binding(response)
+                self._preserve_recoverable_binding(response, code)
             state = self._error_state(exc)
             with self._lock:
                 self._authorized = False

@@ -633,6 +633,8 @@ class JSApi:
                 if state.get("authorized"):
                     continue
                 self._stop_licensed_runtime()
+                if int(state.get("http_status") or 0) == 401:
+                    self.api.clear_license_cloud_sessions()
                 window = self._window
                 if window is not None and self.license_url:
                     try:
@@ -658,7 +660,10 @@ class JSApi:
                 "app_name": APP_NAME,
                 "message": "开发环境未启用在线授权门禁",
             }
-        return manager.startup_check()
+        result = manager.startup_check()
+        if int(result.get("http_status") or 0) == 401:
+            self.api.clear_license_cloud_sessions()
+        return result
 
     def activateOnlineLicense(self, activationCode=None):
         manager = self.license_manager
@@ -699,6 +704,8 @@ class JSApi:
         result = manager.management_info(refresh=True)
         if not result.get("authorized") and self._licensed_runtime_started:
             self._stop_licensed_runtime()
+        if int(result.get("http_status") or 0) == 401:
+            self.api.clear_license_cloud_sessions()
         return result
 
     def unbindCurrentLicense(self):
@@ -712,6 +719,7 @@ class JSApi:
         result = manager.unbind_current_device()
         if result.get("success") and not result.get("authorized"):
             self._stop_licensed_runtime()
+            self.api.clear_license_cloud_sessions()
         return result
 
     def getContactApiUrl(self):

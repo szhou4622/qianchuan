@@ -62,6 +62,7 @@ def status_payload(license_type="monthly", **overrides):
 class FakeStore:
     def __init__(self, machine="machine_stable_12345678"):
         self.credentials = None
+        self.activation_context = {}
         self.metadata = {}
         self.machine = machine
         self.clear_count = 0
@@ -74,10 +75,16 @@ class FakeStore:
             "device_session": payload["device_session"],
             "device_credential": payload["device_credential"],
         }
+        for name in ("activation_code", "code_id", "machine_code"):
+            if payload.get(name):
+                self.activation_context[name] = str(payload[name])
 
     def clear_credentials(self):
         self.credentials = None
         self.clear_count += 1
+
+    def load_activation_context(self):
+        return dict(self.activation_context)
 
     def get_or_create_machine_code(self):
         return self.machine
@@ -95,11 +102,18 @@ class FakeClient:
         self.status = status or status_payload()
         self.unbind_response = unbind or {"message": "当前设备已解绑"}
         self.activate_calls = []
+        self.activate_options = []
         self.status_calls = []
         self.unbind_calls = []
 
-    def activate(self, code, machine):
+    def activate(self, code, machine, *, current_code_id="", credential_refresh=False):
         self.activate_calls.append((code, machine))
+        self.activate_options.append(
+            {
+                "current_code_id": current_code_id,
+                "credential_refresh": credential_refresh,
+            }
+        )
         if isinstance(self.activation, Exception):
             raise self.activation
         return dict(self.activation)
@@ -157,6 +171,9 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual(EXPIRES_AT, state["license"]["expires_at"])
         self.assertEqual(30, state["license"]["duration_days"])
         self.assertEqual([("MONTH-TEST", store.machine)], client.activate_calls)
+        self.assertEqual("MONTH-TEST", store.activation_context["activation_code"])
+        self.assertEqual("code-test-001", store.activation_context["code_id"])
+        self.assertEqual(store.machine, store.activation_context["machine_code"])
         public_json = json.dumps(state, ensure_ascii=False)
         self.assertNotIn("session-sensitive-value", public_json)
         self.assertNotIn("credential-sensitive-value", public_json)
@@ -335,6 +352,82 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual(original_expiry, state["license"]["expires_at"])
         self.assertEqual(18, state["license"]["remaining_days"])
 
+    def test_rebound_uses_server_balance_and_reports_rebind_success(self):
+        state = LicenseManager(
+            client=FakeClient(
+                activation=license_payload(
+                    "monthly",
+                    action="rebound",
+                    grant_score=0,
+                    remaining_credits=37,
+                    transfer_count=1,
+                )
+            ),
+            store=FakeStore(machine="machine_new"),
+        ).activate("ORIGINAL-CODE")
+        self.assertTrue(state["authorized"])
+        self.assertEqual("换机绑定成功", state["message"])
+        self.assertEqual(37, state["license"]["remaining_credits"])
+        self.assertEqual(0, state["license"]["grant_score"])
+
+    def test_rebound_must_not_grant_initial_entitlement_again(self):
+        state = LicenseManager(
+            client=FakeClient(
+                activation=license_payload(
+                    "monthly",
+                    action="rebound",
+                    grant_score=100,
+                )
+            ),
+            store=FakeStore(machine="machine_new"),
+        ).activate("ORIGINAL-CODE")
+        self.assertFalse(state["authorized"])
+        self.assertEqual("invalid_response", state["code"])
+
+    def test_old_active_binding_without_credentials_requests_controlled_refresh(self):
+        store = FakeStore()
+        store.metadata = {
+            "app_name": LICENSE_APP_NAME,
+            "code_id": "code-test-001",
+            "binding_status": "active",
+        }
+        store.activation_context = {
+            "activation_code": "ORIGINAL-CODE",
+            "code_id": "code-test-001",
+            "machine_code": store.machine,
+        }
+        client = FakeClient(activation=license_payload("monthly"))
+        state = LicenseManager(client=client, store=store).activate("ORIGINAL-CODE")
+        self.assertTrue(state["authorized"])
+        self.assertEqual(
+            {
+                "current_code_id": "code-test-001",
+                "credential_refresh": True,
+            },
+            client.activate_options[0],
+        )
+
+    def test_unbound_code_rebind_does_not_request_credential_refresh(self):
+        store = FakeStore(machine="machine_new")
+        store.metadata = {
+            "app_name": LICENSE_APP_NAME,
+            "code_id": "code-test-001",
+            "binding_status": "unbound",
+        }
+        store.activation_context = {
+            "activation_code": "ORIGINAL-CODE",
+            "code_id": "code-test-001",
+            "machine_code": "machine_old",
+        }
+        client = FakeClient(
+            activation=license_payload("monthly", action="rebound", grant_score=0)
+        )
+        self.assertTrue(
+            LicenseManager(client=client, store=store)
+            .activate("ORIGINAL-CODE")["authorized"]
+        )
+        self.assertFalse(client.activate_options[0]["credential_refresh"])
+
     def test_points_and_unlimited_points_types_are_rejected(self):
         for license_type in ("points", "unlimited_points"):
             with self.subTest(license_type=license_type):
@@ -406,7 +499,8 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         ).startup_check()
         self.assertFalse(state["authorized"])
         self.assertEqual(401, state["http_status"])
-        self.assertEqual("设备授权已失效，请重新激活或联系管理员", state["message"])
+        self.assertEqual("当前设备授权已失效，请重新激活", state["message"])
+        self.assertIsNone(store.credentials)
 
 
 class OnlineLicenseHttpTests(unittest.TestCase):
@@ -440,6 +534,23 @@ class OnlineLicenseHttpTests(unittest.TestCase):
         self.assertEqual(LICENSE_APP_NAME, body["app_name"])
         self.assertEqual(LICENSE_PROTOCOL_VERSION, body["license_protocol_version"])
         self.assertEqual("TEST-CODE", body["activation_code"])
+
+    def test_legacy_credential_refresh_fields_are_sent_only_when_requested(self):
+        captured = []
+
+        def opener(request, timeout):
+            captured.append(request)
+            return FakeHttpResponse({"ok": True, "data": license_payload()})
+
+        LicenseHttpClient(opener=opener).activate(
+            "ORIGINAL-CODE",
+            "machine_stable",
+            current_code_id="code-test-001",
+            credential_refresh=True,
+        )
+        body = json.loads(captured[0].data.decode("utf-8"))
+        self.assertEqual("code-test-001", body["current_code_id"])
+        self.assertIs(True, body["credential_refresh"])
 
     def test_status_retries_one_transient_network_failure(self):
         calls = []
@@ -484,6 +595,26 @@ class OnlineLicenseHttpTests(unittest.TestCase):
         self.assertEqual(409, caught.exception.http_status)
         self.assertEqual(message, caught.exception.message)
 
+    def test_http_429_keeps_server_cooldown_message(self):
+        message = "成功换机后 24 小时内不能再次解绑。"
+
+        def opener(_request, timeout=None):
+            body = json.dumps({"message": message, "code": "cooldown"}).encode()
+            raise HTTPError(
+                "https://license.example/device/unbind",
+                429,
+                "Too Many Requests",
+                {},
+                io.BytesIO(body),
+            )
+
+        with self.assertRaises(LicenseServiceError) as caught:
+            LicenseHttpClient(opener=opener).unbind(
+                {"device_session": "session", "device_credential": "credential"}
+            )
+        self.assertEqual(429, caught.exception.http_status)
+        self.assertEqual(message, caught.exception.message)
+
 
 @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
 class WindowsLicenseStorageTests(unittest.TestCase):
@@ -499,11 +630,15 @@ class WindowsLicenseStorageTests(unittest.TestCase):
                 {
                     "device_session": "plain-session-must-not-appear",
                     "device_credential": "plain-credential-must-not-appear",
+                    "activation_code": "ORIGINAL-CODE-MUST-NOT-APPEAR",
+                    "code_id": "code-001",
+                    "machine_code": "machine-stable",
                 }
             )
             raw = (Path(root) / "credentials.dpapi").read_text(encoding="ascii")
             self.assertNotIn("plain-session", raw)
             self.assertNotIn("plain-credential", raw)
+            self.assertNotIn("ORIGINAL-CODE", raw)
             self.assertEqual(
                 "plain-session-must-not-appear",
                 store.load_credentials()["device_session"],
@@ -512,6 +647,16 @@ class WindowsLicenseStorageTests(unittest.TestCase):
             second = store.get_or_create_machine_code()
             self.assertEqual(first, second)
             self.assertTrue(first.startswith("machine_"))
+            self.assertEqual(
+                "ORIGINAL-CODE-MUST-NOT-APPEAR",
+                store.load_activation_context()["activation_code"],
+            )
+            store.clear_credentials()
+            self.assertIsNone(store.load_credentials())
+            self.assertEqual(
+                "ORIGINAL-CODE-MUST-NOT-APPEAR",
+                store.load_activation_context()["activation_code"],
+            )
 
 
 class MacKeychainStorageTests(unittest.TestCase):
