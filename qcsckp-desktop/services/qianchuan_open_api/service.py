@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .client import ApiResponse, QianchuanOpenApiClient
 from .errors import OfficialApiWriteDisabled
@@ -292,7 +292,12 @@ class QianchuanOfficialApiService:
         )
         return [normalize_plan(row, advertiser_id=aid) for row in rows], request_ids
 
-    def list_all_plans(self, advertiser_id: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def list_all_plans(
+        self,
+        advertiser_id: Any,
+        *,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         combined: list[dict[str, Any]] = []
         evidence: dict[str, Any] = {"complete": True, "classes": {}}
@@ -305,7 +310,18 @@ class QianchuanOfficialApiService:
             ("global_live", "LIVE_PROM_GOODS", "UNI_PROJECT"),
             ("global_product", "VIDEO_PROM_GOODS", "UNI_PROJECT"),
         )
-        for class_key, goal, scene in classes:
+        for class_index, (class_key, goal, scene) in enumerate(classes, 1):
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "catalog_classes",
+                        "class_key": class_key,
+                        "class_index": class_index,
+                        "class_total": len(classes),
+                        "completed_classes": class_index - 1,
+                        "discovered_plans": len(combined),
+                    }
+                )
             try:
                 plans, request_ids = self.list_plans(
                     aid,
@@ -329,6 +345,17 @@ class QianchuanOfficialApiService:
                     "adlab_scene": scene,
                     "error": str(exc),
                 }
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "catalog_classes",
+                        "class_key": class_key,
+                        "class_index": class_index,
+                        "class_total": len(classes),
+                        "completed_classes": class_index,
+                        "discovered_plans": len(combined),
+                    }
+                )
         deduped: dict[str, dict[str, Any]] = {}
         for plan in combined:
             if plan.get("ad_id"):

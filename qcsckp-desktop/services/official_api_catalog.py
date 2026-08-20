@@ -169,9 +169,27 @@ def _capability(plan: dict[str, Any], target_uid: str) -> dict[str, Any]:
     return common
 
 
-def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
+def _sync_account(
+    account: dict[str, Any],
+    db: SQLiteStore,
+    *,
+    processed_accounts: int = 0,
+    total_accounts: int = 1,
+) -> dict[str, Any]:
     service = get_official_api_service()
     aavid = str(account.get("aavid") or "")
+    account_name = account.get("account_name") or aavid
+    mark_catalog_sync_progress(
+        processed_accounts=processed_accounts,
+        total_accounts=total_accounts,
+        current_account=account_name,
+        message=f"正在校验账户授权：{account_name}",
+        phase="account_access",
+        phase_label="校验账户授权",
+        phase_current=0,
+        phase_total=1,
+        account_progress_percent=5,
+    )
     business_accounts, account_evidence = service.list_business_accounts()
     authorized = {str(row.get("advertiser_id") or ""): row for row in business_accounts}
     official_account = authorized.get(aavid)
@@ -186,8 +204,51 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
             seen=True,
             db=db,
         )
+    mark_catalog_sync_progress(
+        processed_accounts=processed_accounts,
+        total_accounts=total_accounts,
+        current_account=account_name,
+        message=f"账户授权已确认，准备读取四类计划：{account_name}",
+        phase="catalog_classes",
+        phase_label="读取四类计划",
+        phase_current=0,
+        phase_total=4,
+        account_progress_percent=10,
+    )
 
-    plans, evidence = service.list_all_plans(aavid)
+    class_labels = {
+        "chengfang_live": "乘方·推直播",
+        "chengfang_product": "乘方·推商品",
+        "global_live": "全域·推直播",
+        "global_product": "全域·推商品",
+    }
+
+    def catalog_progress(progress: dict[str, Any]) -> None:
+        completed = int(progress.get("completed_classes") or 0)
+        current = int(progress.get("class_index") or 0)
+        total = max(1, int(progress.get("class_total") or 4))
+        class_key = str(progress.get("class_key") or "")
+        found = int(progress.get("discovered_plans") or 0)
+        mark_catalog_sync_progress(
+            processed_accounts=processed_accounts,
+            total_accounts=total_accounts,
+            current_account=account_name,
+            message=(
+                f"正在读取{class_labels.get(class_key, class_key or '计划')}"
+                f"（{current}/{total}），已发现 {found} 条计划"
+            ),
+            phase="catalog_classes",
+            phase_label=f"读取{class_labels.get(class_key, '计划目录')}",
+            phase_current=completed,
+            phase_total=total,
+            discovered_plans=found,
+            account_progress_percent=10 + completed / total * 35,
+        )
+
+    plans, evidence = service.list_all_plans(
+        aavid,
+        progress_callback=catalog_progress,
+    )
     evidence["account_chain"] = account_evidence
     if not account_evidence.get("complete"):
         evidence["complete"] = False
@@ -204,7 +265,20 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
         "chengfang_product": 0,
     }
     detail_evidence: dict[str, dict[str, Any]] = {}
-    for plan in plans:
+    total_plan_details = len(plans)
+    mark_catalog_sync_progress(
+        processed_accounts=processed_accounts,
+        total_accounts=total_accounts,
+        current_account=account_name,
+        message=f"已发现 {total_plan_details} 条计划，正在核验计划详情",
+        phase="plan_details",
+        phase_label="核验计划详情",
+        phase_current=0,
+        phase_total=total_plan_details,
+        discovered_plans=total_plan_details,
+        account_progress_percent=48,
+    )
+    for plan_index, plan in enumerate(plans, 1):
         ad_id = str(plan.get("ad_id") or "")
         if not ad_id:
             continue
@@ -289,6 +363,21 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
                 capability_updates=_capability(plan, saved["target_uid"]),
                 db=db,
             )
+        mark_catalog_sync_progress(
+            processed_accounts=processed_accounts,
+            total_accounts=total_accounts,
+            current_account=account_name,
+            message=f"正在核验并保存计划详情 {plan_index}/{max(1, total_plan_details)}",
+            phase="plan_details",
+            phase_label="核验计划详情",
+            phase_current=plan_index,
+            phase_total=total_plan_details,
+            discovered_plans=total_plan_details,
+            saved_plans=len(seen),
+            account_progress_percent=(
+                48 + (plan_index / max(1, total_plan_details)) * 47
+            ),
+        )
 
     # 只有两类 marketing_goal 的全部分页都成功时，才把本轮未见计划标为历史；
     # 部分失败时保留上次完整目录，绝不以异常空结果覆盖。
@@ -316,6 +405,19 @@ def _sync_account(account: dict[str, Any], db: SQLiteStore) -> dict[str, Any]:
         str(item.get("error") or "")
         for item in (evidence.get("classes") or {}).values()
         if isinstance(item, dict) and item.get("error")
+    )
+    mark_catalog_sync_progress(
+        processed_accounts=processed_accounts,
+        total_accounts=total_accounts,
+        current_account=account_name,
+        message=f"计划已保存 {len(seen)} 条，正在完成目录校验",
+        phase="finalizing",
+        phase_label="完成目录校验",
+        phase_current=len(seen),
+        phase_total=max(len(seen), total_plan_details),
+        discovered_plans=total_plan_details,
+        saved_plans=len(seen),
+        account_progress_percent=98,
     )
     return evidence
 
@@ -346,13 +448,23 @@ def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None)
             total_accounts=len(accounts),
             current_account=account.get("account_name") or account.get("aavid"),
             message=f"正在通过千川官方 API 同步 {account.get('account_name') or account.get('aavid')}",
+            phase="starting_account",
+            phase_label="开始同步账户",
+            phase_current=0,
+            phase_total=1,
+            account_progress_percent=1,
         )
         try:
             # Official API reads are protected by the shared endpoint/account
             # rate limiter. They must not reuse the legacy browser-wide lock:
             # a long catalog refresh would otherwise block a newly enabled
             # plan from collecting its first snapshot.
-            result = _sync_account(account, store)
+            result = _sync_account(
+                account,
+                store,
+                processed_accounts=index - 1,
+                total_accounts=len(accounts),
+            )
             results[uid] = result
             if result.get("complete"):
                 complete.append(uid)

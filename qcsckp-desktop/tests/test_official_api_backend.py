@@ -2027,13 +2027,17 @@ class OfficialApiBackendTests(unittest.TestCase):
     def test_all_plan_catalog_queries_four_explicit_classes(self):
         service = QianchuanOfficialApiService(_CaptureClient())
         calls = []
+        progress = []
 
         def fake_list(_advertiser_id, *, marketing_goal, adlab_scene, **_kwargs):
             calls.append((marketing_goal, adlab_scene))
             return [], [f"req-{len(calls)}"]
 
         with patch.object(service, "list_plans", side_effect=fake_list):
-            rows, evidence = service.list_all_plans("1854823495704009")
+            rows, evidence = service.list_all_plans(
+                "1854823495704009",
+                progress_callback=lambda item: progress.append(dict(item)),
+            )
 
         self.assertEqual([], rows)
         self.assertEqual(
@@ -2055,6 +2059,10 @@ class OfficialApiBackendTests(unittest.TestCase):
             set(evidence["classes"]),
         )
         self.assertTrue(evidence["complete"])
+        self.assertEqual(8, len(progress))
+        self.assertEqual(0, progress[0]["completed_classes"])
+        self.assertEqual(4, progress[-1]["completed_classes"])
+        self.assertEqual(4, progress[-1]["class_total"])
 
     def test_live_plan_list_ad_info_wrapper_is_normalized(self):
         plan = normalize_plan(

@@ -53,6 +53,19 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         self.assertIn("刷新页面显示", self.html)
         self.assertIn("本次没有访问千川后台", self.html)
 
+    def test_account_add_and_refresh_show_stage_progress(self):
+        self.assertIn('id="catalogProgress"', self.html)
+        self.assertIn('id="catalogProgressBar"', self.html)
+        self.assertIn("progress_percent", self.html)
+        self.assertIn("phase_label", self.html)
+        self.assertIn("已发现 ${Number(progress.discovered_plans)} 条计划", self.html)
+        self.assertIn("已用时 ${Number(progress.elapsed_seconds)||0} 秒", self.html)
+        self.assertIn("正在添加账户", self.html)
+
+    def test_plan_list_has_no_advanced_settings_entry(self):
+        self.assertNotIn("data-advanced", self.html)
+        self.assertNotIn(">高级设置</button>", self.html)
+
     def test_plan_groups_put_chengfang_and_live_first(self):
         expected = (
             "const groupDefs=[['chengfang','live','乘方 · 推直播'],"

@@ -35,6 +35,13 @@ _STATE: Dict[str, Any] = {
     "failure_kind": "",
     "recovery_action": "",
     "next_due_at": "",
+    "phase": "idle",
+    "phase_label": "",
+    "phase_current": 0,
+    "phase_total": 0,
+    "discovered_plans": 0,
+    "saved_plans": 0,
+    "progress_percent": 0,
 }
 
 
@@ -75,6 +82,13 @@ def mark_catalog_sync_started(
                 "total_accounts": 1 if requested_account_uid else 0,
                 "current_account": "",
                 "requested_account_uid": requested_account_uid,
+                "phase": "queued",
+                "phase_label": "准备同步",
+                "phase_current": 0,
+                "phase_total": 0,
+                "discovered_plans": 0,
+                "saved_plans": 0,
+                "progress_percent": 1,
             }
         )
         return dict(_STATE)
@@ -86,16 +100,38 @@ def mark_catalog_sync_progress(
     total_accounts: int,
     current_account: Any = "",
     message: Any = "",
+    phase: Any = "",
+    phase_label: Any = "",
+    phase_current: int = 0,
+    phase_total: int = 0,
+    discovered_plans: int = 0,
+    saved_plans: int = 0,
+    account_progress_percent: float = 0,
 ) -> Dict[str, Any]:
+    processed = max(0, int(processed_accounts))
+    total = max(0, int(total_accounts))
+    account_percent = min(100.0, max(0.0, float(account_progress_percent or 0)))
+    overall = (
+        min(99, int(round(((processed + account_percent / 100.0) / total) * 100)))
+        if total
+        else min(99, int(round(account_percent)))
+    )
     with _LOCK:
         _STATE.update(
             {
                 "running": True,
                 "status": "syncing",
-                "processed_accounts": max(0, int(processed_accounts)),
-                "total_accounts": max(0, int(total_accounts)),
+                "processed_accounts": processed,
+                "total_accounts": total,
                 "current_account": str(current_account or "")[:256],
                 "message": str(message or "正在只读同步账户计划目录")[:1000],
+                "phase": str(phase or "syncing")[:64],
+                "phase_label": str(phase_label or "正在同步")[:128],
+                "phase_current": max(0, int(phase_current or 0)),
+                "phase_total": max(0, int(phase_total or 0)),
+                "discovered_plans": max(0, int(discovered_plans or 0)),
+                "saved_plans": max(0, int(saved_plans or 0)),
+                "progress_percent": overall,
             }
         )
         return dict(_STATE)
@@ -142,6 +178,13 @@ def clear_catalog_login_failure(
                 "processed_accounts": 0,
                 "total_accounts": 0,
                 "current_account": "",
+                "phase": "idle",
+                "phase_label": "",
+                "phase_current": 0,
+                "phase_total": 0,
+                "discovered_plans": 0,
+                "saved_plans": 0,
+                "progress_percent": 0,
             }
         )
         return dict(_STATE)
@@ -308,6 +351,11 @@ def finalize_catalog_sync(
                 "requested_account_uid": (
                     next(iter(refresh_scope)) if len(refresh_scope) == 1 else ""
                 ),
+                "phase": "complete" if state_status == "complete" else "finished",
+                "phase_label": "同步完成" if state_status == "complete" else "同步结束",
+                "phase_current": len(refreshed_accounts),
+                "phase_total": len(refreshed_accounts),
+                "progress_percent": 100,
             }
         )
         return catalog_sync_status(owner_username=owner, db=store)
@@ -349,6 +397,13 @@ def catalog_sync_status(
             "failure_kind": "",
             "recovery_action": "",
             "next_due_at": "",
+            "phase": "idle",
+            "phase_label": "",
+            "phase_current": 0,
+            "phase_total": 0,
+            "discovered_plans": 0,
+            "saved_plans": 0,
+            "progress_percent": 0,
         }
     account_states = [
         {
@@ -409,6 +464,9 @@ def catalog_sync_status(
                         "processed_accounts": len(scoped_states),
                         "total_accounts": len(scoped_states),
                         "current_account": "",
+                        "phase": "complete" if all_complete else "finished",
+                        "phase_label": "同步完成" if all_complete else "同步结束",
+                        "progress_percent": 100,
                     }
                 )
                 state = dict(_STATE)
@@ -446,6 +504,16 @@ def catalog_sync_status(
             "interval_minutes": CATALOG_INTERVAL_MINUTES,
         }
     )
+    if state.get("running") and state.get("started_at"):
+        try:
+            state["elapsed_seconds"] = max(
+                0,
+                int((_now() - datetime.strptime(str(state["started_at"]), "%Y-%m-%d %H:%M:%S")).total_seconds()),
+            )
+        except (TypeError, ValueError):
+            state["elapsed_seconds"] = 0
+    else:
+        state["elapsed_seconds"] = 0
     return state
 
 
