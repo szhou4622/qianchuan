@@ -40,9 +40,9 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install . pyinstaller
+          python -m pip install --upgrade uv
+          uv sync --frozen --no-install-project
+          .venv/bin/python -m pip install --upgrade pyinstaller
 
       - name: Materialize signing certificate
         env:
