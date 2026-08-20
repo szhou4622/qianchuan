@@ -174,6 +174,90 @@
         }
         .sidebar.collapsed .sidebar-footer-rule { display: none; }
 
+        /* 联系作者：位于业务导航与账号卡之间。首次交互才读取本地配置接口。 */
+        .sidebar-contact-slot {
+            position: relative;
+            flex-shrink: 0;
+            padding: 0 10px 10px;
+        }
+        .sidebar-contact-btn {
+            width: 100%;
+            min-height: 42px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 9px;
+            padding: 9px 12px;
+            border: 1px solid rgba(51, 65, 85, 0.8);
+            border-radius: 10px;
+            color: #cbd5e1;
+            background: rgba(30, 41, 59, 0.62);
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: color .16s ease, border-color .16s ease, background .16s ease;
+        }
+        .sidebar-contact-btn:hover,
+        .sidebar-contact-btn:focus-visible,
+        .sidebar-contact-btn[aria-expanded="true"] {
+            color: #f8fafc;
+            border-color: rgba(56, 189, 248, 0.48);
+            background: rgba(14, 165, 233, 0.12);
+            outline: none;
+        }
+        .sidebar-contact-btn i { width: 17px; height: 17px; flex: none; }
+        .sidebar-contact-popover {
+            position: absolute;
+            left: 10px;
+            right: 10px;
+            bottom: 100%;
+            z-index: 80;
+            display: none;
+            margin-bottom: 9px;
+            padding: 12px;
+            border: 1px solid rgba(71, 85, 105, .94);
+            border-radius: 14px;
+            background: rgba(15, 23, 42, .98);
+            box-shadow: 0 20px 45px rgba(2, 6, 23, .58);
+        }
+        .sidebar-contact-popover.is-open { display: block; }
+        .sidebar-contact-title {
+            color: #f8fafc;
+            font-size: 13px;
+            font-weight: 700;
+            margin-bottom: 9px;
+        }
+        .sidebar-contact-image {
+            display: block;
+            width: 100%;
+            max-height: 240px;
+            object-fit: contain;
+            border-radius: 10px;
+            background: #f8fafc;
+        }
+        .sidebar-contact-message {
+            min-height: 18px;
+            margin-top: 8px;
+            color: #94a3b8;
+            font-size: 11px;
+            line-height: 1.55;
+            text-align: center;
+        }
+        .sidebar.collapsed .sidebar-contact-slot { padding: 0 10px 10px; }
+        .sidebar.collapsed .sidebar-contact-btn {
+            width: 44px;
+            height: 44px;
+            min-height: 44px;
+            padding: 0;
+        }
+        .sidebar.collapsed .sidebar-contact-label { display: none; }
+        .sidebar.collapsed .sidebar-contact-popover {
+            left: 56px;
+            right: auto;
+            bottom: 0;
+            width: 230px;
+        }
+
         /* 登录弹窗 */
         .login-modal-overlay {
             display: none; position: fixed; inset: 0; z-index: 100;
@@ -511,6 +595,36 @@
                 <span>账户操作流水</span>
             </div>
         </nav>
+        <div class="sidebar-contact-slot" id="sidebarContactSlot">
+            <button
+                type="button"
+                class="sidebar-contact-btn"
+                id="sidebarContactBtn"
+                aria-expanded="false"
+                aria-controls="sidebarContactPopover"
+                title="联系作者"
+            >
+                <i data-lucide="contact-round" aria-hidden="true"></i>
+                <span class="sidebar-contact-label">联系作者</span>
+            </button>
+            <div
+                class="sidebar-contact-popover"
+                id="sidebarContactPopover"
+                role="dialog"
+                aria-label="联系作者"
+                aria-hidden="true"
+            >
+                <div class="sidebar-contact-title">联系作者</div>
+                <img
+                    class="sidebar-contact-image"
+                    id="sidebarContactImage"
+                    src="images/contact-author-fallback.svg"
+                    data-builtin-src="images/contact-author-fallback.svg"
+                    alt="联系作者"
+                />
+                <div class="sidebar-contact-message" id="sidebarContactMessage" aria-live="polite">首次查看时读取联系方式</div>
+            </div>
+        </div>
         <div class="sidebar-footer">
             <button type="button" class="sidebar-user-btn" id="sidebarUserBtn">
                 <div class="sidebar-user-top">
@@ -1022,6 +1136,142 @@
                 setMainFramePage(page);
             });
         });
+
+        // ---------- 联系作者（首次悬停/聚焦/点击才访问本地接口）----------
+        const sidebarContactSlot = document.getElementById('sidebarContactSlot');
+        const sidebarContactBtn = document.getElementById('sidebarContactBtn');
+        const sidebarContactPopover = document.getElementById('sidebarContactPopover');
+        const sidebarContactImage = document.getElementById('sidebarContactImage');
+        const sidebarContactMessage = document.getElementById('sidebarContactMessage');
+        let contactConfigPromise = null;
+        let contactPinned = false;
+        let contactHideTimer = null;
+
+        function setContactOpen(open) {
+            if (!sidebarContactPopover || !sidebarContactBtn) return;
+            sidebarContactPopover.classList.toggle('is-open', !!open);
+            sidebarContactPopover.setAttribute('aria-hidden', open ? 'false' : 'true');
+            sidebarContactBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+
+        function showBuiltinContact(message) {
+            if (!sidebarContactImage) return;
+            const builtin = sidebarContactImage.dataset.builtinSrc || 'images/contact-author-fallback.svg';
+            sidebarContactImage.src = builtin;
+            sidebarContactImage.style.display = 'block';
+            if (sidebarContactMessage) sidebarContactMessage.textContent = message || '';
+        }
+
+        function preloadAndSwapContactImage(url, failureMessage) {
+            return new Promise((resolve) => {
+                const candidate = new Image();
+                candidate.onload = () => {
+                    if (sidebarContactImage) {
+                        sidebarContactImage.src = url;
+                        sidebarContactImage.style.display = 'block';
+                    }
+                    if (sidebarContactMessage) sidebarContactMessage.textContent = '';
+                    resolve(true);
+                };
+                candidate.onerror = () => {
+                    showBuiltinContact(failureMessage || '联系方式图片加载失败，已显示内置图片');
+                    resolve(false);
+                };
+                candidate.src = url;
+            });
+        }
+
+        function loadContactConfigOnce() {
+            if (contactConfigPromise) return contactConfigPromise;
+            contactConfigPromise = (async () => {
+                showBuiltinContact('正在读取联系方式…');
+                try {
+                    const api = await waitTopApi();
+                    if (!api || typeof api.getContactApiUrl !== 'function') {
+                        throw new Error('本地联系接口尚未就绪');
+                    }
+                    const endpoint = await api.getContactApiUrl();
+                    const localUrl = endpoint && typeof endpoint === 'object'
+                        ? String(endpoint.url || '')
+                        : String(endpoint || '');
+                    if (!localUrl || !/^http:\/\/127\.0\.0\.1:\d+\/api\/contact$/.test(localUrl)) {
+                        throw new Error('本地联系接口地址无效');
+                    }
+                    const response = await fetch(localUrl, { cache: 'no-store' });
+                    if (!response.ok) throw new Error('本地联系接口请求失败');
+                    const config = await response.json();
+                    const expectedAppName = String(endpoint.app_name || '');
+                    if (!expectedAppName || String(config.app_name || '') !== expectedAppName) {
+                        throw new Error('联系配置应用标识不匹配');
+                    }
+                    if (config.enabled === false || config.status === 'disabled') {
+                        if (sidebarContactImage) sidebarContactImage.style.display = 'none';
+                        if (sidebarContactMessage) sidebarContactMessage.textContent = '联系方式暂未开放';
+                        return;
+                    }
+                    if (config.status === 'missing_image') {
+                        if (sidebarContactImage) sidebarContactImage.style.display = 'none';
+                        if (sidebarContactMessage) sidebarContactMessage.textContent = '联系方式图片暂未配置';
+                        return;
+                    }
+                    const imageUrl = String(config.display_image_url || config.qr_image_url || '');
+                    if (!imageUrl) {
+                        showBuiltinContact('');
+                        return;
+                    }
+                    await preloadAndSwapContactImage(
+                        imageUrl,
+                        '远程联系方式图片加载失败，已显示内置图片'
+                    );
+                } catch (error) {
+                    console.warn('读取联系作者配置失败', error);
+                    showBuiltinContact('暂时无法读取远程配置，已显示内置图片');
+                }
+            })();
+            return contactConfigPromise;
+        }
+
+        function openContactPopover() {
+            if (contactHideTimer) {
+                clearTimeout(contactHideTimer);
+                contactHideTimer = null;
+            }
+            setContactOpen(true);
+            void loadContactConfigOnce();
+        }
+
+        function scheduleContactClose() {
+            if (contactPinned) return;
+            if (contactHideTimer) clearTimeout(contactHideTimer);
+            contactHideTimer = setTimeout(() => setContactOpen(false), 120);
+        }
+
+        if (sidebarContactSlot && sidebarContactBtn) {
+            sidebarContactSlot.addEventListener('mouseenter', openContactPopover);
+            sidebarContactSlot.addEventListener('mouseleave', scheduleContactClose);
+            sidebarContactSlot.addEventListener('focusin', openContactPopover);
+            sidebarContactSlot.addEventListener('focusout', (event) => {
+                if (!sidebarContactSlot.contains(event.relatedTarget)) scheduleContactClose();
+            });
+            sidebarContactBtn.addEventListener('click', (event) => {
+                event.stopPropagation();
+                contactPinned = !contactPinned;
+                if (contactPinned) openContactPopover();
+                else setContactOpen(false);
+            });
+            sidebarContactBtn.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape') {
+                    contactPinned = false;
+                    setContactOpen(false);
+                    sidebarContactBtn.focus();
+                }
+            });
+            document.addEventListener('click', (event) => {
+                if (!contactPinned || sidebarContactSlot.contains(event.target)) return;
+                contactPinned = false;
+                setContactOpen(false);
+            });
+        }
 
         // ---------- 账号登录（左下角）----------
         const QC_AUTH_SESSION = 'qc_auth_session';

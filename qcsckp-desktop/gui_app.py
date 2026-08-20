@@ -20,6 +20,7 @@ from ctypes.util import find_library
 from api import Api
 # 项目配置
 from config import (
+    APP_NAME,
     PROJECT_ROOT,
     DATA_DIR,
     DATA_TEMP_DIR,
@@ -33,6 +34,7 @@ from config import (
     LOCAL_AUTH_USERNAME,
     QIANCHUAN_BACKEND,
 )
+from services.contact_http import ContactLocalHttpServer
 from services.control_panel_config import ensure_all_control_defaults
 from services.runtime_supervisor import RUNTIME_SUPERVISOR
 
@@ -581,7 +583,7 @@ def configure_macos_lifecycle(window, tray_app):
 
 # ===== 创建 js_api =====
 class JSApi:
-    def __init__(self):
+    def __init__(self, contact_server=None):
         # 必须早于 Api() 的 SQLite 建表迁移，保证可以完整恢复rc23数据。
         try:
             from services.rc23_rollback import ensure_rc23_upgrade_snapshot
@@ -590,6 +592,17 @@ class JSApi:
         except Exception as exc:
             print(f"警告：rc23升级快照创建失败：{exc}")
         self.api = Api()
+        self.contact_server = contact_server
+
+    def getContactApiUrl(self):
+        """Return only the loopback facade; the UI never receives the remote endpoint."""
+        server = self.contact_server
+        return {
+            "success": bool(server and server.contact_url),
+            "app_name": APP_NAME,
+            "url": server.contact_url if server else "",
+            "preview_url": server.preview_url if server else "",
+        }
 
     def getTableData(
         self,
@@ -1182,6 +1195,7 @@ def _cleanup_data_temp_dir():
 
 
 def main():
+    contact_server = None
     if not single_instance_checker.acquire_runtime_lease():
         single_instance_checker._write_show_window_command()
         print("[!] 当前数据目录已有工具实例运行，已激活现有窗口")
@@ -1233,7 +1247,18 @@ def main():
         # Windows 上勿用 f"file://{path}"：反斜杠、空格、中文路径会导致 WebView2 解析失败 → 白屏。
         index_url = Path(index_path).resolve().as_uri()
 
-        js_api = JSApi()
+        # Starting the loopback listener performs no network request.  The
+        # shared contact service is consulted only after the UI's first
+        # hover/focus/click on "联系作者".
+        try:
+            contact_server = ContactLocalHttpServer()
+            contact_server.start()
+            print(f"[联系作者] 本地接口已就绪: {contact_server.contact_url}")
+        except Exception as exc:
+            contact_server = None
+            print(f"[联系作者] 本地接口启动失败，界面将使用内置兜底图: {exc}")
+
+        js_api = JSApi(contact_server=contact_server)
 
         # ===== 创建窗口 =====
         storage_path = os.path.join(DATA_DIR, "storage")
@@ -1341,6 +1366,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        try:
+            if contact_server is not None:
+                contact_server.stop()
+        except Exception:
+            pass
         try:
             RUNTIME_SUPERVISOR.stop()
         except Exception:

@@ -58,6 +58,11 @@ PROJECT_ROOT = _get_project_root()
 
 CURRENT_VERSION = "0.1.56"
 
+# The public application identity is also the PyInstaller product name used by
+# packaging/windows/build_windows.ps1.  Remote per-application services must
+# use this existing identity rather than a translated window title.
+APP_NAME = "QCSCKP"
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -104,6 +109,7 @@ else:
         DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
         LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
+CONTACT_CONFIG_CACHE_FILE = os.path.join(DATA_DIR, "contact_config_cache.json")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
 QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
     DATA_DIR,
@@ -187,6 +193,11 @@ def _pick_static_dir() -> str:
 
 
 STATIC_DIR = _pick_static_dir()
+CONTACT_FALLBACK_IMAGE_FILE = os.path.join(
+    STATIC_DIR,
+    "images",
+    "contact-author-fallback.svg",
+)
 
 
 # --- SQLite 裁剪 pmc_promotion_material（北京时间）---

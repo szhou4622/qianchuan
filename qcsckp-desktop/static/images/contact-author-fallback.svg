@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="720" viewBox="0 0 720 720" role="img" aria-labelledby="title desc">
+  <title id="title">联系作者</title>
+  <desc id="desc">联系方式由软件后台配置</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+  <rect width="720" height="720" fill="url(#bg)"/>
+  <rect x="42" y="42" width="636" height="636" rx="54" fill="none" stroke="#334155" stroke-width="4"/>
+  <circle cx="360" cy="286" r="122" fill="url(#accent)" opacity=".16"/>
+  <path d="M284 274c0-47 34-82 76-82s76 35 76 82-34 82-76 82-76-35-76-82Zm-56 211c12-71 66-112 132-112s120 41 132 112" fill="none" stroke="url(#accent)" stroke-width="30" stroke-linecap="round"/>
+  <text x="360" y="570" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="54" font-weight="700" text-anchor="middle">联系作者</text>
+  <text x="360" y="622" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="25" text-anchor="middle">联系方式以后台配置为准</text>
+</svg>
