@@ -239,6 +239,7 @@ class LicenseSecureStore:
             "activated_at",
             "expires_at",
             "remaining_days",
+            "is_permanent",
             "transfer_count",
             "current_device",
             "license_status",
@@ -249,4 +250,3 @@ class LicenseSecureStore:
             self.metadata_file,
             json.dumps(clean, ensure_ascii=False, sort_keys=True),
         )
-

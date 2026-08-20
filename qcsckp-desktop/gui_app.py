@@ -678,6 +678,13 @@ class JSApi:
                 "authorized": False,
                 "message": "软件授权尚未通过，不能进入主界面",
             }
+        identity = self.api.activate_license_runtime_identity()
+        if not identity.get("success"):
+            return {
+                "success": False,
+                "authorized": True,
+                "message": identity.get("message") or "本机授权身份初始化失败",
+            }
         with self._licensed_runtime_lock:
             if not self._licensed_runtime_started:
                 RUNTIME_SUPERVISOR.start(self)

@@ -24,6 +24,16 @@ _MONTH_TYPES = {
     "time_30d",
     "月卡",
 }
+_WEEK_TYPES = {
+    "week",
+    "weekly",
+    "week_card",
+    "weekly_card",
+    "time_week",
+    "time_7d",
+    "7d",
+    "周卡",
+}
 _YEAR_TYPES = {
     "year",
     "yearly",
@@ -35,6 +45,17 @@ _YEAR_TYPES = {
     "time_365d",
     "年卡",
 }
+_PERMANENT_TYPES = {
+    "permanent",
+    "lifetime",
+    "forever",
+    "permanent_card",
+    "lifetime_card",
+    "time_permanent",
+    "永久",
+    "永久卡",
+}
+_GENERIC_TIME_TYPES = {"time", "time_based", "duration", "standard"}
 _BLOCKED_LICENSE_STATUSES = {"expired", "disabled", "revoked", "inactive"}
 
 
@@ -58,15 +79,44 @@ def _int_field(data: Mapping[str, Any], name: str, *, minimum: int = 0) -> int:
     return value
 
 
-def _license_type_label(value: Any) -> tuple[str, str]:
+def _optional_int_field(
+    data: Mapping[str, Any],
+    name: str,
+    *,
+    minimum: int = 0,
+) -> Optional[int]:
+    value = data.get(name)
+    if value in (None, ""):
+        return None
+    return _int_field(data, name, minimum=minimum)
+
+
+def _license_type_label(value: Any, duration_days: Optional[int]) -> tuple[str, str]:
     normalized = str(value or "").strip().lower()
+    if normalized in _PERMANENT_TYPES:
+        return "permanent", "永久授权"
+    if normalized in _WEEK_TYPES:
+        if duration_days not in (None, 7):
+            raise LicenseServiceError("invalid_response", "周卡授权天数不是7天")
+        return normalized, "周卡"
     if normalized in _MONTH_TYPES:
+        if duration_days not in (None, 30):
+            raise LicenseServiceError("invalid_response", "月卡授权天数不是30天")
         return normalized, "月卡"
     if normalized in _YEAR_TYPES:
+        if duration_days not in (None, 365):
+            raise LicenseServiceError("invalid_response", "年卡授权天数不是365天")
         return normalized, "年卡"
+    if normalized in _GENERIC_TIME_TYPES:
+        if duration_days == 7:
+            return "time_7d", "周卡"
+        if duration_days == 30:
+            return "time_30d", "月卡"
+        if duration_days == 365:
+            return "time_365d", "年卡"
     raise LicenseServiceError(
         "unsupported_license_type",
-        "当前软件只支持月卡或年卡时间授权",
+        "当前软件只支持周卡、月卡、年卡或永久授权",
     )
 
 
@@ -149,19 +199,43 @@ class LicenseManager:
                 "app_name_mismatch",
                 "授权结果不属于当前软件",
             )
-        license_type, type_label = _license_type_label(data.get("license_type"))
+        raw_duration_days = _optional_int_field(data, "duration_days", minimum=0)
+        license_type, type_label = _license_type_label(
+            data.get("license_type"),
+            raw_duration_days,
+        )
+        is_permanent = license_type == "permanent"
+        if not is_permanent and raw_duration_days is None:
+            raise LicenseServiceError(
+                "invalid_response",
+                "授权服务器未返回有效的 duration_days",
+            )
         binding_status = _required_text(data, "binding_status").lower()
         license_status = str(data.get("license_status") or data.get("status") or "active").strip().lower()
+        expires_at = str(data.get("expires_at") or "").strip()
+        remaining_days = _optional_int_field(data, "remaining_days", minimum=0)
+        if not is_permanent:
+            if not expires_at:
+                raise LicenseServiceError(
+                    "invalid_response",
+                    "授权服务器未返回 expires_at",
+                )
+            if remaining_days is None:
+                raise LicenseServiceError(
+                    "invalid_response",
+                    "授权服务器未返回有效的 remaining_days",
+                )
         metadata = {
             "app_name": LICENSE_APP_NAME,
             "code_id": _required_text(data, "code_id"),
             "binding_status": binding_status,
             "license_type": license_type,
             "license_type_label": type_label,
-            "duration_days": _int_field(data, "duration_days", minimum=1),
+            "duration_days": 0 if is_permanent else int(raw_duration_days or 0),
             "activated_at": _required_text(data, "activated_at"),
-            "expires_at": _required_text(data, "expires_at"),
-            "remaining_days": _int_field(data, "remaining_days", minimum=0),
+            "expires_at": expires_at,
+            "remaining_days": None if is_permanent else remaining_days,
+            "is_permanent": is_permanent,
             "transfer_count": _int_field(data, "transfer_count", minimum=0),
             "license_status": license_status,
             "last_verified_at": _now_text(),

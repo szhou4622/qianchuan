@@ -22,6 +22,18 @@ EXPIRES_AT = "2027-08-20T12:00:00+08:00"
 
 
 def license_payload(license_type="monthly", **overrides):
+    duration_by_type = {
+        "weekly": 7,
+        "time_7d": 7,
+        "monthly": 30,
+        "time_30d": 30,
+        "yearly": 365,
+        "time_365d": 365,
+        "permanent": 0,
+        "lifetime": 0,
+    }
+    duration_days = duration_by_type.get(license_type, 30)
+    is_permanent = license_type in {"permanent", "lifetime"}
     payload = {
         "app_name": LICENSE_APP_NAME,
         "code_id": "code-test-001",
@@ -30,10 +42,10 @@ def license_payload(license_type="monthly", **overrides):
         "binding_status": "active",
         "license_status": "active",
         "license_type": license_type,
-        "duration_days": 30 if license_type == "monthly" else 365,
+        "duration_days": duration_days,
         "activated_at": "2026-08-20T12:00:00+08:00",
-        "expires_at": EXPIRES_AT,
-        "remaining_days": 30 if license_type == "monthly" else 365,
+        "expires_at": "" if is_permanent else EXPIRES_AT,
+        "remaining_days": None if is_permanent else duration_days,
         "transfer_count": 0,
     }
     payload.update(overrides)
@@ -150,6 +162,16 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertNotIn("credential-sensitive-value", public_json)
         self.assertNotIn("MONTH-TEST", public_json)
 
+    def test_week_card_uses_server_seven_day_entitlement(self):
+        state = LicenseManager(
+            client=FakeClient(activation=license_payload("weekly")),
+            store=FakeStore(),
+        ).activate("WEEK-TEST")
+        self.assertTrue(state["authorized"])
+        self.assertEqual("周卡", state["license"]["license_type_label"])
+        self.assertEqual(7, state["license"]["duration_days"])
+        self.assertFalse(state["license"]["is_permanent"])
+
     def test_year_card_uses_server_timestamps_without_recalculation(self):
         state = LicenseManager(
             client=FakeClient(activation=license_payload("yearly")),
@@ -159,6 +181,18 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual("年卡", state["license"]["license_type_label"])
         self.assertEqual(EXPIRES_AT, state["license"]["expires_at"])
         self.assertEqual(365, state["license"]["duration_days"])
+
+    def test_permanent_card_allows_missing_expiry_fields(self):
+        state = LicenseManager(
+            client=FakeClient(activation=license_payload("permanent")),
+            store=FakeStore(),
+        ).activate("PERMANENT-TEST")
+        self.assertTrue(state["authorized"])
+        self.assertEqual("永久授权", state["license"]["license_type_label"])
+        self.assertTrue(state["license"]["is_permanent"])
+        self.assertEqual(0, state["license"]["duration_days"])
+        self.assertEqual("", state["license"]["expires_at"])
+        self.assertIsNone(state["license"]["remaining_days"])
 
     def test_server_time_duration_license_types_map_to_month_and_year(self):
         month = LicenseManager(
@@ -256,8 +290,8 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual(original_expiry, state["license"]["expires_at"])
         self.assertEqual(18, state["license"]["remaining_days"])
 
-    def test_points_and_unlimited_types_are_rejected(self):
-        for license_type in ("points", "unlimited_points", "lifetime"):
+    def test_points_and_unlimited_points_types_are_rejected(self):
+        for license_type in ("points", "unlimited_points"):
             with self.subTest(license_type=license_type):
                 state = LicenseManager(
                     client=FakeClient(activation=license_payload(license_type)),
@@ -487,6 +521,20 @@ class LicenseSurfaceTests(unittest.TestCase):
         self.assertNotIn("transfer_code", combined)
         self.assertIn("正在激活，请勿重复点击", (ROOT / "services" / "license_manager.py").read_text(encoding="utf-8"))
         self.assertGreaterEqual(management.count("confirm("), 2)
+
+    def test_main_surface_has_no_username_password_login(self):
+        source = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn('id="loginForm"', source)
+        self.assertNotIn('id="loginUser"', source)
+        self.assertNotIn('id="loginPass"', source)
+        self.assertNotIn("verifyAccountLogin", source)
+        self.assertIn("getLicenseManagementInfo", source)
+
+    def test_service_start_uses_license_identity_not_account_password(self):
+        source = (ROOT / "api" / "views.py").read_text(encoding="utf-8")
+        start = source[source.index("    def startService"):source.index("    def stopService")]
+        self.assertIn("activate_license_runtime_identity", start)
+        self.assertNotIn("verify_can_start_service", start)
 
     def test_client_registers_only_required_three_license_routes(self):
         source = (ROOT / "services" / "license_client.py").read_text(encoding="utf-8")

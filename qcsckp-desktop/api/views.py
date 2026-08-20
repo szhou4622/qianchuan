@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 from .dashboard import DashboardApi
 from .account_auth import AccountAuthApi
-from config import QIANCHUAN_BACKEND
+from config import LOCAL_AUTH_USERNAME, QIANCHUAN_BACKEND
 
 
 def _get_service_controller():
@@ -873,46 +873,18 @@ class Api:
 
     def startService(self, interval: int = None, headful: bool = True, username: str = None, password: str = None):
         """
-        启动服务（必须传入账号密码，并由当前认证模式校验通过后才真正启动）。
+        启动服务。软件授权由桌面桥接层统一校验，不再要求工具账号密码。
 
         Args:
             interval: 轮询间隔（秒）
             headful: 轮询阶段是否无头（True=无头）；登录识别阶段始终有头浏览器
-            username: 普通用户账号
-            password: 密码
+            username/password: 旧版兼容参数，当前版本忽略
         """
-        u = (username or "").strip()
-        p = password if password is not None else ""
-        if not u or not p:
-            return self._start_denied_response("启动采集须传入账号与密码并通过本机校验")
-        from services.cloud_retarget_client import load_device_session
-
-        old_owner = str(
-            (load_device_session() or {}).get("username") or ""
-        ).strip().casefold()
-        new_owner = u.casefold()
-        if old_owner and old_owner != new_owner:
-            stopped = self.service.stop_and_wait(30)
-            if stopped.get("running"):
-                return self._start_denied_response(
-                    "旧工具账号的千川会话仍在安全退出，请稍后重新启动"
-                )
-        chk = self.account_auth.verify_can_start_service(u, p)
-        if not chk.get("ok"):
-            return self._start_denied_response(chk.get("message") or "账号校验失败")
-        if old_owner and old_owner != new_owner:
-            from services.local_feishu_bridge import (
-                cancel_active_local_retarget_tasks,
+        identity = self.activate_license_runtime_identity()
+        if not identity.get("success"):
+            return self._start_denied_response(
+                identity.get("message") or "本机授权身份尚未就绪"
             )
-
-            cancel_active_local_retarget_tasks(
-                old_owner,
-                "工具账号已经切换，旧追投提醒已作废",
-            )
-        from services.local_feishu_bridge import activate_local_feishu_account
-
-        activate_local_feishu_account(u)
-        self.service.set_cloud_backup_credentials(u, p)
         # 与界面一致：写入 control_panel.json → crawl 后再启动线程
         from services.control_panel_config import load_scrape_service_config, save_scrape_service_config
 
@@ -924,6 +896,31 @@ class Api:
         iv = max(5, iv)
         save_scrape_service_config(interval_seconds=iv, headless_poll=bool(headful))
         return self.service.start()
+
+    def activate_license_runtime_identity(self):
+        """Prepare the stable, invisible local data owner after activation."""
+        from services.cloud_retarget_client import ensure_license_runtime_session
+        from services.local_feishu_bridge import activate_local_feishu_account
+
+        owner = str(LOCAL_AUTH_USERNAME or "qcsckp_local").strip().casefold()
+        result = ensure_license_runtime_session(owner)
+        if not result.get("success"):
+            return result
+        activate_local_feishu_account(owner)
+        try:
+            from services.qianchuan_accounts import migrate_existing_qianchuan_accounts
+            from services.qianchuan_session import migrate_legacy_qcookie
+
+            migrate_legacy_qcookie()
+            migrate_existing_qianchuan_accounts(owner_username=owner, db=self.db)
+        except Exception as exc:
+            from utils.log import logger
+
+            logger.warning("[授权身份] 既有本机数据迁移暂未完成: %s", exc)
+        return {
+            "success": True,
+            "data": {"owner_username": owner, "auth_mode": "license"},
+        }
 
     def stopService(self):
         return self.service.stop()

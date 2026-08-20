@@ -639,12 +639,12 @@
                     </div>
                     <div class="sidebar-user-kv">
                         <div class="sidebar-kv-row">
-                            <span class="sidebar-kv-label">账号</span>
-                            <span class="sidebar-kv-value" id="sidebarUserName">未登录</span>
+                            <span class="sidebar-kv-label">授权</span>
+                            <span class="sidebar-kv-value" id="sidebarUserName">正在验证</span>
                         </div>
                         <div class="sidebar-kv-row">
                             <span class="sidebar-kv-label">状态</span>
-                            <span class="sidebar-kv-value sidebar-kv-value--status sidebar-user-status--muted" id="sidebarUserStatus">未登录</span>
+                            <span class="sidebar-kv-value sidebar-kv-value--status sidebar-user-status--muted" id="sidebarUserStatus">验证中</span>
                         </div>
                     </div>
                     <i data-lucide="chevron-right" class="w-4 h-4 text-slate-500 sidebar-user-chevron"></i>
@@ -667,45 +667,6 @@
             </div>
         </div>
     </aside>
-
-    <!-- 登录弹窗 -->
-    <div class="login-modal-overlay" id="loginModal" aria-hidden="true">
-        <div class="login-modal" role="dialog" aria-labelledby="loginModalTitle">
-            <h2 id="loginModalTitle">登录账号</h2>
-            <p class="sub" id="loginModalSub">登录后工具会自动运行；千川登录、账户和监控计划请在「千川账户管理」中配置。</p>
-
-            <div id="loginFormPanel">
-                <form id="loginForm">
-                    <div class="field">
-                        <label for="loginUser">用户名</label>
-                        <input type="text" id="loginUser" name="username" autocomplete="username" placeholder="普通用户账号" />
-                    </div>
-                    <div class="field">
-                        <label for="loginPass">密码</label>
-                        <input type="password" id="loginPass" name="password" autocomplete="current-password" placeholder="密码" />
-                    </div>
-                    <div class="err" id="loginErr"></div>
-                    <div class="actions">
-                        <button type="button" class="btn-cancel" id="loginCancel">取消</button>
-                        <button type="submit" class="btn-submit" id="loginSubmit">登录</button>
-                    </div>
-                </form>
-            </div>
-
-            <div id="loggedPanel" style="display: none;">
-                <div class="rounded-lg border border-slate-600/80 bg-slate-950/40 p-3 mb-3 text-sm">
-                    <div class="text-slate-400 text-xs mb-1">当前账号</div>
-                    <div class="text-white font-semibold" id="loggedUserName">—</div>
-                    <div class="text-xs text-slate-400 mt-2">有效期：<span id="loggedRange">—</span></div>
-                    <div class="text-xs mt-1" id="loggedStatus"></div>
-                </div>
-                <div class="actions" style="justify-content: space-between;">
-                    <button type="button" class="btn-cancel" id="btnSwitchAccount">切换账号</button>
-                    <button type="button" class="btn-submit" style="background:#f87171;color:#fff;" id="btnLogout">退出登录</button>
-                </div>
-            </div>
-        </div>
-    </div>
 
     <!-- 版本信息 -->
     <div class="login-modal-overlay" id="versionModal" aria-hidden="true">
@@ -1278,179 +1239,49 @@
             });
         }
 
-        // ---------- 账号登录（左下角）----------
-        const QC_AUTH_SESSION = 'qc_auth_session';
-        const QC_AUTH_LAST = 'qc_auth_last';
+        // ---------- 激活授权（左下角）----------
+        // v0.1.56 及更早版本可能在 WebView localStorage 中留下账号密码；
+        // 新版只有激活码门禁，启动后立即清理旧凭据。
+        try {
+            localStorage.removeItem('qc_auth_session');
+            localStorage.removeItem('qc_auth_last');
+        } catch (_) {}
+        let currentLicenseState = null;
 
-        function readAuthSession() {
-            try {
-                const raw = localStorage.getItem(QC_AUTH_SESSION);
-                if (!raw) return null;
-                const o = JSON.parse(raw);
-                if (o && o.username && o.password != null) return o;
-            } catch (_) {}
-            return null;
-        }
-
-        function readAuthLast() {
-            try {
-                const raw = localStorage.getItem(QC_AUTH_LAST);
-                if (!raw) return null;
-                return JSON.parse(raw);
-            } catch (_) {}
-            return null;
-        }
-
-        function saveAuthSession(username, password) {
-            localStorage.setItem(QC_AUTH_SESSION, JSON.stringify({ username, password }));
-        }
-
-        function clearAuthSession() {
-            try {
-                localStorage.removeItem(QC_AUTH_SESSION);
-                localStorage.removeItem(QC_AUTH_LAST);
-            } catch (_) {}
-        }
-
-        function saveAuthLast(payload) {
-            try {
-                localStorage.setItem(QC_AUTH_LAST, JSON.stringify(payload));
-            } catch (_) {}
-        }
-
-        function notifyIframeAuthChanged() {
-            ['contentFrame', 'frameDashboard', 'frameRuleRetargeting', 'frameRuleRegulation'].forEach((id) => {
-                const f = document.getElementById(id);
-                if (!f || !f.contentWindow) return;
-                if (id !== 'contentFrame' && f.dataset.loaded !== '1') return;
-                try {
-                    f.contentWindow.postMessage({ type: 'qc-auth-changed' }, '*');
-                } catch (_) {}
-            });
-        }
-
-        /** 子页（如服务控制）因后端校验失败要求主窗口清除登录态 */
-        window.addEventListener('message', function (e) {
-            if (!e.data || e.data.type !== 'qc-auth-clear') return;
-            clearAuthSession();
-            updateSidebarUserUI();
-            notifyIframeAuthChanged();
-        });
-
-        function sidebarAvatarLetter(username) {
-            const s = username == null ? '' : String(username).trim();
-            if (!s) return 'U';
-            const ch = [...s][0];
-            if (/[a-zA-Z]/.test(ch)) return ch.toUpperCase();
-            return ch;
-        }
-
-        function updateSidebarUserUI() {
+        function renderSidebarLicense(state) {
+            currentLicenseState = state || null;
+            const license = state && state.license ? state.license : {};
             const nameEl = document.getElementById('sidebarUserName');
             const avEl = document.getElementById('sidebarUserAvatarLetter');
             const stEl = document.getElementById('sidebarUserStatus');
             const vaEl = document.getElementById('sidebarUserValid');
-            const sess = readAuthSession();
-            if (!sess) {
-                nameEl.textContent = '未登录';
-                if (avEl) avEl.textContent = 'U';
-                if (stEl) {
-                    stEl.textContent = '未登录';
-                    stEl.classList.remove('sidebar-user-status--ok', 'sidebar-user-status--bad');
-                    stEl.classList.add('sidebar-user-status--muted');
-                }
-                if (vaEl) vaEl.textContent = '—';
-                return;
-            }
-            nameEl.textContent = sess.username;
-            if (avEl) avEl.textContent = sidebarAvatarLetter(sess.username);
-            const last = readAuthLast();
+            if (nameEl) nameEl.textContent = license.license_type_label || '激活码授权';
+            if (avEl) avEl.textContent = 'Q';
             if (stEl) {
                 stEl.classList.remove('sidebar-user-status--muted', 'sidebar-user-status--ok', 'sidebar-user-status--bad');
-                if (last && last.is_disabled === 1) {
-                    stEl.textContent = '已禁用';
-                    stEl.classList.add('sidebar-user-status--bad');
-                } else {
-                    stEl.textContent = '正常';
-                    stEl.classList.add('sidebar-user-status--ok');
-                }
+                stEl.textContent = state && state.authorized ? '已激活' : '需激活';
+                stEl.classList.add(state && state.authorized ? 'sidebar-user-status--ok' : 'sidebar-user-status--bad');
             }
             if (vaEl) {
-                const vu = last && last.valid_until ? String(last.valid_until).trim() : '';
-                vaEl.textContent = vu || '—';
+                vaEl.textContent = license.is_permanent ? '永久有效' : String(license.expires_at || '—');
             }
         }
 
-        const loginModal = document.getElementById('loginModal');
-        const loginFormPanel = document.getElementById('loginFormPanel');
-        const loggedPanel = document.getElementById('loggedPanel');
-        const loginErr = document.getElementById('loginErr');
-
-        function openLoginModal() {
-            const sess = readAuthSession();
-            loginErr.textContent = '';
-            if (sess) {
-                loginFormPanel.style.display = 'none';
-                loggedPanel.style.display = 'block';
-                document.getElementById('loginModalTitle').textContent = '账号';
-                document.getElementById('loginModalSub').style.display = 'none';
-                document.getElementById('loggedUserName').textContent = sess.username;
-                const last = readAuthLast();
-                const vf = last && last.valid_from ? last.valid_from : '—';
-                const vu = last && last.valid_until ? last.valid_until : '—';
-                document.getElementById('loggedRange').textContent =
-                    (vf === '—' && vu === '—') ? '—' : (vf + ' ~ ' + vu);
-                const st = document.getElementById('loggedStatus');
-                if (last && last.is_disabled === 1) {
-                    st.textContent = '状态：已禁用（含代理被禁用）';
-                    st.style.color = '#f87171';
-                } else {
-                    st.textContent = '状态：正常';
-                    st.style.color = '#4ade80';
-                }
-            } else {
-                loginFormPanel.style.display = 'block';
-                loggedPanel.style.display = 'none';
-                document.getElementById('loginModalTitle').textContent = '登录账号';
-                document.getElementById('loginModalSub').style.display = 'block';
-                document.getElementById('loginUser').value = window.qcLocalAuthUsername || '';
-                document.getElementById('loginPass').value = '';
-            }
-            loginModal.classList.add('show');
-            loginModal.setAttribute('aria-hidden', 'false');
-            lucide.createIcons();
-        }
-
-        function closeLoginModal() {
-            loginModal.classList.remove('show');
-            loginModal.setAttribute('aria-hidden', 'true');
-        }
-
-        document.getElementById('sidebarUserBtn').addEventListener('click', openLoginModal);
-        document.getElementById('loginCancel').addEventListener('click', closeLoginModal);
-        loginModal.addEventListener('click', (e) => {
-            if (e.target === loginModal) closeLoginModal();
-        });
-        document.getElementById('btnLogout').addEventListener('click', async () => {
+        async function refreshSidebarLicense() {
+            const api = await waitTopApi();
+            if (!api || typeof api.getLicenseManagementInfo !== 'function') return;
             try {
-                const api = await waitTopApi();
-                if (api && typeof api.clearDeviceSession === 'function') await api.clearDeviceSession();
-            } catch (_) {}
-            clearAuthSession();
-            updateSidebarUserUI();
-            closeLoginModal();
-            notifyIframeAuthChanged();
-        });
-        document.getElementById('btnSwitchAccount').addEventListener('click', () => {
-            const sess = readAuthSession();
-            loginFormPanel.style.display = 'block';
-            loggedPanel.style.display = 'none';
-            document.getElementById('loginModalTitle').textContent = '登录账号';
-            document.getElementById('loginModalSub').style.display = 'block';
-            document.getElementById('loginUser').value = sess ? (sess.username || '') : '';
-            document.getElementById('loginPass').value = '';
-            loginErr.textContent = '';
-            lucide.createIcons();
+                const state = await api.getLicenseManagementInfo();
+                renderSidebarLicense(state);
+                if (!state || !state.authorized) window.top.location.replace('license.html');
+            } catch (_) {
+                renderSidebarLicense(currentLicenseState);
+            }
+        }
+
+        document.getElementById('sidebarUserBtn').addEventListener('click', () => {
+            const menu = document.querySelector('.menu-item[data-page="license-management"]');
+            if (menu) menu.click();
         });
 
         function waitTopApi(maxAttempts = 120) {
@@ -1459,7 +1290,7 @@
                 const t = setInterval(() => {
                     try {
                         const api = window.top && window.top.pywebviewAPI;
-                        if (api && typeof api.verifyAccountLogin === 'function'
+                        if (api && typeof api.getLicenseManagementInfo === 'function'
                             && typeof api.checkAppVersion === 'function'
                             && typeof api.getAppVersion === 'function') {
                             clearInterval(t);
@@ -1641,183 +1472,14 @@
             versionPollTimer = setInterval(refreshVersionUI, 10 * 60 * 1000);
         }
 
-        function parseServerDateLogin(s) {
-            if (!s) return null;
-            const d = new Date(String(s).replace(' ', 'T'));
-            return isNaN(d.getTime()) ? null : d;
-        }
-        function isWithinValidityLogin(data) {
-            if (!data || typeof data !== 'object') return true;
-            const now = Date.now();
-            const from = parseServerDateLogin(data.valid_from);
-            const until = parseServerDateLogin(data.valid_until);
-            if (from && now < from.getTime()) return false;
-            if (until && now > until.getTime()) return false;
-            return true;
-        }
-
-        let startupAuthVerifyStarted = false;
-
-        /**
-         * 软件启动后主窗口校验一次本地已保存账号；失败则清空 localStorage 并显示未登录。
-         * 远程校验不在进入「服务控制」时做，而在启动采集时由后端再做。
-         */
-        async function verifySavedSessionOnStartup() {
-            if (startupAuthVerifyStarted) return;
-            startupAuthVerifyStarted = true;
-            const sess = readAuthSession();
-            if (!sess) {
-                updateSidebarUserUI();
-                return;
-            }
-            const api = await waitTopApi();
-            if (!api || typeof api.verifyAccountLogin !== 'function') {
-                updateSidebarUserUI();
-                return;
-            }
-            try {
-                const res = await api.verifyAccountLogin(sess.username, sess.password);
-                if (!res || !res.success) {
-                    clearAuthSession();
-                    updateSidebarUserUI();
-                    notifyIframeAuthChanged();
-                    return;
-                }
-                const d = res.data || {};
-                if (d.is_disabled === 1) {
-                    clearAuthSession();
-                    updateSidebarUserUI();
-                    notifyIframeAuthChanged();
-                    return;
-                }
-                if (!isWithinValidityLogin(d)) {
-                    clearAuthSession();
-                    updateSidebarUserUI();
-                    notifyIframeAuthChanged();
-                    return;
-                }
-                saveAuthLast({
-                    username: sess.username,
-                    valid_from: d.valid_from,
-                    valid_until: d.valid_until,
-                    is_disabled: d.is_disabled,
-                    verifiedAt: Date.now(),
-                });
-                updateSidebarUserUI();
-                notifyIframeAuthChanged();
-            } catch (_) {
-                updateSidebarUserUI();
-            }
-        }
-
-        /**
-         * 本地测试版使用运行环境里随机生成的隔离账号自动登录。
-         * 正式环境没有该能力，仍保持原账号登录流程。
-         */
+        let startupLicenseRenderStarted = false;
         async function initializeAccountSessionOnStartup() {
-            if (readAuthSession()) {
-                await verifySavedSessionOnStartup();
-                return;
-            }
-            const api = await waitTopApi();
-            if (!api || typeof api.getLocalTestLoginCredentials !== 'function') {
-                updateSidebarUserUI();
-                return;
-            }
-            let credentials = null;
-            try {
-                credentials = await api.getLocalTestLoginCredentials();
-            } catch (_) {
-                updateSidebarUserUI();
-                return;
-            }
-            if (!credentials || !credentials.success || !credentials.username || !credentials.password) {
-                updateSidebarUserUI();
-                try {
-                    const info = await api.getEnvironmentInfo();
-                    window.qcLocalAuthUsername = (
-                        info && info.auth_mode === 'local'
-                            ? String(info.local_auth_username || '')
-                            : ''
-                    );
-                } catch (_) {}
-                openLoginModal();
-                return;
-            }
-            try {
-                const res = await api.verifyAccountLogin(credentials.username, credentials.password);
-                if (!res || !res.success) {
-                    updateSidebarUserUI();
-                    return;
-                }
-                const d = res.data || {};
-                if (d.is_disabled === 1 || !isWithinValidityLogin(d)) {
-                    updateSidebarUserUI();
-                    return;
-                }
-                saveAuthSession(credentials.username, credentials.password);
-                saveAuthLast({
-                    username: credentials.username,
-                    valid_from: d.valid_from,
-                    valid_until: d.valid_until,
-                    is_disabled: d.is_disabled,
-                    verifiedAt: Date.now(),
-                });
-                updateSidebarUserUI();
-                notifyIframeAuthChanged();
-            } catch (_) {
-                updateSidebarUserUI();
-            }
+            if (startupLicenseRenderStarted) return;
+            startupLicenseRenderStarted = true;
+            await refreshSidebarLicense();
         }
 
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            loginErr.textContent = '';
-            const u = (document.getElementById('loginUser').value || '').trim();
-            const p = document.getElementById('loginPass').value || '';
-            if (!u || !p) {
-                loginErr.textContent = '请输入账号和密码';
-                return;
-            }
-            const api = await waitTopApi();
-            if (!api) {
-                loginErr.textContent = '无法连接桌面端接口，请重试';
-                return;
-            }
-            const btn = document.getElementById('loginSubmit');
-            btn.disabled = true;
-            try {
-                const res = await api.verifyAccountLogin(u, p);
-                if (!res || !res.success) {
-                    loginErr.textContent = (res && res.message) ? res.message : '登录失败';
-                    return;
-                }
-                const d = res.data || {};
-                if (d.is_disabled === 1) {
-                    loginErr.textContent = '账号已禁用或所属代理已禁用，无法使用';
-                    return;
-                }
-                if (!isWithinValidityLogin(d)) {
-                    loginErr.textContent = '账号不在有效期内';
-                    return;
-                }
-                saveAuthSession(u, p);
-                saveAuthLast({
-                    username: u,
-                    valid_from: d.valid_from,
-                    valid_until: d.valid_until,
-                    is_disabled: d.is_disabled,
-                    verifiedAt: Date.now(),
-                });
-                updateSidebarUserUI();
-                closeLoginModal();
-                notifyIframeAuthChanged();
-            } finally {
-                btn.disabled = false;
-            }
-        });
-
-        updateSidebarUserUI();
+        renderSidebarLicense(null);
 
         setTimeout(() => {
             refreshVersionUI();

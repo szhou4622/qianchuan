@@ -23,7 +23,7 @@
     </style>
 </head>
 <body>
-    <header class="head"><div><h1>授权管理</h1><p class="sub">仅查看当前时间授权，或解绑本机设备；不能修改激活码和有效期。</p></div></header>
+    <header class="head"><div><h1>授权管理</h1><p class="sub">查看当前激活码授权，或解绑本机设备；不能修改激活码和授权权益。</p></div></header>
     <section class="card">
         <div class="status" id="status">正在验证授权…</div>
         <div class="grid" id="details"></div>
@@ -55,7 +55,9 @@
                 const labelEl=document.createElement('div'); labelEl.className='label'; labelEl.textContent=label;
                 const valueEl=document.createElement('div'); valueEl.className='value';
                 let value=key==='software_name'?(state.software_name||'千川素材看盘工具'):license[key];
-                if(key==='remaining_days'&&value!==undefined&&value!==null)value=String(value)+' 天';
+                if(key==='expires_at'&&license.is_permanent)value='永久有效';
+                if(key==='remaining_days'&&license.is_permanent)value='永久';
+                else if(key==='remaining_days'&&value!==undefined&&value!==null)value=String(value)+' 天';
                 valueEl.textContent=value===undefined||value===null||value===''?'—':String(value);
                 item.append(labelEl,valueEl); details.appendChild(item);
             }

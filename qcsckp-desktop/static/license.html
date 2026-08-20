@@ -74,7 +74,7 @@
                 <div class="mark" aria-hidden="true">Q</div>
                 <div>
                     <h1 id="softwareName">千川素材看盘工具</h1>
-                    <p class="subtitle">在线授权验证 · 时间授权协议 v2</p>
+                    <p class="subtitle">在线激活验证 · 授权协议 v2</p>
                 </div>
             </div>
         </header>
@@ -85,12 +85,12 @@
             </div>
             <form id="activationForm" hidden>
                 <label for="activationCode">激活码</label>
-                <input id="activationCode" name="activation_code" type="text" maxlength="256" autocomplete="off" placeholder="请输入月卡或年卡激活码">
+                <input id="activationCode" name="activation_code" type="text" maxlength="256" autocomplete="off" placeholder="请输入周卡、月卡、年卡或永久激活码">
                 <div class="actions">
                     <button class="primary" id="activateButton" type="submit">立即激活</button>
                     <button id="retryButton" type="button">重新验证</button>
                 </div>
-                <p class="hint">激活码仅提交给授权服务器验证，不会保存在本机、浏览器或普通日志中。当前软件不支持积分码。</p>
+                <p class="hint">软件只需激活码，不需要账号密码。激活码仅提交给授权服务器验证，不会保存在本机、浏览器或普通日志中。</p>
             </form>
             <div class="license-summary" id="licenseSummary"></div>
         </main>
@@ -116,8 +116,9 @@
             summary.style.display = 'block';
             summary.innerHTML = '';
             const line = document.createElement('div');
-            line.innerHTML = '<strong>' + String(license.license_type_label || '时间授权') + '</strong>'
-                + ' · 到期时间：' + String(license.expires_at || '—');
+            const expiry = license.is_permanent ? '永久有效' : String(license.expires_at || '—');
+            line.innerHTML = '<strong>' + String(license.license_type_label || '软件授权') + '</strong>'
+                + ' · 到期时间：' + expiry;
             summary.appendChild(line);
         }
 

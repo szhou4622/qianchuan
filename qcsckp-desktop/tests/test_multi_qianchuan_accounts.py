@@ -988,25 +988,25 @@ class ToolAccountSwitchTests(unittest.TestCase):
         self.assertFalse(result["monitoring"]["success"])
         self.assertIn("设置已保存", result["message"])
 
-    def test_start_service_switch_stops_old_owner_before_remote_verification(self):
+    def test_start_service_uses_prepared_license_identity_without_account_credentials(self):
         api = Api.__new__(Api)
         api.service = Mock()
-        api.service.stop_and_wait.return_value = {"running": True}
-        api.service.status.return_value = {"running": True}
+        api.service.start.return_value = {"success": True, "running": True}
+        api.activate_license_runtime_identity = Mock(
+            return_value={"success": True, "data": {"owner_username": "qcsckp_local"}}
+        )
         api.account_auth = Mock()
 
-        with patch(
-            "services.cloud_retarget_client.load_device_session",
-            return_value={"username": "tool-a"},
+        with patch("services.control_panel_config.load_scrape_service_config", return_value={"interval_seconds": 600}), patch(
+            "services.control_panel_config.save_scrape_service_config"
         ):
             result = api.startService(
                 username="tool-b",
                 password="password",
             )
 
-        self.assertFalse(result["success"])
-        self.assertIn("安全退出", result["message"])
-        api.service.stop_and_wait.assert_called_once_with(30)
+        self.assertTrue(result["success"])
+        api.activate_license_runtime_identity.assert_called_once_with()
         api.account_auth.verify_can_start_service.assert_not_called()
 
     def test_login_switch_must_stop_old_service_before_new_session_registration(self):

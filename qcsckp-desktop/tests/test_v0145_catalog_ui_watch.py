@@ -86,7 +86,7 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
             self.html,
         )
 
-    def test_clean_install_opens_login_and_prefills_local_username(self):
+    def test_clean_install_uses_online_activation_without_account_login(self):
         index_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
             "static",
@@ -94,9 +94,11 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
         )
         with open(index_path, "r", encoding="utf-8") as handle:
             index_html = handle.read()
-        self.assertIn("window.qcLocalAuthUsername", index_html)
-        self.assertIn("await api.getEnvironmentInfo()", index_html)
-        self.assertIn("openLoginModal();", index_html)
+        self.assertIn("getLicenseManagementInfo", index_html)
+        self.assertIn("refreshSidebarLicense", index_html)
+        self.assertNotIn("openLoginModal", index_html)
+        self.assertNotIn('id="loginUser"', index_html)
+        self.assertNotIn('id="loginPass"', index_html)
 
 
 if __name__ == "__main__":

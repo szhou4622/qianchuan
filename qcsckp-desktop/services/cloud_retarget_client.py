@@ -132,6 +132,41 @@ def register_device_session(username: str, password: str) -> Dict[str, Any]:
     return res
 
 
+def ensure_license_runtime_session(username: str) -> Dict[str, Any]:
+    """Create the invisible local owner session after online activation.
+
+    The desktop license is now the only product login.  Business data still
+    needs one stable local owner key for account/plan/Feishu isolation, but it
+    must not require or persist a second username/password pair.
+    """
+    owner = str(username or "").strip().casefold()
+    if not owner:
+        return {"success": False, "message": "本机授权身份初始化失败"}
+    current = load_device_session()
+    if (
+        str(current.get("username") or "").strip().casefold() == owner
+        and str(current.get("auth_mode") or "").strip().lower() == "license"
+    ):
+        return {
+            "success": True,
+            "message": "本机授权身份已就绪",
+            "data": {"username": owner, "auth_mode": "license"},
+        }
+    _atomic_save(
+        {
+            "username": owner,
+            "token": "license-local-only",
+            "device_name": device_name(),
+            "auth_mode": "license",
+        }
+    )
+    return {
+        "success": True,
+        "message": "本机授权身份已就绪",
+        "data": {"username": owner, "auth_mode": "license"},
+    }
+
+
 def _token() -> str:
     return str(load_device_session().get("token") or "").strip()
 

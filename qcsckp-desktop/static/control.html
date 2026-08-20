@@ -330,20 +330,7 @@
     <script>
         lucide.createIcons();
 
-        const QC_AUTH_SESSION = 'qc_auth_session';
-        const QC_AUTH_LAST = 'qc_auth_last';
-
-        function getAuthSession() {
-            try {
-                const raw = localStorage.getItem(QC_AUTH_SESSION);
-                if (!raw) return null;
-                const o = JSON.parse(raw);
-                if (o && o.username && o.password != null) return o;
-            } catch (_) {}
-            return null;
-        }
-
-        let authGateOk = false;
+        let authGateOk = true;
         let authGateReason = '';
 
         function setStartAuthHint(text, show) {
@@ -383,7 +370,7 @@
         function syncStartButtonOnly() {
             const running = lastStatusSnapshot.running;
             const startEl = document.getElementById('btnStart');
-            if (startEl) startEl.disabled = running || !authGateOk;
+            if (startEl) startEl.disabled = running;
         }
 
         function getCurrentTimestamp() {
@@ -528,18 +515,8 @@
             document.getElementById('btnStop').disabled = !running;
         }
 
-        /**
-         * 仅根据 localStorage 是否已有会话更新「启动」按钮；远程校验在主窗口启动时及点击「启动」后由后端完成。
-         */
+        /** 在线激活是唯一入口门禁，页面不再要求第二套账号密码。 */
         function syncAuthGateFromLocalOnly() {
-            const sess = getAuthSession();
-            if (!sess) {
-                authGateOk = false;
-                authGateReason = '请先在左侧栏底部登录账号';
-                setStartAuthHint(authGateReason, true);
-                syncStartButtonOnly();
-                return;
-            }
             authGateOk = true;
             authGateReason = '';
             setStartAuthHint('', false);
@@ -853,31 +830,17 @@
                 );
                 return;
             }
-            syncAuthGateFromLocalOnly();
-            const sess = getAuthSession();
-            if (!sess || !sess.username) {
-                await appAlert('请先在左侧栏底部登录账号', '无法启动');
-                return;
-            }
             const interval = getIntervalFromUI();
             const headlessPoll = getHeadlessPollFromUI();
             let st;
             try {
-                st = await api.startService(interval, headlessPoll, sess.username, sess.password);
+                st = await api.startService(interval, headlessPoll);
             } catch (e) {
                 await appAlert((e && e.message) ? String(e.message) : '启动请求异常', '无法启动');
                 return;
             }
             if (st && st.success === false) {
-                try {
-                    localStorage.removeItem(QC_AUTH_SESSION);
-                    localStorage.removeItem(QC_AUTH_LAST);
-                } catch (_) {}
-                syncAuthGateFromLocalOnly();
-                try {
-                    window.top.postMessage({ type: 'qc-auth-clear' }, '*');
-                } catch (_) {}
-                await appAlert(st.message || '账号校验失败，无法启动采集', '无法启动');
+                await appAlert(st.message || '授权状态异常，无法启动采集', '无法启动');
                 try {
                     const st2 = await api.getServiceStatus();
                     setStatusUI(st2);
@@ -1016,10 +979,6 @@
         initScrollListener();
         refreshStatusAndLogs();
         setInterval(refreshStatusAndLogs, 2000);
-
-        window.addEventListener('message', (e) => {
-            if (e.data && e.data.type === 'qc-auth-changed') syncAuthGateFromLocalOnly();
-        });
 
         syncAuthGateFromLocalOnly();
     </script>
