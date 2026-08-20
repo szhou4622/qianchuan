@@ -194,6 +194,33 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual("", state["license"]["expires_at"])
         self.assertIsNone(state["license"]["remaining_days"])
 
+    def test_server_standard_zero_day_entitlement_maps_to_permanent(self):
+        payload = license_payload("standard")
+        payload.update(
+            {
+                "duration_days": 0,
+                "expires_at": "",
+                "remaining_days": None,
+            }
+        )
+        state = LicenseManager(
+            client=FakeClient(activation=payload),
+            store=FakeStore(),
+        ).activate("SERVER-PERMANENT")
+        self.assertTrue(state["authorized"])
+        self.assertEqual("永久授权", state["license"]["license_type_label"])
+        self.assertTrue(state["license"]["is_permanent"])
+
+    def test_server_unlimited_type_maps_to_permanent_but_points_variant_does_not(self):
+        allowed = license_payload("unlimited")
+        allowed.update({"duration_days": 0, "expires_at": "", "remaining_days": None})
+        state = LicenseManager(
+            client=FakeClient(activation=allowed),
+            store=FakeStore(),
+        ).activate("SERVER-UNLIMITED")
+        self.assertTrue(state["authorized"])
+        self.assertEqual("永久授权", state["license"]["license_type_label"])
+
     def test_server_time_duration_license_types_map_to_month_and_year(self):
         month = LicenseManager(
             client=FakeClient(activation=license_payload("time_30d", duration_days=30)),

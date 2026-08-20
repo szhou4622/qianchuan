@@ -49,13 +49,27 @@ _PERMANENT_TYPES = {
     "permanent",
     "lifetime",
     "forever",
+    "perpetual",
+    "unlimited",
+    "unlimited_time",
+    "unlimited_duration",
     "permanent_card",
     "lifetime_card",
     "time_permanent",
+    "time_forever",
     "永久",
     "永久卡",
 }
-_GENERIC_TIME_TYPES = {"time", "time_based", "duration", "standard"}
+_GENERIC_TIME_TYPES = {
+    "time",
+    "timed",
+    "time_based",
+    "time_limited",
+    "duration",
+    "duration_based",
+    "standard",
+    "时间授权",
+}
 _BLOCKED_LICENSE_STATUSES = {"expired", "disabled", "revoked", "inactive"}
 
 
@@ -108,6 +122,11 @@ def _license_type_label(value: Any, duration_days: Optional[int]) -> tuple[str, 
             raise LicenseServiceError("invalid_response", "年卡授权天数不是365天")
         return normalized, "年卡"
     if normalized in _GENERIC_TIME_TYPES:
+        # The existing administration backend represents a permanent
+        # entitlement as the generic `standard`/time type with no positive
+        # duration.  This is a server-issued semantic, not a code-text guess.
+        if duration_days in (None, 0):
+            return "permanent", "永久授权"
         if duration_days == 7:
             return "time_7d", "周卡"
         if duration_days == 30:
