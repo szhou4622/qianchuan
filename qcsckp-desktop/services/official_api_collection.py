@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from api.promotion_targets import (
     patch_target_sync_state,
+    record_target_verification_failure,
     replace_material_product_links,
     update_target_catalog_evidence,
     upsert_products,
@@ -813,6 +814,7 @@ def collect_target(
     )
     detail_request_id = str(capability.get("plan_detail_request_id") or "")
     detail_status = str(target.get("platform_status") or "")
+    detail_capability_updates: dict[str, Any] = {}
     if refresh_plan_detail or not goal:
         try:
             detail, detail_response = service.get_plan_detail(aavid, ad_id)
@@ -837,7 +839,16 @@ def collect_target(
                 promotion_scene=expected_scene,
                 db=store,
             )
+            from services.official_api_catalog import _capability as catalog_capability
+
+            detail_capability_updates = catalog_capability(detail, target_uid)
         except (ApiTokenError, ApiPermissionError):
+            raise
+        except RuntimeError as exc:
+            # Account/plan/scene/system/status mismatches are deterministic
+            # safety failures, not transient transport errors. Stop this
+            # selected plan until a later trusted catalog/detail proof restores it.
+            record_target_verification_failure(target_uid, str(exc), db=store)
             raise
         except (ApiRateLimitError, ApiRequestError, TimeoutError, ConnectionError, OSError) as exc:
             if not goal:
@@ -892,6 +903,14 @@ def collect_target(
         raise RuntimeError(
             "官方 API 报表字段已变化，未找到可用素材指标，本轮数据不入库"
         )
+    patch_target_sync_state(
+        target_uid,
+        status="collecting",
+        error="",
+        synced=False,
+        capability_updates={"collection_stage": "materials"},
+        db=store,
+    )
     materials, material_request_ids = service.list_plan_materials(
         aavid,
         ad_id,
@@ -1290,6 +1309,8 @@ def collect_target(
         "collection_window_start": start_date,
         "collection_window_end": end_date,
         "collection_scope": "materials_and_active_retarget_metrics",
+        "collection_stage": "healthy",
+        **detail_capability_updates,
     }
     if rotate_maintenance and maintenance_phase:
         capability_updates.update(
@@ -1455,7 +1476,10 @@ def _collect_target_safely(
                 status="collecting",
                 error="",
                 synced=False,
-                capability_updates={"collection_started_at": _now()},
+                capability_updates={
+                    "collection_started_at": _now(),
+                    "collection_stage": "plan_verification",
+                },
                 db=db,
             )
             result = collect_target(target, rotate_maintenance=True, db=db)

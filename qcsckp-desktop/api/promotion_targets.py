@@ -776,11 +776,14 @@ def upsert_promotion_target(
     owner_username: Any = None,
     trusted_catalog: bool = False,
     db: Optional[SQLiteStore] = None,
+    ensure_schema: bool = True,
+    refresh_capacity: bool = True,
 ) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("监控目标须为对象")
-    init_sqlite_schema()
     store = db or SQLiteStore()
+    if ensure_schema:
+        init_sqlite_schema(database=store.config.get("database"))
     aavid = str(data.get("aavid") or data.get("aadvid") or "").strip()
     ad_id = str(data.get("ad_id") or data.get("adId") or "").strip()
     if not aavid.isdigit() or not ad_id.isdigit():
@@ -1030,9 +1033,10 @@ def upsert_promotion_target(
         },
     )
     assert saved is not None
-    from services.qianchuan_accounts import refresh_monitor_capacity
+    if refresh_capacity:
+        from services.qianchuan_accounts import refresh_monitor_capacity
 
-    refresh_monitor_capacity(db=store)
+        refresh_monitor_capacity(db=store)
     saved = store.select_one(
         "promotion_target",
         where={

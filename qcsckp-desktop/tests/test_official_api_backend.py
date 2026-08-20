@@ -432,7 +432,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             "services.official_api_collection.update_target_catalog_evidence"
         ), patch(
             "services.official_api_collection.patch_target_sync_state"
-        ), patch(
+        ) as patch_state, patch(
             "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
         ):
             result = collect_target(target, db=store)
@@ -442,6 +442,46 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         service.list_control_tasks.assert_called_once()
         self.assertEqual(7, result["product_count"])
         self.assertFalse(result["product_catalog_refreshed"])
+        capability = patch_state.call_args.kwargs["capability_updates"]
+        self.assertTrue(capability["retarget_execute"])
+        self.assertTrue(capability["regulation_execute"])
+        self.assertEqual("target-product", capability["retarget_target_uid"])
+
+    def test_selected_plan_detail_mismatch_disables_monitoring_and_writes(self):
+        target = {
+            "target_uid": "target-mismatch",
+            "account_uid": "account-product",
+            "aadvid": "1001",
+            "ad_id": "2001",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "platform_status": "active",
+            "capability": {},
+        }
+        service = MagicMock()
+        service.get_plan_detail.return_value = (
+            {
+                "aavid": "different-account",
+                "ad_id": "2001",
+                "marketing_goal": "VIDEO_PROM_GOODS",
+                "adlab_scene": "UNI_PROJECT",
+                "platform_status": "active",
+            },
+            ApiResponse(data={}, raw={"code": 0}, request_id="detail-mismatch"),
+        )
+        store = MagicMock(config={"database": ":memory:"})
+        with patch(
+            "services.official_api_collection.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_collection.init_sqlite_schema"
+        ), patch(
+            "services.official_api_collection.record_target_verification_failure"
+        ) as record_failure:
+            with self.assertRaisesRegex(RuntimeError, "账户或计划不一致"):
+                collect_target(target, db=store)
+        record_failure.assert_called_once()
+        self.assertEqual("target-mismatch", record_failure.call_args.args[0])
 
     def test_optional_catalog_failure_does_not_discard_five_minute_metrics(self):
         target = {
@@ -1643,7 +1683,28 @@ class OfficialApiBackendTests(unittest.TestCase):
             self.assertTrue(result["queued"])
             self.assertIn("account-uid-2", catalog._PENDING_ACCOUNT_UIDS)
 
-    def test_unknown_detail_system_does_not_replace_list_classification(self):
+    def test_business_account_chain_is_reused_for_sixty_seconds(self):
+        service = QianchuanOfficialApiService(_CaptureClient())
+        with patch.object(
+            service,
+            "list_authorized_accounts",
+            return_value=[
+                {
+                    "advertiser_id": "10001",
+                    "advertiser_name": "账户一",
+                    "role": "ADVERTISER",
+                }
+            ],
+        ) as load_accounts:
+            first, _ = service.list_business_accounts()
+            second, _ = service.list_business_accounts()
+            self.assertEqual(first, second)
+            load_accounts.assert_called_once_with()
+            service.clear_business_account_cache()
+            service.list_business_accounts()
+            self.assertEqual(2, load_accounts.call_count)
+
+    def test_fast_catalog_uses_list_classification_without_plan_detail_requests(self):
         from services import official_api_catalog as catalog
 
         fake_service = unittest.mock.Mock()
@@ -1666,19 +1727,6 @@ class OfficialApiBackendTests(unittest.TestCase):
             ],
             {"complete": True, "classes": {}},
         )
-        fake_service.get_plan_detail.return_value = (
-            {
-                "aavid": "10001",
-                "ad_id": "20001",
-                "plan_name": "直播全域",
-                "promotion_scene": "live",
-                "plan_system": "unknown",
-                "marketing_goal": "LIVE_PROM_GOODS",
-                "adlab_scene": "0",
-                "platform_status": "active",
-            },
-            ApiResponse(data={}, raw={"code": 0}, request_id="req-detail"),
-        )
         account = {
             "aavid": "10001",
             "account_uid": "account-1",
@@ -1690,15 +1738,16 @@ class OfficialApiBackendTests(unittest.TestCase):
             catalog, "ensure_qianchuan_account"
         ), patch.object(catalog, "list_promotion_targets", return_value=[]), patch.object(
             catalog, "upsert_promotion_target", side_effect=lambda payload, **_kwargs: captured.append(payload) or {"target_uid": "target-1"}
-        ), patch.object(catalog, "patch_target_sync_state") as patch_sync:
+        ), patch("services.qianchuan_accounts.refresh_monitor_capacity"):
             result = catalog._sync_account(account, unittest.mock.Mock())
         self.assertTrue(result["complete"])
         self.assertEqual("global", captured[0]["plan_system"])
         self.assertEqual("live", captured[0]["promotion_scene"])
-        self.assertIsNone(patch_sync.call_args.kwargs["status"])
-        self.assertIsNone(patch_sync.call_args.kwargs["error"])
+        self.assertFalse(captured[0]["verification_evidence_fresh"])
+        self.assertEqual(1, result["details_deferred"])
+        fake_service.get_plan_detail.assert_not_called()
 
-    def test_unknown_detail_status_does_not_replace_list_status(self):
+    def test_fast_catalog_preserves_list_status_without_plan_detail_requests(self):
         from services import official_api_catalog as catalog
 
         fake_service = unittest.mock.Mock()
@@ -1719,19 +1768,6 @@ class OfficialApiBackendTests(unittest.TestCase):
             }],
             {"complete": True, "classes": {}},
         )
-        fake_service.get_plan_detail.return_value = (
-            {
-                "aavid": "10001",
-                "ad_id": "20001",
-                "plan_name": "商品全域",
-                "promotion_scene": "product",
-                "plan_system": "global",
-                "marketing_goal": "VIDEO_PROM_GOODS",
-                "adlab_scene": "UNI_PROJECT",
-                "platform_status": "unknown",
-            },
-            ApiResponse(data={}, raw={"code": 0}, request_id="req-detail"),
-        )
         account = {
             "aavid": "10001",
             "account_uid": "account-1",
@@ -1745,10 +1781,60 @@ class OfficialApiBackendTests(unittest.TestCase):
             catalog,
             "upsert_promotion_target",
             side_effect=lambda payload, **_kwargs: captured.append(payload) or {"target_uid": "target-1"},
-        ), patch.object(catalog, "patch_target_sync_state"):
+        ), patch("services.qianchuan_accounts.refresh_monitor_capacity"):
             result = catalog._sync_account(account, unittest.mock.Mock())
         self.assertTrue(result["complete"])
         self.assertEqual("active", captured[0]["platform_status"])
+        fake_service.get_plan_detail.assert_not_called()
+
+    def test_131_plan_fast_catalog_makes_zero_detail_requests(self):
+        from services import official_api_catalog as catalog
+
+        fake_service = unittest.mock.Mock()
+        fake_service.list_business_accounts.return_value = (
+            [{"advertiser_id": "10001", "advertiser_name": "大账户"}],
+            {"complete": True},
+        )
+        plans = [
+            {
+                "aavid": "10001",
+                "ad_id": str(20000 + index),
+                "plan_name": f"计划{index}",
+                "promotion_scene": "live" if index % 2 else "product",
+                "plan_system": "chengfang" if index % 3 == 0 else "global",
+                "marketing_goal": "LIVE_PROM_GOODS" if index % 2 else "VIDEO_PROM_GOODS",
+                "adlab_scene": "OVERALL_PROJECT" if index % 3 == 0 else "UNI_PROJECT",
+                "platform_status": "active",
+            }
+            for index in range(1, 132)
+        ]
+        fake_service.list_all_plans.return_value = (
+            plans,
+            {"complete": True, "classes": {}},
+        )
+        account = {
+            "aavid": "10001",
+            "account_uid": "account-1",
+            "account_name": "大账户",
+            "owner_username": "owner",
+        }
+        with patch.object(
+            catalog, "get_official_api_service", return_value=fake_service
+        ), patch.object(catalog, "ensure_qianchuan_account"), patch.object(
+            catalog, "list_promotion_targets", return_value=[]
+        ), patch.object(
+            catalog,
+            "upsert_promotion_target",
+            side_effect=lambda payload, **_kwargs: {
+                "target_uid": "target-" + str(payload["ad_id"])
+            },
+        ), patch(
+            "services.qianchuan_accounts.refresh_monitor_capacity"
+        ):
+            result = catalog._sync_account(account, unittest.mock.Mock())
+        self.assertEqual(131, result["plan_count"])
+        self.assertEqual(131, result["details_deferred"])
+        fake_service.get_plan_detail.assert_not_called()
 
     def test_single_shop_account_inherits_official_shop_name(self):
         service = QianchuanOfficialApiService(_CaptureClient())

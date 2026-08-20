@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+import json
+import threading
+import time
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .client import ApiResponse, QianchuanOpenApiClient
@@ -65,6 +68,10 @@ class QianchuanOfficialApiService:
             )
         else:
             self.allow_writes = bool(allow_writes)
+        self._business_account_cache_lock = threading.Lock()
+        self._business_account_cache: Optional[
+            tuple[float, list[dict[str, Any]], dict[str, Any]]
+        ] = None
 
     def _require_writes(self) -> None:
         if not self.allow_writes:
@@ -135,12 +142,34 @@ class QianchuanOfficialApiService:
             )
         return result
 
-    def list_business_accounts(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def clear_business_account_cache(self) -> None:
+        with self._business_account_cache_lock:
+            self._business_account_cache = None
+
+    def list_business_accounts(
+        self,
+        *,
+        cache_ttl_seconds: float = 60.0,
+        force_refresh: bool = False,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Resolve OAuth subjects to final Qianchuan advertiser accounts.
 
         A shop subject is not itself an advertiser.  It must be expanded through
         ``shop/advertiser/list`` before any plan or write API is called.
         """
+        ttl = max(0.0, float(cache_ttl_seconds or 0))
+        with self._business_account_cache_lock:
+            cached = self._business_account_cache
+            if (
+                not force_refresh
+                and cached is not None
+                and time.monotonic() - cached[0] <= ttl
+            ):
+                return (
+                    [dict(item) for item in cached[1]],
+                    json.loads(json.dumps(cached[2], ensure_ascii=False)),
+                )
+
         authorized = self.list_authorized_accounts()
         resolved: dict[str, dict[str, Any]] = {}
         evidence: dict[str, Any] = {"complete": True, "subjects": []}
@@ -248,7 +277,14 @@ class QianchuanOfficialApiService:
                 # Account IDs are still valid and may be selected.  A name lookup
                 # failure must not make the plan catalog itself incomplete.
                 evidence["account_name_error"] = str(exc)
-        return list(resolved.values()), evidence
+        result = list(resolved.values())
+        with self._business_account_cache_lock:
+            self._business_account_cache = (
+                time.monotonic(),
+                [dict(item) for item in result],
+                json.loads(json.dumps(evidence, ensure_ascii=False)),
+            )
+        return result, evidence
 
     @staticmethod
     def _default_plan_window() -> tuple[str, str]:

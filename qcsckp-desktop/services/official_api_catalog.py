@@ -10,7 +10,6 @@ from typing import Any, Optional
 from api.promotion_targets import (
     get_promotion_target,
     list_promotion_targets,
-    patch_target_sync_state,
     upsert_promotion_target,
 )
 from services.qianchuan_accounts import (
@@ -264,71 +263,37 @@ def _sync_account(
         "chengfang_live": 0,
         "chengfang_product": 0,
     }
-    detail_evidence: dict[str, dict[str, Any]] = {}
-    total_plan_details = len(plans)
+    total_plans = len(plans)
     mark_catalog_sync_progress(
         processed_accounts=processed_accounts,
         total_accounts=total_accounts,
         current_account=account_name,
-        message=f"已发现 {total_plan_details} 条计划，正在核验计划详情",
-        phase="plan_details",
-        phase_label="核验计划详情",
+        message=f"已发现 {total_plans} 条计划，正在保存目录",
+        phase="saving_catalog",
+        phase_label="保存计划目录",
         phase_current=0,
-        phase_total=total_plan_details,
-        discovered_plans=total_plan_details,
+        phase_total=total_plans,
+        discovered_plans=total_plans,
         account_progress_percent=48,
     )
     for plan_index, plan in enumerate(plans, 1):
         ad_id = str(plan.get("ad_id") or "")
         if not ad_id:
             continue
-        try:
-            detail, detail_response = service.get_plan_detail(aavid, ad_id)
-            if (
-                str(detail.get("aavid") or "") != aavid
-                or str(detail.get("ad_id") or "") != ad_id
-            ):
-                raise RuntimeError("计划详情账户或计划 ID 不一致")
-            list_plan = plan
-            plan = {**list_plan, **detail}
-            # The current detail response uses numeric ``adlab_scene=0`` for
-            # some full-domain plans, while the list response carries the
-            # explicit ``UNI_PROJECT/OVERALL_PROJECT`` contract.  An unknown
-            # detail value must not overwrite a confirmed list classification.
-            if str(detail.get("plan_system") or "") not in {"global", "chengfang"}:
-                plan["plan_system"] = list_plan.get("plan_system") or "unknown"
-                plan["adlab_scene"] = list_plan.get("adlab_scene") or ""
-            if str(detail.get("promotion_scene") or "") not in {"live", "product"}:
-                plan["promotion_scene"] = list_plan.get("promotion_scene") or ""
-                plan["marketing_goal"] = list_plan.get("marketing_goal") or ""
-            # The list and detail endpoints do not always expose status through
-            # the same field set. An unknown detail enum must not erase a
-            # status already confirmed by the scoped list.
-            if str(detail.get("platform_status") or "") == "unknown":
-                plan["platform_status"] = list_plan.get("platform_status") or "unknown"
-            detail_evidence[ad_id] = {
-                "complete": True,
-                "request_id": detail_response.request_id,
-            }
-        except Exception as exc:
-            detail_evidence[ad_id] = {
-                "complete": False,
-                "error": str(exc),
-            }
         scene = str(plan.get("promotion_scene") or "")
         system = str(plan.get("plan_system") or "unknown")
         seen.add(ad_id)
         if f"{system}_{scene}" in class_counts:
             class_counts[f"{system}_{scene}"] += 1
         prior = existing.get(ad_id) or {}
-        # The official paginated list is the catalog source of truth. Detail
-        # evidence strengthens execution eligibility, but a transient detail
-        # failure must not hide a valid plan or mark the directory partial.
+        # The complete official list is sufficient for directory display and
+        # read-only monitor selection. Exact detail/capability evidence is
+        # deferred until the user actually enables this plan.
         verified = bool(
             scene in {"live", "product"}
             and system in {"global", "chengfang"}
         )
-        saved = upsert_promotion_target(
+        upsert_promotion_target(
             {
                 "aavid": aavid,
                 "ad_id": ad_id,
@@ -338,7 +303,7 @@ def _sync_account(
                 "plan_system": system,
                 "platform_status": plan.get("platform_status") or "unknown",
                 "verification_state": "verified" if verified else "candidate",
-                "verification_evidence_fresh": True,
+                "verification_evidence_fresh": False,
                 "enabled": bool(prior.get("enabled")),
                 # Catalog and material collection are separate state machines.
                 # Preserve the existing collection state so catalog refreshes
@@ -353,31 +318,28 @@ def _sync_account(
             owner_username=account.get("owner_username"),
             trusted_catalog=True,
             db=db,
+            ensure_schema=False,
+            refresh_capacity=False,
         )
-        if verified and detail_evidence[ad_id].get("complete"):
-            patch_target_sync_state(
-                saved["target_uid"],
-                status=None,
-                error=None,
-                synced=False,
-                capability_updates=_capability(plan, saved["target_uid"]),
-                db=db,
-            )
         mark_catalog_sync_progress(
             processed_accounts=processed_accounts,
             total_accounts=total_accounts,
             current_account=account_name,
-            message=f"正在核验并保存计划详情 {plan_index}/{max(1, total_plan_details)}",
-            phase="plan_details",
-            phase_label="核验计划详情",
+            message=f"正在保存计划目录 {plan_index}/{max(1, total_plans)}",
+            phase="saving_catalog",
+            phase_label="保存计划目录",
             phase_current=plan_index,
-            phase_total=total_plan_details,
-            discovered_plans=total_plan_details,
+            phase_total=total_plans,
+            discovered_plans=total_plans,
             saved_plans=len(seen),
             account_progress_percent=(
-                48 + (plan_index / max(1, total_plan_details)) * 47
+                48 + (plan_index / max(1, total_plans)) * 47
             ),
         )
+
+    from services.qianchuan_accounts import refresh_monitor_capacity
+
+    refresh_monitor_capacity(db=db)
 
     # 只有两类 marketing_goal 的全部分页都成功时，才把本轮未见计划标为历史；
     # 部分失败时保留上次完整目录，绝不以异常空结果覆盖。
@@ -400,7 +362,7 @@ def _sync_account(
             )
     evidence["counts"] = class_counts
     evidence["plan_count"] = len(seen)
-    evidence["details"] = detail_evidence
+    evidence["details_deferred"] = len(seen)
     evidence["error"] = "; ".join(
         str(item.get("error") or "")
         for item in (evidence.get("classes") or {}).values()
@@ -414,8 +376,8 @@ def _sync_account(
         phase="finalizing",
         phase_label="完成目录校验",
         phase_current=len(seen),
-        phase_total=max(len(seen), total_plan_details),
-        discovered_plans=total_plan_details,
+        phase_total=max(len(seen), total_plans),
+        discovered_plans=total_plans,
         saved_plans=len(seen),
         account_progress_percent=98,
     )

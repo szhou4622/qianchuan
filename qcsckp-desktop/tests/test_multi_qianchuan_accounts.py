@@ -123,6 +123,21 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertEqual(["retarget"], [row["action_type"] for row in rows_a])
         self.assertEqual(["stop"], [row["action_type"] for row in rows_b])
 
+    def test_unchecked_plan_never_enters_collection_schedule(self):
+        selected = self._target("10001", 1)
+        unchecked = self._target("10001", 2)
+        self.db.update(
+            "promotion_target",
+            {"enabled": 0, "capacity_state": "disabled"},
+            where={"target_uid": unchecked["target_uid"]},
+        )
+        refresh_monitor_capacity(db=self.db)
+        scheduled = schedulable_promotion_targets(db=self.db)
+        self.assertEqual(
+            [selected["target_uid"]],
+            [row["target_uid"] for row in scheduled],
+        )
+
     def test_authorized_account_catalog_is_not_auto_added_to_user_directory(self):
         upsert_authorized_accounts(
             [
@@ -744,7 +759,9 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn("刷新任务已进入官方API后台队列", html)
         self.assertIn("const collectionHealth=String(p.collection_health||'').toLowerCase()", html)
         self.assertIn("collectionFailed?'采集失败，自动重试中'", html)
-        self.assertIn("firstRun?'等待首次采集':late?'监控延迟'", html)
+        self.assertIn("firstRun?'等待首次核验':late?'监控延迟'", html)
+        self.assertIn("正在核验计划", html)
+        self.assertIn("正在采集素材", html)
         self.assertIn("数据年龄：${esc(dataAge(p.last_lag_seconds))}", html)
         self.assertIn('data-field="report_enabled"', html)
         self.assertIn("reportInput.disabled=!input.checked", html)

@@ -761,7 +761,14 @@ class Api:
     def saveQianchuanOfficialApiConfig(self, config=None):
         from services.qianchuan_open_api.configuration import save_configuration
         payload = config if isinstance(config, dict) else {}
-        return save_configuration(payload.get("app_id"), payload.get("app_secret"))
+        result = save_configuration(payload.get("app_id"), payload.get("app_secret"))
+        try:
+            from services.qianchuan_open_api.runtime import get_official_api_service
+
+            get_official_api_service().clear_business_account_cache()
+        except Exception:
+            pass
+        return result
 
     def startQianchuanOfficialApiAuthorization(self):
         from services.qianchuan_open_api.configuration import start_authorization
@@ -770,15 +777,28 @@ class Api:
     def saveAndStartQianchuanOfficialApiAuthorization(self, config=None):
         from services.qianchuan_open_api.configuration import save_and_start_authorization
         payload = config if isinstance(config, dict) else {}
-        return save_and_start_authorization(
+        result = save_and_start_authorization(
             payload.get("app_id"),
             payload.get("app_secret"),
         )
+        try:
+            from services.qianchuan_open_api.runtime import get_official_api_service
+
+            get_official_api_service().clear_business_account_cache()
+        except Exception:
+            pass
+        return result
 
     def finishQianchuanOfficialApiAuthorization(self, authCode=None):
         from services.qianchuan_open_api.configuration import finish_authorization
         result = finish_authorization(authCode)
         if result.get("success") and result.get("completed") and result.get("authorized"):
+            try:
+                from services.qianchuan_open_api.runtime import get_official_api_service
+
+                get_official_api_service().clear_business_account_cache()
+            except Exception:
+                pass
             try:
                 result["monitoring"] = self.service.start_from_saved_session()
             except Exception as exc:
@@ -792,7 +812,14 @@ class Api:
 
     def clearQianchuanOfficialApiConfig(self):
         from services.qianchuan_open_api.configuration import disconnect_configuration
-        return disconnect_configuration()
+        result = disconnect_configuration()
+        try:
+            from services.qianchuan_open_api.runtime import get_official_api_service
+
+            get_official_api_service().clear_business_account_cache()
+        except Exception:
+            pass
+        return result
 
     def startQianchuanRelogin(self):
         try:
