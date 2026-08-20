@@ -11,7 +11,7 @@
         h1 { margin:0; color:#f8fafc; font-size:24px; } .sub { margin:6px 0 0; color:#64748b; font-size:12px; }
         .card { max-width:920px; padding:22px; border:1px solid #334155; border-radius:16px; background:#111c31; box-shadow:0 18px 45px #02061755; }
         .status { margin-bottom:18px; padding:12px 14px; border:1px solid #334155; border-radius:11px; color:#cbd5e1; background:#0f172a; font-size:13px; }
-        .status.ok { color:#bbf7d0; border-color:#166534; } .status.error { color:#fecaca; border-color:#7f1d1d; }
+        .status.ok { color:#bbf7d0; border-color:#166534; } .status.warn { color:#fde68a; border-color:#a16207; } .status.error { color:#fecaca; border-color:#7f1d1d; }
         .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
         .item { min-height:78px; padding:13px 14px; border:1px solid rgba(51,65,85,.75); border-radius:12px; background:rgba(15,23,42,.58); }
         .label { color:#64748b; font-size:11px; margin-bottom:7px; } .value { color:#f1f5f9; font-size:14px; font-weight:650; overflow-wrap:anywhere; }
@@ -42,7 +42,7 @@
         const fields = [
             ['software_name','软件中文名'],['license_type_label','授权类型'],['binding_status','授权状态'],
             ['activated_at','激活时间'],['expires_at','到期时间'],['remaining_days','剩余天数'],
-            ['remaining_credits','剩余权益'],['current_device','当前绑定设备'],['code_id','授权编号'],
+            ['current_device','当前绑定设备'],['code_id','授权编号'],
             ['transfer_count','换机次数'],['self_transfers_used_30d','近30天已自助换机'],
             ['self_transfers_remaining_30d','近30天剩余自助换机']
         ];
@@ -50,7 +50,7 @@
         function render(state){
             const license=state&&state.license||{};
             status.textContent=(state&&state.message)||'授权状态未知';
-            status.className='status '+(state&&state.authorized?'ok':'error');
+            status.className='status '+(state&&state.network_grace?'warn':state&&state.authorized?'ok':'error');
             details.innerHTML='';
             for(const [key,label] of fields){
                 const item=document.createElement('div'); item.className='item';

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 
 from config import LICENSE_APP_NAME, LICENSE_PROTOCOL_VERSION, SOFTWARE_CHINESE_NAME
 from services.license_client import (
@@ -63,6 +64,7 @@ class FakeStore:
     def __init__(self, machine="machine_stable_12345678"):
         self.credentials = None
         self.activation_context = {}
+        self.license_snapshot = {}
         self.metadata = {}
         self.machine = machine
         self.clear_count = 0
@@ -86,6 +88,12 @@ class FakeStore:
     def load_activation_context(self):
         return dict(self.activation_context)
 
+    def load_license_snapshot(self):
+        return dict(self.license_snapshot)
+
+    def save_license_snapshot(self, payload):
+        self.license_snapshot = dict(payload)
+
     def get_or_create_machine_code(self):
         return self.machine
 
@@ -100,7 +108,10 @@ class FakeClient:
     def __init__(self, *, activation=None, status=None, unbind=None):
         self.activation = activation or license_payload()
         self.status = status or status_payload()
-        self.unbind_response = unbind or {"message": "当前设备已解绑"}
+        self.unbind_response = unbind or {
+            "binding_status": "unbound",
+            "message": "当前设备已解绑",
+        }
         self.activate_calls = []
         self.activate_options = []
         self.status_calls = []
@@ -118,14 +129,26 @@ class FakeClient:
             raise self.activation
         return dict(self.activation)
 
-    def device_status(self, credentials):
-        self.status_calls.append(dict(credentials))
+    def device_status(self, credentials, *, machine_code, code_id):
+        self.status_calls.append(
+            {
+                "credentials": dict(credentials),
+                "machine_code": machine_code,
+                "code_id": code_id,
+            }
+        )
         if isinstance(self.status, Exception):
             raise self.status
         return dict(self.status)
 
-    def unbind(self, credentials):
-        self.unbind_calls.append(dict(credentials))
+    def unbind(self, credentials, *, machine_code, code_id):
+        self.unbind_calls.append(
+            {
+                "credentials": dict(credentials),
+                "machine_code": machine_code,
+                "code_id": code_id,
+            }
+        )
         if isinstance(self.unbind_response, Exception):
             raise self.unbind_response
         return dict(self.unbind_response)
@@ -294,6 +317,75 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual("月卡", restarted["license"]["license_type_label"])
         self.assertEqual(30, restarted["license"]["duration_days"])
 
+    def test_plain_metadata_tampering_cannot_override_encrypted_snapshot(self):
+        store = FakeStore()
+        manager = LicenseManager(client=FakeClient(), store=store)
+        self.assertTrue(manager.activate("MONTH-SNAPSHOT")["authorized"])
+        store.metadata.update(
+            {
+                "license_type": "permanent",
+                "license_type_label": "永久授权",
+                "duration_days": 0,
+                "expires_at": "",
+                "is_permanent": True,
+            }
+        )
+        response = status_payload("monthly")
+        response.pop("license_type")
+        response.pop("duration_days")
+        restarted = LicenseManager(
+            client=FakeClient(status=response),
+            store=store,
+        ).startup_check()
+        self.assertTrue(restarted["authorized"])
+        self.assertEqual("月卡", restarted["license"]["license_type_label"])
+        self.assertFalse(restarted["license"]["is_permanent"])
+
+    def test_matching_legacy_metadata_migrates_once_to_secure_snapshot(self):
+        store = FakeStore()
+        store.credentials = {
+            "device_session": "session",
+            "device_credential": "credential",
+        }
+        store.activation_context = {
+            "activation_code": "LEGACY-CODE",
+            "code_id": "code-test-001",
+            "machine_code": store.machine,
+        }
+        store.metadata = {
+            **status_payload("monthly"),
+            "license_type_label": "月卡",
+            "is_permanent": False,
+        }
+        response = status_payload("monthly", machine_code=store.machine)
+        response.pop("license_type")
+        response.pop("duration_days")
+        state = LicenseManager(
+            client=FakeClient(status=response),
+            store=store,
+        ).startup_check()
+        self.assertTrue(state["authorized"])
+        self.assertEqual("monthly", store.license_snapshot["license_type"])
+
+    def test_legacy_binding_without_secret_context_requires_original_code(self):
+        store = FakeStore()
+        store.credentials = {
+            "device_session": "session",
+            "device_credential": "credential",
+        }
+        store.metadata = {
+            **status_payload("monthly"),
+            "license_type_label": "月卡",
+            "is_permanent": False,
+        }
+        state = LicenseManager(
+            client=FakeClient(status=status_payload("monthly")),
+            store=store,
+        ).startup_check()
+        self.assertFalse(state["authorized"])
+        self.assertTrue(state["credential_refresh_required"])
+        self.assertIsNotNone(store.credentials)
+
     def test_duplicate_activation_after_success_is_not_resubmitted(self):
         client = FakeClient()
         manager = LicenseManager(client=client, store=FakeStore())
@@ -352,7 +444,7 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual(original_expiry, state["license"]["expires_at"])
         self.assertEqual(18, state["license"]["remaining_days"])
 
-    def test_rebound_uses_server_balance_and_reports_rebind_success(self):
+    def test_rebound_reports_rebind_success_without_points_logic(self):
         state = LicenseManager(
             client=FakeClient(
                 activation=license_payload(
@@ -367,7 +459,7 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         ).activate("ORIGINAL-CODE")
         self.assertTrue(state["authorized"])
         self.assertEqual("换机绑定成功", state["message"])
-        self.assertEqual(37, state["license"]["remaining_credits"])
+        self.assertNotIn("remaining_credits", state["license"])
         self.assertEqual(0, state["license"]["grant_score"])
 
     def test_rebound_must_not_grant_initial_entitlement_again(self):
@@ -407,6 +499,23 @@ class OnlineLicenseManagerTests(unittest.TestCase):
             client.activate_options[0],
         )
 
+    def test_invalid_same_device_binding_requests_controlled_refresh(self):
+        store = FakeStore()
+        store.metadata = {
+            "app_name": LICENSE_APP_NAME,
+            "code_id": "code-test-001",
+            "binding_status": "invalid",
+        }
+        store.activation_context = {
+            "activation_code": "ORIGINAL-CODE",
+            "code_id": "code-test-001",
+            "machine_code": store.machine,
+        }
+        client = FakeClient(activation=license_payload("monthly"))
+        state = LicenseManager(client=client, store=store).activate("ORIGINAL-CODE")
+        self.assertTrue(state["authorized"])
+        self.assertTrue(client.activate_options[0]["credential_refresh"])
+
     def test_unbound_code_rebind_does_not_request_credential_refresh(self):
         store = FakeStore(machine="machine_new")
         store.metadata = {
@@ -444,6 +553,23 @@ class OnlineLicenseManagerTests(unittest.TestCase):
             "device_session": "session",
             "device_credential": "credential",
         }
+        store.activation_context = {
+            "activation_code": "EXPIRED-CODE",
+            "code_id": "code-test-001",
+            "machine_code": store.machine,
+        }
+        store.license_snapshot = {
+            key: value
+            for key, value in license_payload("monthly").items()
+            if key in {
+                "app_name",
+                "code_id",
+                "license_type",
+                "duration_days",
+                "activated_at",
+                "expires_at",
+            }
+        }
         manager = LicenseManager(
             client=FakeClient(status=status_payload(license_status="expired", remaining_days=0)),
             store=store,
@@ -467,6 +593,77 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertIsNotNone(store.credentials)
         self.assertEqual(0, store.clear_count)
 
+    def test_runtime_network_failure_has_monotonic_thirty_minute_grace(self):
+        clock = [100.0]
+        store = FakeStore()
+        client = FakeClient()
+        manager = LicenseManager(
+            client=client,
+            store=store,
+            monotonic=lambda: clock[0],
+            runtime_network_grace_seconds=1800,
+        )
+        self.assertTrue(manager.activate("GRACE-CODE")["authorized"])
+        client.status = LicenseNetworkError()
+        first = manager.runtime_check()
+        self.assertTrue(first["authorized"])
+        self.assertTrue(first["network_grace"])
+        self.assertEqual(1800, first["network_grace_remaining_seconds"])
+        clock[0] += 1799
+        self.assertTrue(manager.runtime_check()["authorized"])
+        clock[0] += 2
+        expired = manager.runtime_check()
+        self.assertFalse(expired["authorized"])
+        self.assertEqual(0, expired["network_grace_remaining_seconds"])
+        self.assertIsNotNone(store.credentials)
+
+    def test_runtime_network_grace_resets_after_server_recovers(self):
+        clock = [1.0]
+        store = FakeStore()
+        client = FakeClient()
+        manager = LicenseManager(
+            client=client,
+            store=store,
+            monotonic=lambda: clock[0],
+        )
+        self.assertTrue(manager.activate("RECOVERY-CODE")["authorized"])
+        client.status = LicenseNetworkError()
+        self.assertTrue(manager.runtime_check()["network_grace"])
+        client.status = status_payload("monthly")
+        recovered = manager.runtime_check()
+        self.assertTrue(recovered["authorized"])
+        self.assertFalse(recovered.get("network_grace", False))
+
+    def test_runtime_401_never_enters_network_grace(self):
+        store = FakeStore()
+        client = FakeClient()
+        manager = LicenseManager(client=client, store=store)
+        self.assertTrue(manager.activate("REVOKED-CODE")["authorized"])
+        client.status = LicenseServiceError(
+            "http_401",
+            "设备已失效",
+            http_status=401,
+        )
+        state = manager.runtime_check()
+        self.assertFalse(state["authorized"])
+        self.assertFalse(state.get("network_grace", False))
+        self.assertIsNone(store.credentials)
+
+    def test_runtime_server_5xx_uses_network_grace(self):
+        store = FakeStore()
+        client = FakeClient()
+        manager = LicenseManager(client=client, store=store)
+        self.assertTrue(manager.activate("SERVER-ERROR-GRACE")["authorized"])
+        client.status = LicenseServiceError(
+            "http_503",
+            "service unavailable",
+            http_status=503,
+            retryable=True,
+        )
+        state = manager.runtime_check()
+        self.assertTrue(state["authorized"])
+        self.assertTrue(state["network_grace"])
+
     def test_minimal_unbound_status_clears_invalid_credentials(self):
         store = FakeStore()
         store.credentials = {
@@ -480,6 +677,65 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertFalse(state["authorized"])
         self.assertIsNone(store.credentials)
         self.assertEqual("unbound", store.metadata["binding_status"])
+
+    def test_unbind_requires_explicit_server_unbound_confirmation(self):
+        store = FakeStore()
+        client = FakeClient(unbind={"message": "request accepted"})
+        manager = LicenseManager(client=client, store=store)
+        self.assertTrue(manager.activate("KEEP-BOUND")["authorized"])
+        state = manager.unbind_current_device()
+        self.assertFalse(state["success"])
+        self.assertIsNotNone(store.credentials)
+        self.assertTrue(manager.is_runtime_authorized())
+
+    def test_unbind_refreshes_server_transfer_counters(self):
+        store = FakeStore()
+        client = FakeClient(
+            unbind={
+                "binding_status": "unbound",
+                "transfer_count": 2,
+                "self_transfers_used_30d": 1,
+                "self_transfers_remaining_30d": 2,
+                "message": "解绑成功",
+            }
+        )
+        manager = LicenseManager(client=client, store=store)
+        self.assertTrue(manager.activate("UNBIND-COUNTERS")["authorized"])
+        state = manager.unbind_current_device()
+        self.assertTrue(state["success"])
+        self.assertEqual(2, store.metadata["transfer_count"])
+        self.assertEqual(1, store.metadata["self_transfers_used_30d"])
+        self.assertEqual(2, store.metadata["self_transfers_remaining_30d"])
+
+    def test_unbind_401_clears_invalid_device_credentials(self):
+        store = FakeStore()
+        client = FakeClient(
+            unbind=LicenseServiceError(
+                "http_401",
+                "设备凭证已失效",
+                http_status=401,
+            )
+        )
+        manager = LicenseManager(client=client, store=store)
+        self.assertTrue(manager.activate("UNBIND-401")["authorized"])
+        state = manager.unbind_current_device()
+        self.assertFalse(state["authorized"])
+        self.assertEqual(401, state["http_status"])
+        self.assertIsNone(store.credentials)
+        self.assertEqual("invalid", store.metadata["binding_status"])
+
+    def test_duplicate_unbind_is_rejected_before_second_request(self):
+        store = FakeStore()
+        manager = LicenseManager(client=FakeClient(), store=store)
+        self.assertTrue(manager.activate("UNBIND-LOCK")["authorized"])
+        manager._unbind_lock.acquire()
+        try:
+            state = manager.unbind_current_device()
+        finally:
+            manager._unbind_lock.release()
+        self.assertFalse(state["success"])
+        self.assertEqual("unbind_in_progress", state["code"])
+        self.assertEqual([], manager.client.unbind_calls)
 
     def test_401_message_is_specific_and_does_not_fake_recovery(self):
         store = FakeStore()
@@ -565,7 +821,9 @@ class OnlineLicenseHttpTests(unittest.TestCase):
 
         client = LicenseHttpClient(opener=opener, sleeper=lambda _seconds: None)
         result = client.device_status(
-            {"device_session": "session", "device_credential": "credential"}
+            {"device_session": "session", "device_credential": "credential"},
+            machine_code="machine-stable",
+            code_id="code-001",
         )
         self.assertEqual("active", result["binding_status"])
         self.assertEqual(2, len(calls))
@@ -574,6 +832,58 @@ class OnlineLicenseHttpTests(unittest.TestCase):
             "credential",
             requests[-1].get_header("X-device-credential"),
         )
+        query = parse_qs(urlparse(requests[-1].full_url).query)
+        self.assertEqual([LICENSE_APP_NAME], query["app_name"])
+        self.assertEqual([str(LICENSE_PROTOCOL_VERSION)], query["license_protocol_version"])
+        self.assertEqual(["machine-stable"], query["machine_code"])
+        self.assertEqual(["code-001"], query["code_id"])
+
+    def test_status_drops_server_returned_activation_code_and_credentials(self):
+        payload = status_payload(
+            primary_activation_code="FULL-CODE-MUST-DROP",
+            activation_code="OTHER-CODE-MUST-DROP",
+            device_session="session-must-drop",
+            device_credential="credential-must-drop",
+        )
+        result = LicenseHttpClient(
+            opener=lambda _request, timeout=None: FakeHttpResponse(
+                {"ok": True, "data": payload}
+            )
+        ).device_status(
+            {"device_session": "session", "device_credential": "credential"},
+            machine_code="machine-stable",
+            code_id="code-001",
+        )
+        for field in (
+            "primary_activation_code",
+            "activation_code",
+            "device_session",
+            "device_credential",
+        ):
+            self.assertNotIn(field, result)
+
+    def test_unbind_sends_complete_protocol_v2_device_identity(self):
+        captured = []
+
+        def opener(request, timeout=None):
+            captured.append(request)
+            return FakeHttpResponse(
+                {"ok": True, "binding_status": "unbound"}
+            )
+
+        result = LicenseHttpClient(opener=opener).unbind(
+            {"device_session": "session", "device_credential": "credential"},
+            machine_code="machine-stable",
+            code_id="code-001",
+        )
+        self.assertEqual("unbound", result["binding_status"])
+        request = captured[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(LICENSE_APP_NAME, body["app_name"])
+        self.assertEqual(LICENSE_PROTOCOL_VERSION, body["license_protocol_version"])
+        self.assertEqual("machine-stable", body["machine_code"])
+        self.assertEqual("code-001", body["current_code_id"])
+        self.assertEqual("Bearer session", request.get_header("Authorization"))
 
     def test_http_409_keeps_server_business_message(self):
         message = "24小时内不能再次换机"
@@ -590,7 +900,9 @@ class OnlineLicenseHttpTests(unittest.TestCase):
 
         with self.assertRaises(LicenseServiceError) as caught:
             LicenseHttpClient(opener=opener).unbind(
-                {"device_session": "session", "device_credential": "credential"}
+                {"device_session": "session", "device_credential": "credential"},
+                machine_code="machine-stable",
+                code_id="code-001",
             )
         self.assertEqual(409, caught.exception.http_status)
         self.assertEqual(message, caught.exception.message)
@@ -610,7 +922,9 @@ class OnlineLicenseHttpTests(unittest.TestCase):
 
         with self.assertRaises(LicenseServiceError) as caught:
             LicenseHttpClient(opener=opener).unbind(
-                {"device_session": "session", "device_credential": "credential"}
+                {"device_session": "session", "device_credential": "credential"},
+                machine_code="machine-stable",
+                code_id="code-001",
             )
         self.assertEqual(429, caught.exception.http_status)
         self.assertEqual(message, caught.exception.message)
@@ -635,10 +949,23 @@ class WindowsLicenseStorageTests(unittest.TestCase):
                     "machine_code": "machine-stable",
                 }
             )
+            store.save_license_snapshot(
+                {
+                    "app_name": LICENSE_APP_NAME,
+                    "code_id": "code-001",
+                    "license_type": "monthly",
+                    "license_type_label": "月卡",
+                    "duration_days": 30,
+                    "activated_at": "2026-08-20T12:00:00+08:00",
+                    "expires_at": EXPIRES_AT,
+                    "is_permanent": False,
+                }
+            )
             raw = (Path(root) / "credentials.dpapi").read_text(encoding="ascii")
             self.assertNotIn("plain-session", raw)
             self.assertNotIn("plain-credential", raw)
             self.assertNotIn("ORIGINAL-CODE", raw)
+            self.assertNotIn("monthly", raw)
             self.assertEqual(
                 "plain-session-must-not-appear",
                 store.load_credentials()["device_session"],
@@ -653,6 +980,7 @@ class WindowsLicenseStorageTests(unittest.TestCase):
             )
             store.clear_credentials()
             self.assertIsNone(store.load_credentials())
+            self.assertEqual("monthly", store.load_license_snapshot()["license_type"])
             self.assertEqual(
                 "ORIGINAL-CODE-MUST-NOT-APPEAR",
                 store.load_activation_context()["activation_code"],
@@ -709,6 +1037,7 @@ class LicenseSurfaceTests(unittest.TestCase):
         self.assertNotIn("localStorage", combined)
         self.assertNotIn("/api/license/admin/", combined)
         self.assertNotIn("transfer_code", combined)
+        self.assertNotIn("remaining_credits", management)
         self.assertIn("正在激活，请勿重复点击", (ROOT / "services" / "license_manager.py").read_text(encoding="utf-8"))
         self.assertGreaterEqual(management.count("confirm("), 2)
 
@@ -741,6 +1070,13 @@ class LicenseSurfaceTests(unittest.TestCase):
         self.assertNotIn("RUNTIME_SUPERVISOR.start(js_api)", source)
         self.assertIn("def enterLicensedApplication", source)
         self.assertIn("url=license_url", source)
+        self.assertIn('QCSCKP_LICENSE_RECHECK_SECONDS", "60"', source)
+        self.assertIn("state = manager.runtime_check()", source)
+        self.assertIn("window.applyLicenseRuntimeState", source)
+        self.assertIn(
+            "window.applyLicenseRuntimeState = renderSidebarLicense",
+            (ROOT / "static" / "index.html").read_text(encoding="utf-8"),
+        )
 
     def test_backend_gate_rejects_business_method_when_not_authorized(self):
         import gui_app

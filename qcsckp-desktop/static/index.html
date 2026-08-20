@@ -1276,13 +1276,19 @@
             if (avEl) avEl.textContent = 'Q';
             if (stEl) {
                 stEl.classList.remove('sidebar-user-status--muted', 'sidebar-user-status--ok', 'sidebar-user-status--bad');
-                stEl.textContent = state && state.authorized ? '已激活' : '需激活';
-                stEl.classList.add(state && state.authorized ? 'sidebar-user-status--ok' : 'sidebar-user-status--bad');
+                if (state && state.network_grace) {
+                    stEl.textContent = '授权重连中';
+                    stEl.classList.add('sidebar-user-status--muted');
+                } else {
+                    stEl.textContent = state && state.authorized ? '已激活' : '需激活';
+                    stEl.classList.add(state && state.authorized ? 'sidebar-user-status--ok' : 'sidebar-user-status--bad');
+                }
             }
             if (vaEl) {
                 vaEl.textContent = license.is_permanent ? '永久有效' : String(license.expires_at || '—');
             }
         }
+        window.applyLicenseRuntimeState = renderSidebarLicense;
 
         async function refreshSidebarLicense() {
             const api = await waitTopApi();

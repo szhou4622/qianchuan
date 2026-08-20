@@ -27,6 +27,16 @@ _KEYCHAIN_SERVICE = f"com.dadaozixun.{LICENSE_APP_NAME.lower()}.license-v2"
 _CREDENTIAL_ACCOUNT = "device-credentials"
 _MACHINE_ACCOUNT = "machine-code"
 _WINDOWS_DESCRIPTION = f"{LICENSE_APP_NAME} License Protocol v2"
+_LICENSE_SNAPSHOT_FIELDS = {
+    "app_name",
+    "code_id",
+    "license_type",
+    "license_type_label",
+    "duration_days",
+    "activated_at",
+    "expires_at",
+    "is_permanent",
+}
 
 
 class LicenseStorageError(RuntimeError):
@@ -170,6 +180,17 @@ class LicenseSecureStore:
             "machine_code": str(payload.get("machine_code") or "").strip(),
         }
 
+    def load_license_snapshot(self) -> dict[str, Any]:
+        payload = self._load_secret_payload()
+        snapshot = payload.get("license_snapshot")
+        if not isinstance(snapshot, Mapping):
+            return {}
+        return {
+            key: snapshot.get(key)
+            for key in _LICENSE_SNAPSHOT_FIELDS
+            if key in snapshot
+        }
+
     def _save_secret_payload(self, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(
             dict(payload),
@@ -208,14 +229,34 @@ class LicenseSecureStore:
                 existing[name] = value
         self._save_secret_payload(existing)
 
+    def save_license_snapshot(self, payload: Mapping[str, Any]) -> None:
+        snapshot = {
+            key: payload.get(key)
+            for key in _LICENSE_SNAPSHOT_FIELDS
+            if key in payload
+        }
+        if not snapshot.get("app_name") or not snapshot.get("code_id"):
+            raise LicenseStorageError("授权服务未返回完整的加密授权快照")
+        existing = self._load_secret_payload()
+        existing["license_snapshot"] = snapshot
+        self._save_secret_payload(existing)
+
     def clear_credentials(self) -> None:
         existing = self._load_secret_payload()
         existing.pop("device_session", None)
         existing.pop("device_credential", None)
         preserved = {
             key: existing.get(key)
-            for key in ("activation_code", "code_id", "machine_code")
-            if str(existing.get(key) or "").strip()
+            for key in (
+                "activation_code",
+                "code_id",
+                "machine_code",
+                "license_snapshot",
+            )
+            if (
+                isinstance(existing.get(key), Mapping)
+                or str(existing.get(key) or "").strip()
+            )
         }
         if preserved:
             self._save_secret_payload(preserved)
@@ -277,7 +318,6 @@ class LicenseSecureStore:
             "transfer_count",
             "self_transfers_used_30d",
             "self_transfers_remaining_30d",
-            "remaining_credits",
             "action",
             "grant_score",
             "current_device",

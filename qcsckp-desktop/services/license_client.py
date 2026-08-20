@@ -9,6 +9,7 @@ import time
 import uuid
 from typing import Any, Mapping, Optional
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from config import (
@@ -17,6 +18,11 @@ from config import (
     LICENSE_PROTOCOL_VERSION,
     LICENSE_SERVICE_BASE_URL,
 )
+
+
+_ACTIVATE_PATH = "/activate"
+_DEVICE_STATUS_PATH = "/device/status"
+_DEVICE_UNBIND_PATH = "/device/unbind"
 
 
 class LicenseServiceError(RuntimeError):
@@ -78,6 +84,28 @@ def _data_from_payload(payload: Any) -> dict[str, Any]:
             result["message"] = str(payload.get("message"))
         return result
     return dict(payload)
+
+
+_STATUS_SENSITIVE_FIELDS = {
+    "activation_code",
+    "primary_activation_code",
+    "device_session",
+    "device_credential",
+    "access_token",
+    "refresh_token",
+    "token",
+    "app_secret",
+    "secret",
+}
+
+
+def _sanitize_status_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop secrets the status endpoint does not need to expose to the app."""
+    return {
+        str(key): value
+        for key, value in payload.items()
+        if str(key).strip().lower() not in _STATUS_SENSITIVE_FIELDS
+    }
 
 
 class LicenseHttpClient:
@@ -144,6 +172,9 @@ class LicenseHttpClient:
                 except Exception:
                     error_payload = {}
                 status = int(getattr(exc, "code", 0) or 0)
+                if status >= 500 and attempt < attempts:
+                    self._sleep(0.35 * attempt + random.random() * 0.15)
+                    continue
                 if status == 401:
                     message = "当前设备授权已失效，请重新激活"
                 else:
@@ -208,23 +239,52 @@ class LicenseHttpClient:
             body["credential_refresh"] = True
         return self._request(
             "POST",
-            "/activate",
+            _ACTIVATE_PATH,
             body=body,
             attempts=1,
         )
 
-    def device_status(self, credentials: Mapping[str, str]) -> dict[str, Any]:
-        return self._request(
+    def device_status(
+        self,
+        credentials: Mapping[str, str],
+        *,
+        machine_code: str,
+        code_id: str,
+    ) -> dict[str, Any]:
+        query = urlencode(
+            {
+                "license_protocol_version": LICENSE_PROTOCOL_VERSION,
+                "app_name": LICENSE_APP_NAME,
+                "machine_code": str(machine_code or "").strip(),
+                "code_id": str(code_id or "").strip(),
+                "client_version": CURRENT_VERSION,
+            }
+        )
+        result = self._request(
             "GET",
-            "/device/status",
+            _DEVICE_STATUS_PATH + "?" + query,
             credentials=credentials,
             attempts=self.status_attempts,
         )
+        return _sanitize_status_payload(result)
 
-    def unbind(self, credentials: Mapping[str, str]) -> dict[str, Any]:
+    def unbind(
+        self,
+        credentials: Mapping[str, str],
+        *,
+        machine_code: str,
+        code_id: str,
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
-            "/device/unbind",
+            _DEVICE_UNBIND_PATH,
+            body={
+                "license_protocol_version": LICENSE_PROTOCOL_VERSION,
+                "app_name": LICENSE_APP_NAME,
+                "machine_code": str(machine_code or "").strip(),
+                "current_code_id": str(code_id or "").strip(),
+                "client_version": CURRENT_VERSION,
+            },
             credentials=credentials,
             attempts=1,
         )

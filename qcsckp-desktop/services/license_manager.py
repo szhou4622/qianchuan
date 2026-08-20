@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
@@ -71,6 +72,7 @@ _GENERIC_TIME_TYPES = {
     "时间授权",
 }
 _BLOCKED_LICENSE_STATUSES = {"expired", "disabled", "revoked", "inactive"}
+_DEFAULT_RUNTIME_NETWORK_GRACE_SECONDS = 30 * 60
 
 
 def _now_text() -> str:
@@ -174,11 +176,20 @@ class LicenseManager:
         *,
         client: Optional[LicenseHttpClient] = None,
         store: Optional[LicenseSecureStore] = None,
+        monotonic=None,
+        runtime_network_grace_seconds: float = _DEFAULT_RUNTIME_NETWORK_GRACE_SECONDS,
     ) -> None:
         self.client = client or LicenseHttpClient()
         self.store = store or LicenseSecureStore()
         self._lock = threading.RLock()
         self._activation_lock = threading.Lock()
+        self._unbind_lock = threading.Lock()
+        self._monotonic = monotonic or time.monotonic
+        self._runtime_network_grace_seconds = max(
+            0.0,
+            float(runtime_network_grace_seconds),
+        )
+        self._runtime_network_failure_started: Optional[float] = None
         self._authorized = False
         self._last_public_state: dict[str, Any] = self._inactive_state()
 
@@ -200,7 +211,10 @@ class LicenseManager:
         if isinstance(exc, LicenseServiceError):
             message = exc.message
             code = exc.code
-            network_error = isinstance(exc, LicenseNetworkError)
+            network_error = bool(
+                isinstance(exc, LicenseNetworkError)
+                or (exc.retryable and int(exc.http_status or 0) >= 500)
+            )
             http_status = exc.http_status
         elif isinstance(exc, LicenseStorageError):
             message = str(exc)
@@ -288,7 +302,6 @@ class LicenseManager:
             "self_transfers_remaining_30d": _optional_int_field(
                 data, "self_transfers_remaining_30d", minimum=0
             ),
-            "remaining_credits": _optional_number_field(data, "remaining_credits"),
             "action": action,
             "grant_score": 0 if action == "rebound" else grant_score,
             "license_status": license_status,
@@ -387,13 +400,82 @@ class LicenseManager:
             "license": dict(metadata),
         }
 
+    @staticmethod
+    def _snapshot_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: metadata.get(key)
+            for key in (
+                "app_name",
+                "code_id",
+                "license_type",
+                "license_type_label",
+                "duration_days",
+                "activated_at",
+                "expires_at",
+                "is_permanent",
+            )
+            if key in metadata
+        }
+
+    @staticmethod
+    def _merge_status_with_snapshot(
+        response: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(response)
+        for field in (
+            "app_name",
+            "code_id",
+            "license_type",
+            "duration_days",
+            "activated_at",
+            "expires_at",
+        ):
+            if merged.get(field) in (None, "") and snapshot.get(field) not in (None, ""):
+                merged[field] = snapshot.get(field)
+        return merged
+
+    def _legacy_snapshot_is_migratable(
+        self,
+        response: Mapping[str, Any],
+        saved: Mapping[str, Any],
+        context: Mapping[str, Any],
+        machine_code: str,
+    ) -> bool:
+        """Permit one safe migration from the old display-only metadata file."""
+        response_app = str(response.get("app_name") or "").strip()
+        response_code = str(response.get("code_id") or "").strip()
+        response_machine = str(response.get("machine_code") or "").strip()
+        context_code = str(context.get("code_id") or "").strip()
+        saved_code = str(saved.get("code_id") or "").strip()
+        if response_app != LICENSE_APP_NAME:
+            return False
+        if not response_code or response_code not in {context_code, saved_code}:
+            return False
+        if response_machine and response_machine.casefold() != machine_code.casefold():
+            return False
+        if str(saved.get("app_name") or "").strip() != LICENSE_APP_NAME:
+            return False
+        if not context.get("activation_code") or not context_code:
+            return False
+        response_expiry = str(response.get("expires_at") or "").strip()
+        saved_expiry = str(saved.get("expires_at") or "").strip()
+        if response_expiry and saved_expiry != response_expiry:
+            return False
+        if not response_expiry and not bool(saved.get("is_permanent")):
+            return False
+        return bool(saved.get("license_type") and saved.get("activated_at"))
+
     def is_runtime_authorized(self) -> bool:
         with self._lock:
             return bool(self._authorized)
 
-    def startup_check(self) -> dict[str, Any]:
+    def startup_check(self, *, allow_network_grace: bool = False) -> dict[str, Any]:
         with self._lock:
-            self._authorized = False
+            previously_authorized = bool(self._authorized)
+            if not allow_network_grace:
+                self._authorized = False
+                self._runtime_network_failure_started = None
         try:
             credentials = self.store.load_credentials()
             if not credentials:
@@ -413,9 +495,23 @@ class LicenseManager:
                 else:
                     state = self._inactive_state()
             else:
-                response = self.client.device_status(credentials)
+                machine_code = self.store.get_or_create_machine_code()
+                context = self.store.load_activation_context()
+                saved = self.store.load_metadata()
+                encrypted_snapshot = self.store.load_license_snapshot()
+                code_id = str(
+                    context.get("code_id")
+                    or encrypted_snapshot.get("code_id")
+                    or saved.get("code_id")
+                    or ""
+                ).strip()
+                response = self.client.device_status(
+                    credentials,
+                    machine_code=machine_code,
+                    code_id=code_id,
+                )
                 if str(response.get("binding_status") or "").strip().lower() == "unbound":
-                    metadata = self.store.load_metadata()
+                    metadata = saved
                     metadata.update(
                         {
                             "app_name": LICENSE_APP_NAME,
@@ -428,6 +524,8 @@ class LicenseManager:
                     state = self._inactive_state("当前设备已解绑，请重新激活")
                     state["license"] = metadata
                     with self._lock:
+                        self._authorized = False
+                        self._runtime_network_failure_started = None
                         self._last_public_state = dict(state)
                     return state
                 # The protocol-v2 status endpoint intentionally omits static
@@ -435,18 +533,23 @@ class LicenseManager:
                 # time and are used only for display/type validation; active,
                 # expiry and binding decisions still come from this fresh
                 # status response.
-                saved = self.store.load_metadata()
                 response = dict(response)
-                for field in (
-                    "license_type",
-                    "duration_days",
-                    "activated_at",
-                    "expires_at",
-                    "code_id",
-                    "transfer_count",
-                ):
-                    if response.get(field) in (None, "") and saved.get(field) not in (None, ""):
-                        response[field] = saved.get(field)
+                if not encrypted_snapshot:
+                    if not self._legacy_snapshot_is_migratable(
+                        response,
+                        saved,
+                        context,
+                        machine_code,
+                    ):
+                        raise LicenseServiceError(
+                            "credential_refresh_required",
+                            "检测到旧版授权，请重新输入原激活码刷新安全凭证",
+                        )
+                    encrypted_snapshot = self._snapshot_from_metadata(saved)
+                response = self._merge_status_with_snapshot(
+                    response,
+                    encrypted_snapshot,
+                )
                 metadata, _ = self._normalize_license(
                     response,
                     require_credentials=False,
@@ -458,10 +561,14 @@ class LicenseManager:
                     )
                     state["license"] = metadata
                 else:
+                    self.store.save_license_snapshot(
+                        self._snapshot_from_metadata(metadata)
+                    )
                     self.store.save_metadata(metadata)
                     state = self._public_active_state(metadata)
                     with self._lock:
                         self._authorized = True
+                        self._runtime_network_failure_started = None
         except Exception as exc:
             if isinstance(exc, LicenseServiceError) and exc.http_status == 401:
                 try:
@@ -485,9 +592,67 @@ class LicenseManager:
                 state["license"] = metadata or None
             else:
                 state = self._error_state(exc)
+                if (
+                    isinstance(exc, LicenseServiceError)
+                    and exc.code == "credential_refresh_required"
+                ):
+                    state["credential_refresh_required"] = True
+                    state["license"] = self.store.load_metadata() or None
+            try:
+                credentials_remain = bool(self.store.load_credentials())
+            except Exception:
+                credentials_remain = False
+            if (
+                allow_network_grace
+                and previously_authorized
+                and state.get("network_error")
+                and credentials_remain
+            ):
+                now = float(self._monotonic())
+                with self._lock:
+                    if self._runtime_network_failure_started is None:
+                        self._runtime_network_failure_started = now
+                    elapsed = max(
+                        0.0,
+                        now - float(self._runtime_network_failure_started),
+                    )
+                remaining = max(
+                    0,
+                    int(self._runtime_network_grace_seconds - elapsed),
+                )
+                if elapsed < self._runtime_network_grace_seconds:
+                    state.update(
+                        {
+                            "success": True,
+                            "authorized": True,
+                            "needs_activation": False,
+                            "network_error": True,
+                            "network_grace": True,
+                            "network_grace_remaining_seconds": remaining,
+                            "message": "授权服务器连接异常，正在重试",
+                            "license": self.store.load_metadata() or None,
+                        }
+                    )
+                    with self._lock:
+                        self._authorized = True
+                else:
+                    state["message"] = "授权服务器连续30分钟无法连接，后台任务已停止"
+                    state["network_grace"] = False
+                    state["network_grace_remaining_seconds"] = 0
+                    with self._lock:
+                        self._authorized = False
+            elif not state.get("authorized"):
+                with self._lock:
+                    self._authorized = False
+                    self._runtime_network_failure_started = None
         with self._lock:
+            if not state.get("authorized"):
+                self._authorized = False
             self._last_public_state = dict(state)
         return state
+
+    def runtime_check(self) -> dict[str, Any]:
+        return self.startup_check(allow_network_grace=True)
 
     def activate(self, activation_code: Any) -> dict[str, Any]:
         if self.is_runtime_authorized():
@@ -513,16 +678,22 @@ class LicenseManager:
             existing_credentials = self.store.load_credentials()
             saved = self.store.load_metadata()
             context = self.store.load_activation_context()
+            current_code_id = str(
+                context.get("code_id") or saved.get("code_id") or ""
+            ).strip()
             refresh_credentials = bool(
                 not existing_credentials
-                and str(saved.get("binding_status") or "").strip().lower() == "active"
-                and str(saved.get("code_id") or "").strip()
+                and str(saved.get("binding_status") or "").strip().lower()
+                in {"active", "invalid"}
+                and current_code_id
                 and str(context.get("activation_code") or "").strip() == code
+                and str(context.get("machine_code") or "").strip().casefold()
+                == machine_code.casefold()
             )
             response = self.client.activate(
                 code,
                 machine_code,
-                current_code_id=str(saved.get("code_id") or "").strip(),
+                current_code_id=current_code_id,
                 credential_refresh=refresh_credentials,
             )
             metadata, credentials = self._normalize_license(
@@ -543,6 +714,9 @@ class LicenseManager:
                 }
             )
             self.store.save_credentials(credential_payload)
+            self.store.save_license_snapshot(
+                self._snapshot_from_metadata(metadata)
+            )
             self.store.save_metadata(metadata)
             state = self._public_active_state(metadata)
             with self._lock:
@@ -565,11 +739,22 @@ class LicenseManager:
 
     def management_info(self, *, refresh: bool = True) -> dict[str, Any]:
         if refresh:
-            return self.startup_check()
+            return (
+                self.runtime_check()
+                if self.is_runtime_authorized()
+                else self.startup_check()
+            )
         with self._lock:
             return dict(self._last_public_state)
 
     def unbind_current_device(self) -> dict[str, Any]:
+        if not self._unbind_lock.acquire(blocking=False):
+            return self._error_state(
+                LicenseServiceError(
+                    "unbind_in_progress",
+                    "正在解绑当前设备，请勿重复点击",
+                )
+            )
         try:
             credentials = self.store.load_credentials()
             if not credentials:
@@ -577,8 +762,22 @@ class LicenseManager:
                     "license_not_activated",
                     "本机没有可解绑的设备授权",
                 )
-            response = self.client.unbind(credentials)
+            machine_code = self.store.get_or_create_machine_code()
+            context = self.store.load_activation_context()
             metadata = self.store.load_metadata()
+            code_id = str(
+                context.get("code_id") or metadata.get("code_id") or ""
+            ).strip()
+            response = self.client.unbind(
+                credentials,
+                machine_code=machine_code,
+                code_id=code_id,
+            )
+            if str(response.get("binding_status") or "").strip().lower() != "unbound":
+                raise LicenseServiceError(
+                    "invalid_unbind_response",
+                    "授权服务器未确认设备已解绑，本机仍保持原授权状态",
+                )
             metadata.update(
                 {
                     "app_name": LICENSE_APP_NAME,
@@ -591,6 +790,13 @@ class LicenseManager:
                     "last_verified_at": _now_text(),
                 }
             )
+            for field in (
+                "transfer_count",
+                "self_transfers_used_30d",
+                "self_transfers_remaining_30d",
+            ):
+                if response.get(field) not in (None, ""):
+                    metadata[field] = response.get(field)
             # Preserve server-issued activated_at/expires_at and all display
             # metadata.  Only the current device credentials are removed.
             self.store.clear_credentials()
@@ -604,7 +810,24 @@ class LicenseManager:
                 self._last_public_state = dict(state)
             return state
         except Exception as exc:
+            if isinstance(exc, LicenseServiceError) and exc.http_status == 401:
+                try:
+                    self.store.clear_credentials()
+                    metadata = self.store.load_metadata()
+                    metadata.update(
+                        {
+                            "binding_status": "invalid",
+                            "last_verified_at": _now_text(),
+                        }
+                    )
+                    self.store.save_metadata(metadata)
+                    with self._lock:
+                        self._authorized = False
+                except Exception:
+                    pass
             state = self._error_state(exc)
             with self._lock:
                 self._last_public_state = dict(state)
             return state
+        finally:
+            self._unbind_lock.release()
