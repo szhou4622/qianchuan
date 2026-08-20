@@ -933,12 +933,34 @@ class OperationEventTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_operation_account_options_include_account_name_and_id(self):
+    def test_operation_account_options_include_only_enabled_monitored_account(self):
         from services.qianchuan_accounts import ensure_qianchuan_account
 
-        ensure_qianchuan_account(
+        account = ensure_qianchuan_account(
             "1001",
             account_name="松之选专卖店",
+            enabled=True,
+            db=self.db,
+        )
+        self.db.insert(
+            "promotion_target",
+            {
+                "target_uid": "target-operation-list",
+                "account_uid": account["account_uid"],
+                "aadvid": "1001",
+                "ad_id": "2001",
+                "promotion_scene": "product",
+                "plan_system": "global",
+                "platform_status": "active",
+                "verification_state": "verified",
+                "monitor_eligible": 1,
+                "enabled": 1,
+            },
+        )
+        ensure_qianchuan_account(
+            "1002",
+            account_name="未选择监控的账户",
+            enabled=True,
             db=self.db,
         )
         items = list_operation_accounts(db=self.db)

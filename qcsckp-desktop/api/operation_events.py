@@ -550,6 +550,8 @@ def list_operation_accounts(
 
     accounts: List[Dict[str, str]] = []
     for item in list_qianchuan_accounts(db=store):
+        if not item.get("enabled") or int(item.get("enabled_plan_count") or 0) < 1:
+            continue
         aavid = str(item.get("aavid") or "").strip()
         if not aavid:
             continue
@@ -623,6 +625,17 @@ def operation_sync_state(
         "last_sync_at": "",
         "last_status": "not_configured",
         "last_error": "尚未发现千川后台操作日志接口；当前流水可能不完整",
+        "active_batch_uid": "",
+        "requested_from": "",
+        "requested_to": "",
+        "progress_completed": 0,
+        "progress_total": 0,
+        "progress_rows_seen": 0,
+        "progress_rows_inserted": 0,
+        "current_object": "",
+        "history_complete": 0,
+        "next_retry_at": "",
+        "last_progress_at": "",
     }
 
 

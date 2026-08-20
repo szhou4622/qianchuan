@@ -700,6 +700,18 @@ def _remove_qianchuan_account_unlocked(
             where={"account_uid": account["account_uid"]},
             connection=conn,
         )
+        store.update(
+            "operation_log_sync_window",
+            {
+                "status": "cancelled",
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "last_error": "千川账户已从工具中移除",
+            },
+            where="account_uid=? AND status IN ('queued','running','backoff')",
+            params=(account["account_uid"],),
+            connection=conn,
+        )
         store.execute(
             "UPDATE local_retarget_task SET status='cancelled',"
             "active_dedupe_key=NULL,result_message=?,finished_at=?,updated_at=? "
@@ -780,6 +792,19 @@ def save_qianchuan_account_settings(
         values,
         where={"account_uid": account["account_uid"]},
     )
+    if not values["enabled"]:
+        store.update(
+            "operation_log_sync_window",
+            {
+                "status": "cancelled",
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "last_error": "千川账户已停用",
+            },
+            where="account_uid=? AND request_kind<>'manual' "
+            "AND status IN ('queued','running','backoff')",
+            params=(account["account_uid"],),
+        )
     if not values["enabled"]:
         store.update(
             "promotion_target",
@@ -924,6 +949,35 @@ def save_qianchuan_account_automation_setup(
                 },
                 connection=conn,
             )
+        if not normalized_settings["enabled"]:
+            store.update(
+                "operation_log_sync_window",
+                {
+                    "status": "cancelled",
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_error": "千川账户已停用",
+                },
+                where="account_uid=? AND request_kind<>'manual' "
+                "AND status IN ('queued','running','backoff')",
+                params=(account["account_uid"],),
+                connection=conn,
+            )
+        store.execute(
+            "UPDATE operation_log_sync_window SET status='cancelled',"
+            "lease_owner=NULL,lease_expires_at=NULL,last_error=?,updated_at=? "
+            "WHERE account_uid=? AND object_type='AD' AND request_kind<>'manual' "
+            "AND status IN ('queued','running','backoff') "
+            "AND NOT EXISTS (SELECT 1 FROM promotion_target t "
+            "WHERE t.account_uid=operation_log_sync_window.account_uid "
+            "AND t.ad_id=operation_log_sync_window.object_id AND t.enabled=1)",
+            (
+                "计划已取消监控",
+                _now_text(),
+                account["account_uid"],
+            ),
+            connection=conn,
+        )
 
     refresh_monitor_capacity(owner_username=owner_username, db=store)
     _sync_daily_selected_aavids(

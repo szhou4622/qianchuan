@@ -1304,6 +1304,8 @@ async def _sync_account_platform_logs(
 def request_platform_log_sync(
     aavid: Any,
     *,
+    date_from: Any = "",
+    date_to: Any = "",
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     if QIANCHUAN_BACKEND == "official_api":
@@ -1311,7 +1313,12 @@ def request_platform_log_sync(
             request_official_operation_log_sync,
         )
 
-        return request_official_operation_log_sync(aavid, db=db)
+        return request_official_operation_log_sync(
+            aavid,
+            date_from=date_from,
+            date_to=date_to,
+            db=db,
+        )
     aid = str(aavid or "").strip()
     owner = current_session_owner()
     if not aid:

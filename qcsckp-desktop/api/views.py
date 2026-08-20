@@ -1822,11 +1822,16 @@ class Api:
         except Exception as exc:
             return {"success": False, "message": str(exc)}
 
-    def syncOperationLogsNow(self, aavid=None):
+    def syncOperationLogsNow(self, aavid=None, dateFrom=None, dateTo=None):
         from services.operation_log_monitor import request_platform_log_sync
 
         try:
-            return request_platform_log_sync(aavid, db=self.db)
+            return request_platform_log_sync(
+                aavid,
+                date_from=dateFrom,
+                date_to=dateTo,
+                db=self.db,
+            )
         except Exception as e:
             return {"success": False, "message": str(e)}
 
