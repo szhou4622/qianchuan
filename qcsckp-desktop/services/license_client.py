@@ -61,6 +61,16 @@ def _message_from_payload(payload: Any, fallback: str) -> str:
 def _data_from_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise LicenseServiceError("invalid_response", "授权服务器响应格式无效")
+    license_data = payload.get("license")
+    if isinstance(license_data, Mapping):
+        result = dict(license_data)
+        summary = payload.get("data")
+        if isinstance(summary, Mapping):
+            for key, value in summary.items():
+                result.setdefault(str(key), value)
+        if payload.get("message") and not result.get("message"):
+            result["message"] = str(payload.get("message"))
+        return result
     data = payload.get("data")
     if isinstance(data, Mapping):
         result = dict(data)

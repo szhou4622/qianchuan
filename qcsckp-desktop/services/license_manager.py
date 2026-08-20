@@ -21,6 +21,7 @@ _MONTH_TYPES = {
     "month_card",
     "monthly_card",
     "time_month",
+    "time_30d",
     "月卡",
 }
 _YEAR_TYPES = {
@@ -31,6 +32,7 @@ _YEAR_TYPES = {
     "yearly_card",
     "annual_card",
     "time_year",
+    "time_365d",
     "年卡",
 }
 _BLOCKED_LICENSE_STATUSES = {"expired", "disabled", "revoked", "inactive"}
@@ -227,6 +229,23 @@ class LicenseManager:
                     with self._lock:
                         self._last_public_state = dict(state)
                     return state
+                # The protocol-v2 status endpoint intentionally omits static
+                # card fields.  They were issued by the server at activation
+                # time and are used only for display/type validation; active,
+                # expiry and binding decisions still come from this fresh
+                # status response.
+                saved = self.store.load_metadata()
+                response = dict(response)
+                for field in (
+                    "license_type",
+                    "duration_days",
+                    "activated_at",
+                    "expires_at",
+                    "code_id",
+                    "transfer_count",
+                ):
+                    if response.get(field) in (None, "") and saved.get(field) not in (None, ""):
+                        response[field] = saved.get(field)
                 metadata, _ = self._normalize_license(
                     response,
                     require_credentials=False,

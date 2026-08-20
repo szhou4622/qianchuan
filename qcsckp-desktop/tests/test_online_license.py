@@ -160,6 +160,18 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertEqual(EXPIRES_AT, state["license"]["expires_at"])
         self.assertEqual(365, state["license"]["duration_days"])
 
+    def test_server_time_duration_license_types_map_to_month_and_year(self):
+        month = LicenseManager(
+            client=FakeClient(activation=license_payload("time_30d", duration_days=30)),
+            store=FakeStore(),
+        ).activate("MONTH-TIME")
+        year = LicenseManager(
+            client=FakeClient(activation=license_payload("time_365d", duration_days=365)),
+            store=FakeStore(),
+        ).activate("YEAR-TIME")
+        self.assertEqual("月卡", month["license"]["license_type_label"])
+        self.assertEqual("年卡", year["license"]["license_type_label"])
+
     def test_restart_uses_device_status_and_never_needs_activation_code(self):
         store = FakeStore()
         first = LicenseManager(client=FakeClient(), store=store)
@@ -170,6 +182,21 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertTrue(state["authorized"])
         self.assertEqual(1, len(second_client.status_calls))
         self.assertEqual(EXPIRES_AT, state["license"]["expires_at"])
+
+    def test_status_uses_server_issued_saved_static_card_fields(self):
+        store = FakeStore()
+        manager = LicenseManager(client=FakeClient(), store=store)
+        self.assertTrue(manager.activate("ONCE")["authorized"])
+        status_without_static_fields = status_payload()
+        status_without_static_fields.pop("license_type")
+        status_without_static_fields.pop("duration_days")
+        restarted = LicenseManager(
+            client=FakeClient(status=status_without_static_fields),
+            store=store,
+        ).startup_check()
+        self.assertTrue(restarted["authorized"])
+        self.assertEqual("月卡", restarted["license"]["license_type_label"])
+        self.assertEqual(30, restarted["license"]["duration_days"])
 
     def test_duplicate_activation_after_success_is_not_resubmitted(self):
         client = FakeClient()
@@ -304,6 +331,21 @@ class OnlineLicenseManagerTests(unittest.TestCase):
 
 
 class OnlineLicenseHttpTests(unittest.TestCase):
+    def test_activation_reads_full_license_object_from_real_server_envelope(self):
+        envelope = {
+            "ok": True,
+            "message": "激活成功",
+            "data": {"app_name": LICENSE_APP_NAME},
+            "license": license_payload("time_30d", duration_days=30),
+        }
+        client = LicenseHttpClient(
+            opener=lambda _request, timeout=None: FakeHttpResponse(envelope)
+        )
+        result = client.activate("TEST-CODE", "machine-stable")
+        self.assertEqual("time_30d", result["license_type"])
+        self.assertEqual(30, result["duration_days"])
+        self.assertEqual("session-sensitive-value", result["device_session"])
+
     def test_activate_payload_is_protocol_v2_and_post_is_not_retried(self):
         captured = []
 
