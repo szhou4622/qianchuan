@@ -63,6 +63,8 @@
         button:hover { filter: brightness(1.08); }
         button:disabled { cursor: not-allowed; opacity: .55; filter: none; }
         .hint { margin: 14px 0 0; color: #64748b; font-size: 11px; line-height: 1.65; }
+        .machine-info { margin-top: 13px; padding: 10px 12px; border: 1px solid #334155; border-radius: 10px; color: #94a3b8; background: rgba(15,23,42,.55); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+        .machine-info strong { color: #cbd5e1; }
         .license-summary { display: none; margin-top: 14px; color: #94a3b8; font-size: 12px; line-height: 1.7; }
         .license-summary strong { color: #e2e8f0; }
         .contact-link { width: 100%; margin-top: 12px; background: transparent; }
@@ -97,8 +99,9 @@
                 </div>
                 <p class="hint">软件只需激活码，不需要账号密码。原激活码仅提交给授权服务器，并使用 Windows DPAPI 或 macOS Keychain 加密保存在本机；不会写入浏览器、明文配置或普通日志。</p>
             </form>
+            <div class="machine-info"><strong>本机机器码：</strong><span id="machineCode">正在读取…</span></div>
             <div class="license-summary" id="licenseSummary"></div>
-            <button class="contact-link" id="contactButton" type="button">联系作者</button>
+            <button class="contact-link" id="contactButton" type="button" aria-expanded="false">联系作者</button>
             <div class="contact-panel" id="contactPanel">
                 <img id="contactImage" alt="联系作者二维码">
                 <div class="contact-message" id="contactMessage">正在读取联系方式…</div>
@@ -112,6 +115,7 @@
         const input = document.getElementById('activationCode');
         const activateButton = document.getElementById('activateButton');
         const retryButton = document.getElementById('retryButton');
+        const machineCode = document.getElementById('machineCode');
         const summary = document.getElementById('licenseSummary');
         const contactButton = document.getElementById('contactButton');
         const contactPanel = document.getElementById('contactPanel');
@@ -123,6 +127,10 @@
         function setStatus(message, tone = '') {
             statusText.textContent = message || '授权状态未知';
             statusBox.className = 'status' + (tone ? ' ' + tone : '');
+        }
+
+        function showMachineCode(state) {
+            machineCode.textContent = String(state && state.machine_code || '未取得');
         }
 
         function showLicenseInfo(license) {
@@ -176,6 +184,7 @@
                 api = api || await waitForApi();
                 if (!api) throw new Error('无法连接本地授权模块，请重新启动软件');
                 const state = await api.getLicenseBootstrapStatus();
+                showMachineCode(state);
                 document.getElementById('softwareName').textContent = state.software_name || '千川素材看盘工具';
                 if (state.authorized) {
                     await enterApplication(state);
@@ -202,6 +211,7 @@
             setStatus('正在提交激活码并绑定当前设备…');
             try {
                 const state = await api.activateOnlineLicense(code);
+                showMachineCode(state);
                 input.value = '';
                 if (!state || !state.authorized) {
                     setStatus((state && state.message) || '激活失败，请重试', 'error');
@@ -216,7 +226,15 @@
         });
         retryButton.addEventListener('click', checkAuthorization);
         contactButton.addEventListener('click', async () => {
+            if (contactPanel.classList.contains('show')) {
+                contactPanel.classList.remove('show');
+                contactButton.setAttribute('aria-expanded', 'false');
+                contactButton.textContent = '联系作者';
+                return;
+            }
             contactPanel.classList.add('show');
+            contactButton.setAttribute('aria-expanded', 'true');
+            contactButton.textContent = '收起联系方式';
             contactImage.style.display = 'none';
             contactMessage.textContent = '正在读取联系方式…';
             try {

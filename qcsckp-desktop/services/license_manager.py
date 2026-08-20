@@ -450,13 +450,13 @@ class LicenseManager:
         saved_code = str(saved.get("code_id") or "").strip()
         if response_app != LICENSE_APP_NAME:
             return False
-        if not response_code or response_code not in {context_code, saved_code}:
+        if not response_code or not saved_code or response_code != saved_code:
+            return False
+        if context_code and context_code != response_code:
             return False
         if response_machine and response_machine.casefold() != machine_code.casefold():
             return False
         if str(saved.get("app_name") or "").strip() != LICENSE_APP_NAME:
-            return False
-        if not context.get("activation_code") or not context_code:
             return False
         response_expiry = str(response.get("expires_at") or "").strip()
         saved_expiry = str(saved.get("expires_at") or "").strip()
@@ -546,6 +546,13 @@ class LicenseManager:
                             "检测到旧版授权，请重新输入原激活码刷新安全凭证",
                         )
                     encrypted_snapshot = self._snapshot_from_metadata(saved)
+                    self.store.save_credentials(
+                        {
+                            **credentials,
+                            "code_id": str(response.get("code_id") or "").strip(),
+                            "machine_code": machine_code,
+                        }
+                    )
                 response = self._merge_status_with_snapshot(
                     response,
                     encrypted_snapshot,
@@ -686,7 +693,10 @@ class LicenseManager:
                 and str(saved.get("binding_status") or "").strip().lower()
                 in {"active", "invalid"}
                 and current_code_id
-                and str(context.get("activation_code") or "").strip() == code
+                and (
+                    not str(context.get("activation_code") or "").strip()
+                    or str(context.get("activation_code") or "").strip() == code
+                )
                 and str(context.get("machine_code") or "").strip().casefold()
                 == machine_code.casefold()
             )

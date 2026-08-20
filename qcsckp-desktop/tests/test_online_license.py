@@ -377,7 +377,7 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertTrue(state["authorized"])
         self.assertEqual("monthly", store.license_snapshot["license_type"])
 
-    def test_legacy_binding_without_secret_context_requires_original_code(self):
+    def test_legacy_binding_without_secret_context_migrates_when_server_identity_matches(self):
         store = FakeStore()
         store.credentials = {
             "device_session": "session",
@@ -392,9 +392,28 @@ class OnlineLicenseManagerTests(unittest.TestCase):
             client=FakeClient(status=status_payload("monthly")),
             store=store,
         ).startup_check()
+        self.assertTrue(state["authorized"])
+        self.assertEqual("monthly", store.license_snapshot["license_type"])
+        self.assertIsNotNone(store.credentials)
+
+    def test_legacy_binding_with_mismatched_server_code_id_is_rejected(self):
+        store = FakeStore()
+        store.credentials = {
+            "device_session": "session",
+            "device_credential": "credential",
+        }
+        store.metadata = {
+            **status_payload("monthly"),
+            "license_type_label": "月卡",
+            "is_permanent": False,
+        }
+        response = status_payload("monthly", code_id="different-code-id")
+        state = LicenseManager(
+            client=FakeClient(status=response),
+            store=store,
+        ).startup_check()
         self.assertFalse(state["authorized"])
         self.assertTrue(state["credential_refresh_required"])
-        self.assertIsNotNone(store.credentials)
 
     def test_legacy_binding_reactivation_sends_existing_device_credentials(self):
         store = FakeStore()
@@ -409,7 +428,6 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         }
         client = FakeClient(activation=license_payload("monthly"))
         manager = LicenseManager(client=client, store=store)
-        self.assertFalse(manager.startup_check()["authorized"])
         state = manager.activate("ORIGINAL-CODE")
         self.assertTrue(state["authorized"])
         self.assertEqual(
@@ -1098,6 +1116,15 @@ class LicenseSurfaceTests(unittest.TestCase):
         self.assertNotIn("remaining_credits", management)
         self.assertIn("正在激活，请勿重复点击", (ROOT / "services" / "license_manager.py").read_text(encoding="utf-8"))
         self.assertGreaterEqual(management.count("confirm("), 2)
+
+    def test_activation_page_displays_machine_code_and_contact_panel_can_collapse(self):
+        source = (ROOT / "static" / "license.html").read_text(encoding="utf-8")
+        self.assertIn('id="machineCode"', source)
+        self.assertIn("showMachineCode(state)", source)
+        self.assertIn("contactPanel.classList.remove('show')", source)
+        self.assertIn("收起联系方式", source)
+        gui = (ROOT / "gui_app.py").read_text(encoding="utf-8")
+        self.assertIn('result["machine_code"]', gui)
 
     def test_main_surface_has_no_username_password_login(self):
         source = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
