@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from api.dashboard_optimized import OptimizedDashboardQueries
+from api.dashboard_optimized import DASHBOARD_CONTRACT_VERSION
 from utils.dashboard_storage_maintenance import (
     backfill_latest_from_legacy,
     backfill_recent_metric_snapshots,
@@ -154,6 +155,25 @@ class DashboardOptimizationTests(unittest.TestCase):
             {"target-1", "target-2"},
             {row["target_uid"] for row in result["plans"]},
         )
+
+    def test_bootstrap_uses_one_versioned_scope_contract(self):
+        result = self.queries.get_bootstrap()
+        self.assertTrue(result["success"])
+        self.assertEqual(DASHBOARD_CONTRACT_VERSION, result["dashboardContractVersion"])
+        self.assertEqual("0.1.58", result["appVersion"])
+        self.assertEqual("dashboard-owner", result["ownerUsername"])
+        self.assertEqual(2, result["accountCount"])
+        self.assertEqual(2, result["planCount"])
+        self.assertEqual(2, result["materialCount"])
+        self.assertEqual("all_enabled_accounts", result["defaultScope"]["mode"])
+        self.assertTrue(result["runtimeInstanceId"])
+        self.assertNotIn(str(Path(self.temp.name)), result["runtimeInstanceId"])
+
+    def test_bootstrap_never_reports_zero_scope_with_scoped_materials(self):
+        result = self.queries.get_bootstrap()
+        self.assertGreater(result["materialCount"], 0)
+        self.assertGreater(result["accountCount"], 0)
+        self.assertGreater(result["planCount"], 0)
 
     def test_scope_options_expose_capacity_waiting_warning_count(self):
         self.db.update(

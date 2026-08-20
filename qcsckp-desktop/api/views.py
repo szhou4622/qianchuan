@@ -53,6 +53,9 @@ class Api:
 
     # ========== 大屏相关 API ==========
 
+    def get_dashboard_bootstrap(self):
+        return self.dashboard.get_bootstrap()
+
     def get_dashboard_scope_options(self):
         return self.dashboard.get_scope_options()
 

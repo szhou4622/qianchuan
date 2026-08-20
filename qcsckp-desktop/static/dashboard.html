@@ -318,19 +318,23 @@
             <!-- 大屏范围：默认汇总所有已启用账户，可下钻到账户或单计划 -->
             <div class="flex-none px-3 py-2 border-b border-slate-700/50 bg-slate-900/45 flex flex-wrap items-center gap-2">
                 <label for="dashboardAccountFilter" class="text-xs text-slate-500 shrink-0">千川账户</label>
-                <select id="dashboardAccountFilter" class="min-w-[12rem] max-w-[18rem] rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none">
-                    <option value="">全部已启用账户</option>
+                <select id="dashboardAccountFilter" disabled class="min-w-[12rem] max-w-[18rem] rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none disabled:cursor-wait disabled:opacity-60">
+                    <option value="">正在加载账户…</option>
                 </select>
                 <label for="dashboardPlanFilter" class="text-xs text-slate-500 shrink-0 ml-1">监控计划</label>
-                <select id="dashboardPlanFilter" class="min-w-[14rem] max-w-[22rem] flex-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none">
-                    <option value="">全部已监控计划</option>
+                <select id="dashboardPlanFilter" disabled class="min-w-[14rem] max-w-[22rem] flex-1 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none disabled:cursor-wait disabled:opacity-60">
+                    <option value="">正在加载计划…</option>
                 </select>
                 <label class="flex items-center gap-1 text-[11px] text-slate-400 shrink-0 cursor-pointer">
                     <input id="dashboardShowPaused" type="checkbox" checked class="accent-sky-500" />
                     显示已暂停素材
                 </label>
-                <span id="dashboardScopeSummary" class="text-[11px] text-slate-500 tabular-nums shrink-0">0个账户 · 0条计划</span>
+                <span id="dashboardScopeSummary" class="text-[11px] text-slate-500 tabular-nums shrink-0">正在加载账户和计划</span>
                 <span id="dashboardFreshness" class="ml-auto text-[11px] text-slate-500 tabular-nums shrink-0">等待数据</span>
+            </div>
+            <div id="dashboardScopeError" class="hidden flex-none items-center gap-2 border-b border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-300">
+                <span id="dashboardScopeErrorText" class="min-w-0 flex-1 truncate">筛选加载失败</span>
+                <button id="dashboardScopeRetryBtn" type="button" class="shrink-0 rounded border border-rose-400/40 px-2 py-0.5 text-rose-200 hover:bg-rose-400/10">重新加载筛选</button>
             </div>
             <div id="dashboardCapacityWarning" class="hidden flex-none border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300"></div>
             <!-- 列表顶部栏 -->
@@ -1021,17 +1025,18 @@
             return null;
         }
 
-        // 等待 pywebview API 初始化
-        async function waitForAPI(maxAttempts = 50) {
+        // 等待 pywebview API 初始化；调用方可声明当前操作真正依赖的方法。
+        async function waitForAPI(maxAttempts = 50, requiredMethods = ['getTableData']) {
             for (let i = 0; i < maxAttempts; i++) {
                 const api = getPywebviewAPI();
-                if (api && api.getTableData) {
+                const ready = api && requiredMethods.every(name => typeof api[name] === 'function');
+                if (ready) {
                     console.log('pywebview API 已就绪');
                     return api;
                 }
                 await new Promise(r => setTimeout(r, 200));
             }
-            console.error('pywebview API 初始化超时');
+            console.error('pywebview API 初始化超时，缺少方法:', requiredMethods);
             return null;
         }
 
@@ -1078,38 +1083,164 @@
             }
         }
 
-        async function loadDashboardScopeOptions() {
-            const api = await waitForAPI();
-            if (!api || !api.getDashboardScopeOptions) return;
-            try {
-                const result = await api.getDashboardScopeOptions();
-                if (!result || !result.success) return;
-                dashboardScopeOptions = {
-                    accounts: Array.isArray(result.accounts) ? result.accounts : [],
-                    plans: Array.isArray(result.plans) ? result.plans : [],
-                    capacityWaitingCount: Number(result.capacityWaitingCount || 0),
-                };
-                const accountSelect = document.getElementById('dashboardAccountFilter');
-                setSelectOptions(
-                    accountSelect,
-                    dashboardScopeOptions.accounts,
-                    '全部已启用账户',
-                    'aavid',
-                    account => `${account.account_name || '未命名账户'} (${account.aavid || '-'})`
-                );
-                accountSelect.value = selectedDashboardAavid;
-                rebuildDashboardPlanOptions();
-                const warning = document.getElementById('dashboardCapacityWarning');
-                if (warning) {
-                    const waiting = dashboardScopeOptions.capacityWaitingCount || 0;
-                    warning.classList.toggle('hidden', waiting <= 0);
-                    warning.textContent = waiting > 0
-                        ? `${waiting}条计划当前超出5分钟容量，已进入轮换探测；工具会持续重测并自动恢复，不会再静默停止采集。`
-                        : '';
-                }
-            } catch (error) {
-                console.error('加载大屏账户与计划范围失败', error);
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function setDashboardScopeLoading(message = '正在加载账户和计划') {
+            const accountSelect = document.getElementById('dashboardAccountFilter');
+            const planSelect = document.getElementById('dashboardPlanFilter');
+            const summary = document.getElementById('dashboardScopeSummary');
+            if (accountSelect) {
+                accountSelect.disabled = true;
+                setSelectOptions(accountSelect, [], '正在加载账户…', 'aavid', () => '');
             }
+            if (planSelect) {
+                planSelect.disabled = true;
+                setSelectOptions(planSelect, [], '正在加载计划…', 'target_uid', () => '');
+            }
+            if (summary) summary.textContent = message;
+        }
+
+        function hideDashboardScopeError() {
+            const banner = document.getElementById('dashboardScopeError');
+            if (!banner) return;
+            banner.classList.add('hidden');
+            banner.classList.remove('flex');
+        }
+
+        function showDashboardScopeError(message) {
+            const banner = document.getElementById('dashboardScopeError');
+            const text = document.getElementById('dashboardScopeErrorText');
+            const summary = document.getElementById('dashboardScopeSummary');
+            if (text) text.textContent = String(message || '筛选加载失败，请重试');
+            if (summary) summary.textContent = '筛选加载失败';
+            if (banner) {
+                banner.classList.remove('hidden');
+                banner.classList.add('flex');
+            }
+        }
+
+        function validateDashboardBootstrap(result) {
+            if (!result || result.success !== true) {
+                throw new Error((result && result.message) || '大屏启动接口返回失败');
+            }
+            const contract = Number(result.dashboardContractVersion || 0);
+            if (contract !== DASHBOARD_CONTRACT_VERSION) {
+                throw new Error(
+                    `前端与后台版本不匹配（前端协议${DASHBOARD_CONTRACT_VERSION}，后台协议${contract || '缺失'}），请关闭旧版并重启`
+                );
+            }
+            const accounts = Array.isArray(result.accounts) ? result.accounts : [];
+            const plans = Array.isArray(result.plans) ? result.plans : [];
+            const materialCount = Number(result.materialCount || 0);
+            if (materialCount > 0 && (accounts.length === 0 || plans.length === 0)) {
+                throw new Error(
+                    `范围数据不一致：已有${materialCount}条素材，但账户或计划筛选为空`
+                );
+            }
+            return { accounts, plans, materialCount };
+        }
+
+        function applyDashboardBootstrap(result, validated) {
+            const accounts = validated.accounts;
+            const plans = validated.plans;
+            const validAccountIds = new Set(accounts.map(item => String(item.aavid || '')));
+            const validTargetIds = new Set(plans.map(item => String(item.target_uid || '')));
+            if (selectedDashboardAavid && !validAccountIds.has(selectedDashboardAavid)) {
+                selectedDashboardAavid = '';
+                selectedDashboardTargetUid = '';
+            }
+            if (selectedDashboardTargetUid && !validTargetIds.has(selectedDashboardTargetUid)) {
+                selectedDashboardTargetUid = '';
+            }
+            dashboardScopeOptions = {
+                accounts,
+                plans,
+                capacityWaitingCount: Number(result.capacityWaitingCount || 0),
+            };
+            dashboardScopeRevision = String(result.scopeRevision || '');
+            dashboardRuntimeInstanceId = String(result.runtimeInstanceId || '');
+            dashboardDataVersion = String(result.dataVersion || dashboardDataVersion || '');
+            const accountSelect = document.getElementById('dashboardAccountFilter');
+            const planSelect = document.getElementById('dashboardPlanFilter');
+            setSelectOptions(
+                accountSelect,
+                accounts,
+                '全部已启用账户',
+                'aavid',
+                account => `${account.account_name || '未命名账户'} (${String(account.aavid || '-')})`
+            );
+            if (accountSelect) {
+                accountSelect.value = selectedDashboardAavid;
+                accountSelect.disabled = false;
+            }
+            rebuildDashboardPlanOptions();
+            if (planSelect) planSelect.disabled = false;
+            const warning = document.getElementById('dashboardCapacityWarning');
+            if (warning) {
+                const waiting = dashboardScopeOptions.capacityWaitingCount || 0;
+                warning.classList.toggle('hidden', waiting <= 0);
+                warning.textContent = waiting > 0
+                    ? `${waiting}条计划当前超出5分钟容量，已进入轮换探测；工具会持续重测并自动恢复，不会再静默停止采集。`
+                    : '';
+            }
+            dashboardBootstrapReady = true;
+            hideDashboardScopeError();
+            console.info('[dashboard-bootstrap]', {
+                contract: result.dashboardContractVersion,
+                appVersion: result.appVersion,
+                runtimeInstanceId: result.runtimeInstanceId,
+                owner: result.ownerUsername,
+                accountCount: accounts.length,
+                planCount: plans.length,
+                materialCount: validated.materialCount,
+            });
+        }
+
+        async function loadDashboardBootstrap({ reason = 'manual', retry = true } = {}) {
+            if (dashboardBootstrapPromise) return dashboardBootstrapPromise;
+            dashboardBootstrapPromise = (async () => {
+                const delays = retry ? DASHBOARD_BOOTSTRAP_RETRY_DELAYS : [0];
+                let lastError = null;
+                if (!dashboardBootstrapReady) setDashboardScopeLoading();
+                hideDashboardScopeError();
+                for (const delay of delays) {
+                    if (delay) await sleep(delay);
+                    try {
+                        const api = await waitForAPI(15, ['getTableData']);
+                        if (!api) throw new Error('后台桥接尚未就绪');
+                        if (typeof api.getDashboardBootstrap !== 'function') {
+                            throw new Error(
+                                `当前后台不支持大屏协议${DASHBOARD_CONTRACT_VERSION}，请关闭旧版并重启`
+                            );
+                        }
+                        const result = await api.getDashboardBootstrap();
+                        const validated = validateDashboardBootstrap(result);
+                        applyDashboardBootstrap(result, validated);
+                        return { success: true, result };
+                    } catch (error) {
+                        lastError = error;
+                        console.warn(`[dashboard-bootstrap] ${reason} 加载失败`, error);
+                    }
+                }
+                dashboardBootstrapReady = false;
+                showDashboardScopeError(
+                    lastError && lastError.message
+                        ? lastError.message
+                        : '账户和计划筛选加载失败，请重试'
+                );
+                return { success: false, error: lastError };
+            })();
+            try {
+                return await dashboardBootstrapPromise;
+            } finally {
+                dashboardBootstrapPromise = null;
+            }
+        }
+
+        async function loadDashboardScopeOptions() {
+            return loadDashboardBootstrap({ reason: 'scope-refresh', retry: true });
         }
 
         function formatFreshness(state) {
@@ -1201,12 +1332,18 @@
         }
 
         // 当前周期设置，默认 1h
+        const DASHBOARD_CONTRACT_VERSION = 2;
+        const DASHBOARD_BOOTSTRAP_RETRY_DELAYS = [0, 500, 1000, 2000, 3000, 5000];
         let currentPeriod = "1h";
         let dashboardScopeOptions = { accounts: [], plans: [] };
         let selectedDashboardAavid = '';
         let selectedDashboardTargetUid = '';
         let dashboardDataVersion = '';
         let dashboardRefreshInFlight = false;
+        let dashboardBootstrapPromise = null;
+        let dashboardBootstrapReady = false;
+        let dashboardScopeRevision = '';
+        let dashboardRuntimeInstanceId = '';
 
         // 排序和分页状态
         let currentSortBy = "costDiff";
@@ -1402,6 +1539,39 @@
                         : `${tagBase} bg-slate-500/15 text-slate-300 border-slate-500/35`;
                     return { text, tagClass };
                 }
+            }
+        }
+
+        function bindDashboardBootstrapRecoveryEvents() {
+            const retryButton = document.getElementById('dashboardScopeRetryBtn');
+            const recover = async reason => {
+                const result = await loadDashboardBootstrap({ reason, retry: true });
+                if (result.success && !isLoadingData) {
+                    await checkDashboardDataVersion(true);
+                }
+                return result;
+            };
+            if (retryButton) {
+                retryButton.addEventListener('click', () => recover('retry-button'));
+            }
+            window.addEventListener('focus', () => recover('window-focus'));
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) recover('visibility-resume');
+            });
+            window.addEventListener('message', event => {
+                if (event && event.data && event.data.type === 'dashboard-activated') {
+                    recover('dashboard-activated');
+                }
+            });
+            try {
+                if (window.top) {
+                    window.top.addEventListener(
+                        'pywebviewready',
+                        () => recover('pywebviewready')
+                    );
+                }
+            } catch (_) {
+                // 同源 iframe 正常可监听；跨域部署时由其它恢复事件兜底。
             }
         }
 
@@ -1674,6 +1844,12 @@
         function showMaterialTableLoadingPlaceholder() {
             const tb = document.getElementById('materialTable');
             if (tb) tb.innerHTML = MATERIAL_TABLE_LOADING_ROW_HTML;
+        }
+
+        function showMaterialTableScopeError(message) {
+            const tb = document.getElementById('materialTable');
+            if (!tb) return;
+            tb.innerHTML = `<tr><td colspan="20" class="p-6 text-center text-rose-300">${escapeHtml(message || '账户和计划筛选加载失败')}</td></tr>`;
         }
 
         function showAssistTableLoadingPlaceholder() {
@@ -2884,18 +3060,53 @@
             initColumnConfig();
             updateSortIcons();
             bindDashboardScopeEvents();
+            bindDashboardBootstrapRecoveryEvents();
 
             // 显示加载状态
             showMaterialTableLoadingPlaceholder();
 
-            // 等待页面完全加载 + pywebview 注入
-            await new Promise(r => setTimeout(r, 500));
-            await loadDashboardScopeOptions();
+            // 等待页面完全加载 + pywebview 注入；筛选范围失败时不能继续
+            // 展示一张与“0账户/0计划”互相矛盾的素材表。
+            await new Promise(r => setTimeout(r, 200));
+            const bootstrap = await loadDashboardBootstrap({
+                reason: 'initial',
+                retry: true,
+            });
+            if (!bootstrap.success) {
+                isLoadingData = false;
+                showMaterialTableScopeError(
+                    bootstrap.error && bootstrap.error.message
+                        ? bootstrap.error.message
+                        : '账户和计划筛选加载失败，请点击重新加载筛选'
+                );
+                return;
+            }
 
             // 从 API 获取数据
             console.log('[dashboard] calling getTableData...');
             materials = await fetchMaterials();
             isLoadingData = false;
+            if (
+                materials.length > 0 &&
+                (
+                    dashboardScopeOptions.accounts.length === 0 ||
+                    dashboardScopeOptions.plans.length === 0
+                )
+            ) {
+                dashboardBootstrapReady = false;
+                showDashboardScopeError(
+                    `范围数据不一致：素材表返回${materials.length}条，但账户或计划筛选为空`
+                );
+                showMaterialTableScopeError('账户、计划与素材范围不一致，正在等待重新同步');
+                setTimeout(async () => {
+                    const retried = await loadDashboardBootstrap({
+                        reason: 'consistency-retry',
+                        retry: true,
+                    });
+                    if (retried.success) await queryAndUpdateData(true);
+                }, 500);
+                return;
+            }
 
             const sortedData = processData();
             // 默认选中第一条数据
@@ -2922,11 +3133,32 @@
         // 主查询逻辑：异步重新从 API 获取数据
         async function queryAndUpdateData(force = false) {
             if (isLoadingData || dashboardRefreshInFlight) return;
+            if (!dashboardBootstrapReady) {
+                const bootstrap = await loadDashboardBootstrap({
+                    reason: 'table-query',
+                    retry: true,
+                });
+                if (!bootstrap.success) return;
+            }
             dashboardRefreshInFlight = true;
             try {
 
             // 从 API 重新获取数据
             const newMaterials = await fetchMaterials();
+            if (
+                newMaterials.length > 0 &&
+                (
+                    dashboardScopeOptions.accounts.length === 0 ||
+                    dashboardScopeOptions.plans.length === 0
+                )
+            ) {
+                dashboardBootstrapReady = false;
+                showDashboardScopeError(
+                    `范围数据不一致：素材表返回${newMaterials.length}条，但账户或计划筛选为空`
+                );
+                showMaterialTableScopeError('账户、计划与素材范围不一致，请重新加载筛选');
+                return;
+            }
 
             // 保持选中状态
             const selectedId = selectedMaterial ? selectedMaterial.id : null;
@@ -2977,7 +3209,18 @@
                     await Promise.all([
                         runRefreshIconSpin180(btn),
                         (async () => {
-                            await loadDashboardScopeOptions();
+                            const bootstrap = await loadDashboardBootstrap({
+                                reason: 'manual-refresh',
+                                retry: true,
+                            });
+                            if (!bootstrap.success) {
+                                showMaterialTableScopeError(
+                                    bootstrap.error && bootstrap.error.message
+                                        ? bootstrap.error.message
+                                        : '账户和计划筛选加载失败'
+                                );
+                                return;
+                            }
                             await queryAndUpdateData(true);
                             if (selectedMaterial && selectedMaterial.id) {
                                 await refreshHistoryOnce(selectedMaterial.id);

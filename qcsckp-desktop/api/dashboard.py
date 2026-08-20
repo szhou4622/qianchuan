@@ -30,6 +30,9 @@ class DashboardApi:
     def get_scope_options(self) -> Dict[str, Any]:
         return self.optimized.get_scope_options()
 
+    def get_bootstrap(self) -> Dict[str, Any]:
+        return self.optimized.get_bootstrap()
+
     def get_refresh_state(
         self, aavid: Any = "", target_uid: Any = ""
     ) -> Dict[str, Any]:

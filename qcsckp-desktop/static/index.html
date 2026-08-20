@@ -852,6 +852,14 @@
                 rrFrame.classList.remove('is-active');
                 rgFrame.classList.remove('is-active');
                 dashFrame.classList.add('is-active');
+                try {
+                    if (dashFrame.contentWindow) {
+                        dashFrame.contentWindow.postMessage(
+                            { type: 'dashboard-activated' },
+                            '*'
+                        );
+                    }
+                } catch (_) {}
 
                 if (dashFrame.dataset.loaded === '1') {
                     hideIframeLoading();
@@ -865,6 +873,14 @@
                     } catch (_) {}
                     cleanupFrameLoadListener();
                     hideIframeLoading();
+                    try {
+                        if (dashFrame.contentWindow) {
+                            dashFrame.contentWindow.postMessage(
+                                { type: 'dashboard-activated' },
+                                '*'
+                            );
+                        }
+                    } catch (_) {}
                 }
 
                 function fallbackDash() {

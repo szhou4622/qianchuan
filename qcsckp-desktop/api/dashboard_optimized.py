@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import sys
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+from config import CURRENT_VERSION, DATA_DIR, TEST_MODE
 from services.qianchuan_session import current_session_owner
+from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+
+
+DASHBOARD_CONTRACT_VERSION = 2
 
 
 class OptimizedDashboardQueries:
@@ -89,6 +97,81 @@ class OptimizedDashboardQueries:
             "capacityWaitingCount": waiting_count,
             "dataVersion": newest,
         }
+
+    @staticmethod
+    def _runtime_identity() -> tuple[str, str]:
+        if bool(TEST_MODE):
+            mode = "test"
+        elif bool(getattr(sys, "frozen", False)):
+            mode = "production"
+        else:
+            mode = "development"
+        canonical = os.path.normcase(os.path.realpath(DATA_DIR))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+        return mode, f"{mode}-{digest}"
+
+    def get_bootstrap(self) -> dict[str, Any]:
+        """Return one atomic dashboard contract for filters and table scope."""
+        owner = self._owner()
+        scope = self.get_scope_options()
+        refresh = self.get_refresh_state()
+        accounts = list(scope.get("accounts") or [])
+        plans = list(scope.get("plans") or [])
+        material_count = int(refresh.get("materialCount") or 0)
+        runtime_mode, runtime_instance_id = self._runtime_identity()
+        scope_revision_source = "|".join(
+            [
+                owner,
+                *(str(item.get("aavid") or "") for item in accounts),
+                *(str(item.get("target_uid") or "") for item in plans),
+                str(refresh.get("dataVersion") or ""),
+            ]
+        )
+        scope_revision = hashlib.sha256(
+            scope_revision_source.encode("utf-8")
+        ).hexdigest()[:16]
+        response = {
+            "success": True,
+            "dashboardContractVersion": DASHBOARD_CONTRACT_VERSION,
+            "appVersion": str(CURRENT_VERSION),
+            "runtimeMode": runtime_mode,
+            "runtimeInstanceId": runtime_instance_id,
+            "ownerUsername": owner,
+            "accounts": accounts,
+            "plans": plans,
+            "accountCount": len(accounts),
+            "planCount": len(plans),
+            "materialCount": material_count,
+            "capacityWaitingCount": int(scope.get("capacityWaitingCount") or 0),
+            "dataVersion": str(refresh.get("dataVersion") or ""),
+            "scopeRevision": scope_revision,
+            "lastCollectedAt": str(refresh.get("newestAt") or ""),
+            "oldestCollectedAt": str(refresh.get("oldestAt") or ""),
+            "dataAgeSeconds": refresh.get("dataAgeSeconds"),
+            "defaultScope": {
+                "mode": "all_enabled_accounts",
+                "aavid": "",
+                "targetUid": "",
+            },
+            "capabilities": {
+                "table": True,
+                "accountFilter": True,
+                "planFilter": True,
+                "scopeRetry": True,
+            },
+        }
+        logger.info(
+            "[DashboardBootstrap] contract=%s app=%s runtime=%s owner=%s "
+            "accounts=%s plans=%s materials=%s",
+            DASHBOARD_CONTRACT_VERSION,
+            CURRENT_VERSION,
+            runtime_instance_id,
+            owner,
+            len(accounts),
+            len(plans),
+            material_count,
+        )
+        return response
 
     def get_refresh_state(self, *, aavid: Any = "", target_uid: Any = "") -> dict[str, Any]:
         owner = self._owner()

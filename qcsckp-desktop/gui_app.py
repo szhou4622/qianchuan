@@ -126,21 +126,62 @@ def _psutil_resolve_exe(proc) -> str:
 
 # ==================== 单实例检查管理器 ====================
 class SingleInstanceChecker:
-    """单实例：仅当「规范化后的可执行文件路径」与当前进程一致时视为同一应用。"""
+    """开发版按数据目录隔离；正式包跨安装路径只允许一个实例。"""
 
     def __init__(self, project_root):
-        # project_root 保留参数以兼容旧调用；单实例只认可执行路径，不再用工作目录推断
-        self.command_file = os.path.join(DATA_DIR, "command.json")
+        # 正式安装包升级后可执行文件路径会变化，不能继续按 exe 路径或版本
+        # 目录加锁；否则旧版与新版会同时读写 production 数据库。源码和
+        # TEST_MODE 仍按各自 DATA_DIR 隔离，便于开发对比测试。
+        self.production_scope = bool(getattr(sys, "frozen", False) and not TEST_MODE)
+        if self.production_scope:
+            local_root = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+            self.lock_dir = os.path.join(local_root, "QCSCKP")
+            lock_name = "qcsckp-production.instance.lock"
+            command_name = "qcsckp-production.command.json"
+            owner_name = "qcsckp-production.owner.json"
+        else:
+            self.lock_dir = DATA_DIR
+            lock_name = "qcsckp.instance.lock"
+            command_name = "command.json"
+            owner_name = "qcsckp.instance.owner.json"
+        self.lock_path = os.path.join(self.lock_dir, lock_name)
+        self.command_file = os.path.join(self.lock_dir, command_name)
+        self.owner_file = os.path.join(self.lock_dir, owner_name)
         self._command_mtime = None
         self._lease_handle = None
 
+    def _read_lease_owner_pid(self) -> int:
+        try:
+            with open(self.owner_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return max(0, int((payload or {}).get("pid") or 0))
+        except Exception:
+            return 0
+
+    def _write_lease_owner(self) -> None:
+        try:
+            os.makedirs(self.lock_dir, exist_ok=True)
+            temp = self.owner_file + f".{os.getpid()}.tmp"
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "version": CURRENT_VERSION,
+                        "production": self.production_scope,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                )
+            os.replace(temp, self.owner_file)
+        except Exception as exc:
+            print(f"[单实例检查] 写入实例所有者失败: {exc}")
+
     def acquire_runtime_lease(self) -> bool:
-        """按数据目录加跨进程锁，源码运行和打包运行都只能启动一个实例。"""
+        """正式包全局加锁；开发/测试按各自数据目录加锁。"""
         if self._lease_handle is not None:
             return True
-        os.makedirs(DATA_DIR, exist_ok=True)
-        lock_path = os.path.join(DATA_DIR, "qcsckp.instance.lock")
-        handle = open(lock_path, "a+b")
+        os.makedirs(self.lock_dir, exist_ok=True)
+        handle = open(self.lock_path, "a+b")
         try:
             handle.seek(0)
             if handle.read(1) != b"1":
@@ -162,6 +203,7 @@ class SingleInstanceChecker:
             self.activate_existing_instance()
             return False
         self._lease_handle = handle
+        self._write_lease_owner()
         return True
 
     def release_runtime_lease(self) -> None:
@@ -183,6 +225,11 @@ class SingleInstanceChecker:
             pass
         finally:
             handle.close()
+        try:
+            if self._read_lease_owner_pid() == os.getpid():
+                os.unlink(self.owner_file)
+        except OSError:
+            pass
 
     @staticmethod
     def _activate_windows_process(pid: int) -> bool:
@@ -230,9 +277,17 @@ class SingleInstanceChecker:
             return False
 
     def activate_existing_instance(self) -> bool:
-        """按规范化可执行路径查找并恢复已经运行的同一工具。"""
+        """优先按正式锁所有者PID恢复；开发版继续按可执行路径恢复。"""
         if not PSUTIL_AVAILABLE:
             return False
+        owner_pid = self._read_lease_owner_pid()
+        if owner_pid and owner_pid != os.getpid():
+            try:
+                if psutil.pid_exists(owner_pid) and self._activate_windows_process(owner_pid):
+                    print(f"[单实例检查] 已恢复锁所有者窗口: PID={owner_pid}")
+                    return True
+            except Exception:
+                pass
         current_pid = os.getpid()
         current_key = _canonical_exe_path(sys.executable)
         if not current_key:
@@ -264,8 +319,8 @@ class SingleInstanceChecker:
 
     def check_single_instance(self):
         """
-        检查是否已有实例在运行（仅比较可执行文件路径，需 psutil）。
-        返回 True 表示已有同路径实例，新进程应退出并唤醒已有窗口。
+        正式包检查任意安装路径下的 QCSCKP.exe；开发/测试仅比较当前
+        可执行文件路径。返回 True 表示新进程应退出并唤醒已有窗口。
         """
         if not PSUTIL_AVAILABLE:
             print("[单实例检查] 未安装 psutil，跳过单实例检查")
@@ -277,16 +332,20 @@ class SingleInstanceChecker:
             if not current_key:
                 return False
 
-            for proc in psutil.process_iter(["pid", "exe"]):
+            for proc in psutil.process_iter(["pid", "exe", "name"]):
                 try:
                     if proc.info["pid"] == current_pid:
                         continue
                     proc_exe = _psutil_resolve_exe(proc)
                     if not proc_exe:
                         continue
-                    if _canonical_exe_path(proc_exe) == current_key:
+                    process_name = str(proc.info.get("name") or "").strip().casefold()
+                    same_production_app = (
+                        self.production_scope and process_name == "qcsckp.exe"
+                    )
+                    if same_production_app or _canonical_exe_path(proc_exe) == current_key:
                         print(
-                            f"[单实例检查] 已有同路径实例: PID={proc.info['pid']}, exe={proc_exe}"
+                            f"[单实例检查] 已有工具实例: PID={proc.info['pid']}, exe={proc_exe}"
                         )
                         self._write_show_window_command()
                         self._activate_windows_process(proc.info["pid"])
@@ -302,7 +361,7 @@ class SingleInstanceChecker:
     def _write_show_window_command(self):
         """写入显示窗口命令"""
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
+            os.makedirs(self.lock_dir, exist_ok=True)
             with open(self.command_file, 'w', encoding='utf-8') as f:
                 json.dump({"show_window": True}, f)
         except Exception as e:
@@ -757,6 +816,9 @@ class JSApi:
 
     def getDashboardScopeOptions(self):
         return self.api.get_dashboard_scope_options()
+
+    def getDashboardBootstrap(self):
+        return self.api.get_dashboard_bootstrap()
 
     def getDashboardRefreshState(self, aavid=None, targetUid=None):
         return self.api.get_dashboard_refresh_state(aavid, targetUid)
