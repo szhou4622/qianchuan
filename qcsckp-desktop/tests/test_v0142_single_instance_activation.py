@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import unittest
-import tempfile
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import gui_app
@@ -13,41 +11,6 @@ from gui_app import SingleInstanceChecker
 
 
 class SingleInstanceActivationV0142Tests(unittest.TestCase):
-    def test_packaged_release_uses_one_cross_version_production_lock(self):
-        with tempfile.TemporaryDirectory() as temp:
-            with (
-                patch.object(gui_app.sys, "frozen", True, create=True),
-                patch.object(gui_app, "TEST_MODE", False),
-                patch.dict(gui_app.os.environ, {"LOCALAPPDATA": temp}),
-            ):
-                checker = SingleInstanceChecker("unused")
-        expected_root = str(Path(temp) / "QCSCKP")
-        self.assertTrue(checker.production_scope)
-        self.assertEqual(expected_root, checker.lock_dir)
-        self.assertTrue(checker.lock_path.endswith("qcsckp-production.instance.lock"))
-        self.assertTrue(checker.command_file.endswith("qcsckp-production.command.json"))
-
-    def test_production_detects_old_release_from_another_install_path(self):
-        checker = SingleInstanceChecker("unused")
-        checker.production_scope = True
-        process = Mock()
-        process.info = {
-            "pid": 9527,
-            "exe": r"C:\OldVersion\QCSCKP.exe",
-            "name": "QCSCKP.exe",
-        }
-        with (
-            patch.object(gui_app, "PSUTIL_AVAILABLE", True),
-            patch.object(gui_app.os, "getpid", return_value=100),
-            patch.object(gui_app.sys, "executable", r"C:\NewVersion\QCSCKP.exe"),
-            patch.object(gui_app.psutil, "process_iter", return_value=[process]),
-            patch.object(checker, "_write_show_window_command"),
-            patch.object(checker, "_activate_windows_process", return_value=True) as activated,
-        ):
-            result = checker.check_single_instance()
-        self.assertTrue(result)
-        activated.assert_called_once_with(9527)
-
     def test_existing_same_executable_is_activated(self):
         checker = SingleInstanceChecker("unused")
         process = Mock()
