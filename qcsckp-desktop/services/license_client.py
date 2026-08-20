@@ -224,6 +224,7 @@ class LicenseHttpClient:
         *,
         current_code_id: str = "",
         credential_refresh: bool = False,
+        credentials: Optional[Mapping[str, str]] = None,
     ) -> dict[str, Any]:
         # POST is deliberately not retried.  If the response is unknown, the
         # user can retry manually with the same code and stable machine code.
@@ -241,6 +242,7 @@ class LicenseHttpClient:
             "POST",
             _ACTIVATE_PATH,
             body=body,
+            credentials=credentials,
             attempts=1,
         )
 

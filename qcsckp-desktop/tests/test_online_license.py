@@ -114,10 +114,19 @@ class FakeClient:
         }
         self.activate_calls = []
         self.activate_options = []
+        self.activate_credentials = []
         self.status_calls = []
         self.unbind_calls = []
 
-    def activate(self, code, machine, *, current_code_id="", credential_refresh=False):
+    def activate(
+        self,
+        code,
+        machine,
+        *,
+        current_code_id="",
+        credential_refresh=False,
+        credentials=None,
+    ):
         self.activate_calls.append((code, machine))
         self.activate_options.append(
             {
@@ -125,6 +134,7 @@ class FakeClient:
                 "credential_refresh": credential_refresh,
             }
         )
+        self.activate_credentials.append(dict(credentials) if credentials else None)
         if isinstance(self.activation, Exception):
             raise self.activation
         return dict(self.activation)
@@ -385,6 +395,30 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertFalse(state["authorized"])
         self.assertTrue(state["credential_refresh_required"])
         self.assertIsNotNone(store.credentials)
+
+    def test_legacy_binding_reactivation_sends_existing_device_credentials(self):
+        store = FakeStore()
+        store.credentials = {
+            "device_session": "existing-session",
+            "device_credential": "existing-credential",
+        }
+        store.metadata = {
+            **status_payload("monthly"),
+            "license_type_label": "月卡",
+            "is_permanent": False,
+        }
+        client = FakeClient(activation=license_payload("monthly"))
+        manager = LicenseManager(client=client, store=store)
+        self.assertFalse(manager.startup_check()["authorized"])
+        state = manager.activate("ORIGINAL-CODE")
+        self.assertTrue(state["authorized"])
+        self.assertEqual(
+            {
+                "device_session": "existing-session",
+                "device_credential": "existing-credential",
+            },
+            client.activate_credentials[-1],
+        )
 
     def test_duplicate_activation_after_success_is_not_resubmitted(self):
         client = FakeClient()
@@ -790,6 +824,30 @@ class OnlineLicenseHttpTests(unittest.TestCase):
         self.assertEqual(LICENSE_APP_NAME, body["app_name"])
         self.assertEqual(LICENSE_PROTOCOL_VERSION, body["license_protocol_version"])
         self.assertEqual("TEST-CODE", body["activation_code"])
+
+    def test_reactivation_can_authenticate_with_existing_device_credentials(self):
+        captured = []
+
+        def opener(request, timeout):
+            captured.append(request)
+            return FakeHttpResponse({"ok": True, "data": license_payload()})
+
+        LicenseHttpClient(opener=opener).activate(
+            "ORIGINAL-CODE",
+            "machine_stable",
+            credentials={
+                "device_session": "existing-session",
+                "device_credential": "existing-credential",
+            },
+        )
+        self.assertEqual(
+            "Bearer existing-session",
+            captured[0].get_header("Authorization"),
+        )
+        self.assertEqual(
+            "existing-credential",
+            captured[0].get_header("X-device-credential"),
+        )
 
     def test_legacy_credential_refresh_fields_are_sent_only_when_requested(self):
         captured = []

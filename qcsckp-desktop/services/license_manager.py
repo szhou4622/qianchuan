@@ -695,6 +695,7 @@ class LicenseManager:
                 machine_code,
                 current_code_id=current_code_id,
                 credential_refresh=refresh_credentials,
+                credentials=existing_credentials,
             )
             metadata, credentials = self._normalize_license(
                 response,
