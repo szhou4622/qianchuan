@@ -621,21 +621,34 @@ class JSApi:
         try:
             interval = max(
                 60,
-                int(os.getenv("QCSCKP_LICENSE_RECHECK_SECONDS", "600")),
+                int(os.getenv("QCSCKP_LICENSE_RECHECK_SECONDS", "60")),
             )
         except (TypeError, ValueError):
-            interval = 600
+            interval = 60
         self._license_watchdog_stop = threading.Event()
 
         def watch():
             while not self._license_watchdog_stop.wait(interval):
-                state = manager.startup_check()
+                state = manager.runtime_check()
+                window = self._window
+                if window is not None:
+                    try:
+                        public_state = json.dumps(
+                            state,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        )
+                        window.evaluate_js(
+                            "window.applyLicenseRuntimeState&&"
+                            f"window.applyLicenseRuntimeState({public_state})"
+                        )
+                    except Exception:
+                        pass
                 if state.get("authorized"):
                     continue
                 self._stop_licensed_runtime()
                 if int(state.get("http_status") or 0) == 401:
                     self.api.clear_license_cloud_sessions()
-                window = self._window
                 if window is not None and self.license_url:
                     try:
                         window.load_url(self.license_url)
