@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from api.dashboard_optimized import OptimizedDashboardQueries
 from api.dashboard_optimized import DASHBOARD_CONTRACT_VERSION
+from config import CURRENT_VERSION
 from utils.dashboard_storage_maintenance import (
     backfill_latest_from_legacy,
     backfill_recent_metric_snapshots,
@@ -160,7 +161,7 @@ class DashboardOptimizationTests(unittest.TestCase):
         result = self.queries.get_bootstrap()
         self.assertTrue(result["success"])
         self.assertEqual(DASHBOARD_CONTRACT_VERSION, result["dashboardContractVersion"])
-        self.assertEqual("0.1.58", result["appVersion"])
+        self.assertEqual(CURRENT_VERSION, result["appVersion"])
         self.assertEqual("dashboard-owner", result["ownerUsername"])
         self.assertEqual(2, result["accountCount"])
         self.assertEqual(2, result["planCount"])
