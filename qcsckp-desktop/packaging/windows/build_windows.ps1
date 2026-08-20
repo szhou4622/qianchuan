@@ -18,10 +18,15 @@ $staticDir = Join-Path $projectRoot "static"
 $contactConfig = Join-Path $projectRoot "services\contact_config.py"
 $contactHttp = Join-Path $projectRoot "services\contact_http.py"
 $contactFallback = Join-Path $staticDir "images\contact-author-fallback.svg"
+$licenseClient = Join-Path $projectRoot "services\license_client.py"
+$licenseStorage = Join-Path $projectRoot "services\license_storage.py"
+$licenseManager = Join-Path $projectRoot "services\license_manager.py"
+$licensePage = Join-Path $staticDir "license.html"
+$licenseManagementPage = Join-Path $staticDir "license_management.html"
 $usageFile = Join-Path $scriptDir "README-Windows.txt"
 $privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $usageFile, $privacyVerifier)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $privacyVerifier)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
@@ -61,6 +66,9 @@ $pyinstallerArgs = @(
     "--hidden-import", "webview.platforms.edgechromium",
     "--hidden-import", "services.contact_config",
     "--hidden-import", "services.contact_http",
+    "--hidden-import", "services.license_client",
+    "--hidden-import", "services.license_storage",
+    "--hidden-import", "services.license_manager",
     "--distpath", $distRoot,
     "--workpath", $workRoot,
     "--specpath", $specRoot,

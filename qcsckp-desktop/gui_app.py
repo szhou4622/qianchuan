@@ -15,12 +15,14 @@ import ctypes
 import threading
 import time
 import json
+from functools import wraps
 import webview
 from ctypes.util import find_library
 from api import Api
 # 项目配置
 from config import (
     APP_NAME,
+    SOFTWARE_CHINESE_NAME,
     PROJECT_ROOT,
     DATA_DIR,
     DATA_TEMP_DIR,
@@ -36,6 +38,7 @@ from config import (
 )
 from services.contact_http import ContactLocalHttpServer
 from services.control_panel_config import ensure_all_control_defaults
+from services.license_manager import LicenseManager
 from services.runtime_supervisor import RUNTIME_SUPERVISOR
 
 
@@ -583,7 +586,7 @@ def configure_macos_lifecycle(window, tray_app):
 
 # ===== 创建 js_api =====
 class JSApi:
-    def __init__(self, contact_server=None):
+    def __init__(self, contact_server=None, license_manager=None, license_url=""):
         # 必须早于 Api() 的 SQLite 建表迁移，保证可以完整恢复rc23数据。
         try:
             from services.rc23_rollback import ensure_rc23_upgrade_snapshot
@@ -593,6 +596,116 @@ class JSApi:
             print(f"警告：rc23升级快照创建失败：{exc}")
         self.api = Api()
         self.contact_server = contact_server
+        self.license_manager = license_manager
+        self.license_url = str(license_url or "")
+        self._window = None
+        self._licensed_runtime_started = False
+        self._licensed_runtime_lock = threading.Lock()
+        self._license_watchdog_stop = threading.Event()
+        self._license_watchdog_thread = None
+
+    def _stop_licensed_runtime(self):
+        self._license_watchdog_stop.set()
+        with self._licensed_runtime_lock:
+            if self._licensed_runtime_started:
+                RUNTIME_SUPERVISOR.stop()
+                self._licensed_runtime_started = False
+
+    def _start_license_watchdog(self):
+        manager = self.license_manager
+        if manager is None:
+            return
+        current = self._license_watchdog_thread
+        if current is not None and current.is_alive():
+            return
+        try:
+            interval = max(
+                60,
+                int(os.getenv("QCSCKP_LICENSE_RECHECK_SECONDS", "600")),
+            )
+        except (TypeError, ValueError):
+            interval = 600
+        self._license_watchdog_stop = threading.Event()
+
+        def watch():
+            while not self._license_watchdog_stop.wait(interval):
+                state = manager.startup_check()
+                if state.get("authorized"):
+                    continue
+                self._stop_licensed_runtime()
+                window = self._window
+                if window is not None and self.license_url:
+                    try:
+                        window.load_url(self.license_url)
+                    except Exception:
+                        pass
+                return
+
+        self._license_watchdog_thread = threading.Thread(
+            target=watch,
+            daemon=True,
+            name="qcsckp-license-watchdog",
+        )
+        self._license_watchdog_thread.start()
+
+    def getLicenseBootstrapStatus(self):
+        manager = self.license_manager
+        if manager is None:
+            return {
+                "success": True,
+                "authorized": True,
+                "software_name": SOFTWARE_CHINESE_NAME,
+                "app_name": APP_NAME,
+                "message": "开发环境未启用在线授权门禁",
+            }
+        return manager.startup_check()
+
+    def activateOnlineLicense(self, activationCode=None):
+        manager = self.license_manager
+        if manager is None:
+            return {
+                "success": False,
+                "authorized": False,
+                "message": "当前环境未启用在线授权",
+            }
+        return manager.activate(activationCode)
+
+    def enterLicensedApplication(self):
+        manager = self.license_manager
+        if manager is not None and not manager.is_runtime_authorized():
+            return {
+                "success": False,
+                "authorized": False,
+                "message": "软件授权尚未通过，不能进入主界面",
+            }
+        with self._licensed_runtime_lock:
+            if not self._licensed_runtime_started:
+                RUNTIME_SUPERVISOR.start(self)
+                self._licensed_runtime_started = True
+        self._start_license_watchdog()
+        return {"success": True, "authorized": True}
+
+    def getLicenseManagementInfo(self):
+        manager = self.license_manager
+        if manager is None:
+            return self.getLicenseBootstrapStatus()
+        result = manager.management_info(refresh=True)
+        if not result.get("authorized") and self._licensed_runtime_started:
+            self._stop_licensed_runtime()
+        return result
+
+    def unbindCurrentLicense(self):
+        manager = self.license_manager
+        if manager is None:
+            return {
+                "success": False,
+                "authorized": False,
+                "message": "当前环境未启用在线授权",
+            }
+        result = manager.unbind_current_device()
+        if result.get("success") and not result.get("authorized"):
+            self._stop_licensed_runtime()
+        return result
 
     def getContactApiUrl(self):
         """Return only the loopback facade; the UI never receives the remote endpoint."""
@@ -1083,6 +1196,42 @@ class JSApi:
         return self.api.getOperationRecordBrowserStatus()
 
 
+_LICENSE_GATE_METHODS = {
+    "getLicenseBootstrapStatus",
+    "activateOnlineLicense",
+    "enterLicensedApplication",
+    "getLicenseManagementInfo",
+    "unbindCurrentLicense",
+}
+
+
+def _install_js_api_license_gate() -> None:
+    """Wrap every non-license bridge method with a backend authorization gate."""
+    for name, method in list(vars(JSApi).items()):
+        if name.startswith("_") or name in _LICENSE_GATE_METHODS or not callable(method):
+            continue
+
+        @wraps(method)
+        def guarded(self, *args, __method=method, **kwargs):
+            # A few legacy bridge unit tests instantiate JSApi via
+            # object.__new__ and inject only ``api``.  Production construction
+            # always sets LicenseManager explicitly in main().
+            manager = getattr(self, "license_manager", None)
+            if manager is not None and not manager.is_runtime_authorized():
+                return {
+                    "success": False,
+                    "authorized": False,
+                    "error": "license_required",
+                    "message": "软件授权未通过，请重新激活或联系管理员",
+                }
+            return __method(self, *args, **kwargs)
+
+        setattr(JSApi, name, guarded)
+
+
+_install_js_api_license_gate()
+
+
 # ==================== 屏幕信息获取 ====================
 def get_real_screen_info():
     """获取物理分辨率（跨平台）"""
@@ -1196,6 +1345,8 @@ def _cleanup_data_temp_dir():
 
 def main():
     contact_server = None
+    license_manager = None
+    js_api = None
     if not single_instance_checker.acquire_runtime_lease():
         single_instance_checker._write_show_window_command()
         print("[!] 当前数据目录已有工具实例运行，已激活现有窗口")
@@ -1239,13 +1390,15 @@ def main():
 
         # ===== 加载 HTML 页面 =====
         index_path = os.path.join(STATIC_DIR, "index.html")
+        license_path = os.path.join(STATIC_DIR, "license.html")
 
-        if not os.path.exists(index_path):
-            print(f"[ERR] index.html 不存在: {index_path}")
+        if not os.path.exists(index_path) or not os.path.exists(license_path):
+            print(f"[ERR] 授权页或主页面不存在: {license_path} / {index_path}")
             return
 
         # Windows 上勿用 f"file://{path}"：反斜杠、空格、中文路径会导致 WebView2 解析失败 → 白屏。
         index_url = Path(index_path).resolve().as_uri()
+        license_url = Path(license_path).resolve().as_uri()
 
         # Starting the loopback listener performs no network request.  The
         # shared contact service is consulted only after the UI's first
@@ -1258,7 +1411,12 @@ def main():
             contact_server = None
             print(f"[联系作者] 本地接口启动失败，界面将使用内置兜底图: {exc}")
 
-        js_api = JSApi(contact_server=contact_server)
+        license_manager = LicenseManager()
+        js_api = JSApi(
+            contact_server=contact_server,
+            license_manager=license_manager,
+            license_url=license_url,
+        )
 
         # ===== 创建窗口 =====
         storage_path = os.path.join(DATA_DIR, "storage")
@@ -1270,7 +1428,7 @@ def main():
 
         window = webview.create_window(
             title=window_title,
-            url=index_url,
+            url=license_url,
             width=width,
             height=height,
             x=x,
@@ -1279,6 +1437,7 @@ def main():
             min_size=(1200, 800),
             js_api=js_api
         )
+        js_api._window = window
 
         # ===== 创建托盘 =====
         tray_app = None
@@ -1350,10 +1509,8 @@ def main():
                 name="qcsckp-test-auto-start",
             ).start()
 
-        # One owner starts and stops all business workers. Hiding the window to
-        # the tray does not stop it; "complete exit" returns from WebView and
-        # the finally block below drains the runtime.
-        RUNTIME_SUPERVISOR.start(js_api)
+        # Business workers are intentionally not started here.  The license
+        # page starts them only after the server confirms this device is active.
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")
@@ -1366,6 +1523,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        try:
+            if js_api is not None:
+                js_api._stop_licensed_runtime()
+        except Exception:
+            pass
         try:
             if contact_server is not None:
                 contact_server.stop()

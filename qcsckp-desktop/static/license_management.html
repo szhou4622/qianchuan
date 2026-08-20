@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>授权管理</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 28px; color: #e2e8f0; background: #08111f; font-family: Inter,"Microsoft YaHei",system-ui,sans-serif; }
+        .head { display:flex; align-items:flex-end; justify-content:space-between; gap:18px; margin-bottom:20px; }
+        h1 { margin:0; color:#f8fafc; font-size:24px; } .sub { margin:6px 0 0; color:#64748b; font-size:12px; }
+        .card { max-width:920px; padding:22px; border:1px solid #334155; border-radius:16px; background:#111c31; box-shadow:0 18px 45px #02061755; }
+        .status { margin-bottom:18px; padding:12px 14px; border:1px solid #334155; border-radius:11px; color:#cbd5e1; background:#0f172a; font-size:13px; }
+        .status.ok { color:#bbf7d0; border-color:#166534; } .status.error { color:#fecaca; border-color:#7f1d1d; }
+        .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+        .item { min-height:78px; padding:13px 14px; border:1px solid rgba(51,65,85,.75); border-radius:12px; background:rgba(15,23,42,.58); }
+        .label { color:#64748b; font-size:11px; margin-bottom:7px; } .value { color:#f1f5f9; font-size:14px; font-weight:650; overflow-wrap:anywhere; }
+        .actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; padding-top:18px; border-top:1px solid #334155; }
+        button { min-height:42px; padding:0 17px; border:1px solid #475569; border-radius:10px; color:#e2e8f0; background:#1e293b; cursor:pointer; font-weight:700; }
+        button.danger { color:#fee2e2; border-color:#991b1b; background:#7f1d1d; } button:disabled{opacity:.5;cursor:not-allowed}
+        .note { margin-top:14px; color:#64748b; font-size:11px; line-height:1.7; }
+        @media(max-width:720px){body{padding:16px}.grid{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+    <header class="head"><div><h1>授权管理</h1><p class="sub">仅查看当前时间授权，或解绑本机设备；不能修改激活码和有效期。</p></div></header>
+    <section class="card">
+        <div class="status" id="status">正在验证授权…</div>
+        <div class="grid" id="details"></div>
+        <div class="actions">
+            <button id="refresh" type="button">刷新状态</button>
+            <button id="unbind" class="danger" type="button">解绑当前设备</button>
+        </div>
+        <p class="note">解绑不会删除服务器上的授权记录，也不会改变原到期时间。解绑后本机将立即停止运行；如需在新电脑继续使用，请输入原激活码重新绑定。服务器返回的换机限制提示会原样显示。</p>
+    </section>
+    <script>
+        const status = document.getElementById('status');
+        const details = document.getElementById('details');
+        const refreshButton = document.getElementById('refresh');
+        const unbindButton = document.getElementById('unbind');
+        let api = null;
+        const fields = [
+            ['software_name','软件中文名'],['license_type_label','授权类型'],['binding_status','授权状态'],
+            ['activated_at','激活时间'],['expires_at','到期时间'],['remaining_days','剩余天数'],
+            ['current_device','当前绑定设备'],['code_id','授权编号'],['transfer_count','换机次数']
+        ];
+        function waitApi(){return new Promise(resolve=>{let n=0;const t=setInterval(()=>{const a=window.top&&window.top.pywebviewAPI;if(a&&typeof a.getLicenseManagementInfo==='function'){clearInterval(t);resolve(a)}else if(++n>150){clearInterval(t);resolve(null)}},100)})}
+        function render(state){
+            const license=state&&state.license||{};
+            status.textContent=(state&&state.message)||'授权状态未知';
+            status.className='status '+(state&&state.authorized?'ok':'error');
+            details.innerHTML='';
+            for(const [key,label] of fields){
+                const item=document.createElement('div'); item.className='item';
+                const labelEl=document.createElement('div'); labelEl.className='label'; labelEl.textContent=label;
+                const valueEl=document.createElement('div'); valueEl.className='value';
+                let value=key==='software_name'?(state.software_name||'千川素材看盘工具'):license[key];
+                if(key==='remaining_days'&&value!==undefined&&value!==null)value=String(value)+' 天';
+                valueEl.textContent=value===undefined||value===null||value===''?'—':String(value);
+                item.append(labelEl,valueEl); details.appendChild(item);
+            }
+            unbindButton.disabled=!(state&&state.authorized);
+        }
+        async function load(){
+            refreshButton.disabled=true; unbindButton.disabled=true; status.textContent='正在连接授权服务器验证…';
+            try{api=api||await waitApi();if(!api)throw new Error('无法连接本地授权模块');const state=await api.getLicenseManagementInfo();render(state);if(!state.authorized&&state.code!=='license_service_unavailable'){setTimeout(()=>window.top.location.replace('license.html'),900)}}
+            catch(error){render({authorized:false,message:error.message||'授权验证失败，请重试',license:null})}
+            finally{refreshButton.disabled=false}
+        }
+        refreshButton.addEventListener('click',load);
+        unbindButton.addEventListener('click',async()=>{
+            if(!confirm('确认解绑当前设备？解绑后本机将不能继续使用。'))return;
+            if(!confirm('请再次确认：立即解绑本机设备并停止所有后台任务？'))return;
+            refreshButton.disabled=true;unbindButton.disabled=true;status.textContent='正在解绑当前设备…';
+            try{const state=await api.unbindCurrentLicense();render(state);if(state.success&&!state.authorized){alert(state.message||'当前设备已解绑');window.top.location.replace('license.html')}}
+            catch(error){status.textContent=error.message||'解绑失败，请重试';status.className='status error';refreshButton.disabled=false;unbindButton.disabled=false}
+        });
+        window.addEventListener('DOMContentLoaded',load);
+    </script>
+</body>
+</html>

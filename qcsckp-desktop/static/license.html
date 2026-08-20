@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>千川素材看盘工具 · 在线授权</title>
+    <style>
+        * { box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; margin: 0; }
+        body {
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            color: #e2e8f0;
+            background:
+                radial-gradient(circle at 20% 10%, rgba(14,165,233,.14), transparent 36%),
+                radial-gradient(circle at 84% 86%, rgba(99,102,241,.13), transparent 34%),
+                #08111f;
+            font-family: Inter, "Microsoft YaHei", system-ui, sans-serif;
+        }
+        .card {
+            width: min(460px, 100%);
+            overflow: hidden;
+            border: 1px solid rgba(71,85,105,.88);
+            border-radius: 20px;
+            background: linear-gradient(165deg, rgba(30,41,59,.98), rgba(15,23,42,.99));
+            box-shadow: 0 28px 70px rgba(2,6,23,.55);
+        }
+        .head { padding: 28px 30px 20px; border-bottom: 1px solid rgba(51,65,85,.7); }
+        .brand { display: flex; align-items: center; gap: 13px; }
+        .mark {
+            width: 44px; height: 44px; display: grid; place-items: center;
+            border-radius: 13px; color: #7dd3fc; background: rgba(14,165,233,.14);
+            border: 1px solid rgba(56,189,248,.3); font-size: 22px; font-weight: 800;
+        }
+        h1 { margin: 0; color: #f8fafc; font-size: 21px; }
+        .subtitle { margin: 6px 0 0; color: #94a3b8; font-size: 12px; line-height: 1.6; }
+        .body { padding: 24px 30px 30px; }
+        .status {
+            display: flex; align-items: center; gap: 10px; min-height: 48px;
+            padding: 12px 14px; margin-bottom: 18px; border-radius: 12px;
+            color: #cbd5e1; background: rgba(15,23,42,.7); border: 1px solid #334155;
+            font-size: 13px; line-height: 1.55;
+        }
+        .dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: #38bdf8; box-shadow: 0 0 12px rgba(56,189,248,.7); }
+        .status.error { color: #fecaca; border-color: rgba(248,113,113,.45); background: rgba(127,29,29,.12); }
+        .status.error .dot { background: #f87171; box-shadow: 0 0 12px rgba(248,113,113,.65); }
+        .status.ok { color: #bbf7d0; border-color: rgba(74,222,128,.38); background: rgba(20,83,45,.14); }
+        .status.ok .dot { background: #4ade80; box-shadow: 0 0 12px rgba(74,222,128,.65); }
+        label { display: block; margin-bottom: 8px; color: #cbd5e1; font-size: 13px; font-weight: 650; }
+        input {
+            width: 100%; height: 46px; padding: 0 13px; border: 1px solid #475569;
+            border-radius: 11px; outline: none; color: #f8fafc; background: #0f172a;
+            font-size: 14px; letter-spacing: .02em;
+        }
+        input:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56,189,248,.12); }
+        .actions { display: flex; gap: 10px; margin-top: 16px; }
+        button {
+            min-height: 44px; padding: 0 18px; border: 1px solid #475569; border-radius: 11px;
+            color: #e2e8f0; background: #1e293b; cursor: pointer; font-size: 13px; font-weight: 700;
+        }
+        button.primary { flex: 1; color: #082f49; border-color: #38bdf8; background: #38bdf8; }
+        button:hover { filter: brightness(1.08); }
+        button:disabled { cursor: not-allowed; opacity: .55; filter: none; }
+        .hint { margin: 14px 0 0; color: #64748b; font-size: 11px; line-height: 1.65; }
+        .license-summary { display: none; margin-top: 14px; color: #94a3b8; font-size: 12px; line-height: 1.7; }
+        .license-summary strong { color: #e2e8f0; }
+    </style>
+</head>
+<body>
+    <section class="card" aria-labelledby="softwareName">
+        <header class="head">
+            <div class="brand">
+                <div class="mark" aria-hidden="true">Q</div>
+                <div>
+                    <h1 id="softwareName">千川素材看盘工具</h1>
+                    <p class="subtitle">在线授权验证 · 时间授权协议 v2</p>
+                </div>
+            </div>
+        </header>
+        <main class="body">
+            <div class="status" id="statusBox" role="status" aria-live="polite">
+                <span class="dot" aria-hidden="true"></span>
+                <span id="statusText">正在检查本机授权…</span>
+            </div>
+            <form id="activationForm" hidden>
+                <label for="activationCode">激活码</label>
+                <input id="activationCode" name="activation_code" type="text" maxlength="256" autocomplete="off" placeholder="请输入月卡或年卡激活码">
+                <div class="actions">
+                    <button class="primary" id="activateButton" type="submit">立即激活</button>
+                    <button id="retryButton" type="button">重新验证</button>
+                </div>
+                <p class="hint">激活码仅提交给授权服务器验证，不会保存在本机、浏览器或普通日志中。当前软件不支持积分码。</p>
+            </form>
+            <div class="license-summary" id="licenseSummary"></div>
+        </main>
+    </section>
+    <script>
+        const statusBox = document.getElementById('statusBox');
+        const statusText = document.getElementById('statusText');
+        const form = document.getElementById('activationForm');
+        const input = document.getElementById('activationCode');
+        const activateButton = document.getElementById('activateButton');
+        const retryButton = document.getElementById('retryButton');
+        const summary = document.getElementById('licenseSummary');
+        let api = null;
+        let busy = false;
+
+        function setStatus(message, tone = '') {
+            statusText.textContent = message || '授权状态未知';
+            statusBox.className = 'status' + (tone ? ' ' + tone : '');
+        }
+
+        function showLicenseInfo(license) {
+            if (!license) { summary.style.display = 'none'; return; }
+            summary.style.display = 'block';
+            summary.innerHTML = '';
+            const line = document.createElement('div');
+            line.innerHTML = '<strong>' + String(license.license_type_label || '时间授权') + '</strong>'
+                + ' · 到期时间：' + String(license.expires_at || '—');
+            summary.appendChild(line);
+        }
+
+        function setBusy(value, label) {
+            busy = !!value;
+            activateButton.disabled = busy;
+            retryButton.disabled = busy;
+            input.disabled = busy;
+            activateButton.textContent = busy ? (label || '处理中…') : '立即激活';
+        }
+
+        function waitForApi() {
+            return new Promise((resolve) => {
+                let count = 0;
+                const timer = setInterval(() => {
+                    const bridge = window.pywebview && window.pywebview.api;
+                    if (bridge && typeof bridge.getLicenseBootstrapStatus === 'function') {
+                        clearInterval(timer); resolve(bridge); return;
+                    }
+                    if (++count >= 150) { clearInterval(timer); resolve(null); }
+                }, 100);
+            });
+        }
+
+        async function enterApplication(state) {
+            showLicenseInfo(state && state.license);
+            setStatus('授权有效，正在进入软件…', 'ok');
+            const entered = await api.enterLicensedApplication();
+            if (!entered || !entered.success) {
+                throw new Error((entered && entered.message) || '主程序启动失败');
+            }
+            window.location.replace('index.html');
+        }
+
+        async function checkAuthorization() {
+            if (busy) return;
+            setBusy(true, '正在验证…');
+            form.hidden = true;
+            setStatus('正在连接授权服务器验证本机设备…');
+            try {
+                api = api || await waitForApi();
+                if (!api) throw new Error('无法连接本地授权模块，请重新启动软件');
+                const state = await api.getLicenseBootstrapStatus();
+                document.getElementById('softwareName').textContent = state.software_name || '千川素材看盘工具';
+                if (state.authorized) {
+                    await enterApplication(state);
+                    return;
+                }
+                showLicenseInfo(state.license);
+                setStatus(state.message || '请输入激活码', state.network_error ? 'error' : 'error');
+                form.hidden = false;
+                if (!state.network_error) input.focus();
+            } catch (error) {
+                setStatus(error && error.message ? error.message : '授权验证失败，请重试', 'error');
+                form.hidden = false;
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (busy) return;
+            const code = input.value.trim();
+            if (!code) { setStatus('请输入激活码', 'error'); input.focus(); return; }
+            setBusy(true, '正在激活…');
+            setStatus('正在提交激活码并绑定当前设备…');
+            try {
+                const state = await api.activateOnlineLicense(code);
+                input.value = '';
+                if (!state || !state.authorized) {
+                    setStatus((state && state.message) || '激活失败，请重试', 'error');
+                    return;
+                }
+                await enterApplication(state);
+            } catch (error) {
+                setStatus(error && error.message ? error.message : '激活失败，请重试', 'error');
+            } finally {
+                setBusy(false);
+            }
+        });
+        retryButton.addEventListener('click', checkAuthorization);
+        window.addEventListener('pywebviewready', checkAuthorization);
+        if (window.pywebview && window.pywebview.api) checkAuthorization();
+    </script>
+</body>
+</html>

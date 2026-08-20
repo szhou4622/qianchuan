@@ -8,6 +8,7 @@ dependencies = [
     "auto-py-to-exe>=2.50.0",
     "baseopensdk",
     "lark-oapi==1.7.1",
+    "keyring>=25.6.0; sys_platform == 'darwin'",
     "pillow>=12.1.1",
     "playwright>=1.58.0",
     "psutil>=7.2.2",
@@ -15,7 +16,7 @@ dependencies = [
     "pystray>=0.19.5",
     "python-dotenv>=1.2.2",
     "pywebview>=6.1",
-    "pywin32>=311",
+    "pywin32>=311; sys_platform == 'win32'",
     "screeninfo>=0.8.1",
 ]
 

@@ -62,6 +62,10 @@ CURRENT_VERSION = "0.1.56"
 # packaging/windows/build_windows.ps1.  Remote per-application services must
 # use this existing identity rather than a translated window title.
 APP_NAME = "QCSCKP"
+SOFTWARE_CHINESE_NAME = "千川素材看盘工具"
+LICENSE_APP_NAME = APP_NAME
+LICENSE_PROTOCOL_VERSION = 2
+LICENSE_SERVICE_BASE_URL = "https://license.dadaozixun.com/api/license"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -110,6 +114,9 @@ else:
         LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 CONTACT_CONFIG_CACHE_FILE = os.path.join(DATA_DIR, "contact_config_cache.json")
+LICENSE_CREDENTIAL_FILE = os.path.join(DATA_DIR, "license_credentials.dpapi")
+LICENSE_MACHINE_CODE_FILE = os.path.join(DATA_DIR, "license_machine_code.dpapi")
+LICENSE_METADATA_FILE = os.path.join(DATA_DIR, "license_metadata.json")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
 QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
     DATA_DIR,
