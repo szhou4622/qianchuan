@@ -998,8 +998,8 @@ class JSApi:
             ),
         }
 
-    def performAppUpdate(self, download_url):
-        return self.api.perform_app_update(download_url)
+    def performAppUpdate(self, download_url, expectedSha256=""):
+        return self.api.perform_app_update(download_url, expectedSha256)
 
     def openUrlInBrowser(self, url):
         return self.api.open_url_in_browser(url)
@@ -1217,6 +1217,8 @@ _LICENSE_GATE_METHODS = {
     "enterLicensedApplication",
     "getLicenseManagementInfo",
     "unbindCurrentLicense",
+    # Users must be able to reach support when activation itself is blocked.
+    "getContactApiUrl",
 }
 
 

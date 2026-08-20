@@ -9,6 +9,7 @@ Windows 打包应用 ZIP 覆盖更新（参考 MindHear update 流程简化版�
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 from config import PROJECT_ROOT, DATA_TEMP_DIR
 
 def _open_zip_read(path: Path) -> zipfile.ZipFile:
@@ -35,6 +37,14 @@ def _open_zip_read(path: Path) -> zipfile.ZipFile:
             return zipfile.ZipFile(path, "r", metadata_encoding="gbk")
         except (UnicodeDecodeError, LookupError, OSError):
             return zipfile.ZipFile(path, "r")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 
@@ -73,7 +83,7 @@ def _pick_new_exe(payload: Path, target_exe_name: str) -> Optional[Path]:
     return exes[0]
 
 
-def run_desktop_update(download_url: str) -> Dict[str, Any]:
+def run_desktop_update(download_url: str, expected_sha256: str = "") -> Dict[str, Any]:
     """
     执行更新：成功启动批处理后返回重启标记，由运行主管优雅退出。
     失败时返回 {"success": False, "message": "..."}。
@@ -87,6 +97,12 @@ def run_desktop_update(download_url: str) -> Dict[str, Any]:
     url = (download_url or "").strip()
     if not url:
         return {"success": False, "message": "缺少下载地址"}
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or parsed.hostname != "update.dadaozixun.com":
+        return {"success": False, "message": "更新包地址不是官方 HTTPS 地址"}
+    checksum = str(expected_sha256 or "").strip().lower()
+    if len(checksum) != 64 or any(ch not in "0123456789abcdef" for ch in checksum):
+        return {"success": False, "message": "缺少有效的更新包 SHA256 校验值"}
 
     exe_path = Path(sys.executable).resolve()
     exe_name = exe_path.name
@@ -106,6 +122,9 @@ def run_desktop_update(download_url: str) -> Dict[str, Any]:
         with urlopen(req, timeout=600) as resp:
             with open(zip_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
+        actual = _sha256_file(zip_path)
+        if actual != checksum:
+            return {"success": False, "message": "更新包 SHA256 校验失败，已停止安装"}
 
         with _open_zip_read(zip_path) as zf:
             zf.extractall(extract_dir)

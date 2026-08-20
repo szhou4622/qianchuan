@@ -65,6 +65,11 @@
         .hint { margin: 14px 0 0; color: #64748b; font-size: 11px; line-height: 1.65; }
         .license-summary { display: none; margin-top: 14px; color: #94a3b8; font-size: 12px; line-height: 1.7; }
         .license-summary strong { color: #e2e8f0; }
+        .contact-link { width: 100%; margin-top: 12px; background: transparent; }
+        .contact-panel { display: none; margin-top: 14px; padding: 12px; border: 1px solid #334155; border-radius: 12px; background: #fff; text-align: center; }
+        .contact-panel.show { display: block; }
+        .contact-panel img { display: block; max-width: 100%; max-height: 430px; margin: auto; object-fit: contain; }
+        .contact-message { color: #64748b; font-size: 12px; line-height: 1.6; }
     </style>
 </head>
 <body>
@@ -93,6 +98,11 @@
                 <p class="hint">软件只需激活码，不需要账号密码。原激活码仅提交给授权服务器，并使用 Windows DPAPI 或 macOS Keychain 加密保存在本机；不会写入浏览器、明文配置或普通日志。</p>
             </form>
             <div class="license-summary" id="licenseSummary"></div>
+            <button class="contact-link" id="contactButton" type="button">联系作者</button>
+            <div class="contact-panel" id="contactPanel">
+                <img id="contactImage" alt="联系作者二维码">
+                <div class="contact-message" id="contactMessage">正在读取联系方式…</div>
+            </div>
         </main>
     </section>
     <script>
@@ -103,6 +113,10 @@
         const activateButton = document.getElementById('activateButton');
         const retryButton = document.getElementById('retryButton');
         const summary = document.getElementById('licenseSummary');
+        const contactButton = document.getElementById('contactButton');
+        const contactPanel = document.getElementById('contactPanel');
+        const contactImage = document.getElementById('contactImage');
+        const contactMessage = document.getElementById('contactMessage');
         let api = null;
         let busy = false;
 
@@ -201,6 +215,27 @@
             }
         });
         retryButton.addEventListener('click', checkAuthorization);
+        contactButton.addEventListener('click', async () => {
+            contactPanel.classList.add('show');
+            contactImage.style.display = 'none';
+            contactMessage.textContent = '正在读取联系方式…';
+            try {
+                api = api || await waitForApi();
+                if (!api || typeof api.getContactApiUrl !== 'function') throw new Error('联系接口未就绪');
+                const endpoint = await api.getContactApiUrl();
+                const url = String(endpoint && endpoint.url || '');
+                if (!/^http:\/\/127\.0\.0\.1:\d+\/api\/contact$/.test(url)) throw new Error('联系接口地址无效');
+                const response = await fetch(url, { cache: 'no-store' });
+                const config = await response.json();
+                const imageUrl = String(config.display_image_url || config.qr_image_url || '');
+                if (!imageUrl) throw new Error(config.message || '联系方式暂未配置');
+                contactImage.onload = () => { contactImage.style.display = 'block'; contactMessage.textContent = ''; };
+                contactImage.onerror = () => { contactMessage.textContent = '联系方式图片加载失败，请稍后重试'; };
+                contactImage.src = imageUrl;
+            } catch (error) {
+                contactMessage.textContent = error && error.message ? error.message : '暂时无法读取联系方式';
+            }
+        });
         window.addEventListener('pywebviewready', checkAuthorization);
         if (window.pywebview && window.pywebview.api) checkAuthorization();
     </script>

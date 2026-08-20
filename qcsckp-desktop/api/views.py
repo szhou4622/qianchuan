@@ -1240,9 +1240,14 @@ class Api:
             current_version = self.normalize_version_for_api(CURRENT_VERSION)
         else:
             current_version = self.normalize_version_for_api(str(current_version))
-        return self.account_auth.check_version_update(str(current_version))
+        from services.update_manifest import check_for_update
 
-    def perform_app_update(self, download_url: str):
+        try:
+            return check_for_update(str(current_version))
+        except Exception as exc:
+            return {"success": False, "message": str(exc)}
+
+    def perform_app_update(self, download_url: str, expected_sha256: str = ""):
         """
         下载 ZIP 并覆盖当前主程序与 bin（仅 Windows / macOS 打包环境）。
         成功后先停止后台服务并刷新数据库状态，再关闭桌面窗口。
@@ -1251,14 +1256,14 @@ class Api:
         if sys.platform == "win32":
             from services.update_service_win import run_desktop_update
 
-            result = run_desktop_update(download_url)
+            result = run_desktop_update(download_url, expected_sha256)
             if result.get("success") and result.get("restart_scheduled"):
                 self._schedule_graceful_update_exit()
             return result
         if sys.platform == "darwin":
             from services.update_service_mac import run_desktop_update as run_desktop_update_mac
 
-            result = run_desktop_update_mac(download_url)
+            result = run_desktop_update_mac(download_url, expected_sha256)
             if result.get("success") and result.get("restart_scheduled"):
                 self._schedule_graceful_update_exit()
             return result

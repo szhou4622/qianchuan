@@ -156,6 +156,15 @@ class ContactAuthorTests(unittest.TestCase):
         self.assertIn("candidate.onload", html)
         self.assertNotIn("update.dadaozixun.com/api/contact", html)
 
+    def test_contact_is_available_before_activation_and_large_enough_to_scan(self):
+        index_html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        license_html = (ROOT / "static" / "license.html").read_text(encoding="utf-8")
+        gui = (ROOT / "gui_app.py").read_text(encoding="utf-8")
+        self.assertIn('id="contactButton"', license_html)
+        self.assertIn("getContactApiUrl", license_html)
+        self.assertIn('"getContactApiUrl"', gui)
+        self.assertIn("max-height: 460px", index_html)
+
     def test_windows_and_macos_manifests_include_contact_modules_and_image(self):
         windows = (ROOT / "packaging" / "windows" / "build_windows.ps1").read_text(encoding="utf-8")
         macos = (ROOT / "packaging" / "macos" / "build_macos.sh").read_text(encoding="utf-8")

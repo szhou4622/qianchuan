@@ -69,6 +69,8 @@ $pyinstallerArgs = @(
     "--hidden-import", "services.license_client",
     "--hidden-import", "services.license_storage",
     "--hidden-import", "services.license_manager",
+    "--hidden-import", "services.update_manifest",
+    "--hidden-import", "services.update_service_win",
     "--distpath", $distRoot,
     "--workpath", $workRoot,
     "--specpath", $specRoot,

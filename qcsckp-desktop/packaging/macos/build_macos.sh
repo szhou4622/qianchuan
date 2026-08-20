@@ -96,6 +96,8 @@ mkdir -p "$OUTPUT_ROOT/dist" "$OUTPUT_ROOT/build" "$OUTPUT_ROOT/spec"
   --hidden-import services.license_client \
   --hidden-import services.license_storage \
   --hidden-import services.license_manager \
+  --hidden-import services.update_manifest \
+  --hidden-import services.update_service_mac \
   --codesign-identity "$IDENTITY" \
   --osx-bundle-identifier "$BUNDLE_ID" \
   --target-arch "$ARCH" \
