@@ -221,6 +221,24 @@ class OnlineLicenseManagerTests(unittest.TestCase):
         self.assertTrue(state["authorized"])
         self.assertEqual("永久授权", state["license"]["license_type_label"])
 
+    def test_unknown_server_type_keeps_issued_credentials_without_authorizing(self):
+        store = FakeStore()
+        payload = license_payload("future_server_type")
+        payload["machine_code"] = store.machine
+        manager = LicenseManager(
+            client=FakeClient(activation=payload),
+            store=store,
+        )
+        state = manager.activate("FUTURE-TYPE")
+        self.assertFalse(state["authorized"])
+        self.assertEqual("unsupported_license_type", state["code"])
+        self.assertEqual(
+            "session-sensitive-value",
+            store.credentials["device_session"],
+        )
+        self.assertEqual("future_server_type", store.metadata["license_type"])
+        self.assertFalse(manager.is_runtime_authorized())
+
     def test_server_time_duration_license_types_map_to_month_and_year(self):
         month = LicenseManager(
             client=FakeClient(activation=license_payload("time_30d", duration_days=30)),

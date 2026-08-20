@@ -272,6 +272,51 @@ class LicenseManager:
             }
         return metadata, credentials
 
+    def _preserve_recoverable_binding(self, data: Mapping[str, Any]) -> bool:
+        """Keep a newly issued device credential if display normalization fails.
+
+        Activation is state-changing on the server.  If a newer server license
+        label is not understood by this client, discarding the returned
+        credential would leave the code bound but unrecoverable locally.  This
+        method validates the binding envelope and stores only the secure device
+        credential plus a small display-only metadata subset; it never grants
+        runtime access by itself.
+        """
+        try:
+            returned_app_name = str(data.get("app_name") or "").strip()
+            if returned_app_name != LICENSE_APP_NAME:
+                return False
+            if str(data.get("binding_status") or "").strip().lower() != "active":
+                return False
+            returned_machine = str(data.get("machine_code") or "").strip()
+            local_machine = self.store.get_or_create_machine_code()
+            if returned_machine and returned_machine.casefold() != local_machine.casefold():
+                return False
+            credentials = {
+                "device_session": _required_text(data, "device_session"),
+                "device_credential": _required_text(data, "device_credential"),
+            }
+            metadata = {
+                "app_name": LICENSE_APP_NAME,
+                "code_id": _required_text(data, "code_id"),
+                "binding_status": "active",
+                "license_type": str(data.get("license_type") or "").strip(),
+                "duration_days": data.get("duration_days"),
+                "activated_at": str(data.get("activated_at") or "").strip(),
+                "expires_at": str(data.get("expires_at") or "").strip(),
+                "remaining_days": data.get("remaining_days"),
+                "transfer_count": data.get("transfer_count", 0),
+                "license_status": str(
+                    data.get("license_status") or data.get("status") or "active"
+                ).strip(),
+                "last_verified_at": _now_text(),
+            }
+            self.store.save_credentials(credentials)
+            self.store.save_metadata(metadata)
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _is_server_active(metadata: Mapping[str, Any]) -> bool:
         return (
@@ -378,6 +423,7 @@ class LicenseManager:
             return self._error_state(
                 LicenseServiceError("activation_in_progress", "正在激活，请勿重复点击")
             )
+        response: Mapping[str, Any] = {}
         try:
             machine_code = self.store.get_or_create_machine_code()
             response = self.client.activate(code, machine_code)
@@ -398,6 +444,11 @@ class LicenseManager:
                 self._last_public_state = dict(state)
             return state
         except Exception as exc:
+            if isinstance(exc, LicenseServiceError) and exc.code in {
+                "unsupported_license_type",
+                "invalid_response",
+            }:
+                self._preserve_recoverable_binding(response)
             state = self._error_state(exc)
             with self._lock:
                 self._authorized = False
