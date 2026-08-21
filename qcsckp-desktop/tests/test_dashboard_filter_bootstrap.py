@@ -53,6 +53,24 @@ class DashboardFilterBootstrapTests(unittest.TestCase):
         self.assertIn("def getDashboardBootstrap(self):", self.gui)
         self.assertIn("return self.api.get_dashboard_bootstrap()", self.gui)
 
+    def test_scope_change_requeries_materials_and_restarts_selected_curve(self):
+        self.assertNotIn("clearSelectionAndCharts()", self.dashboard)
+        self.assertGreaterEqual(
+            self.dashboard.count("await queryAndUpdateData(true)"), 2
+        )
+        self.assertIn("fetchMaterials(requestScope)", self.dashboard)
+        self.assertIn(
+            "startHistoryPolling(selectedMaterial.id, selectedMaterial.targetUid)",
+            self.dashboard,
+        )
+
+    def test_scope_is_forwarded_to_table_pie_and_cost_total_queries(self):
+        self.assertIn("scopedTargetUid || null", self.dashboard)
+        self.assertIn("scopedAavid || null", self.dashboard)
+        self.assertIn("fetchTop20ByCost(1, scope)", self.dashboard)
+        self.assertIn("fetchLatestCrawlCostSum(hours, scope)", self.dashboard)
+        self.assertIn("generation !== dashboardScopeGeneration", self.dashboard)
+
 
 if __name__ == "__main__":
     unittest.main()

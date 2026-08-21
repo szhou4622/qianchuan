@@ -1291,10 +1291,12 @@
             if (accountSelect) accountSelect.addEventListener('change', async function () {
                 selectedDashboardAavid = String(this.value || '');
                 selectedDashboardTargetUid = '';
+                dashboardScopeGeneration++;
                 currentPage = 1;
                 rebuildDashboardPlanOptions();
-                clearSelectionAndCharts();
-                await checkDashboardDataVersion(true);
+                clearMaterialSelection();
+                showMaterialTableLoadingPlaceholder();
+                await queryAndUpdateData(true);
             });
             if (planSelect) planSelect.addEventListener('change', async function () {
                 selectedDashboardTargetUid = String(this.value || '');
@@ -1307,9 +1309,11 @@
                     rebuildDashboardPlanOptions();
                     planSelect.value = selectedDashboardTargetUid;
                 }
+                dashboardScopeGeneration++;
                 currentPage = 1;
-                clearSelectionAndCharts();
-                await checkDashboardDataVersion(true);
+                clearMaterialSelection();
+                showMaterialTableLoadingPlaceholder();
+                await queryAndUpdateData(true);
             });
         }
 
@@ -1340,6 +1344,8 @@
         let selectedDashboardTargetUid = '';
         let dashboardDataVersion = '';
         let dashboardRefreshInFlight = false;
+        let dashboardForcedRefreshPending = false;
+        let dashboardScopeGeneration = 0;
         let dashboardBootstrapPromise = null;
         let dashboardBootstrapReady = false;
         let dashboardScopeRevision = '';
@@ -2109,7 +2115,7 @@
         }
 
         // 使用 pywebview js_api 获取素材列表（后端分页返回当前页数据）
-        async function fetchMaterials() {
+        async function fetchMaterials(scope = null) {
             try {
                 // 等待 API 初始化
                 const api = await waitForAPI();
@@ -2117,6 +2123,8 @@
                     console.error('pywebview API 未初始化');
                     return [];
                 }
+                const scopedAavid = String(scope?.aavid ?? selectedDashboardAavid ?? '');
+                const scopedTargetUid = String(scope?.targetUid ?? selectedDashboardTargetUid ?? '');
                 // 调用 Python 端的 getTableData 方法（后端分页）
                 const result = await api.getTableData(
                     currentPeriod,
@@ -2124,8 +2132,8 @@
                     currentSortOrder,
                     currentPage,
                     currentPageSize,
-                    selectedDashboardTargetUid || null,
-                    selectedDashboardAavid || null
+                    scopedTargetUid || null,
+                    scopedAavid || null
                 );
                 if (result.success && result.data) {
                     if (result.dataVersion) dashboardDataVersion = String(result.dataVersion);
@@ -2205,17 +2213,19 @@
         }
 
         // 获取 Top20 消耗数据（饼图专用）
-        async function fetchTop20ByCost(hours = 1) {
+        async function fetchTop20ByCost(hours = 1, scope = null) {
             try {
                 const api = await waitForAPI();
                 if (!api || !api.getTop20ByCost) {
                     console.error('pywebview API 或 getTop20ByCost 方法未就绪');
                     return [];
                 }
+                const scopedAavid = String(scope?.aavid ?? selectedDashboardAavid ?? '');
+                const scopedTargetUid = String(scope?.targetUid ?? selectedDashboardTargetUid ?? '');
                 const result = await api.getTop20ByCost(
                     hours,
-                    selectedDashboardAavid || null,
-                    selectedDashboardTargetUid || null
+                    scopedAavid || null,
+                    scopedTargetUid || null
                 );
                 if (result.success && result.data) {
                     return result.data.map(mat => ({
@@ -2232,17 +2242,19 @@
         }
 
         /** 与 Top20 相同时间窗：最近一批入库（按分钟聚合）的 stat_cost 总和 */
-        async function fetchLatestCrawlCostSum(hours = 1) {
+        async function fetchLatestCrawlCostSum(hours = 1, scope = null) {
             try {
                 const api = await waitForAPI();
                 if (!api || !api.getLatestCrawlCostSum) {
                     console.error('pywebview API 或 getLatestCrawlCostSum 未就绪');
                     return null;
                 }
+                const scopedAavid = String(scope?.aavid ?? selectedDashboardAavid ?? '');
+                const scopedTargetUid = String(scope?.targetUid ?? selectedDashboardTargetUid ?? '');
                 const result = await api.getLatestCrawlCostSum(
                     hours,
-                    selectedDashboardAavid || null,
-                    selectedDashboardTargetUid || null
+                    scopedAavid || null,
+                    scopedTargetUid || null
                 );
                 if (result && result.success) {
                     return {
@@ -2272,12 +2284,13 @@
             return '¥' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
-        async function updateLatestCrawlCostDisplay(hours = 1) {
+        async function updateLatestCrawlCostDisplay(hours = 1, scope = null, generation = dashboardScopeGeneration) {
             const valEl = document.getElementById('latestCrawlCostValue');
             const metaEl = document.getElementById('latestCrawlCostMeta');
             if (!valEl || !metaEl) return;
 
-            const data = await fetchLatestCrawlCostSum(hours);
+            const data = await fetchLatestCrawlCostSum(hours, scope);
+            if (generation !== dashboardScopeGeneration) return;
             const countLabel = (n) => `总统计 ${n} 条素材`;
 
             if (!data) {
@@ -2954,13 +2967,14 @@
             pieChartInstance.setOption({ series: [{ data: pieData }] });
         }
 
-        async function renderPieChart() {
+        async function renderPieChart(scope = null, generation = dashboardScopeGeneration) {
             if (!pieChartInstance) {
                 pieChartInstance = echarts.init(document.getElementById('pieChart'), 'dark');
             }
 
             // 从后端 API 获取 Top20 数据
-            const topData = await fetchTop20ByCost(1);
+            const topData = await fetchTop20ByCost(1, scope);
+            if (generation !== dashboardScopeGeneration) return;
             pieChartData = topData;
 
             const pieData = buildPieDataFromTopList(topData);
@@ -3036,7 +3050,7 @@
             // 兜底：首次渲染/布局变化时强制 resize，避免容器初始高度为 0 导致空白
             pieChartInstance.resize();
 
-            await updateLatestCrawlCostDisplay(1);
+            await updateLatestCrawlCostDisplay(1, scope, generation);
         }
 
         document.getElementById('toggleMaskNames').addEventListener('click', function(e) {
@@ -3132,7 +3146,11 @@
 
         // 主查询逻辑：异步重新从 API 获取数据
         async function queryAndUpdateData(force = false) {
-            if (isLoadingData || dashboardRefreshInFlight) return;
+            if (isLoadingData) return;
+            if (dashboardRefreshInFlight) {
+                if (force) dashboardForcedRefreshPending = true;
+                return;
+            }
             if (!dashboardBootstrapReady) {
                 const bootstrap = await loadDashboardBootstrap({
                     reason: 'table-query',
@@ -3141,10 +3159,16 @@
                 if (!bootstrap.success) return;
             }
             dashboardRefreshInFlight = true;
+            const requestGeneration = dashboardScopeGeneration;
+            const requestScope = {
+                aavid: selectedDashboardAavid,
+                targetUid: selectedDashboardTargetUid,
+            };
             try {
 
             // 从 API 重新获取数据
-            const newMaterials = await fetchMaterials();
+            const newMaterials = await fetchMaterials(requestScope);
+            if (requestGeneration !== dashboardScopeGeneration) return;
             if (
                 newMaterials.length > 0 &&
                 (
@@ -3177,22 +3201,33 @@
                 if (found) {
                     selectedMaterial = found;
                     document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+                    document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${selectedMaterial.id}`;
+                    document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${selectedMaterial.id}`;
                 } else {
-                    clearSelectionAndCharts();
+                    clearMaterialSelection();
                 }
             } else if (sortedData.length > 0) {
                 selectedMaterial = sortedData[0];
                 document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
+                document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${selectedMaterial.id}`;
+                document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${selectedMaterial.id}`;
             }
 
             // 渲染表格
-            renderTable(materials);
+            renderTable(sortedData);
+            if (selectedMaterial && selectedMaterial.id) {
+                startHistoryPolling(selectedMaterial.id, selectedMaterial.targetUid);
+            }
 
             // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
-            await renderPieChart();
+            await renderPieChart(requestScope, requestGeneration);
             if (assistPanelOpen) await fetchAssistRows();
             } finally {
                 dashboardRefreshInFlight = false;
+                if (dashboardForcedRefreshPending) {
+                    dashboardForcedRefreshPending = false;
+                    setTimeout(() => queryAndUpdateData(true), 0);
+                }
             }
         }
 
