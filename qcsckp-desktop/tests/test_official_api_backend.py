@@ -54,6 +54,7 @@ from services.official_api_collection import (
     _fair_order_targets,
     _fixed_cadence_due,
     _material_snapshot,
+    _merge_material_report,
     _metric,
     _metric_values_changed,
     _observe_collection_results,
@@ -1050,6 +1051,52 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertIn("control_task/list", endpoint)
         self.assertEqual("MATERIAL_ADD_BUDGET", query["scene"])
         self.assertEqual("PROCESSING", query["filtering"]["task_status"])
+
+    def test_material_report_uses_data_endpoint_and_required_video_filter(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        service.list_material_report(
+            "1001",
+            plan_system="chengfang",
+            promotion_scene="live",
+            start_date="2026-08-21",
+            end_date="2026-08-21",
+            metrics=["stat_cost_for_roi2"],
+        )
+        endpoint, query, kwargs = client.last_pages
+        self.assertTrue(endpoint.endswith("/report/uni_promotion/data/get/"))
+        self.assertEqual("OVERALL_ROI_LIVE_MATERIAL_VIDEO", query["data_topic"])
+        self.assertEqual(
+            [{"field": "roi2_material_type_v3", "operator": 7, "values": ["3"]}],
+            query["filters"],
+        )
+        self.assertEqual("2026-08-21 00:00:00", query["start_time"])
+        self.assertEqual(200, kwargs["page_size"])
+
+    def test_authoritative_report_metrics_override_zero_material_list_metrics(self):
+        merged = _merge_material_report(
+            [
+                {
+                    "material_id": "3001",
+                    "material_name": "素材1",
+                    "stats_info": {"stat_cost_for_roi2": 0},
+                }
+            ],
+            [
+                {
+                    "material_id": "3001",
+                    "stats_info": {
+                        "stat_cost_for_roi2": 3820.15,
+                        "total_prepay_and_pay_order_roi2": 6.49,
+                    },
+                }
+            ],
+        )
+        self.assertEqual(3820.15, merged[0]["stats_info"]["stat_cost_for_roi2"])
+        self.assertEqual(
+            6.49,
+            merged[0]["stats_info"]["total_prepay_and_pay_order_roi2"],
+        )
 
     def test_ten_thousand_rows_keep_only_active_passed_materials(self):
         class _LargeMaterialClient(_CaptureClient):

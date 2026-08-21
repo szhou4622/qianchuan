@@ -37,7 +37,7 @@ class QianchuanOfficialApiService:
     PLAN_MATERIALS = "/open_api/v1.0/qianchuan/uni_promotion/ad/material/get/"
     PLAN_PRODUCTS = "/open_api/v1.0/qianchuan/uni_promotion/ad/product/get/"
     REPORT_CONFIG = "/open_api/v1.0/qianchuan/report/uni_promotion/config/get/"
-    REPORT_DATA = "/open_api/v1.0/qianchuan/report/uni_promotion/get/"
+    REPORT_DATA = "/open_api/v1.0/qianchuan/report/uni_promotion/data/get/"
     CONTROL_LIST = "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/list/"
     CONTROL_CREATE = "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/create/"
     CONTROL_UPDATE = "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/update/"
@@ -578,6 +578,98 @@ class QianchuanOfficialApiService:
             advertiser_id=aid,
             page_size=page_size,
         )
+
+    @staticmethod
+    def _report_value(block: Any) -> Any:
+        if isinstance(block, Mapping):
+            for key in ("Value", "value", "ValueStr", "value_str"):
+                if block.get(key) not in (None, ""):
+                    return block.get(key)
+            return None
+        return block
+
+    def list_material_report(
+        self,
+        advertiser_id: Any,
+        *,
+        plan_system: str,
+        promotion_scene: str,
+        start_date: str,
+        end_date: str,
+        metrics: Iterable[str],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Read authoritative material metrics for one account/topic/day.
+
+        Plan membership still comes from ``ad/material/get``. The report topic
+        aggregates by material and is intersected with each monitored plan by
+        the collector, matching the platform's own all-domain/Chengfang UI.
+        """
+        aid = require_digit_id(advertiser_id, "advertiser_id")
+        system = str(plan_system or "").strip().lower()
+        scene = str(promotion_scene or "").strip().lower()
+        topic = self.REPORT_MATERIAL_TOPICS.get((system, scene))
+        if not topic:
+            raise ValueError("计划体系或推广场景未确认，无法查询素材报表")
+        metric_fields = [str(field) for field in metrics if str(field)]
+        if not metric_fields:
+            raise ValueError("素材报表至少需要一个指标")
+        filters: list[dict[str, Any]] = []
+        if system == "chengfang":
+            # Chengfang material topics require the explicit video material
+            # type even though the topic name itself already says VIDEO.
+            filters.append(
+                {
+                    "field": "roi2_material_type_v3",
+                    "operator": 7,
+                    "values": ["3"],
+                }
+            )
+        rows, request_ids = self.client.get_all_pages(
+            self.REPORT_DATA,
+            {
+                "advertiser_id": aid,
+                "data_topic": topic,
+                "dimensions": ["material_id", "roi2_material_video_name"],
+                "metrics": metric_fields,
+                "filters": filters,
+                "start_time": f"{str(start_date).strip()} 00:00:00",
+                "end_time": f"{str(end_date).strip()} 23:59:59",
+                "order_by": [{"field": "material_id", "type": 1}],
+                "data_period": "ALL_DATA",
+            },
+            advertiser_id=aid,
+            page_size=200,
+            identity_getter=lambda row: self._report_value(
+                (row.get("dimensions") or {}).get("material_id")
+            ),
+            verify_stability=True,
+        )
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            dimensions = row.get("dimensions") or {}
+            raw_metrics = row.get("metrics") or {}
+            material_id = text_id(
+                self._report_value(dimensions.get("material_id"))
+            )
+            if not material_id:
+                continue
+            normalized.append(
+                {
+                    "material_id": material_id,
+                    "material_name": str(
+                        self._report_value(
+                            dimensions.get("roi2_material_video_name")
+                        )
+                        or ""
+                    ),
+                    "stats_info": {
+                        str(field): self._report_value(block)
+                        for field, block in raw_metrics.items()
+                    },
+                    "raw": dict(row),
+                }
+            )
+        return normalized, request_ids
 
     def list_control_tasks(
         self,

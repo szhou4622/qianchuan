@@ -644,6 +644,29 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _merge_material_report(
+    materials: Iterable[Mapping[str, Any]],
+    report_rows: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    report_by_material = {
+        text_id(row.get("material_id")): row
+        for row in report_rows
+        if text_id(row.get("material_id"))
+    }
+    merged: list[dict[str, Any]] = []
+    for material in materials:
+        item = dict(material)
+        report = report_by_material.get(text_id(item.get("material_id")))
+        if report:
+            stats = dict(item.get("stats_info") or {})
+            stats.update(dict(report.get("stats_info") or {}))
+            item["stats_info"] = stats
+            if not str(item.get("material_name") or "").strip():
+                item["material_name"] = str(report.get("material_name") or "")
+        merged.append(item)
+    return merged
+
+
 def _metric_block(stats: Mapping[str, Any], *names: str) -> tuple[Any, Any]:
     for name in names:
         if name not in stats:
@@ -1098,7 +1121,26 @@ def collect_target(
         delivery_only=True,
         parallel_workers=3,
     )
-    material_request_id = material_request_ids[-1] if material_request_ids else detail_request_id
+    report_result = service.list_material_report(
+        aavid,
+        plan_system=expected_system,
+        promotion_scene=expected_scene,
+        start_date=start_date,
+        end_date=end_date,
+        metrics=supported_material_metrics,
+    )
+    if isinstance(report_result, tuple) and len(report_result) == 2:
+        material_report_rows, material_report_request_ids = report_result
+    else:  # compatibility for narrow legacy/test doubles
+        material_report_rows, material_report_request_ids = [], []
+    materials = _merge_material_report(materials, material_report_rows)
+    material_request_id = (
+        material_report_request_ids[-1]
+        if material_report_request_ids
+        else material_request_ids[-1]
+        if material_request_ids
+        else detail_request_id
+    )
     snapshots = [
         _material_snapshot(item, target=target, units=units, request_id=material_request_id)
         for item in materials
@@ -1143,8 +1185,32 @@ def collect_target(
                 delivery_only=True,
                 parallel_workers=3,
             )
+            recovery_report_result = service.list_material_report(
+                aavid,
+                plan_system=expected_system,
+                promotion_scene=expected_scene,
+                start_date=recovery_date,
+                end_date=recovery_date,
+                metrics=supported_material_metrics,
+            )
+            if (
+                isinstance(recovery_report_result, tuple)
+                and len(recovery_report_result) == 2
+            ):
+                recovery_report_rows, recovery_report_request_ids = (
+                    recovery_report_result
+                )
+            else:
+                recovery_report_rows, recovery_report_request_ids = [], []
+            recovery_materials = _merge_material_report(
+                recovery_materials, recovery_report_rows
+            )
             recovery_request_id = (
-                recovery_request_ids[-1] if recovery_request_ids else ""
+                recovery_report_request_ids[-1]
+                if recovery_report_request_ids
+                else recovery_request_ids[-1]
+                if recovery_request_ids
+                else ""
             )
             recovery_snapshots = [
                 {
@@ -1377,6 +1443,8 @@ def collect_target(
         "assist_sync_ok": not control_suspicious,
         "assist_synced_at": cycle_observed_at,
         "material_request_ids": material_request_ids,
+        "material_report_request_ids": material_report_request_ids,
+        "material_report_count": len(material_report_rows),
         "control_request_ids": control_request_ids,
         "collected_at": cycle_observed_at,
         "collection_window_start": start_date,
