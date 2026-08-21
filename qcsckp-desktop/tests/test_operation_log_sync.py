@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
+from api import operation_events as operation_events_module
 from api.operation_events import (
     ingest_platform_log_rows,
     operation_event_account_summary,
@@ -214,6 +215,52 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual("stop", event["action_type"])
         self.assertEqual("987654321", event["regulate_task_id"])
         self.assertEqual("", event["material_id"])
+
+    def test_large_backfill_releases_writer_between_idempotent_chunks(self):
+        self._account()
+        rows = [
+            {
+                "logId": f"chunk-log-{index}",
+                "aavid": "1001",
+                "operateTime": "2026-08-11 12:00:00",
+                "optContent": "修改预算",
+                "operatorName": "测试用户",
+            }
+            for index in range(120)
+        ]
+        original = operation_events_module.upsert_operation_event
+        attempts = 0
+
+        def fail_in_second_chunk(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 61:
+                raise RuntimeError("simulated chunk failure")
+            return original(*args, **kwargs)
+
+        with patch.object(
+            operation_events_module,
+            "OPERATION_EVENT_TRANSACTION_BATCH_SIZE",
+            50,
+        ), patch.object(
+            operation_events_module,
+            "upsert_operation_event",
+            side_effect=fail_in_second_chunk,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated chunk failure"):
+                ingest_platform_log_rows(
+                    "1001",
+                    rows,
+                    owner_username="tool-owner",
+                    db=self.db,
+                    update_sync_state=False,
+                )
+        saved = self.db.execute(
+            "SELECT COUNT(1) AS count FROM account_operation_event "
+            "WHERE aavid='1001'",
+            fetch=True,
+        )[0]["count"]
+        self.assertEqual(50, saved)
 
     def test_account_summary_explains_filters_that_hide_existing_rows(self):
         self._account()

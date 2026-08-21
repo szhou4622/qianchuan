@@ -1456,6 +1456,14 @@ def collect_target(
         for item in previous_control_rows
         if str(item.get("assist_task_id") or "")
     }
+    recovery_metric_upserts = [
+        _metric_snapshot_row(
+            recovery_row,
+            target=target,
+            observed_at=f"{recovery_date} 23:59:59",
+        )
+        for recovery_row in recovery_snapshots
+    ]
     latest_upserts: list[dict[str, Any]] = []
     metric_upserts: list[dict[str, Any]] = []
     for row in snapshots:
@@ -1487,24 +1495,38 @@ def collect_target(
                     observed_at=cycle_observed_at,
                 )
             )
+    control_upserts: list[dict[str, Any]] = []
+    for row in control_rows:
+        task_id = str(row.get("assist_task_id") or "")
+        effective_control = dict(row)
+        previous_control = previous_control_by_task.get(task_id) or {}
+        for field in (
+            "stat_cost_for_roi2_assist",
+            "total_pay_order_count_for_roi2_assist",
+            "total_pay_order_gmv_include_coupon_for_roi2_assist",
+            "total_prepay_and_pay_order_roi2_assist",
+            "total_order_settle_amount_for_roi2_1h_assist",
+            "total_prepay_and_pay_settle_roi2_1h_assist",
+        ):
+            if (
+                effective_control.get(field) is None
+                and previous_control.get(field) is not None
+            ):
+                effective_control[field] = previous_control.get(field)
+        effective_control["updated_at"] = cycle_observed_at
+        control_upserts.append(effective_control)
     with store.transaction() as connection:
-        recovery_observed_at = f"{recovery_date} 23:59:59"
-        for recovery_row in recovery_snapshots:
-            store.insert_or_update(
-                "pmc_material_metric_snapshot",
-                _metric_snapshot_row(
-                    recovery_row,
-                    target=target,
-                    observed_at=recovery_observed_at,
-                ),
-                unique_fields=[
-                    "account_username",
-                    "target_uid",
-                    "material_id",
-                    "bucket_key",
-                ],
-                connection=connection,
-            )
+        _bulk_upsert_rows(
+            connection,
+            "pmc_material_metric_snapshot",
+            recovery_metric_upserts,
+            unique_fields=(
+                "account_username",
+                "target_uid",
+                "material_id",
+                "bucket_key",
+            ),
+        )
         _bulk_upsert_rows(
             connection,
             "pmc_promotion_material_latest",
@@ -1543,29 +1565,12 @@ def collect_target(
                 (target_uid,),
                 connection=connection,
             )
-        for row in control_rows:
-            task_id = str(row.get("assist_task_id") or "")
-            effective_control = dict(row)
-            previous_control = previous_control_by_task.get(task_id) or {}
-            for field in (
-                "stat_cost_for_roi2_assist",
-                "total_pay_order_count_for_roi2_assist",
-                "total_pay_order_gmv_include_coupon_for_roi2_assist",
-                "total_prepay_and_pay_order_roi2_assist",
-                "total_order_settle_amount_for_roi2_1h_assist",
-                "total_prepay_and_pay_settle_roi2_1h_assist",
-            ):
-                if (
-                    effective_control.get(field) is None
-                    and previous_control.get(field) is not None
-                ):
-                    effective_control[field] = previous_control.get(field)
-            store.insert_or_update(
-                "pmc_roi2_assist_task",
-                effective_control,
-                unique_fields=["target_uid", "assist_task_id"],
-                connection=connection,
-            )
+        _bulk_upsert_rows(
+            connection,
+            "pmc_roi2_assist_task",
+            control_upserts,
+            unique_fields=("target_uid", "assist_task_id"),
+        )
         # The API list call is complete-or-raise.  Only after a complete list
         # may stale local control tasks be removed; otherwise old complete data
         # remains available and no stop candidate is created from a partial page.

@@ -836,6 +836,8 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         ), patch(
             "services.official_api_collection.patch_target_sync_state"
         ) as patch_state, patch(
+            "services.official_api_collection._bulk_upsert_rows"
+        ) as bulk_upsert, patch(
             "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
         ):
             result = collect_target(target, db=store)
@@ -844,13 +846,16 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         state = patch_state.call_args.kwargs["capability_updates"]
         self.assertEqual(yesterday, state["recovery_backfill_date"])
         self.assertEqual(1, state["recovery_backfill_count"])
-        recovery_calls = [
-            call for call in store.insert_or_update.call_args_list
-            if call.args and call.args[0] == "pmc_material_metric_snapshot"
-            and call.args[1].get("stat_date") == yesterday
+        recovery_rows = [
+            row
+            for call in bulk_upsert.call_args_list
+            if len(call.args) >= 3
+            and call.args[1] == "pmc_material_metric_snapshot"
+            for row in call.args[2]
+            if row.get("stat_date") == yesterday
         ]
-        self.assertEqual(1, len(recovery_calls))
-        self.assertEqual(yesterday, recovery_calls[0].args[1]["stat_date"])
+        self.assertEqual(1, len(recovery_rows))
+        self.assertEqual(yesterday, recovery_rows[0]["stat_date"])
 
     def test_official_delivery_ok_material_is_writable(self):
         self.assertTrue(

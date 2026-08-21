@@ -7,15 +7,21 @@ import hashlib
 import io
 import json
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.plan_system import normalize_plan_system
-from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+from utils.sqlite_store import (
+    SQLiteStore,
+    _sqlite_upsert_lock,
+    init_sqlite_schema,
+)
 
 
 TABLE = "account_operation_event"
+OPERATION_EVENT_TRANSACTION_BATCH_SIZE = 10
 ALLOWED_SOURCES = {
     "tool_direct",
     "browser_observed",
@@ -832,17 +838,67 @@ def ingest_platform_log_rows(
             or ""
         )
         materialized_rows = list(rows)
-        with store.transaction() as connection:
-            return ingest_platform_log_rows(
-                aid,
-                materialized_rows,
-                owner_username=owner_username,
-                db=_ConnectionBoundStore(store, connection),
-                update_sync_state=update_sync_state,
-                _batched=True,
-                _account_uid=account_uid,
-                source=source,
+        inserted = 0
+        # Platform history backfills may return thousands of rows. Committing
+        # the entire response in one transaction used to hold SQLite's only
+        # writer slot for minutes and blocked collection, Feishu and daily
+        # reports. Small idempotent chunks release the writer between batches;
+        # a retry safely skips rows already committed by an earlier chunk.
+        batch_size = max(1, int(OPERATION_EVENT_TRANSACTION_BATCH_SIZE))
+        for offset in range(0, len(materialized_rows), batch_size):
+            chunk = materialized_rows[offset : offset + batch_size]
+            # Lock order is always global-upsert -> SQLite writer. Row-level
+            # insert_or_update calls are re-entrant under this guard, so no
+            # competing thread can hold the upsert lock while waiting for the
+            # transaction's SQLite write lock (the former 30-second deadlock).
+            with _sqlite_upsert_lock:
+                with store.transaction() as connection:
+                    store.execute("BEGIN IMMEDIATE", connection=connection)
+                    inserted += ingest_platform_log_rows(
+                        aid,
+                        chunk,
+                        owner_username=owner_username,
+                        db=_ConnectionBoundStore(store, connection),
+                        update_sync_state=False,
+                        _batched=True,
+                        _account_uid=account_uid,
+                        source=source,
+                    )
+            # Yield after every durable chunk so collection/card/report writers
+            # already waiting on SQLite get a scheduling opportunity.
+            if offset + batch_size < len(materialized_rows):
+                time.sleep(0.01)
+        if update_sync_state:
+            normalized_source = (
+                "qianchuan_open_api"
+                if str(source or "").strip() == "qianchuan_open_api"
+                else "platform_log"
             )
+            coverage = store.execute(
+                "SELECT MIN(occurred_at) AS coverage_from,"
+                "MAX(occurred_at) AS coverage_to FROM account_operation_event "
+                "WHERE account_uid=? AND aavid=? AND source=?",
+                (account_uid, aid, normalized_source),
+                fetch=True,
+            ) or [{}]
+            bounds = coverage[0] if coverage else {}
+            state = {
+                "aavid": aid,
+                "account_uid": account_uid,
+                "last_sync_at": _now(),
+                "last_status": "ok",
+                "last_error": "",
+            }
+            if bounds.get("coverage_from"):
+                state["coverage_from"] = str(bounds["coverage_from"])
+            if bounds.get("coverage_to"):
+                state["coverage_to"] = str(bounds["coverage_to"])
+            store.insert_or_update(
+                "platform_log_sync_state",
+                state,
+                unique_fields=["account_uid", "aavid"],
+            )
+        return inserted
     account_uid = str(_account_uid or "")
     normalized_source = (
         "qianchuan_open_api"

@@ -38,7 +38,10 @@ _WORKERS: list[threading.Thread] = []
 INCREMENTAL_OVERLAP_MINUTES = 10
 MAX_SYNC_WINDOW_HOURS = 24
 MAX_MANUAL_RANGE_DAYS = 30
-OPERATION_LOG_WORKERS = 2
+# Operation-log backfill is deliberately single-worker. API collection owns
+# the multi-account concurrency SLA; low-priority history ingestion must not
+# race another log writer for SQLite's single writer slot.
+OPERATION_LOG_WORKERS = 1
 LEASE_SECONDS = 60
 POLL_SECONDS = 1.0
 _KIND_PRIORITY = {
