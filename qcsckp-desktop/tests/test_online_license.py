@@ -1195,6 +1195,7 @@ class LicenseSurfaceTests(unittest.TestCase):
 
     def test_packaging_manifests_include_license_modules_without_secret_values(self):
         windows = (ROOT / "packaging" / "windows" / "build_windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("services.device_identity", windows)
         macos = (ROOT / "packaging" / "macos" / "build_macos.sh").read_text(encoding="utf-8")
         workflow = (ROOT.parent / ".github" / "workflows" / "build-macos-notarized.yml").read_text(encoding="utf-8")
         for manifest in (windows, macos):
