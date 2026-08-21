@@ -15,6 +15,7 @@ class OfficialApiError(RuntimeError):
         endpoint: Any = "",
         http_status: Optional[int] = None,
         request_uid: Any = "",
+        retry_after: Any = 0,
     ) -> None:
         super().__init__(str(message or "千川官方 API 请求失败"))
         self.code = str(code or "")
@@ -22,6 +23,10 @@ class OfficialApiError(RuntimeError):
         self.endpoint = str(endpoint or "")
         self.http_status = http_status
         self.request_uid = str(request_uid or "")
+        try:
+            self.retry_after = max(0.0, float(retry_after or 0))
+        except (TypeError, ValueError):
+            self.retry_after = 0.0
 
     def asdict(self) -> dict[str, Any]:
         return {
@@ -32,6 +37,7 @@ class OfficialApiError(RuntimeError):
             "endpoint": self.endpoint,
             "http_status": self.http_status,
             "request_uid": self.request_uid,
+            "retry_after": self.retry_after,
         }
 
 

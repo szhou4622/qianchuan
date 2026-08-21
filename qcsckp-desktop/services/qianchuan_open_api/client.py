@@ -61,10 +61,22 @@ def _redact(value: Any) -> Any:
 
 
 class EndpointRateLimiter:
-    """按 endpoint + advertiser_id 串行节流，避免多个后台任务瞬间冲击配额。"""
+    """分层节流：应用 8 QPS、单账户 4 QPS，并保留 endpoint 级保护。"""
 
-    def __init__(self, requests_per_second: float = 5.0) -> None:
+    def __init__(
+        self,
+        requests_per_second: float = 8.0,
+        *,
+        account_requests_per_second: float = 4.0,
+        endpoint_requests_per_second: float = 8.0,
+    ) -> None:
         self.interval = 1.0 / max(0.1, float(requests_per_second))
+        self.account_interval = 1.0 / max(
+            0.1, float(account_requests_per_second)
+        )
+        self.endpoint_interval = 1.0 / max(
+            0.1, float(endpoint_requests_per_second)
+        )
         self._next: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -74,6 +86,24 @@ class EndpointRateLimiter:
             due = self._next.get(key, now)
             delay = max(0.0, due - now)
             self._next[key] = max(now, due) + self.interval
+        if delay:
+            time.sleep(delay)
+
+    def wait_for_request(self, endpoint: str, advertiser_id: Any = "") -> None:
+        """Atomically reserve all applicable quota lanes for one request."""
+        account = str(advertiser_id or "").strip()
+        lanes: list[tuple[str, float]] = [
+            ("application", self.interval),
+            (f"endpoint:{endpoint}", self.endpoint_interval),
+        ]
+        if account:
+            lanes.append((f"account:{account}", self.account_interval))
+        with self._lock:
+            now = time.monotonic()
+            due = max((self._next.get(key, now) for key, _ in lanes), default=now)
+            delay = max(0.0, due - now)
+            for key, interval in lanes:
+                self._next[key] = due + interval
         if delay:
             time.sleep(delay)
 
@@ -193,11 +223,18 @@ class QianchuanOpenApiClient:
         code = str(payload.get("code") or payload.get("err_no") or "")
         message = str(payload.get("message") or payload.get("msg") or "千川官方 API 请求失败")
         request_id = self._request_id(payload, headers)
+        retry_after = 0.0
+        if headers is not None:
+            try:
+                retry_after = float(headers.get("Retry-After") or 0)
+            except (TypeError, ValueError, AttributeError):
+                retry_after = 0.0
         kwargs = {
             "code": code,
             "request_id": request_id,
             "endpoint": endpoint,
             "http_status": http_status,
+            "retry_after": retry_after,
         }
         if (
             http_status == 429
@@ -241,7 +278,16 @@ class QianchuanOpenApiClient:
         local_request_uid = f"oe_{uuid.uuid4().hex}"
         last_error: Optional[BaseException] = None
         for attempt in range(1, attempts + 1):
-            self.rate_limiter.wait(f"{endpoint}:{str(advertiser_id or '')}")
+            wait_for_request = getattr(
+                self.rate_limiter, "wait_for_request", None
+            )
+            if callable(wait_for_request):
+                wait_for_request(endpoint, advertiser_id)
+            else:
+                # Compatibility with narrow test doubles and older embedders.
+                self.rate_limiter.wait(
+                    f"{endpoint}:{str(advertiser_id or '')}"
+                )
             try:
                 bundle = self.token_provider.get_token(force_refresh=token_refreshed)
                 payload = None
@@ -347,12 +393,12 @@ class QianchuanOpenApiClient:
                 except ApiRateLimitError as rate_error:
                     last_error = rate_error
                     if verb == "GET" and attempt < attempts:
-                        retry_after = 0.0
-                        try:
-                            retry_after = float(exc.headers.get("Retry-After") or 0)
-                        except Exception:
-                            retry_after = 0.0
-                        self._sleep(max(retry_after, (2 ** (attempt - 1)) + random.random() * 0.25))
+                        self._sleep(
+                            max(
+                                rate_error.retry_after,
+                                (2 ** (attempt - 1)) + random.random() * 0.25,
+                            )
+                        )
                         continue
                     raise
             except ApiTokenError as exc:
@@ -364,7 +410,12 @@ class QianchuanOpenApiClient:
             except ApiRateLimitError as exc:
                 last_error = exc
                 if verb == "GET" and attempt < attempts:
-                    self._sleep((2 ** (attempt - 1)) + random.random() * 0.25)
+                    self._sleep(
+                        max(
+                            exc.retry_after,
+                            (2 ** (attempt - 1)) + random.random() * 0.25,
+                        )
+                    )
                     continue
                 raise
             except ApiRequestError as exc:
@@ -498,6 +549,8 @@ class QianchuanOpenApiClient:
         page_size: int = 100,
         max_pages: int = 1000,
         parallel_workers: int = 1,
+        identity_getter: Optional[Callable[[Mapping[str, Any]], Any]] = None,
+        verify_stability: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         page_limit = max(1, int(max_pages))
         workers = max(1, min(8, int(parallel_workers or 1)))
@@ -512,6 +565,96 @@ class QianchuanOpenApiClient:
             page_size=page_size,
             item_count=len(first_items),
         )
+        expected_total: Optional[int] = None
+        if isinstance(first_response.data, Mapping):
+            for key in ("page_info", "pageInfo", "pagination"):
+                info = first_response.data.get(key)
+                if not isinstance(info, Mapping):
+                    continue
+                raw_total = None
+                for total_key in (
+                    "total_number",
+                    "total_num",
+                    "total",
+                    "count",
+                ):
+                    if info.get(total_key) not in (None, ""):
+                        raw_total = info.get(total_key)
+                        break
+                if raw_total not in (None, ""):
+                    expected_total = max(0, int(raw_total))
+                break
+
+        def finalize(
+            collected: list[dict[str, Any]], request_ids: list[str]
+        ) -> tuple[list[dict[str, Any]], list[str]]:
+            if expected_total is not None and len(collected) != expected_total:
+                raise ApiRequestError(
+                    "千川官方 API 分页记录数与总数不一致，结果已标记为不完整",
+                    endpoint=endpoint,
+                    request_id=first_response.request_id,
+                )
+            if identity_getter is not None:
+                identities = [
+                    str(identity_getter(item) or "").strip() for item in collected
+                ]
+                if any(not value for value in identities):
+                    raise ApiRequestError(
+                        "千川官方 API 分页返回了缺少唯一标识的记录",
+                        endpoint=endpoint,
+                        request_id=first_response.request_id,
+                    )
+                if len(set(identities)) != len(identities):
+                    raise ApiRequestError(
+                        "千川官方 API 分页返回重复记录，结果已标记为不完整",
+                        endpoint=endpoint,
+                        request_id=first_response.request_id,
+                    )
+            if verify_stability and len(collected) > page_size:
+                verify_response = self.get(
+                    endpoint, first_query, advertiser_id=advertiser_id
+                )
+                verify_items = self.extract_items(verify_response.data)
+                verify_total: Optional[int] = None
+                if isinstance(verify_response.data, Mapping):
+                    for key in ("page_info", "pageInfo", "pagination"):
+                        info = verify_response.data.get(key)
+                        if not isinstance(info, Mapping):
+                            continue
+                        for total_key in (
+                            "total_number",
+                            "total_num",
+                            "total",
+                            "count",
+                        ):
+                            if info.get(total_key) not in (None, ""):
+                                verify_total = int(info[total_key])
+                                break
+                        break
+                if verify_total != expected_total:
+                    raise ApiRequestError(
+                        "千川官方 API 分页期间总记录数发生变化，已保留上次可信数据",
+                        endpoint=endpoint,
+                        request_id=verify_response.request_id,
+                    )
+                if identity_getter is not None:
+                    initial_ids = [
+                        str(identity_getter(item) or "").strip()
+                        for item in first_items
+                    ]
+                    verify_ids = [
+                        str(identity_getter(item) or "").strip()
+                        for item in verify_items
+                    ]
+                    if initial_ids != verify_ids:
+                        raise ApiRequestError(
+                            "千川官方 API 分页期间排序发生变化，已保留上次可信数据",
+                            endpoint=endpoint,
+                            request_id=verify_response.request_id,
+                        )
+                if verify_response.request_id:
+                    request_ids.append(verify_response.request_id)
+            return collected, request_ids
         if first_has_more is None:
             raise ApiRequestError(
                 "千川官方 API 未返回可验证的分页信息，结果已标记为不完整",
@@ -519,7 +662,10 @@ class QianchuanOpenApiClient:
                 request_id=first_response.request_id,
             )
         if not first_has_more:
-            return first_items, ([first_response.request_id] if first_response.request_id else [])
+            return finalize(
+                first_items,
+                [first_response.request_id] if first_response.request_id else [],
+            )
 
         total_pages = 0
         if isinstance(first_response.data, Mapping):
@@ -578,7 +724,7 @@ class QianchuanOpenApiClient:
                 rows.extend(items)
                 if response.request_id:
                     request_ids.append(response.request_id)
-            return rows, request_ids
+            return finalize(rows, request_ids)
 
         rows: list[dict[str, Any]] = []
         request_ids: list[str] = []
@@ -616,7 +762,7 @@ class QianchuanOpenApiClient:
                     request_id=response.request_id,
                 )
             if not has_more:
-                return rows, request_ids
+                return finalize(rows, request_ids)
             if not items:
                 raise ApiRequestError(
                     "千川官方 API 声明仍有下一页但返回空页，结果已标记为不完整",

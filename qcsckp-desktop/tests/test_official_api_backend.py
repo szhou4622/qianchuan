@@ -44,7 +44,10 @@ from services.qianchuan_open_api.token_provider import (
 )
 from services.promotion_capability import check_target_capability
 from services.official_api_collection import (
+    _ACCOUNT_RATE_LIMITED,
+    _account_backoff_remaining,
     _adaptive_worker_limit,
+    _bulk_upsert_rows,
     _collect_target_safely,
     _collection_phase_plan,
     _control_snapshot,
@@ -54,9 +57,11 @@ from services.official_api_collection import (
     _metric,
     _metric_values_changed,
     _observe_collection_results,
+    _observe_account_result,
     _reset_adaptive_collection_state_for_tests,
     _rotating_maintenance_phase,
     _should_escalate_application_backoff,
+    _set_account_backoff,
     _target_is_due,
     collect_target,
     run_collection_cycle,
@@ -153,7 +158,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         row = _control_snapshot(
             {
                 "task_id": "1873507215275220",
-                "status": "ENABLE",
+                "status": "PROCESSING",
                 "budget": "100",
                 "duration": "24",
                 "material_ids": ["7643772216392564762"],
@@ -235,37 +240,52 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
     def test_adaptive_concurrency_backs_off_on_429_and_recovers_gradually(self):
         _reset_adaptive_collection_state_for_tests()
         try:
-            self.assertEqual(3, _adaptive_worker_limit(3))
+            self.assertEqual(6, _adaptive_worker_limit(6))
             self.assertEqual(
-                2,
+                3,
                 _observe_collection_results(
                     [{"success": False, "error_kind": "rate_limit"}]
                 ),
             )
-            for _ in range(2):
+            self.assertEqual(
+                1,
+                _observe_collection_results(
+                    [{"success": False, "error_kind": "rate_limit"}]
+                ),
+            )
+            for _ in range(9):
                 self.assertEqual(
-                    2,
+                    1,
                     _observe_collection_results([{"success": True}]),
                 )
             self.assertEqual(
                 3,
                 _observe_collection_results([{"success": True}]),
             )
+            for _ in range(9):
+                self.assertEqual(
+                    3,
+                    _observe_collection_results([{"success": True}]),
+                )
+            self.assertEqual(
+                6,
+                _observe_collection_results([{"success": True}]),
+            )
         finally:
             _reset_adaptive_collection_state_for_tests()
 
-    def test_non_rate_limit_failures_do_not_block_concurrency_recovery(self):
+    def test_only_successful_batches_recover_global_concurrency(self):
         _reset_adaptive_collection_state_for_tests()
         try:
             self.assertEqual(
-                2,
+                3,
                 _observe_collection_results(
                     [{"success": False, "error_kind": "rate_limit"}]
                 ),
             )
-            for _ in range(2):
+            for _ in range(9):
                 self.assertEqual(
-                    2,
+                    3,
                     _observe_collection_results(
                         [{"success": False, "error_kind": "permission"}]
                     ),
@@ -275,6 +295,15 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                 _observe_collection_results(
                     [{"success": False, "error_kind": "network"}]
                 ),
+            )
+            for _ in range(9):
+                self.assertEqual(
+                    3,
+                    _observe_collection_results([{"success": True}]),
+                )
+            self.assertEqual(
+                6,
+                _observe_collection_results([{"success": True}]),
             )
         finally:
             _reset_adaptive_collection_state_for_tests()
@@ -300,6 +329,27 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         finally:
             _reset_adaptive_collection_state_for_tests()
 
+    def test_persisted_retry_after_rehydrates_account_degradation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "quota-restart.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            with patch(
+                "services.official_api_collection._owner_key",
+                return_value="quota-owner",
+            ):
+                _reset_adaptive_collection_state_for_tests()
+                _set_account_backoff("1001", 90, db=store)
+                _reset_adaptive_collection_state_for_tests()
+                self.assertGreater(
+                    _account_backoff_remaining("1001", db=store), 0
+                )
+                self.assertIn("1001", _ACCOUNT_RATE_LIMITED)
+                for _ in range(10):
+                    _observe_account_result("1001", rate_limited=False)
+                self.assertNotIn("1001", _ACCOUNT_RATE_LIMITED)
+            _reset_adaptive_collection_state_for_tests()
+
     def test_account_fair_order_prevents_one_large_account_from_starving_others(self):
         targets = [
             {"target_uid": "a-1", "aadvid": "account-a"},
@@ -314,7 +364,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             [row["target_uid"] for row in _fair_order_targets(targets)],
         )
 
-    def test_same_account_targets_are_serialized_while_other_accounts_can_parallelize(self):
+    def test_same_account_allows_two_parallel_targets(self):
         _reset_adaptive_collection_state_for_tests()
         active = 0
         max_active = 0
@@ -356,13 +406,14 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                             "interval_seconds": 300,
                         },
                     )
-                    for index in range(2)
+                    for index in range(3)
                 ]
                 for thread in threads:
                     thread.start()
                 for thread in threads:
                     thread.join(timeout=2)
-            self.assertEqual(1, max_active)
+            self.assertEqual(2, max_active)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
         finally:
             _reset_adaptive_collection_state_for_tests()
 
@@ -618,7 +669,17 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             ), patch(
                 "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
             ):
+                first_result = collect_target(target, db=store)
+                pending_row = store.select_one(
+                    "pmc_promotion_material_latest",
+                    where={
+                        "target_uid": "target-soft-delete",
+                        "material_id": "old-paused-material",
+                    },
+                )
                 result = collect_target(target, db=store)
+            self.assertTrue(first_result["success"])
+            self.assertEqual("pending_inactive", pending_row["delivery_state"])
             self.assertTrue(result["success"])
             old_row = store.select_one(
                 "pmc_promotion_material_latest",
@@ -637,6 +698,85 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             self.assertEqual("removed", old_row["delivery_state"])
             self.assertEqual(88.5, old_row["stat_cost"])
             self.assertEqual("delivering", current_row["delivery_state"])
+
+    def test_removed_material_reappears_as_delivering_on_next_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "resume-delivery.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            store.insert(
+                "promotion_target",
+                {
+                    "target_uid": "target-resume",
+                    "aadvid": "1001",
+                    "ad_id": "2001",
+                    "promotion_scene": "product",
+                    "plan_system": "global",
+                    "platform_status": "active",
+                    "verification_state": "verified",
+                    "monitor_eligible": 1,
+                    "enabled": 1,
+                    "capability_json": json.dumps(
+                        {
+                            "marketing_goal": "VIDEO_PROM_GOODS",
+                            "report_metric_units": {"stat_cost_for_roi2": "3"},
+                            "report_config_synced_at": now_text,
+                            "plan_detail_synced_at": now_text,
+                            "product_catalog_synced_at": now_text,
+                            "control_history_synced_at": now_text,
+                        }
+                    ),
+                },
+            )
+            store.insert(
+                "pmc_promotion_material_latest",
+                {
+                    "aadvid": "1001",
+                    "target_uid": "target-resume",
+                    "ad_id": "2001",
+                    "promotion_scene": "product",
+                    "plan_system": "global",
+                    "material_id": "resume-material",
+                    "delivery_state": "removed",
+                    "stat_cost": 5,
+                },
+            )
+            service = MagicMock()
+            service.list_plan_materials.return_value = (
+                [
+                    {
+                        "material_id": "resume-material",
+                        "material_name": "恢复投放素材",
+                        "material_status": "DELIVERY_OK",
+                        "audit_status": "PASS",
+                        "stats_info": {"stat_cost_for_roi2": "9"},
+                    }
+                ],
+                ["resume-request"],
+            )
+            service.list_control_tasks.return_value = ([], ["control-request"])
+            target = store.select_one(
+                "promotion_target", where={"target_uid": "target-resume"}
+            )
+            target["capability"] = json.loads(target["capability_json"])
+            with patch(
+                "services.official_api_collection.get_official_api_service",
+                return_value=service,
+            ), patch(
+                "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
+            ):
+                result = collect_target(target, db=store)
+            self.assertTrue(result["success"])
+            saved = store.select_one(
+                "pmc_promotion_material_latest",
+                where={
+                    "target_uid": "target-resume",
+                    "material_id": "resume-material",
+                },
+            )
+            self.assertEqual("delivering", saved["delivery_state"])
+            self.assertEqual(9.0, saved["stat_cost"])
 
     def test_cross_day_restart_backfills_yesterday_without_replacing_latest(self):
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -813,6 +953,136 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         _, query, kwargs = client.last_pages
         self.assertNotIn("material_status", query["filtering"])
         self.assertEqual(1, kwargs["parallel_workers"])
+
+    def test_hot_material_list_requests_only_delivery_ok_and_passed_video(self):
+        class _MaterialClient(_CaptureClient):
+            def get_all_pages(self, endpoint, query, **kwargs):
+                self.last_pages = (endpoint, dict(query), dict(kwargs))
+                return [
+                    {
+                        "material_status": "DELIVERY_OK",
+                        "audit_status": "PASS",
+                        "material_info": {
+                            "material_type": "VIDEO",
+                            "video_material": {"material_id": "3001"},
+                        },
+                    },
+                    {
+                        "material_status": "DELIVERY_OK",
+                        "audit_status": "REJECTED",
+                        "material_info": {
+                            "material_type": "VIDEO",
+                            "video_material": {"material_id": "3002"},
+                        },
+                    },
+                    {
+                        "material_status": "DELETED",
+                        "audit_status": "PASS",
+                        "material_info": {
+                            "material_type": "VIDEO",
+                            "video_material": {"material_id": "3003"},
+                        },
+                    },
+                ], ["material-page-1"]
+
+        client = _MaterialClient()
+        service = QianchuanOfficialApiService(client)
+        rows, _ = service.list_plan_materials(
+            "1001",
+            "2001",
+            start_date="2026-08-21",
+            end_date="2026-08-21",
+            fields=["stat_cost_for_roi2"],
+            delivery_only=True,
+            parallel_workers=3,
+        )
+        _, query, kwargs = client.last_pages
+        self.assertEqual("DELIVERY_OK", query["filtering"]["material_status"])
+        self.assertNotIn("order_field", query)
+        self.assertEqual(3, kwargs["parallel_workers"])
+        self.assertTrue(kwargs["verify_stability"])
+        self.assertEqual(["3001"], [row["material_id"] for row in rows])
+
+    def test_hot_control_list_requests_only_processing_scene2_tasks(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        service.list_control_tasks(
+            "1001",
+            ad_id="2001",
+            marketing_goal="VIDEO_PROM_GOODS",
+            start_time="2026-08-14 00:00:00",
+            end_time="2026-08-22 23:59:59",
+            active_only=True,
+        )
+        endpoint, query, _ = client.last_pages
+        self.assertIn("control_task/list", endpoint)
+        self.assertEqual("MATERIAL_ADD_BUDGET", query["scene"])
+        self.assertEqual("PROCESSING", query["filtering"]["task_status"])
+
+    def test_ten_thousand_rows_keep_only_active_passed_materials(self):
+        class _LargeMaterialClient(_CaptureClient):
+            def get_all_pages(self, endpoint, query, **kwargs):
+                rows = []
+                for index in range(10_000):
+                    active = index < 137
+                    rows.append(
+                        {
+                            "material_status": "DELIVERY_OK" if active else "DELETED",
+                            "audit_status": "PASS",
+                            "material_info": {
+                                "material_type": "VIDEO",
+                                "video_material": {"material_id": str(50_000 + index)},
+                            },
+                        }
+                    )
+                return rows, ["large-page"]
+
+        rows, _ = QianchuanOfficialApiService(
+            _LargeMaterialClient()
+        ).list_plan_materials(
+            "1001",
+            "2001",
+            start_date="2026-08-21",
+            end_date="2026-08-21",
+            delivery_only=True,
+            parallel_workers=3,
+        )
+        self.assertEqual(137, len(rows))
+        self.assertTrue(
+            all(row["material_status"] == "DELIVERY_OK" for row in rows)
+        )
+
+    def test_ten_thousand_active_rows_use_one_native_upsert_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "bulk-active.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            rows = [
+                {
+                    "aadvid": "1001",
+                    "target_uid": "target-bulk",
+                    "ad_id": "2001",
+                    "material_id": str(70_000 + index),
+                    "material_status": 1,
+                    "delivery_state": "delivering",
+                }
+                for index in range(10_000)
+            ]
+            with store.transaction() as connection:
+                written = _bulk_upsert_rows(
+                    connection,
+                    "pmc_promotion_material_latest",
+                    rows,
+                    unique_fields=("target_uid", "material_id"),
+                )
+            self.assertEqual(10_000, written)
+            count = store.execute(
+                "SELECT COUNT(1) AS count FROM pmc_promotion_material_latest "
+                "WHERE target_uid=? AND delivery_state='delivering'",
+                ("target-bulk",),
+                fetch=True,
+            )[0]["count"]
+            self.assertEqual(10_000, count)
 
     def test_report_topic_without_supported_metrics_fails_closed(self):
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1029,7 +1299,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                 )
             self.assertFalse(result["success"])
             self.assertEqual(120, result["retry_seconds"])
-            self.assertEqual("error", patch_state.call_args_list[1].kwargs["status"])
+            self.assertEqual("rate_limited", patch_state.call_args_list[1].kwargs["status"])
             self.assertTrue(deferred["deferred"])
             self.assertEqual("account_backoff", deferred["error_kind"])
             self.assertEqual(1, collect_one.call_count)
@@ -2321,6 +2591,64 @@ class OfficialApiBackendTests(unittest.TestCase):
         )
         self.assertEqual(["1", "2", "3", "4"], [row["id"] for row in rows])
         self.assertEqual(["r1", "r2", "r3", "r4"], request_ids)
+
+    def test_parallel_pagination_rejects_duplicate_item_ids_across_pages(self):
+        class _DuplicateIdentityClient(QianchuanOpenApiClient):
+            def __init__(self):
+                super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
+
+            def get(self, endpoint, query=None, *, advertiser_id=""):
+                page = int((query or {}).get("page") or 1)
+                row_id = "1" if page in {1, 2} else "3"
+                return ApiResponse(
+                    data={
+                        "list": [{"id": row_id, "page": page}],
+                        "page_info": {"total_page": 3, "total_number": 3},
+                    },
+                    raw={},
+                    request_id=f"r{page}",
+                )
+
+        with self.assertRaisesRegex(ApiRequestError, "重复记录"):
+            _DuplicateIdentityClient().get_all_pages(
+                "/open_api/v1.0/test/",
+                {},
+                page_size=1,
+                parallel_workers=3,
+                identity_getter=lambda row: row.get("id"),
+            )
+
+    def test_parallel_pagination_rejects_dynamic_first_page(self):
+        class _DynamicClient(QianchuanOpenApiClient):
+            def __init__(self):
+                super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
+                self.page_one_calls = 0
+
+            def get(self, endpoint, query=None, *, advertiser_id=""):
+                page = int((query or {}).get("page") or 1)
+                if page == 1:
+                    self.page_one_calls += 1
+                    row_id = "1" if self.page_one_calls == 1 else "9"
+                else:
+                    row_id = "2"
+                return ApiResponse(
+                    data={
+                        "list": [{"id": row_id}],
+                        "page_info": {"total_page": 2, "total_number": 2},
+                    },
+                    raw={},
+                    request_id=f"r{page}-{self.page_one_calls}",
+                )
+
+        with self.assertRaisesRegex(ApiRequestError, "排序发生变化"):
+            _DynamicClient().get_all_pages(
+                "/open_api/v1.0/test/",
+                {},
+                page_size=1,
+                parallel_workers=2,
+                identity_getter=lambda row: row.get("id"),
+                verify_stability=True,
+            )
 
     def test_post_network_failure_is_not_retried(self):
         client = QianchuanOpenApiClient(

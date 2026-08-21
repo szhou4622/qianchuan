@@ -20,7 +20,8 @@ DEFAULT_OWNER = "local_default"
 # in capacity_waiting instead of silently delivering 6-9 minute-old metrics.
 CAPACITY_WINDOW_SECONDS = 5 * 60
 CAPACITY_STALE_SECONDS = 10 * 60
-CAPACITY_PARALLEL_WORKERS = 3
+CAPACITY_PARALLEL_WORKERS = 6
+CAPACITY_ACCOUNT_PARALLEL_WORKERS = 2
 # New targets must be admitted optimistically so their real API duration can
 # be measured.  A pessimistic 45-second seed caused capacity_waiting targets
 # to starve forever without ever receiving a first collection.
@@ -1060,14 +1061,16 @@ def _estimate_duration_ms(row: Dict[str, Any]) -> int:
     return max(MIN_TARGET_DURATION_MS, min(MAX_TARGET_DURATION_MS, value))
 
 
-def _parallel_cycle_ms(durations: Iterable[int]) -> int:
+def _parallel_cycle_ms(
+    durations: Iterable[int], *, workers: int = CAPACITY_PARALLEL_WORKERS
+) -> int:
     """Estimate wall-clock cycle time using the same bounded worker count.
 
     Assigning each target to the currently least-loaded lane mirrors the
     scheduler closely enough for admission without pretending three concurrent
     API requests take the sum of all their durations.
     """
-    lanes = [0] * max(1, int(CAPACITY_PARALLEL_WORKERS))
+    lanes = [0] * max(1, int(workers))
     for duration in durations:
         lane = min(range(len(lanes)), key=lanes.__getitem__)
         lanes[lane] += max(0, int(duration))
@@ -1095,7 +1098,7 @@ def refresh_monitor_capacity(
         fetch=True,
     ) or []
     budget_ms = CAPACITY_WINDOW_SECONDS * 1000
-    account_loads: Dict[str, int] = {}
+    account_durations: Dict[str, List[int]] = {}
     active = 0
     waiting = 0
     disabled = 0
@@ -1113,17 +1116,24 @@ def refresh_monitor_capacity(
             else:
                 estimate = _estimate_duration_ms(row)
                 account_uid = str(row.get("account_uid") or "unknown")
-                candidate_loads = dict(account_loads)
-                candidate_loads[account_uid] = (
-                    candidate_loads.get(account_uid, 0) + estimate
-                )
-                # Targets from the same advertiser are serialized to protect
-                # account-scoped API quota. Admission must therefore model an
-                # account as one serial workload, while different accounts may
-                # occupy the three global lanes concurrently.
-                if _parallel_cycle_ms(candidate_loads.values()) <= budget_ms:
+                candidate_durations = {
+                    key: list(values)
+                    for key, values in account_durations.items()
+                }
+                candidate_durations.setdefault(account_uid, []).append(estimate)
+                # The runtime has six global plan lanes, but at most two lanes
+                # may belong to one advertiser. Model each advertiser's
+                # two-lane makespan before packing advertisers globally.
+                account_cycle_loads = [
+                    _parallel_cycle_ms(
+                        values,
+                        workers=CAPACITY_ACCOUNT_PARALLEL_WORKERS,
+                    )
+                    for values in candidate_durations.values()
+                ]
+                if _parallel_cycle_ms(account_cycle_loads) <= budget_ms:
                     state = "active"
-                    account_loads = candidate_loads
+                    account_durations = candidate_durations
                     active += 1
                 else:
                     state = "capacity_waiting"
@@ -1142,9 +1152,19 @@ def refresh_monitor_capacity(
         "waiting_count": waiting,
         "disabled_count": disabled,
         "estimated_cycle_seconds": int(
-            round(_parallel_cycle_ms(account_loads.values()) / 1000)
+            round(
+                _parallel_cycle_ms(
+                    _parallel_cycle_ms(
+                        values,
+                        workers=CAPACITY_ACCOUNT_PARALLEL_WORKERS,
+                    )
+                    for values in account_durations.values()
+                )
+                / 1000
+            )
         ),
         "parallel_workers": CAPACITY_PARALLEL_WORKERS,
+        "account_parallel_workers": CAPACITY_ACCOUNT_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,
         "healthy": waiting == 0,
@@ -1178,14 +1198,22 @@ def record_target_duration(
     old = int(target.get("last_duration_ms") or measured)
     # Slow samples tighten admission immediately. Fast samples recover through
     # EWMA instead of being permanently pinned to an old slow/429 sample.
-    smoothed = (
-        measured
-        if measured >= old
-        else max(
-            MIN_TARGET_DURATION_MS,
-            int(round(old * 0.7 + measured * 0.3)),
+    interval_ms = max(30, int(interval_seconds)) * 1000
+    if old > interval_ms >= measured:
+        # A target that was waiting under the former all-history collector
+        # must re-enter immediately once the active-only collector proves it
+        # can meet the SLA. Keeping a stale multi-minute EWMA would otherwise
+        # starve it for several additional cycles.
+        smoothed = measured
+    else:
+        smoothed = (
+            measured
+            if measured >= old
+            else max(
+                MIN_TARGET_DURATION_MS,
+                int(round(old * 0.7 + measured * 0.3)),
+            )
         )
-    )
     # The five-minute SLA is start-to-start.  Scheduling from the finish time
     # silently turns a 164-second collection into a 7m44s cycle.  Anchor the
     # next run to the cycle start; when a cycle itself overruns, retry promptly
@@ -1277,7 +1305,7 @@ def capacity_snapshot_readonly(
     active = 0
     waiting = 0
     disabled = 0
-    active_account_loads: Dict[str, int] = {}
+    active_account_durations: Dict[str, List[int]] = {}
     delayed: List[str] = []
     max_lag = 0
     now = datetime.now()
@@ -1299,8 +1327,8 @@ def capacity_snapshot_readonly(
             continue
         active += 1
         account_uid = str(row.get("account_uid") or "unknown")
-        active_account_loads[account_uid] = (
-            active_account_loads.get(account_uid, 0) + _estimate_duration_ms(row)
+        active_account_durations.setdefault(account_uid, []).append(
+            _estimate_duration_ms(row)
         )
         text = str(row.get("last_sync_at") or "").strip()
         try:
@@ -1319,9 +1347,19 @@ def capacity_snapshot_readonly(
         "waiting_count": waiting,
         "disabled_count": disabled,
         "estimated_cycle_seconds": int(
-            round(_parallel_cycle_ms(active_account_loads.values()) / 1000)
+            round(
+                _parallel_cycle_ms(
+                    _parallel_cycle_ms(
+                        values,
+                        workers=CAPACITY_ACCOUNT_PARALLEL_WORKERS,
+                    )
+                    for values in active_account_durations.values()
+                )
+                / 1000
+            )
         ),
         "parallel_workers": CAPACITY_PARALLEL_WORKERS,
+        "account_parallel_workers": CAPACITY_ACCOUNT_PARALLEL_WORKERS,
         "capacity_window_seconds": CAPACITY_WINDOW_SECONDS,
         "stale_after_seconds": CAPACITY_STALE_SECONDS,
         "delayed_count": len(delayed),

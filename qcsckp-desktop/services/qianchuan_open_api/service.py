@@ -13,6 +13,7 @@ from .client import ApiResponse, QianchuanOpenApiClient
 from .errors import OfficialApiWriteDisabled
 from .normalizers import (
     build_metric_unit_map,
+    first,
     id_number,
     normalize_account,
     normalize_control_task,
@@ -417,32 +418,93 @@ class QianchuanOfficialApiService:
         start_date: str,
         end_date: str,
         fields: Optional[Iterable[str]] = None,
+        delivery_only: bool = False,
+        parallel_workers: int = 1,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         pid = require_digit_id(ad_id, "ad_id")
+        filtering = {
+            "material_type": "VIDEO",
+            "start_date": start_date,
+            "end_date": end_date,
+            "material_select_type": "ALL",
+        }
+        if delivery_only:
+            # This value is accepted by the live Open API contract and cuts a
+            # large live plan from every historical material to only the rows
+            # that can currently participate in monitoring and rules.
+            filtering["material_status"] = "DELIVERY_OK"
+        query: dict[str, Any] = {
+            "advertiser_id": aid,
+            "ad_id": pid,
+            "filtering": filtering,
+            "fields": list(fields or []),
+        }
+        if not delivery_only:
+            # Legacy callers keep their existing spend ordering. The active
+            # scanner intentionally uses the API's stable default order so a
+            # changing spend value cannot move rows between parallel pages.
+            query.update(
+                {
+                    "order_type": "DESC",
+                    "order_field": "stat_cost_for_roi2",
+                }
+            )
         rows, request_ids = self.client.get_all_pages(
             self.PLAN_MATERIALS,
-            {
-                "advertiser_id": aid,
-                "ad_id": pid,
-                "filtering": {
-                    "material_type": "VIDEO",
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "material_select_type": "ALL",
-                },
-                "fields": list(fields or []),
-                "order_type": "DESC",
-                "order_field": "stat_cost_for_roi2",
-            },
+            query,
             advertiser_id=aid,
             page_size=100,
-            # The list is dynamically sorted by spend. Parallel pages can
-            # move rows between pages and silently miss materials.
-            parallel_workers=1,
+            parallel_workers=(
+                max(1, min(3, int(parallel_workers or 1)))
+                if delivery_only
+                else 1
+            ),
+            identity_getter=(
+                (lambda row: normalize_material(row).get("material_id"))
+                if delivery_only
+                else None
+            ),
+            verify_stability=bool(delivery_only),
         )
         materials = [normalize_material(row) for row in rows]
-        materials = [item for item in materials if item["material_id"] not in {"", "-2"} and item["material_type"] == "VIDEO"]
+        materials = [
+            item
+            for item in materials
+            if item["material_id"] not in {"", "-2"}
+            and item["material_type"] == "VIDEO"
+        ]
+        if delivery_only:
+            active_statuses = {"DELIVERY_OK"}
+            passed_audits = {"PASS", "PASSED", "APPROVED", "AUDIT_PASS"}
+            inactive_show_statuses = {
+                "PAUSE",
+                "PAUSED",
+                "DISABLE",
+                "DISABLED",
+                "DELETED",
+                "INVALID",
+                "FAILED",
+                "REJECTED",
+            }
+            materials = [
+                item
+                for item in materials
+                if str(item.get("material_status") or "").strip().upper()
+                in active_statuses
+                and str(item.get("audit_status") or "").strip().upper()
+                in passed_audits
+                and str(
+                    first(
+                        item.get("raw") or {},
+                        "show_status",
+                        "showStatus",
+                        "delivery_status",
+                    )
+                    or ""
+                ).strip().upper()
+                not in inactive_show_statuses
+            ]
         return materials, request_ids
 
     def list_plan_products(
@@ -526,19 +588,26 @@ class QianchuanOfficialApiService:
         start_time: str,
         end_time: str,
         scene: str = "MATERIAL_ADD_BUDGET",
+        active_only: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         pid = require_digit_id(ad_id, "ad_id")
+        query = {
+            "advertiser_id": aid,
+            "ad_id": pid,
+            "marketing_goal": str(marketing_goal).upper(),
+            "start_time": start_time,
+            "end_time": end_time,
+            "scene": scene,
+        }
+        if active_only:
+            # The live contract enumerates PROCESSING as the only running
+            # Scene-2 task status. Offline/frozen/disabled/history states are
+            # reconciled by the hourly low-frequency pass instead.
+            query["filtering"] = {"task_status": "PROCESSING"}
         rows, request_ids = self.client.get_all_pages(
             self.CONTROL_LIST,
-            {
-                "advertiser_id": aid,
-                "ad_id": pid,
-                "marketing_goal": str(marketing_goal).upper(),
-                "start_time": start_time,
-                "end_time": end_time,
-                "scene": scene,
-            },
+            query,
             advertiser_id=aid,
             page_size=100,
         )

@@ -44,7 +44,10 @@ class OptimizedDashboardQueries:
             "a.owner_username=?",
             "a.enabled=1",
             "t.enabled=1",
-            "COALESCE(l.delivery_state,'delivering')!='removed'",
+            # Only a freshly confirmed active material enters dashboards and
+            # rule candidates. ``pending_inactive`` is a safe one-cycle hold
+            # before historical removal, not an actionable delivery state.
+            "COALESCE(l.delivery_state,'delivering')='delivering'",
         ]
         params: list[Any] = []
         account_id = str(aavid or "").strip()

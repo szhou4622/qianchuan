@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import threading
 import time
 import uuid
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Optional
@@ -29,7 +31,6 @@ from api.promotion_targets import (
 )
 from services.plan_system import normalize_plan_system
 from services.qianchuan_accounts import (
-    CAPACITY_PARALLEL_WORKERS,
     _owner_key,
     record_target_duration,
     refresh_monitor_capacity,
@@ -81,7 +82,10 @@ _LOCK = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_TARGET_UIDS: set[str] = set()
 _PENDING_TARGET_UIDS: set[str] = set()
-_ACCOUNT_COLLECTION_LOCKS: dict[str, threading.Lock] = {}
+_ACCOUNT_COLLECTION_LOCKS: dict[str, threading.BoundedSemaphore] = {}
+_ACCOUNT_DEGRADED_LOCKS: dict[str, threading.Lock] = {}
+_ACCOUNT_RATE_LIMITED: set[str] = set()
+_ACCOUNT_CLEAN_CYCLES: dict[str, int] = {}
 _ACCOUNT_BACKOFF_UNTIL: dict[str, float] = {}
 _RATE_LIMIT_ACCOUNT_EVENTS: dict[str, float] = {}
 _SCHEMA_LOCK = threading.Lock()
@@ -92,7 +96,8 @@ _SCHEMA_READY_DATABASES: set[str] = set()
 # five minutes to every account behind it.
 COLLECTION_INTERVAL_SECONDS = 5 * 60
 COLLECTION_SCHEDULER_TICK_SECONDS = 5
-COLLECTION_MAX_WORKERS = CAPACITY_PARALLEL_WORKERS
+COLLECTION_MAX_WORKERS = 6
+ACCOUNT_MAX_CONCURRENT_PLANS = 2
 COLLECTION_PERIODIC_BATCH_SIZE = COLLECTION_MAX_WORKERS
 COLLECTION_TRANSIENT_RETRY_SECONDS = 60
 REPORT_CONFIG_INTERVAL_SECONDS = 30 * 60
@@ -101,7 +106,7 @@ PLAN_DETAIL_INTERVAL_SECONDS = 20 * 60
 CONTROL_HISTORY_INTERVAL_SECONDS = 60 * 60
 CONTROL_HOT_WINDOW_DAYS = 7
 COLLECTION_JOB_LEASE_SECONDS = 10 * 60
-ADAPTIVE_RECOVERY_CLEAN_BATCHES = 3
+ADAPTIVE_RECOVERY_CLEAN_BATCHES = 10
 
 _METRIC_SNAPSHOT_FIELDS = (
     "stat_cost",
@@ -350,9 +355,52 @@ def _target_account_key(target: Mapping[str, Any]) -> str:
     )
 
 
-def _account_collection_lock(account_key: str) -> threading.Lock:
+def _account_collection_lock(account_key: str) -> threading.BoundedSemaphore:
     with _ACTIVE_LOCK:
-        return _ACCOUNT_COLLECTION_LOCKS.setdefault(account_key, threading.Lock())
+        return _ACCOUNT_COLLECTION_LOCKS.setdefault(
+            account_key,
+            threading.BoundedSemaphore(ACCOUNT_MAX_CONCURRENT_PLANS),
+        )
+
+
+def _account_degraded_lock(account_key: str) -> threading.Lock:
+    with _ACTIVE_LOCK:
+        return _ACCOUNT_DEGRADED_LOCKS.setdefault(account_key, threading.Lock())
+
+
+@contextmanager
+def _account_collection_slot(account_key: str):
+    """Allow two plan reads per account, or one after an account-level 429."""
+    capacity = _account_collection_lock(account_key)
+    capacity.acquire()
+    degraded: Optional[threading.Lock] = None
+    try:
+        with _ACTIVE_LOCK:
+            is_degraded = account_key in _ACCOUNT_RATE_LIMITED
+        if is_degraded:
+            degraded = _account_degraded_lock(account_key)
+            degraded.acquire()
+        yield
+    finally:
+        if degraded is not None:
+            degraded.release()
+        capacity.release()
+
+
+def _observe_account_result(account_key: str, *, rate_limited: bool) -> None:
+    with _ACTIVE_LOCK:
+        if rate_limited:
+            _ACCOUNT_RATE_LIMITED.add(account_key)
+            _ACCOUNT_CLEAN_CYCLES[account_key] = 0
+            return
+        if account_key not in _ACCOUNT_RATE_LIMITED:
+            return
+        clean = int(_ACCOUNT_CLEAN_CYCLES.get(account_key, 0)) + 1
+        if clean >= ADAPTIVE_RECOVERY_CLEAN_BATCHES:
+            _ACCOUNT_RATE_LIMITED.discard(account_key)
+            _ACCOUNT_CLEAN_CYCLES.pop(account_key, None)
+        else:
+            _ACCOUNT_CLEAN_CYCLES[account_key] = clean
 
 
 def _quota_scope_key(owner: str, scope_type: str, scope_id: str) -> str:
@@ -417,9 +465,13 @@ def _account_backoff_remaining(
         due = float(_ACCOUNT_BACKOFF_UNTIL.get(account_key, 0.0) or 0.0)
     remaining = max(0, int(round(due - time.monotonic())))
     if db is None:
+        if remaining > 0:
+            with _ACTIVE_LOCK:
+                _ACCOUNT_RATE_LIMITED.add(account_key)
+                _ACCOUNT_CLEAN_CYCLES[account_key] = 0
         return remaining
     owner = _owner_key()
-    return max(
+    remaining = max(
         remaining,
         _persistent_backoff_remaining(
             owner=owner, scope_type="application", scope_id="official_api", db=db
@@ -428,6 +480,14 @@ def _account_backoff_remaining(
             owner=owner, scope_type="account", scope_id=account_key, db=db
         ),
     )
+    if remaining > 0:
+        # Rehydrate account degradation from the persisted Retry-After window
+        # after a process restart. Once the window expires, ten clean cycles
+        # are still required before the second account lane is restored.
+        with _ACTIVE_LOCK:
+            _ACCOUNT_RATE_LIMITED.add(account_key)
+            _ACCOUNT_CLEAN_CYCLES[account_key] = 0
+    return remaining
 
 
 def _set_account_backoff(
@@ -514,18 +574,18 @@ def _observe_collection_results(results: Iterable[Mapping[str, Any]]) -> int:
     rows = list(results)
     with _ADAPTIVE_LOCK:
         if any(str(row.get("error_kind") or "") == "rate_limit" for row in rows):
-            _ADAPTIVE_WORKERS = max(1, _ADAPTIVE_WORKERS - 1)
+            _ADAPTIVE_WORKERS = 3 if _ADAPTIVE_WORKERS > 3 else 1
             _ADAPTIVE_CLEAN_BATCHES = 0
-        elif rows:
-            # Token/permission/network failures are isolated to their target.
-            # They must not prevent global concurrency recovering after the
-            # rate-limit window has cleared.
+        elif any(bool(row.get("success")) for row in rows):
+            # Only a batch with a real successful collection proves the quota
+            # window is healthy. Deferred/backoff/permission failures must not
+            # accidentally restore six workers without touching the API.
             _ADAPTIVE_CLEAN_BATCHES += 1
             if (
                 _ADAPTIVE_WORKERS < COLLECTION_MAX_WORKERS
                 and _ADAPTIVE_CLEAN_BATCHES >= ADAPTIVE_RECOVERY_CLEAN_BATCHES
             ):
-                _ADAPTIVE_WORKERS += 1
+                _ADAPTIVE_WORKERS = 3 if _ADAPTIVE_WORKERS <= 1 else COLLECTION_MAX_WORKERS
                 _ADAPTIVE_CLEAN_BATCHES = 0
         return _ADAPTIVE_WORKERS
 
@@ -537,6 +597,9 @@ def _reset_adaptive_collection_state_for_tests() -> None:
         _ADAPTIVE_CLEAN_BATCHES = 0
     with _ACTIVE_LOCK:
         _ACCOUNT_COLLECTION_LOCKS.clear()
+        _ACCOUNT_DEGRADED_LOCKS.clear()
+        _ACCOUNT_RATE_LIMITED.clear()
+        _ACCOUNT_CLEAN_CYCLES.clear()
         _ACCOUNT_BACKOFF_UNTIL.clear()
         _RATE_LIMIT_ACCOUNT_EVENTS.clear()
 
@@ -722,7 +785,14 @@ def _control_snapshot(
         return _metric(stats, units or {}, *names)
 
     status = str(task.get("status") or "").upper()
-    active = status in {"ENABLE", "ENABLED", "ACTIVE", "RUNNING", "DELIVERING"}
+    active = status in {
+        "ENABLE",
+        "ENABLED",
+        "ACTIVE",
+        "RUNNING",
+        "DELIVERING",
+        "PROCESSING",
+    }
     return {
         "assist_task_id": text_id(task.get("task_id")),
         "aadvid": text_id(target.get("aadvid")),
@@ -759,6 +829,17 @@ def _control_snapshot(
     }
 
 
+def _control_is_active(task: Mapping[str, Any]) -> bool:
+    return str(task.get("status") or "").strip().upper() in {
+        "ENABLE",
+        "ENABLED",
+        "ACTIVE",
+        "RUNNING",
+        "DELIVERING",
+        "PROCESSING",
+    }
+
+
 def _count_rows(store: SQLiteStore, table: str, target_uid: str) -> int:
     rows = store.execute(
         f"SELECT COUNT(1) AS count FROM {table} WHERE target_uid=?",
@@ -766,6 +847,103 @@ def _count_rows(store: SQLiteStore, table: str, target_uid: str) -> int:
         fetch=True,
     ) or []
     return int((rows[0] if rows else {}).get("count") or 0)
+
+
+def _patch_target_sync_in_transaction(
+    store: SQLiteStore,
+    target_uid: str,
+    *,
+    connection: Any,
+    status: str,
+    error: str,
+    synced: bool,
+    capability_updates: Mapping[str, Any],
+    capability_remove_keys: Iterable[str] = (),
+) -> None:
+    """Commit hot data and its success marker in the same SQLite transaction."""
+    row = store.select_one(
+        "promotion_target",
+        fields="capability_json",
+        where={"target_uid": target_uid},
+        connection=connection,
+    )
+    if not row:
+        raise RuntimeError("监控目标不存在")
+    try:
+        capability = json.loads(str(row.get("capability_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        capability = {}
+    if not isinstance(capability, dict):
+        capability = {}
+    capability.update(dict(capability_updates or {}))
+    for key in capability_remove_keys or ():
+        capability.pop(str(key), None)
+    capability_json = json.dumps(
+        capability,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if synced:
+        store.execute(
+            "UPDATE promotion_target SET last_status=?,last_error=?,"
+            "capability_json=?,last_sync_at=datetime('now','+8 hours'),"
+            "updated_at=datetime('now','+8 hours') WHERE target_uid=?",
+            (status[:64], error[:2000], capability_json, target_uid),
+            connection=connection,
+        )
+    else:
+        store.update(
+            "promotion_target",
+            {
+                "last_status": status[:64],
+                "last_error": error[:2000],
+                "capability_json": capability_json,
+            },
+            where={"target_uid": target_uid},
+            connection=connection,
+        )
+
+
+def _bulk_upsert_rows(
+    connection: Any,
+    table: str,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    unique_fields: Iterable[str],
+) -> int:
+    """Native SQLite UPSERT for measured high-frequency collector tables."""
+    payloads = [dict(row) for row in rows if isinstance(row, Mapping) and row]
+    if not payloads:
+        return 0
+    columns: list[str] = []
+    seen: set[str] = set()
+    for row in payloads:
+        for column in row:
+            name = str(column)
+            if name not in seen:
+                seen.add(name)
+                columns.append(name)
+    keys = [str(field) for field in unique_fields]
+    if any(key not in seen for key in keys):
+        raise RuntimeError(f"{table} 批量写入缺少唯一键")
+    quoted_columns = ",".join(f'"{column}"' for column in columns)
+    placeholders = ",".join("?" for _ in columns)
+    conflict = ",".join(f'"{key}"' for key in keys)
+    updates = ",".join(
+        f'"{column}"=excluded."{column}"'
+        for column in columns
+        if column not in keys
+    )
+    sql = (
+        f'INSERT INTO "{table}" ({quoted_columns}) VALUES ({placeholders}) '
+        f"ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
+    )
+    connection.executemany(
+        sql,
+        [tuple(row.get(column) for column in columns) for row in payloads],
+    )
+    return len(payloads)
 
 
 def _empty_is_suspicious(
@@ -908,7 +1086,7 @@ def collect_target(
         status="collecting",
         error="",
         synced=False,
-        capability_updates={"collection_stage": "materials"},
+        capability_updates={"collection_stage": "scanning_active_materials"},
         db=store,
     )
     materials, material_request_ids = service.list_plan_materials(
@@ -917,6 +1095,8 @@ def collect_target(
         start_date=start_date,
         end_date=end_date,
         fields=supported_material_metrics,
+        delivery_only=True,
+        parallel_workers=3,
     )
     material_request_id = material_request_ids[-1] if material_request_ids else detail_request_id
     snapshots = [
@@ -924,6 +1104,18 @@ def collect_target(
         for item in materials
         if text_id(item.get("material_id"))
     ]
+    patch_target_sync_state(
+        target_uid,
+        status="collecting",
+        error="",
+        synced=False,
+        capability_updates={
+            "collection_stage": "updating_metrics",
+            "active_material_count": len(snapshots),
+            "material_scan_page_count": max(1, len(material_request_ids) - 1),
+        },
+        db=store,
+    )
 
     # If the computer was closed across a date boundary, recover yesterday's
     # final cumulative metrics once into history. They never replace today's
@@ -945,6 +1137,8 @@ def collect_target(
                 start_date=recovery_date,
                 end_date=recovery_date,
                 fields=supported_material_metrics,
+                delivery_only=True,
+                parallel_workers=3,
             )
             recovery_request_id = (
                 recovery_request_ids[-1] if recovery_request_ids else ""
@@ -1013,25 +1207,51 @@ def collect_target(
         not rotate_maintenance or maintenance_phase == "control_history"
     )
 
-    def fetch_controls(days: int) -> tuple[list[dict[str, Any]], list[str]]:
+    def fetch_controls(
+        days: int, *, active_only: bool = False
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         return service.list_control_tasks(
             aavid,
             ad_id=ad_id,
             marketing_goal=goal,
             start_time=(now - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00"),
             end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+            active_only=active_only,
         )
 
     # Active retarget task metrics (spend/orders/GMV/ROI/status/budget/duration)
     # are part of every five-minute hot cycle.  Hourly 179-day history is an
     # optional supplement and may never prevent the hot seven-day read.
+    active_control_task_count = 0
     if rotate_maintenance:
-        control_tasks, control_request_ids = fetch_controls(
-            CONTROL_HOT_WINDOW_DAYS
+        hot_control_tasks, control_request_ids = fetch_controls(
+            CONTROL_HOT_WINDOW_DAYS,
+            active_only=True,
         )
+        control_tasks = [
+            item for item in hot_control_tasks if _control_is_active(item)
+        ]
+        active_control_task_count = len(control_tasks)
         if refresh_control_history:
             try:
-                control_tasks, control_request_ids = fetch_controls(179)
+                history_tasks, history_request_ids = fetch_controls(
+                    179, active_only=False
+                )
+                # Historical rows are refreshed only in this low-frequency
+                # phase. Active rows from the hot request remain authoritative
+                # for stop-rule freshness.
+                by_task = {
+                    text_id(item.get("task_id")): item
+                    for item in history_tasks
+                    if text_id(item.get("task_id"))
+                }
+                for item in control_tasks:
+                    by_task[text_id(item.get("task_id"))] = item
+                control_tasks = list(by_task.values())
+                control_request_ids = [
+                    *control_request_ids,
+                    *history_request_ids,
+                ]
             except (ApiTokenError, ApiPermissionError):
                 raise
             except (
@@ -1050,8 +1270,17 @@ def collect_target(
                     exc,
                 )
     else:
-        control_tasks, control_request_ids = fetch_controls(
-            179 if refresh_control_history else CONTROL_HOT_WINDOW_DAYS
+        raw_control_tasks, control_request_ids = fetch_controls(
+            179 if refresh_control_history else CONTROL_HOT_WINDOW_DAYS,
+            active_only=not refresh_control_history,
+        )
+        control_tasks = (
+            raw_control_tasks
+            if refresh_control_history
+            else [item for item in raw_control_tasks if _control_is_active(item)]
+        )
+        active_control_task_count = sum(
+            1 for item in raw_control_tasks if _control_is_active(item)
         )
     control_request_id = control_request_ids[-1] if control_request_ids else ""
     control_rows = [
@@ -1066,8 +1295,14 @@ def collect_target(
         and text_id(item.get("task_id"))
     ]
 
-    previous_material_count = _count_rows(
-        store, "pmc_promotion_material_latest", target_uid
+    active_material_rows = store.execute(
+        "SELECT COUNT(1) AS count FROM pmc_promotion_material_latest "
+        "WHERE target_uid=? AND delivery_state='delivering'",
+        (target_uid,),
+        fetch=True,
+    ) or []
+    previous_material_count = int(
+        (active_material_rows[0] if active_material_rows else {}).get("count") or 0
     )
     material_suspicious, material_empty_streak = _empty_is_suspicious(
         current_count=len(snapshots),
@@ -1075,9 +1310,17 @@ def collect_target(
         capability=capability,
         streak_key="material_empty_streak",
     )
-    previous_control_count = _count_rows(store, "pmc_roi2_assist_task", target_uid)
+    active_control_rows = store.execute(
+        "SELECT COUNT(1) AS count FROM pmc_roi2_assist_task "
+        "WHERE target_uid=? AND ad_delivery_type=0",
+        (target_uid,),
+        fetch=True,
+    ) or []
+    previous_control_count = int(
+        (active_control_rows[0] if active_control_rows else {}).get("count") or 0
+    )
     control_suspicious, control_empty_streak = _empty_is_suspicious(
-        current_count=len(control_rows),
+        current_count=active_control_task_count,
         previous_count=previous_control_count,
         capability=capability,
         streak_key="control_empty_streak",
@@ -1091,10 +1334,115 @@ def collect_target(
     ) if products_refreshed else (False, int(capability.get("product_empty_streak") or 0))
 
     cycle_observed_at = _now()
-    previous_latest_rows = store.select(
-        "pmc_promotion_material_latest",
-        where={"target_uid": target_uid},
-    ) or []
+    any_suspicious_empty = bool(material_suspicious or control_suspicious)
+    with _ACTIVE_LOCK:
+        account_concurrency = (
+            1 if _target_account_key(target) in _ACCOUNT_RATE_LIMITED
+            else ACCOUNT_MAX_CONCURRENT_PLANS
+        )
+    core_capability_updates: dict[str, Any] = {
+        "source": "qianchuan_open_api",
+        "material_sync_complete": not material_suspicious,
+        "material_count": (
+            previous_material_count if material_suspicious else len(snapshots)
+        ),
+        "active_material_count": (
+            previous_material_count if material_suspicious else len(snapshots)
+        ),
+        "material_scan_total_count": len(materials),
+        "material_scan_page_count": max(1, len(material_request_ids) - 1),
+        "material_empty_streak": material_empty_streak,
+        "control_task_sync_complete": not control_suspicious,
+        "control_task_count": (
+            previous_control_count
+            if control_suspicious
+            else active_control_task_count
+        ),
+        "active_control_task_count": (
+            previous_control_count
+            if control_suspicious
+            else active_control_task_count
+        ),
+        "control_empty_streak": control_empty_streak,
+        "assist_sync_enabled": True,
+        "assist_sync_in_progress": False,
+        "assist_sync_ok": not control_suspicious,
+        "assist_synced_at": cycle_observed_at,
+        "material_request_ids": material_request_ids,
+        "control_request_ids": control_request_ids,
+        "collected_at": cycle_observed_at,
+        "collection_window_start": start_date,
+        "collection_window_end": end_date,
+        "collection_scope": "active_video_materials_and_running_scene2_tasks",
+        "collection_stage": "healthy",
+        "account_collection_concurrency": account_concurrency,
+        "application_worker_limit": _adaptive_worker_limit(
+            COLLECTION_MAX_WORKERS
+        ),
+        "application_qps_limit": 8,
+        "account_qps_limit": 4,
+        **detail_capability_updates,
+    }
+    if rotate_maintenance and maintenance_phase:
+        core_capability_updates.update(
+            {
+                "maintenance_last_phase": maintenance_phase,
+                "maintenance_last_attempted_at": _now(),
+            }
+        )
+    if recovery_completed:
+        core_capability_updates.update(
+            {
+                "recovery_backfill_date": recovery_date,
+                "recovery_backfill_count": len(recovery_snapshots),
+            }
+        )
+    if maintenance_errors:
+        core_capability_updates.update(
+            {
+                "maintenance_error_at": _now(),
+                "maintenance_error": "; ".join(maintenance_errors)[:1000],
+            }
+        )
+    if refresh_plan_detail:
+        core_capability_updates.update(
+            {
+                "plan_detail_synced_at": _now(),
+                "plan_detail_request_id": detail_request_id,
+                "marketing_goal": goal,
+            }
+        )
+    if refresh_control_history:
+        core_capability_updates["control_history_synced_at"] = _now()
+    if report_config_refreshed:
+        core_capability_updates.update(
+            {
+                "report_config_request_id": report_config_request_id,
+                "report_config_synced_at": _now(),
+                "report_metric_units": dict(units),
+            }
+        )
+    current_snapshot_ids = [
+        str(row.get("material_id") or "")
+        for row in snapshots
+        if str(row.get("material_id") or "")
+    ]
+    if current_snapshot_ids:
+        current_placeholders = ",".join("?" for _ in current_snapshot_ids)
+        previous_latest_rows = store.execute(
+            "SELECT * FROM pmc_promotion_material_latest WHERE target_uid=? "
+            "AND (delivery_state IN ('delivering','pending_inactive') "
+            f"OR material_id IN ({current_placeholders}))",
+            (target_uid, *current_snapshot_ids),
+            fetch=True,
+        ) or []
+    else:
+        previous_latest_rows = store.execute(
+            "SELECT * FROM pmc_promotion_material_latest WHERE target_uid=? "
+            "AND delivery_state IN ('delivering','pending_inactive')",
+            (target_uid,),
+            fetch=True,
+        ) or []
     previous_latest_by_material = {
         str(item.get("material_id") or ""): item
         for item in previous_latest_rows
@@ -1108,6 +1456,37 @@ def collect_target(
         for item in previous_control_rows
         if str(item.get("assist_task_id") or "")
     }
+    latest_upserts: list[dict[str, Any]] = []
+    metric_upserts: list[dict[str, Any]] = []
+    for row in snapshots:
+        material_id = str(row.get("material_id") or "")
+        previous_latest = previous_latest_by_material.get(material_id) or {}
+        effective_row = dict(row)
+        for field in _METRIC_SNAPSHOT_FIELDS:
+            if (
+                effective_row.get(field) is None
+                and previous_latest.get(field) is not None
+            ):
+                effective_row[field] = previous_latest.get(field)
+        metrics_changed = _metric_values_changed(previous_latest, effective_row)
+        latest_row = dict(effective_row)
+        latest_row.update(
+            {
+                "collected_at": cycle_observed_at,
+                "last_seen_at": cycle_observed_at,
+                "delivery_state": "delivering",
+                "updated_at": cycle_observed_at,
+            }
+        )
+        latest_upserts.append(latest_row)
+        if metrics_changed:
+            metric_upserts.append(
+                _metric_snapshot_row(
+                    effective_row,
+                    target=target,
+                    observed_at=cycle_observed_at,
+                )
+            )
     with store.transaction() as connection:
         recovery_observed_at = f"{recovery_date} 23:59:59"
         for recovery_row in recovery_snapshots:
@@ -1126,55 +1505,32 @@ def collect_target(
                 ],
                 connection=connection,
             )
-        for row in snapshots:
-            material_id = str(row.get("material_id") or "")
-            previous_latest = previous_latest_by_material.get(material_id) or {}
-            effective_row = dict(row)
-            for field in _METRIC_SNAPSHOT_FIELDS:
-                if (
-                    effective_row.get(field) is None
-                    and previous_latest.get(field) is not None
-                ):
-                    effective_row[field] = previous_latest.get(field)
-            metrics_changed = _metric_values_changed(
-                previous_latest, effective_row
-            )
-            latest_row = dict(effective_row)
-            latest_row["collected_at"] = cycle_observed_at
-            latest_row["last_seen_at"] = cycle_observed_at
-            latest_row["delivery_state"] = (
-                "delivering"
-                if int(row.get("material_status") or -1) == 1
-                else "paused"
-            )
-            store.insert_or_update(
-                "pmc_promotion_material_latest",
-                latest_row,
-                unique_fields=["target_uid", "material_id"],
-                connection=connection,
-            )
-            if metrics_changed:
-                store.insert_or_update(
-                    "pmc_material_metric_snapshot",
-                    _metric_snapshot_row(
-                        effective_row,
-                        target=target,
-                        observed_at=cycle_observed_at,
-                    ),
-                    unique_fields=[
-                        "account_username",
-                        "target_uid",
-                        "material_id",
-                        "bucket_key",
-                    ],
-                    connection=connection,
-                )
+        _bulk_upsert_rows(
+            connection,
+            "pmc_promotion_material_latest",
+            latest_upserts,
+            unique_fields=("target_uid", "material_id"),
+        )
+        _bulk_upsert_rows(
+            connection,
+            "pmc_material_metric_snapshot",
+            metric_upserts,
+            unique_fields=(
+                "account_username",
+                "target_uid",
+                "material_id",
+                "bucket_key",
+            ),
+        )
         if snapshots:
             current_material_ids = [str(row["material_id"]) for row in snapshots]
             placeholders = ",".join("?" for _ in current_material_ids)
             store.execute(
-                "UPDATE pmc_promotion_material_latest SET delivery_state='removed', "
+                "UPDATE pmc_promotion_material_latest SET delivery_state="
+                "CASE WHEN delivery_state='pending_inactive' THEN 'removed' "
+                "ELSE 'pending_inactive' END, "
                 "updated_at=datetime('now', '+8 hours') WHERE target_uid=? "
+                "AND delivery_state IN ('delivering','pending_inactive') "
                 f"AND material_id NOT IN ({placeholders})",
                 (target_uid, *current_material_ids),
                 connection=connection,
@@ -1182,7 +1538,8 @@ def collect_target(
         elif not material_suspicious:
             store.execute(
                 "UPDATE pmc_promotion_material_latest SET delivery_state='removed', "
-                "updated_at=datetime('now', '+8 hours') WHERE target_uid=?",
+                "updated_at=datetime('now', '+8 hours') WHERE target_uid=? "
+                "AND delivery_state IN ('delivering','pending_inactive')",
                 (target_uid,),
                 connection=connection,
             )
@@ -1235,12 +1592,47 @@ def collect_target(
                     (target_uid, *current_task_ids),
                     connection=connection,
                 )
-        elif refresh_control_history and not control_suspicious:
-            store.execute(
-                "DELETE FROM pmc_roi2_assist_task WHERE target_uid=?",
-                (target_uid,),
-                connection=connection,
-            )
+        elif not control_suspicious:
+            if refresh_control_history:
+                store.execute(
+                    "DELETE FROM pmc_roi2_assist_task WHERE target_uid=?",
+                    (target_uid,),
+                    connection=connection,
+                )
+            else:
+                store.execute(
+                    "UPDATE pmc_roi2_assist_task SET ad_delivery_type=1, "
+                    "ad_delivery_name='NOT_RETURNED_BY_HOT_SYNC', "
+                    "updated_at=datetime('now', '+8 hours') "
+                    "WHERE target_uid=? AND ad_delivery_type=0",
+                    (target_uid,),
+                    connection=connection,
+                )
+
+        _patch_target_sync_in_transaction(
+            store,
+            target_uid,
+            connection=connection,
+            status="suspicious_empty" if any_suspicious_empty else "ok",
+            error=(
+                "官方 API 本轮异常返回空数据，已保留上次可信结果并等待复核"
+                if any_suspicious_empty
+                else ""
+            ),
+            synced=not any_suspicious_empty,
+            capability_updates=core_capability_updates,
+            capability_remove_keys=(
+                "collection_error_at",
+                "collection_error_kind",
+                "collection_retry_seconds",
+                "collection_consecutive_failures",
+                *(
+                    ()
+                    if maintenance_errors
+                    else ("maintenance_error_at", "maintenance_error")
+                ),
+            ),
+        )
 
     if products_refreshed and not product_suspicious:
         if products:
@@ -1284,85 +1676,25 @@ def collect_target(
                 db=store,
             )
 
-    any_suspicious_empty = bool(
-        material_suspicious or control_suspicious or product_suspicious
-    )
-    capability_updates = {
-        "source": "qianchuan_open_api",
-        "material_sync_complete": not material_suspicious,
-        "material_count": (
-            previous_material_count if material_suspicious else len(snapshots)
-        ),
-        "material_empty_streak": material_empty_streak,
-        "control_task_sync_complete": not control_suspicious,
-        "control_task_count": (
-            previous_control_count if control_suspicious else len(control_rows)
-        ),
-        "control_empty_streak": control_empty_streak,
-        "assist_sync_enabled": True,
-        "assist_sync_in_progress": False,
-        "assist_sync_ok": True,
-        "assist_synced_at": cycle_observed_at,
-        "material_request_ids": material_request_ids,
-        "control_request_ids": control_request_ids,
-        "collected_at": cycle_observed_at,
-        "collection_window_start": start_date,
-        "collection_window_end": end_date,
-        "collection_scope": "materials_and_active_retarget_metrics",
-        "collection_stage": "healthy",
-        **detail_capability_updates,
-    }
-    if rotate_maintenance and maintenance_phase:
-        capability_updates.update(
-            {
-                "maintenance_last_phase": maintenance_phase,
-                "maintenance_last_attempted_at": _now(),
-            }
-        )
-    if recovery_completed:
-        capability_updates.update(
-            {
-                "recovery_backfill_date": recovery_date,
-                "recovery_backfill_count": len(recovery_snapshots),
-            }
-        )
-    if maintenance_errors:
-        capability_updates.update(
-            {
-                "maintenance_error_at": _now(),
-                "maintenance_error": "; ".join(maintenance_errors)[:1000],
-            }
-        )
-    if refresh_plan_detail:
-        capability_updates.update(
-            {
-                "plan_detail_synced_at": _now(),
-                "plan_detail_request_id": detail_request_id,
-                "marketing_goal": goal,
-            }
-        )
-    if refresh_control_history:
-        capability_updates["control_history_synced_at"] = _now()
-    if report_config_refreshed:
-        capability_updates.update(
-            {
-                "report_config_request_id": report_config_request_id,
-                "report_config_synced_at": _now(),
-                "report_metric_units": dict(units),
-            }
-        )
+    post_commit_capability_updates = dict(core_capability_updates)
     if products_refreshed:
-        capability_updates.update(
+        post_commit_capability_updates.update(
             {
                 "product_catalog_synced_at": _now(),
                 "product_sync_complete": not product_suspicious,
                 "product_count": (
-                    previous_product_count if product_suspicious else len(products)
+                    previous_product_count
+                    if product_suspicious
+                    else len(products)
                 ),
                 "product_empty_streak": product_empty_streak,
                 "product_request_ids": product_request_ids,
             }
         )
+    # The transaction above already committed latest rows and last_sync_at.
+    # This no-op capability merge only asks the existing helper to recompute
+    # eligibility after the atomic commit is visible; it cannot move the
+    # success timestamp into a second transaction.
     patch_target_sync_state(
         target_uid,
         status="suspicious_empty" if any_suspicious_empty else "ok",
@@ -1371,19 +1703,8 @@ def collect_target(
             if any_suspicious_empty
             else ""
         ),
-        synced=not any_suspicious_empty,
-        capability_updates=capability_updates,
-        capability_remove_keys=(
-            "collection_error_at",
-            "collection_error_kind",
-            "collection_retry_seconds",
-            "collection_consecutive_failures",
-            *(
-                ()
-                if maintenance_errors
-                else ("maintenance_error_at", "maintenance_error")
-            ),
-        ),
+        synced=False,
+        capability_updates=post_commit_capability_updates,
         db=store,
     )
     # 计划刚加入监控或本轮数据更新完成后，立刻让规则线程复核；不再让用户
@@ -1412,7 +1733,7 @@ def collect_target(
         ),
         "product_catalog_refreshed": products_refreshed,
         "report_config_refreshed": report_config_refreshed,
-        "control_task_count": len(control_rows),
+        "control_task_count": active_control_task_count,
         "suspicious_empty": any_suspicious_empty,
     }
 
@@ -1441,10 +1762,10 @@ def _collect_target_safely(
     started = time.monotonic()
     account_key = _target_account_key(target)
     try:
-        # Official API quotas are commonly scoped by advertiser/account.  Do
-        # not let several monitored plans under one advertiser burst in
-        # parallel merely because global worker lanes are available.
-        with _account_collection_lock(account_key):
+        # Two plans under the same advertiser may collect concurrently. After
+        # an account-level 429, the degraded lock temporarily reduces it to one
+        # until ten clean cycles have completed.
+        with _account_collection_slot(account_key):
             backoff_seconds = _account_backoff_remaining(account_key, db=db)
             if backoff_seconds > 0:
                 patch_target_sync_state(
@@ -1483,6 +1804,7 @@ def _collect_target_safely(
                 db=db,
             )
             result = collect_target(target, rotate_maintenance=True, db=db)
+            _observe_account_result(account_key, rate_limited=False)
         duration_ms = int((time.monotonic() - started) * 1000)
         record_target_duration(
             target_uid,
@@ -1541,12 +1863,14 @@ def _collect_target_safely(
         )
         if isinstance(exc, ApiRateLimitError):
             retry_seconds = max(
-                120,
+                int(math.ceil(float(getattr(exc, "retry_after", 0) or 0))),
+                30,
                 min(
                     interval_seconds,
                     120 * (2 ** min(2, consecutive_failures - 1)),
                 ),
             )
+            _observe_account_result(account_key, rate_limited=True)
         if error_kind in {"rate_limit", "token", "permission"}:
             _set_account_backoff(
                 account_key,
@@ -1558,9 +1882,23 @@ def _collect_target_safely(
                 ),
             )
         logger.exception("官方 API 采集失败 target=%s", target_uid)
+        pagination_error = (
+            error_kind == "api"
+            and any(
+                marker in str(exc)
+                for marker in ("分页", "总记录数", "重复记录", "排序发生变化")
+            )
+        )
+        target_status = (
+            "rate_limited"
+            if error_kind == "rate_limit"
+            else "pagination_error"
+            if pagination_error
+            else "error"
+        )
         patch_target_sync_state(
             target_uid,
-            status="error",
+            status=target_status,
             error=str(exc),
             synced=False,
             capability_updates={
@@ -1571,6 +1909,13 @@ def _collect_target_safely(
                 "collection_duration_ms": duration_ms,
                 "collection_retry_seconds": retry_seconds,
                 "collection_consecutive_failures": consecutive_failures,
+                "collection_stage": (
+                    "rate_limit_wait"
+                    if error_kind == "rate_limit"
+                    else "pagination_error"
+                    if pagination_error
+                    else "data_delay"
+                ),
             },
             db=db,
         )
@@ -1789,6 +2134,8 @@ def _claim_collection_jobs(
         # Preserve strict priority between bands while retaining account
         # round-robin fairness inside each band.
         fair_rows: list[dict[str, Any]] = []
+        account_claims: dict[str, int] = {}
+        claim_limit = max(1, int(limit))
         priorities = sorted(
             {int(raw.get("priority") or 0) for raw in rows}, reverse=True
         )
@@ -1797,10 +2144,17 @@ def _claim_collection_jobs(
                 dict(raw) for raw in rows
                 if int(raw.get("priority") or 0) == priority
             ]
-            fair_rows.extend(_fair_order_targets(band))
-            if len(fair_rows) >= max(1, int(limit)):
+            for candidate in _fair_order_targets(band):
+                account_key = _target_account_key(candidate)
+                if account_claims.get(account_key, 0) >= ACCOUNT_MAX_CONCURRENT_PLANS:
+                    continue
+                fair_rows.append(dict(candidate))
+                account_claims[account_key] = account_claims.get(account_key, 0) + 1
+                if len(fair_rows) >= claim_limit:
+                    break
+            if len(fair_rows) >= claim_limit:
                 break
-        fair_rows = fair_rows[: max(1, int(limit))]
+        fair_rows = fair_rows[:claim_limit]
         for raw in fair_rows:
             row = dict(raw)
             changed = db.execute(
@@ -1882,7 +2236,8 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
         or [""]
     )
     quota_rows = store.execute(
-        "SELECT scope_type, scope_id, backoff_until, last_error FROM api_quota_state "
+        "SELECT scope_type,scope_id,backoff_until,last_error,rate_limit_count "
+        "FROM api_quota_state "
         "WHERE owner_username=? AND backoff_until > datetime('now', '+8 hours') "
         "ORDER BY backoff_until DESC LIMIT 20",
         (owner,),
@@ -1899,6 +2254,36 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
         fetch=True,
     ) or [{}]
     freshness = freshness_rows[0] if freshness_rows else {}
+    capability_rows = store.execute(
+        "SELECT pt.capability_json,pt.last_status FROM promotion_target pt "
+        "INNER JOIN qianchuan_account qa ON qa.account_uid=pt.account_uid "
+        "WHERE qa.owner_username=? AND qa.enabled=1 AND pt.enabled=1",
+        (owner,),
+        fetch=True,
+    ) or []
+    active_material_count = 0
+    scanned_pages = 0
+    stages: dict[str, int] = {}
+    for row in capability_rows:
+        try:
+            capability = json.loads(str(row.get("capability_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            capability = {}
+        try:
+            active_material_count += int(
+                capability.get("active_material_count") or 0
+            )
+            scanned_pages += int(capability.get("material_scan_page_count") or 0)
+        except (TypeError, ValueError):
+            pass
+        stage = str(
+            capability.get("collection_stage")
+            or row.get("last_status")
+            or "unknown"
+        )
+        stages[stage] = stages.get(stage, 0) + 1
+    with _ACTIVE_LOCK:
+        degraded_accounts = len(_ACCOUNT_RATE_LIMITED)
     oldest_success_at = str(freshness.get("oldest_success_at") or "")
     oldest_age_seconds: Optional[int] = None
     if oldest_success_at:
@@ -1923,6 +2308,17 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
         "oldest_success_at": oldest_success_at,
         "oldest_data_age_seconds": oldest_age_seconds,
         "never_synced": int(freshness.get("never_synced") or 0),
+        "active_material_count": active_material_count,
+        "last_scan_page_count": scanned_pages,
+        "collection_stages": stages,
+        "global_worker_limit": _adaptive_worker_limit(
+            COLLECTION_MAX_WORKERS
+        ),
+        "global_worker_max": COLLECTION_MAX_WORKERS,
+        "account_concurrency": ACCOUNT_MAX_CONCURRENT_PLANS,
+        "degraded_account_count": degraded_accounts,
+        "application_qps_limit": 8,
+        "account_qps_limit": 4,
     }
 
 

@@ -158,6 +158,18 @@ class MultiAccountCollectionQueueStressTests(unittest.TestCase):
         self.assertEqual(20, len(claimed))
         self.assertEqual(20, len({row["account_uid"] for row in claimed}))
 
+    def test_claim_never_leases_more_than_two_plans_for_one_account(self):
+        target_uids = self._seed_20_accounts_with_10_targets_each()[:10]
+        _enqueue_collection_jobs(
+            target_uids,
+            db=self.db,
+            priority=20,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        claimed = _claim_collection_jobs(db=self.db, limit=6)
+        self.assertEqual(2, len(claimed))
+        self.assertEqual(1, len({row["account_uid"] for row in claimed}))
+
     def test_expired_lease_is_recovered_with_a_new_fencing_token(self):
         target_uid = self._seed_20_accounts_with_10_targets_each()[0]
         _enqueue_collection_jobs(

@@ -424,7 +424,8 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         # all receive a first real measurement instead of starving forever.
         self.assertEqual(37, snapshot["active_count"])
         self.assertEqual(0, snapshot["waiting_count"])
-        self.assertEqual(3, snapshot["parallel_workers"])
+        self.assertEqual(6, snapshot["parallel_workers"])
+        self.assertEqual(2, snapshot["account_parallel_workers"])
         self.assertLessEqual(snapshot["estimated_cycle_seconds"], 5 * 60)
 
     def test_capacity_uses_parallel_lanes_across_different_accounts(self):
@@ -437,7 +438,7 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         snapshot = capacity_snapshot(db=self.db)
         self.assertEqual(36, snapshot["active_count"])
         self.assertEqual(0, snapshot["waiting_count"])
-        self.assertEqual(12 * 5, snapshot["estimated_cycle_seconds"])
+        self.assertEqual(6 * 5, snapshot["estimated_cycle_seconds"])
 
     def test_ten_accounts_with_ten_new_targets_have_no_admission_starvation(self):
         for account_index in range(10):
@@ -671,6 +672,25 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         )
         self.assertEqual(33_000, saved["last_duration_ms"])
 
+    def test_new_active_only_sample_immediately_recovers_stale_overrun(self):
+        target = self._target("10001", 2)
+        self.db.update(
+            "promotion_target",
+            {"last_duration_ms": 480_000},
+            where={"target_uid": target["target_uid"]},
+        )
+        record_target_duration(
+            target["target_uid"],
+            22_000,
+            interval_seconds=300,
+            refresh_capacity=False,
+            db=self.db,
+        )
+        saved = self.db.select_one(
+            "promotion_target", where={"target_uid": target["target_uid"]}
+        )
+        self.assertEqual(22_000, saved["last_duration_ms"])
+
     def test_recorded_duration_keeps_five_minute_start_to_start_cadence(self):
         target = self._target("10001", 1)
         started_at = datetime.now() - timedelta(seconds=164)
@@ -758,8 +778,8 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn("等待开始只读同步", html)
         self.assertIn("刷新任务已进入官方API后台队列", html)
         self.assertIn("const collectionHealth=String(p.collection_health||'').toLowerCase()", html)
-        self.assertIn("collectionFailed?'采集失败，自动重试中'", html)
-        self.assertIn("firstRun?'等待首次核验':late?'监控延迟'", html)
+        self.assertIn("collectionFailed?'数据延迟，自动重试中'", html)
+        self.assertIn("firstRun?'等待采集':late?'数据延迟'", html)
         self.assertIn("正在核验计划", html)
         self.assertIn("正在采集素材", html)
         self.assertIn("数据年龄：${esc(dataAge(p.last_lag_seconds))}", html)
