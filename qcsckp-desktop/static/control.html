@@ -365,6 +365,11 @@
             interval: 60,
             fetchProgress: null,
             assistProgress: null,
+            officialApiMode: false,
+            collectionActive: false,
+            lastSuccessAt: '',
+            nextDueAt: '',
+            activeMaterialCount: 0,
         };
 
         function syncStartButtonOnly() {
@@ -388,6 +393,18 @@
             const text = document.getElementById('statusText');
             const st = lastStatusSnapshot;
             if (!st.running || st.phase !== 'running') return;
+
+            if (st.officialApiMode) {
+                if (st.collectionActive) {
+                    text.textContent = '状态：正在采集投放中素材';
+                } else if (st.lastSuccessAt) {
+                    const next = st.nextDueAt ? `；下一轮 ${st.nextDueAt.slice(11)}` : '';
+                    text.textContent = `状态：正常监控（最近成功 ${st.lastSuccessAt}${next}）`;
+                } else {
+                    text.textContent = '状态：等待首次采集';
+                }
+                return;
+            }
 
             const progress = st.fetchProgress;
             const ap = st.assistProgress;
@@ -451,6 +468,11 @@
                 interval: Math.floor(st?.interval) || 60,
                 fetchProgress: st?.fetchProgress || null,
                 assistProgress: st?.assistProgress || null,
+                officialApiMode: Boolean(st?.officialApiMode || st?.backend === 'official_api'),
+                collectionActive: Boolean(st?.collectionActive),
+                lastSuccessAt: String(st?.lastSuccessAt || ''),
+                nextDueAt: String(st?.nextDueAt || ''),
+                activeMaterialCount: Number(st?.activeMaterialCount) || 0,
             };
 
             const browser = st?.browser || {};
@@ -461,14 +483,20 @@
             const loginStatus = document.getElementById('runtimeLoginStatus');
             const cookieTime = document.getElementById('runtimeCookieTime');
             if (browserName) {
-                browserName.textContent = browser.available === false
+                browserName.textContent = lastStatusSnapshot.officialApiMode
+                    ? '官方 API 模式（无需 Chrome）'
+                    : browser.available === false
                     ? '未检测到Google Chrome'
                     : (browser.name || 'Google Chrome');
-                browserName.className = browser.available === false
+                browserName.className = lastStatusSnapshot.officialApiMode
+                    ? 'text-emerald-400'
+                    : browser.available === false
                     ? 'text-rose-400'
                     : (browser.is_chrome === false ? 'text-amber-400' : 'text-emerald-400');
             }
-            if (browserPath) browserPath.textContent = browser.path || '未检测到可用程序';
+            if (browserPath) browserPath.textContent = lastStatusSnapshot.officialApiMode
+                ? '不启动本地浏览器'
+                : (browser.path || '未检测到可用程序');
             if (browserPhase) browserPhase.textContent = browser.phase || '未运行';
             if (loginStatus) {
                 loginStatus.textContent = login.status || '尚未检测';

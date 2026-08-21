@@ -2304,6 +2304,9 @@
                 return;
             }
             valEl.textContent = formatYuanCompact(data.totalCost);
+            if (data.totalCost === 0) {
+                metaEl.textContent = `${countLabel(data.rowCount)} · 官方API本轮指标为0`;
+            }
         }
 
         // ================= 字段配置 =================

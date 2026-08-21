@@ -8,6 +8,7 @@ official backend is being accepted.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Any
 
 from config import LOGS_DIR
@@ -19,6 +20,7 @@ from services.official_api_catalog import (
     stop_official_api_catalog_scheduler,
 )
 from services.official_api_collection import (
+    get_collection_queue_health,
     start_official_api_collection_background_thread,
     stop_official_api_collection_background_thread,
 )
@@ -46,21 +48,51 @@ class OfficialApiController:
         session = official_api_session_status()
         catalog = official_api_catalog_status()
         available = bool(session.get("available"))
+        try:
+            collection = get_collection_queue_health()
+        except Exception as exc:
+            collection = {"error": str(exc)}
+        last_success_at = str(collection.get("last_success_at") or "")
+        last_fetch_time = 0
+        if last_success_at:
+            try:
+                last_fetch_time = int(
+                    datetime.strptime(
+                        last_success_at, "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+                )
+            except (TypeError, ValueError):
+                last_fetch_time = 0
+        collection_active = int(collection.get("leased") or 0) > 0
+        next_due_at = str(collection.get("next_due_at") or "")
+        if self._running and available:
+            if collection_active:
+                message = "官方 API 正在采集投放中素材"
+            elif last_success_at:
+                message = f"正常监控，最近成功 {last_success_at}"
+            else:
+                message = "官方 API 已启动，等待首次采集"
+        else:
+            message = str(session.get("message") or "千川官方 API 尚未配置")
         return {
             "success": True,
             "running": bool(self._running and available),
             "phase": "running" if self._running and available else "stopped",
-            "message": (
-                "千川官方 API 后台调度中"
-                if self._running and available
-                else str(session.get("message") or "千川官方 API 尚未配置")
-            ),
+            "message": message,
             "target": None,
-            "lastFetchTime": 0,
+            "lastFetchTime": last_fetch_time,
             "interval": 300,
             "fetchProgress": None,
             "assistProgress": None,
             "backend": "official_api",
+            "officialApiMode": True,
+            "collectionActive": collection_active,
+            "lastSuccessAt": last_success_at,
+            "nextDueAt": next_due_at,
+            "activeMaterialCount": int(
+                collection.get("active_material_count") or 0
+            ),
+            "collectionHealth": collection,
             "catalog": catalog,
             "browser": {
                 "available": False,

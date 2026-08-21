@@ -356,6 +356,16 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn("返回千川账户管理", page)
         self.assertIn("window.location.href = 'qianchuan_accounts.html'", page)
 
+    def test_official_api_control_status_uses_collection_health_not_legacy_browser_progress(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "control.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("st.officialApiMode", page)
+        self.assertIn("状态：正常监控", page)
+        self.assertIn("官方 API 模式（无需 Chrome）", page)
+
 
 if __name__ == "__main__":
     unittest.main()

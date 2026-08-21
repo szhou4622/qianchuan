@@ -76,6 +76,7 @@ from services.official_api_execution import (
     _verify_control_task,
     _verify_control_task_eventually,
 )
+from services.official_api_controller import OfficialApiController
 from unittest.mock import MagicMock, Mock
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -128,6 +129,32 @@ class _ReportConfigClient(_CaptureClient):
 
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
+
+    def test_official_controller_reports_real_collection_health(self):
+        controller = OfficialApiController()
+        controller._running = True
+        with patch(
+            "services.official_api_controller.official_api_session_status",
+            return_value={"available": True, "message": "已授权"},
+        ), patch(
+            "services.official_api_controller.official_api_catalog_status",
+            return_value={"running": False},
+        ), patch(
+            "services.official_api_controller.get_collection_queue_health",
+            return_value={
+                "leased": 0,
+                "queued": 1,
+                "last_success_at": "2026-08-21 21:29:10",
+                "next_due_at": "2026-08-21 21:33:17",
+                "active_material_count": 2222,
+            },
+        ):
+            status = controller.status()
+        self.assertTrue(status["officialApiMode"])
+        self.assertFalse(status["collectionActive"])
+        self.assertEqual(2222, status["activeMaterialCount"])
+        self.assertEqual("2026-08-21 21:33:17", status["nextDueAt"])
+        self.assertIn("正常监控", status["message"])
     def test_five_minute_deadline_is_anchored_to_cycle_start(self):
         started = datetime(2026, 8, 19, 12, 0, 0)
         finished = started + timedelta(seconds=164)

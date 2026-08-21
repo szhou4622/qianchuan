@@ -140,6 +140,7 @@ class MultiAccountCollectionQueueStressTests(unittest.TestCase):
                         "verification_state": "verified",
                         "monitor_eligible": 1,
                         "enabled": 1,
+                        "capacity_state": "active",
                     },
                 )
         return target_uids
@@ -169,6 +170,21 @@ class MultiAccountCollectionQueueStressTests(unittest.TestCase):
         claimed = _claim_collection_jobs(db=self.db, limit=6)
         self.assertEqual(2, len(claimed))
         self.assertEqual(1, len({row["account_uid"] for row in claimed}))
+
+    def test_disabled_target_stale_job_is_never_claimed(self):
+        target_uid = self._seed_20_accounts_with_10_targets_each()[0]
+        self.db.update(
+            "promotion_target",
+            {"enabled": 0, "capacity_state": "disabled"},
+            where={"target_uid": target_uid},
+        )
+        _enqueue_collection_jobs(
+            [target_uid],
+            db=self.db,
+            priority=100,
+            due_at=datetime.now() - timedelta(seconds=1),
+        )
+        self.assertEqual([], _claim_collection_jobs(db=self.db, limit=6))
 
     def test_expired_lease_is_recovered_with_a_new_fencing_token(self):
         target_uid = self._seed_20_accounts_with_10_targets_each()[0]

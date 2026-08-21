@@ -1104,6 +1104,9 @@ def collect_target(
         for item in materials
         if text_id(item.get("material_id"))
     ]
+    active_material_with_spend_count = sum(
+        1 for row in snapshots if float(row.get("stat_cost") or 0) > 0
+    )
     patch_target_sync_state(
         target_uid,
         status="collecting",
@@ -1348,6 +1351,11 @@ def collect_target(
         ),
         "active_material_count": (
             previous_material_count if material_suspicious else len(snapshots)
+        ),
+        "active_material_with_spend_count": (
+            int(capability.get("active_material_with_spend_count") or 0)
+            if material_suspicious
+            else active_material_with_spend_count
         ),
         "material_scan_total_count": len(materials),
         "material_scan_page_count": max(1, len(material_request_ids) - 1),
@@ -1731,6 +1739,7 @@ def collect_target(
         "success": True,
         "target_uid": target_uid,
         "material_count": len(snapshots),
+        "material_with_spend_count": active_material_with_spend_count,
         "product_count": (
             len(products)
             if products_refreshed
@@ -1766,6 +1775,12 @@ def _collect_target_safely(
     cycle_started_at = datetime.now()
     started = time.monotonic()
     account_key = _target_account_key(target)
+    logger.info(
+        "[官方API采集] 开始：账户=%s 计划=%s（%s）",
+        str(target.get("aadvid") or ""),
+        str(target.get("plan_name") or target_uid)[:120],
+        target_uid,
+    )
     try:
         # Two plans under the same advertiser may collect concurrently. After
         # an account-level 429, the degraded lock temporarily reduces it to one
@@ -1829,6 +1844,19 @@ def _collect_target_safely(
                 "collection_finished_at": _now(),
             },
             db=db,
+        )
+        logger.info(
+            "[官方API采集] 完成：计划=%s（%s） 投放中素材=%s "
+            "有消耗素材=%s 运行中追投任务=%s 耗时=%.1f秒%s",
+            str(target.get("plan_name") or target_uid)[:120],
+            target_uid,
+            int(result.get("material_count") or 0),
+            int(result.get("material_with_spend_count") or 0),
+            int(result.get("control_task_count") or 0),
+            duration_ms / 1000.0,
+            "，已保留上次可信数据"
+            if result.get("suspicious_empty")
+            else "",
         )
         return result
     except Exception as exc:
@@ -2129,9 +2157,13 @@ def _claim_collection_jobs(
             connection=connection,
         )
         rows = db.execute(
-            "SELECT * FROM collection_job WHERE owner_username=? "
-            "AND status='queued' AND due_at <= datetime('now', '+8 hours') "
-            "ORDER BY priority DESC,due_at ASC,id ASC LIMIT 2000",
+            "SELECT j.* FROM collection_job j "
+            "INNER JOIN promotion_target pt ON pt.target_uid=j.target_uid "
+            "INNER JOIN qianchuan_account qa ON qa.account_uid=pt.account_uid "
+            "WHERE j.owner_username=? AND j.status='queued' "
+            "AND j.due_at <= datetime('now', '+8 hours') "
+            "AND qa.enabled=1 AND pt.enabled=1 AND pt.capacity_state='active' "
+            "ORDER BY j.priority DESC,j.due_at ASC,j.id ASC LIMIT 2000",
             (owner,),
             fetch=True,
             connection=connection,
@@ -2230,8 +2262,12 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
     _ensure_collection_schema(store)
     owner = _owner_key()
     rows = store.execute(
-        "SELECT status, COUNT(1) AS count, MIN(due_at) AS next_due_at "
-        "FROM collection_job WHERE owner_username=? GROUP BY status",
+        "SELECT j.status,COUNT(1) AS count,MIN(j.due_at) AS next_due_at "
+        "FROM collection_job j "
+        "INNER JOIN promotion_target pt ON pt.target_uid=j.target_uid "
+        "INNER JOIN qianchuan_account qa ON qa.account_uid=pt.account_uid "
+        "WHERE j.owner_username=? AND qa.enabled=1 AND pt.enabled=1 "
+        "AND pt.capacity_state='active' GROUP BY j.status",
         (owner,),
         fetch=True,
     ) or []
