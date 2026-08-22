@@ -14,6 +14,45 @@ from .account_auth import AccountAuthApi
 from config import LOCAL_AUTH_USERNAME, QIANCHUAN_BACKEND
 
 
+def _automation_setup_scope(accounts, targets):
+    """Return onboarding state for accounts that the user actually enabled.
+
+    An added account may intentionally remain disabled for later use.  Its
+    unsynchronised catalog must not make the active automation setup look
+    incomplete, and a stale selected target under that disabled account must
+    not make the monitoring step look complete either.
+    """
+    enabled_accounts = [item for item in accounts if bool(item.get("enabled"))]
+    enabled_account_uids = {
+        str(item.get("account_uid") or "").strip()
+        for item in enabled_accounts
+        if str(item.get("account_uid") or "").strip()
+    }
+    catalog_attempted = bool(enabled_accounts) and any(
+        str(item.get("catalog_status") or "")
+        not in {"", "not_synced", "syncing"}
+        or bool(str(item.get("catalog_last_sync_at") or "").strip())
+        for item in enabled_accounts
+    )
+    catalog_complete = bool(enabled_accounts) and all(
+        str(item.get("catalog_status") or "") == "complete"
+        for item in enabled_accounts
+    )
+    plans_selected = any(
+        bool(item.get("enabled"))
+        and bool(item.get("monitor_eligible"))
+        and str(item.get("account_uid") or "").strip() in enabled_account_uids
+        for item in targets
+    )
+    return {
+        "enabled_accounts": enabled_accounts,
+        "enabled_account_uids": enabled_account_uids,
+        "catalog_attempted": catalog_attempted,
+        "catalog_complete": catalog_complete,
+        "plans_selected": plans_selected,
+    }
+
+
 def _get_service_controller():
     """Keep Playwright out of the official API process import graph."""
     if QIANCHUAN_BACKEND == "official_api":
@@ -157,11 +196,9 @@ class Api:
             feishu_bound = bool(feishu.get("connected")) and bool(
                 str(profile.get("authorized_open_id") or "").strip()
             )
-            enabled_accounts = [item for item in accounts if item.get("enabled")]
-            plans_selected = any(
-                item.get("enabled") and item.get("monitor_eligible")
-                for item in targets
-            )
+            setup_scope = _automation_setup_scope(accounts, targets)
+            enabled_accounts = setup_scope["enabled_accounts"]
+            plans_selected = setup_scope["plans_selected"]
             retarget_config = load_rule_retargeting_config()
             stop_config = load_rule_regulation_config()
             rules_saved = bool(retarget_config.get("enabled")) or bool(
@@ -170,10 +207,9 @@ class Api:
             onboarding = {
                 "qianchuan_login": bool(session.get("available"))
                 and session.get("status") != "login_required",
-                "catalog_synced": bool(catalog.get("complete")),
-                "catalog_attempted": bool(catalog.get("account_count"))
-                and catalog.get("status") not in {"not_synced", "syncing"},
-                "catalog_complete": bool(catalog.get("complete")),
+                "catalog_synced": setup_scope["catalog_complete"],
+                "catalog_attempted": setup_scope["catalog_attempted"],
+                "catalog_complete": setup_scope["catalog_complete"],
                 "feishu_bound": feishu_bound,
                 "account_routes": (
                     feishu_bound

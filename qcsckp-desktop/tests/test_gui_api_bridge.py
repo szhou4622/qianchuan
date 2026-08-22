@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from api.views import Api
+from api.views import Api, _automation_setup_scope
 from gui_app import JSApi, TrayApplication
 
 
@@ -423,6 +423,80 @@ class LicenseRuntimeCredentialIsolationTests(unittest.TestCase):
         bridge.api.clear_license_cloud_sessions.assert_called_once_with(
             clear_qianchuan_tokens=True
         )
+
+
+class AccountOnboardingScopeTests(unittest.TestCase):
+    def test_disabled_unsynced_account_does_not_block_active_setup(self):
+        state = _automation_setup_scope(
+            [
+                {
+                    "account_uid": "account-active",
+                    "enabled": True,
+                    "catalog_status": "complete",
+                    "catalog_last_sync_at": "2026-08-22 18:09:50",
+                },
+                {
+                    "account_uid": "account-unused",
+                    "enabled": False,
+                    "catalog_status": "not_synced",
+                    "catalog_last_sync_at": "",
+                },
+            ],
+            [
+                {
+                    "account_uid": "account-active",
+                    "enabled": True,
+                    "monitor_eligible": True,
+                }
+            ],
+        )
+
+        self.assertTrue(state["catalog_attempted"])
+        self.assertTrue(state["catalog_complete"])
+        self.assertTrue(state["plans_selected"])
+
+    def test_selected_plan_under_disabled_account_is_ignored(self):
+        state = _automation_setup_scope(
+            [
+                {
+                    "account_uid": "account-active",
+                    "enabled": True,
+                    "catalog_status": "complete",
+                },
+                {
+                    "account_uid": "account-disabled",
+                    "enabled": False,
+                    "catalog_status": "complete",
+                },
+            ],
+            [
+                {
+                    "account_uid": "account-disabled",
+                    "enabled": True,
+                    "monitor_eligible": True,
+                }
+            ],
+        )
+
+        self.assertTrue(state["catalog_complete"])
+        self.assertFalse(state["plans_selected"])
+
+    def test_enabled_incomplete_account_still_blocks_catalog_step(self):
+        state = _automation_setup_scope(
+            [
+                {
+                    "account_uid": "account-active",
+                    "enabled": True,
+                    "catalog_status": "partial",
+                    "catalog_last_sync_at": "2026-08-22 18:09:50",
+                }
+            ],
+            [],
+        )
+
+        self.assertTrue(state["catalog_attempted"])
+        self.assertFalse(state["catalog_complete"])
+        self.assertFalse(state["plans_selected"])
 
 
 if __name__ == "__main__":
