@@ -952,8 +952,15 @@ class Api:
             "data": {"owner_username": owner, "auth_mode": "license"},
         }
 
-    def clear_license_cloud_sessions(self):
-        """Stop reusing paid/cloud sessions after product-license loss."""
+    def clear_license_cloud_sessions(self, clear_qianchuan_tokens: bool = False):
+        """Suspend license-bound runtimes without losing business credentials.
+
+        A temporary product-license logout/401 must stop background work, but it
+        must not force the user through OceanEngine OAuth again.  The encrypted
+        Qianchuan access/refresh tokens are therefore preserved by default.
+        They are purged only for an explicit device unbind (or by the separate
+        "clear Qianchuan API configuration" command).
+        """
         errors = []
         try:
             from services.cloud_retarget_client import clear_local_device_session_cache
@@ -961,14 +968,15 @@ class Api:
             clear_local_device_session_cache()
         except Exception as exc:
             errors.append(str(exc))
-        try:
-            from services.qianchuan_open_api.token_provider import (
-                clear_api_tokens_keep_credentials,
-            )
+        if clear_qianchuan_tokens:
+            try:
+                from services.qianchuan_open_api.token_provider import (
+                    clear_api_tokens_keep_credentials,
+                )
 
-            clear_api_tokens_keep_credentials()
-        except Exception as exc:
-            errors.append(str(exc))
+                clear_api_tokens_keep_credentials()
+            except Exception as exc:
+                errors.append(str(exc))
         try:
             from services.local_feishu_bridge import deactivate_local_feishu_account
 
@@ -977,7 +985,13 @@ class Api:
             errors.append(str(exc))
         return {
             "success": not errors,
-            "message": "云端会话已清理" if not errors else "部分云端会话清理失败",
+            "message": (
+                "云端会话已清理，已保留千川API授权"
+                if not clear_qianchuan_tokens and not errors
+                else "云端会话已清理"
+                if not errors
+                else "部分云端会话清理失败"
+            ),
         }
 
     def stopService(self):

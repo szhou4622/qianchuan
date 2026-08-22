@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from api.views import Api
 from gui_app import JSApi, TrayApplication
 
 
@@ -365,6 +366,63 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn("st.officialApiMode", page)
         self.assertIn("状态：正常监控", page)
         self.assertIn("官方 API 模式（无需 Chrome）", page)
+
+
+class LicenseRuntimeCredentialIsolationTests(unittest.TestCase):
+    @patch("services.local_feishu_bridge.deactivate_local_feishu_account")
+    @patch("services.qianchuan_open_api.token_provider.clear_api_tokens_keep_credentials")
+    @patch("services.cloud_retarget_client.clear_local_device_session_cache")
+    def test_license_logout_preserves_qianchuan_tokens(
+        self,
+        clear_device_session,
+        clear_qianchuan_tokens,
+        deactivate_feishu,
+    ):
+        api = Api.__new__(Api)
+
+        result = api.clear_license_cloud_sessions()
+
+        self.assertTrue(result["success"])
+        self.assertIn("保留千川API授权", result["message"])
+        clear_device_session.assert_called_once_with()
+        deactivate_feishu.assert_called_once_with()
+        clear_qianchuan_tokens.assert_not_called()
+
+    @patch("services.local_feishu_bridge.deactivate_local_feishu_account")
+    @patch("services.qianchuan_open_api.token_provider.clear_api_tokens_keep_credentials")
+    @patch("services.cloud_retarget_client.clear_local_device_session_cache")
+    def test_explicit_license_unbind_purges_qianchuan_tokens(
+        self,
+        clear_device_session,
+        clear_qianchuan_tokens,
+        deactivate_feishu,
+    ):
+        api = Api.__new__(Api)
+
+        result = api.clear_license_cloud_sessions(clear_qianchuan_tokens=True)
+
+        self.assertTrue(result["success"])
+        clear_device_session.assert_called_once_with()
+        deactivate_feishu.assert_called_once_with()
+        clear_qianchuan_tokens.assert_called_once_with()
+
+    def test_unbind_bridge_requests_qianchuan_token_purge(self):
+        bridge = JSApi.__new__(JSApi)
+        bridge.license_manager = Mock()
+        bridge.license_manager.unbind_current_device.return_value = {
+            "success": True,
+            "authorized": False,
+        }
+        bridge.api = Mock()
+        bridge._stop_licensed_runtime = Mock()
+
+        result = bridge.unbindCurrentLicense()
+
+        self.assertTrue(result["success"])
+        bridge._stop_licensed_runtime.assert_called_once_with()
+        bridge.api.clear_license_cloud_sessions.assert_called_once_with(
+            clear_qianchuan_tokens=True
+        )
 
 
 if __name__ == "__main__":

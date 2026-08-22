@@ -741,7 +741,10 @@ class JSApi:
         result = manager.unbind_current_device()
         if result.get("success") and not result.get("authorized"):
             self._stop_licensed_runtime()
-            self.api.clear_license_cloud_sessions()
+            # Explicit device unbind is the only license action that also
+            # invalidates cached Qianchuan API tokens.  Ordinary license
+            # logout/401 paths preserve them so reactivation can resume work.
+            self.api.clear_license_cloud_sessions(clear_qianchuan_tokens=True)
         return result
 
     def getContactApiUrl(self):
