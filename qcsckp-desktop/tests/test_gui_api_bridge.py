@@ -367,6 +367,16 @@ class JSApiBridgeTests(unittest.TestCase):
         self.assertIn("状态：正常监控", page)
         self.assertIn("官方 API 模式（无需 Chrome）", page)
 
+    def test_dashboard_no_longer_exposes_inaccurate_assist_panel(self):
+        page = (
+            Path(__file__).resolve().parents[1]
+            / "static"
+            / "dashboard.html"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('id="assistPanelToggle"', page)
+        self.assertNotIn('id="assistDataPanel"', page)
+        self.assertNotIn("调控 · 素材追投数据列表", page)
+
 
 class LicenseRuntimeCredentialIsolationTests(unittest.TestCase):
     @patch("services.local_feishu_bridge.deactivate_local_feishu_account")

@@ -312,9 +312,6 @@
 
         <!-- 右侧：核心数据表格 (核心操作区，可内部滚动) -->
         <section class="flex-1 glass-panel rounded-xl flex flex-col min-h-0 overflow-hidden relative border-blue-500/20">
-            <button type="button" id="assistPanelToggle" class="absolute right-0 top-1/2 z-[45] -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50" title="全屏查看调控数据" aria-label="打开调控数据" aria-expanded="false" aria-controls="assistDataPanel">
-                <span class="assist-tab-label" aria-hidden="true"><span>调</span><span>控</span></span>
-            </button>
             <!-- 大屏范围：默认汇总所有已启用账户，可下钻到账户或单计划 -->
             <div class="flex-none px-3 py-2 border-b border-slate-700/50 bg-slate-900/45 flex flex-wrap items-center gap-2">
                 <label for="dashboardAccountFilter" class="text-xs text-slate-500 shrink-0">千川账户</label>
@@ -472,108 +469,6 @@
         </section>
 
     </main>
-
-    <!-- 调控数据：与素材榜单同壳层，从右侧滑入全幅覆盖 -->
-    <aside id="assistDataPanel" class="glass-panel rounded-xl flex flex-col min-h-0 overflow-hidden relative border-blue-500/20" aria-hidden="true">
-        <!-- 左侧留白与表体一致：pl-2.5 sm:pl-3（与表格外层）+ pl-3（与首列表头 th 的 p-3） -->
-        <div id="assistPanelToolbar" class="flex-none pt-3 pb-3 pr-3 pl-2.5 sm:pl-3 border-b border-slate-700/50 flex items-center gap-3 flex-wrap bg-slate-900/95 backdrop-blur-sm">
-            <h2 class="text-lg font-semibold text-white flex items-center gap-2 shrink-0 pl-3 min-w-0">
-                <i data-lucide="sliders-horizontal" class="w-5 h-5 text-sky-400 shrink-0"></i> 调控 · 素材追投数据列表
-            </h2>
-            <div class="flex items-center gap-3 ml-auto shrink-0 flex-wrap">
-                <!-- 与素材榜「脱敏」眼睛同一语义：截断时 eye-off（点此显示全名）；展开全名时 eye（点此恢复截断） -->
-                <button type="button" id="assistToggleTaskNameExpand" class="p-1 -m-0.5 rounded shrink-0 border-0 bg-transparent shadow-none text-slate-400 hover:text-slate-200 transition-colors focus:outline-none" title="显示完整任务名称" aria-pressed="true" aria-label="切换任务名称截断显示">
-                    <i data-lucide="eye-off" class="w-4 h-4"></i>
-                </button>
-                <button type="button" id="assistManualRefreshBtn" class="p-1 -m-0.5 rounded shrink-0 border-0 bg-transparent shadow-none text-slate-400 hover:text-sky-400 transition-colors focus:outline-none disabled:pointer-events-none disabled:cursor-wait" title="刷新" aria-label="刷新">
-                    <span class="qc-refresh-icon-host"><i data-lucide="refresh-cw" class="w-4 h-4"></i></span>
-                </button>
-                <div class="relative shrink-0 flex items-center min-w-0">
-                    <label for="assistTaskSearchInput" class="sr-only">按任务名称或ID搜索</label>
-                    <input type="text" id="assistTaskSearchInput" maxlength="200" autocomplete="off"
-                        class="w-[13rem] sm:w-[15rem] h-[2.125rem] shrink-0 rounded-md border border-slate-600 bg-slate-900/85 py-1.5 pl-2.5 pr-[3.25rem] text-sm text-slate-200 placeholder:text-slate-500 shadow-sm focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500/35" placeholder="输入任务名称或ID搜索" />
-                    <div class="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
-                        <button type="button" id="assistTaskSearchClearBtn" class="hidden shrink-0 rounded-full p-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50" aria-label="清空搜索">
-                            <span class="flex h-3.5 w-3.5 items-center justify-center rounded-full bg-slate-600 text-slate-200 hover:bg-slate-500 hover:text-white transition-colors">
-                                <i data-lucide="x" class="h-2.5 w-2.5 stroke-[2.5]"></i>
-                            </span>
-                        </button>
-                        <button type="button" id="assistTaskSearchBtn" class="shrink-0 rounded p-1 text-slate-400 hover:text-sky-400 focus:outline-none" aria-label="搜索">
-                            <i data-lucide="search" class="h-4 w-4"></i>
-                        </button>
-                    </div>
-                </div>
-                <!-- 与素材榜「流速周期」同结构：说明本表按 updated_at 近 1 小时筛选 -->
-                <div class="flex items-center gap-2 bg-slate-800/80 rounded-lg px-3 py-1.5 border border-slate-700 shrink-0">
-                    <span class="text-sm text-slate-400">入库时间:</span>
-                    <span class="text-sm text-white font-medium">最近1小时</span>
-                </div>
-                <button type="button" id="assistFilterRegulatingBtn" class="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg px-3 py-1.5 border border-slate-700 transition-colors text-sm text-slate-300" title="仅显示调控中的任务">
-                    调控中
-                </button>
-                <div class="relative shrink-0">
-                    <button type="button" id="assistColumnToggle" class="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg px-3 py-1.5 border border-slate-700 transition-colors">
-                        <i data-lucide="settings-2" class="w-4 h-4 text-slate-400"></i>
-                        <span class="text-sm text-slate-300">字段配置</span>
-                    </button>
-                    <div id="assistColumnDropdown" class="hidden absolute right-0 top-full mt-2 bg-slate-800 border border-slate-600 rounded-lg shadow-xl z-[100] w-64">
-                        <div class="p-3 border-b border-slate-700">
-                            <span class="text-sm text-slate-300 font-medium">显示字段</span>
-                        </div>
-                        <div id="assistColumnList" class="p-2 max-h-64 overflow-y-auto custom-scrollbar"></div>
-                        <div class="p-2 border-t border-slate-700 flex justify-between">
-                            <button type="button" id="assistResetColumns" class="text-xs text-slate-400 hover:text-white transition-colors">恢复默认</button>
-                            <button type="button" id="assistSaveColumns" class="text-xs bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded transition-colors">保存</button>
-                        </div>
-                    </div>
-                </div>
-                <div class="text-lg font-mono font-bold text-white" id="assistClock">00:00:00</div>
-            </div>
-        </div>
-        <div id="assistPanelBody" class="flex-1 flex flex-col min-h-0 min-w-0">
-            <button type="button" id="assistPanelClose" class="absolute left-0 top-1/2 z-[45] -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/50" title="返回素材榜单" aria-label="返回素材榜单" aria-controls="dashboardPrimary">
-                <span class="assist-tab-label" aria-hidden="true"><span>素</span><span>材</span></span>
-            </button>
-            <!-- 略留左内边距：与悬浮「素材」半圆错开，不增加列宽计算（padding 在表格外层） -->
-            <div id="assistTableScrollWrap" class="flex-1 overflow-y-auto overflow-x-auto custom-scrollbar min-h-0 bg-slate-900/95 backdrop-blur-sm pl-2.5 sm:pl-3">
-                <table class="w-full text-left border-collapse relative min-w-[720px] bg-transparent">
-                    <thead class="sticky top-0 z-10 bg-slate-900/95 backdrop-blur-sm shadow-md">
-                        <tr class="text-slate-400 text-sm uppercase tracking-wider" id="assistTaskTheadRow">
-                            <th class="p-3 font-medium" data-col="taskInfo">任务信息</th>
-                        </tr>
-                    </thead>
-                    <tbody id="assistTaskTableBody" class="text-sm divide-y divide-slate-700/40">
-                    </tbody>
-                </table>
-            </div>
-            <div id="assistPaginationContainer" hidden class="flex-none shrink-0 py-3 pr-3 pl-2.5 sm:pl-3 border-t border-slate-700/50 flex justify-between items-center bg-slate-900/95 backdrop-blur-sm">
-                <div class="text-sm text-slate-400">
-                    共 <span id="assistTotalCount" class="text-white font-medium">0</span> 条数据
-                </div>
-                <div class="flex items-center gap-4">
-                    <div class="flex items-center gap-2">
-                        <span class="text-sm text-slate-400">每页</span>
-                        <div class="relative" id="assistPageSizeWrapper">
-                            <button type="button" id="assistPageSizeBtn" class="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 rounded px-3 py-1.5 text-sm text-white cursor-pointer border border-slate-600 focus:outline-none focus:border-blue-500 transition-colors" onclick="assistTogglePageSizeDropdown()">
-                                <span id="assistPageSizeLabel">50</span>
-                                <svg id="assistPageSizeArrow" class="w-4 h-4 text-slate-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
-                                </svg>
-                            </button>
-                            <div id="assistPageSizeDropdown" class="hidden absolute bottom-full mb-1 left-0 right-0 bg-slate-800 border border-slate-600 rounded-lg shadow-xl py-1 z-50">
-                                <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="assistSelectPageSize(10)">10</button>
-                                <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="assistSelectPageSize(20)">20</button>
-                                <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="assistSelectPageSize(50)">50</button>
-                                <button type="button" class="w-full px-3 py-1.5 text-sm text-white hover:bg-slate-700 transition-colors" onclick="assistSelectPageSize(100)">100</button>
-                            </div>
-                        </div>
-                        <span class="text-sm text-slate-400">条</span>
-                    </div>
-                    <div class="flex items-center gap-1" id="assistPaginationLinks"></div>
-                </div>
-            </div>
-        </div>
-    </aside>
     </div>
 
     <script>
