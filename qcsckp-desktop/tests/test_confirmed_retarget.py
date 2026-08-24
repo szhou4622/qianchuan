@@ -142,6 +142,35 @@ class RetargetConfigTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("监控账户与计划不一致", message)
 
+    def test_waiting_live_plan_can_save_enabled_retarget_strategy(self):
+        config = {
+            "enabled": True,
+            "strategies": [
+                {
+                    "title": "开播后追投",
+                    "account_uid": "account-live",
+                    "target_uid": "target-live",
+                    "retargeting": {"method": "volume"},
+                }
+            ],
+        }
+        ok, message = validate_strategy_target_compatibility(
+            config,
+            {
+                "target-live": {
+                    "account_uid": "account-live",
+                    "account_enabled": True,
+                    "enabled": True,
+                    "monitor_eligible": True,
+                    "retarget_eligible": False,
+                    "promotion_scene": "live",
+                    "platform_status": "waiting_live",
+                    "verification_state": "verified",
+                }
+            },
+        )
+        self.assertTrue(ok, message)
+
     def test_strategy_hash_includes_account_scope(self):
         base = {
             "id": "strategy-1",

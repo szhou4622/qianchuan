@@ -73,6 +73,25 @@ ALLOWED_MATERIAL_GROUPING_MODES = frozenset({"separate", "merged"})
 ALLOWED_TASK_ACTIONS = frozenset({"create_retarget", "increase_budget"})
 ALLOWED_BUDGET_INCREASE_MODES = frozenset({"fixed", "spend_percentage"})
 ASSIST_TASK_METRICS = frozenset({"assistCost", "assistRoi"})
+
+
+def target_allows_advance_strategy_configuration(
+    target: Dict[str, Any], eligibility_field: str
+) -> bool:
+    """未开播的已启用直播计划可提前启用策略。
+
+    这只放宽配置保存；追投/停投运行器仍必须在每次执行前
+    重新检查 ``retarget_eligible`` / ``stop_eligible``。
+    """
+    if bool(target.get(eligibility_field)):
+        return True
+    return bool(target.get("monitor_eligible")) and (
+        str(target.get("promotion_scene") or "").strip().lower() == "live"
+        and str(target.get("platform_status") or "").strip().lower()
+        == "waiting_live"
+        and str(target.get("verification_state") or "").strip().lower()
+        == "verified"
+    )
 ALLOWED_TRIGGER_LEVELS = frozenset({"material", "product"})
 ALLOWED_CANDIDATE_SORTS = frozenset({"net_roi_desc"})
 MAX_CANDIDATE_LIMIT = 20
@@ -1118,7 +1137,9 @@ def validate_strategy_target_compatibility(
         if not bool(target.get("enabled")):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             return False, f"“{title}”选择的监控计划已停用，请先启用计划"
-        if "retarget_eligible" in target and not bool(target.get("retarget_eligible")):
+        if "retarget_eligible" in target and not target_allows_advance_strategy_configuration(
+            target, "retarget_eligible"
+        ):
             title = str(strategy.get("title") or f"策略{index + 1}").strip()
             reason = str(target.get("ineligible_reason") or "计划尚未取得追投资格").strip()
             return False, f"“{title}”当前不可用于追投：{reason}"

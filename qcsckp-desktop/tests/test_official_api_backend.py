@@ -10,7 +10,11 @@ from decimal import Decimal
 from urllib.error import URLError
 from unittest.mock import patch
 
-from services.qianchuan_open_api.client import ApiResponse, QianchuanOpenApiClient
+from services.qianchuan_open_api.client import (
+    ApiResponse,
+    EndpointRateLimiter,
+    QianchuanOpenApiClient,
+)
 from services.qianchuan_open_api.errors import (
     ApiRateLimitError,
     ApiRequestError,
@@ -59,6 +63,7 @@ from services.official_api_collection import (
     _metric_values_changed,
     _observe_collection_results,
     _observe_account_result,
+    _official_api_error_detail,
     _reset_adaptive_collection_state_for_tests,
     _rotating_maintenance_phase,
     _should_escalate_application_backoff,
@@ -130,6 +135,47 @@ class _ReportConfigClient(_CaptureClient):
 
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
+
+    def test_endpoint_rate_limits_follow_verified_quota_budget(self):
+        limiter = EndpointRateLimiter()
+        self.assertAlmostEqual(1 / 6, limiter.endpoint_intervals[
+            "/open_api/v1.0/qianchuan/uni_promotion/ad/material/get/"
+        ])
+        self.assertAlmostEqual(1 / 20, limiter.endpoint_intervals[
+            "/open_api/v1.0/qianchuan/report/uni_promotion/data/get/"
+        ])
+        self.assertAlmostEqual(0.5, limiter.account_interval)
+
+    def test_waiting_live_plan_detail_is_rechecked_every_hot_cycle(self):
+        plan = _collection_phase_plan(
+            {
+                "promotion_scene": "live",
+                "platform_status": "waiting_live",
+                "capability": {
+                    "plan_detail_synced_at": "2026-08-24 20:00:00",
+                    "report_metric_units": {"stat_cost_for_roi2": "3"},
+                },
+            },
+            now=datetime(2026, 8, 24, 20, 1, 0),
+        )
+        self.assertTrue(plan["refresh_plan_detail"])
+        self.assertTrue(plan["force_plan_detail"])
+        self.assertEqual("plan_detail", _rotating_maintenance_phase(plan))
+
+    def test_structured_api_error_keeps_endpoint_code_and_request_id(self):
+        error = ApiRateLimitError(
+            "系统请求频率超限",
+            code="40110",
+            request_id="req-visible",
+            endpoint="/open_api/example/",
+            http_status=429,
+        )
+        detail = _official_api_error_detail(error)
+        self.assertIn("系统请求频率超限", detail)
+        self.assertIn("接口 /open_api/example/", detail)
+        self.assertIn("错误码 40110", detail)
+        self.assertIn("HTTP 429", detail)
+        self.assertIn("request_id req-visible", detail)
 
     def test_official_controller_reports_real_collection_health(self):
         controller = OfficialApiController()
@@ -2336,7 +2382,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         )
         self.assertEqual("QIANCHUAN", account["role"])
 
-    def test_api_code_40100_is_treated_as_rate_limit(self):
+    def test_explicit_frequency_message_is_treated_as_rate_limit(self):
         client = QianchuanOpenApiClient(
             InjectedTokenProvider(AccessTokenBundle("token")),
             sleep=lambda _seconds: None,
@@ -2347,6 +2393,44 @@ class OfficialApiBackendTests(unittest.TestCase):
                 endpoint="/read/",
                 http_status=200,
             )
+
+    def test_code_40110_is_treated_as_rate_limit(self):
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaises(ApiRateLimitError):
+            client._raise_api_error(
+                {"code": 40110, "message": "developer throttled"},
+                endpoint="/read/",
+                http_status=200,
+            )
+
+    def test_code_40100_without_frequency_evidence_is_not_rate_limit(self):
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaises(ApiRequestError) as caught:
+            client._raise_api_error(
+                {"code": 40100, "message": "downstream dependency error"},
+                endpoint="/read/",
+                http_status=200,
+            )
+        self.assertNotIsInstance(caught.exception, ApiRateLimitError)
+
+    def test_generic_rate_word_is_not_enough_to_mark_rate_limit(self):
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaises(ApiRequestError) as caught:
+            client._raise_api_error(
+                {"code": 50000, "message": "conversion rate field invalid"},
+                endpoint="/read/",
+                http_status=200,
+            )
+        self.assertNotIsInstance(caught.exception, ApiRateLimitError)
 
     def test_shop_advertiser_adv_id_is_normalized_as_long_string(self):
         account = normalize_account({"adv_id": 1782685702496260})

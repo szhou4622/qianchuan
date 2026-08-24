@@ -60,15 +60,37 @@ def _redact(value: Any) -> Any:
     return value
 
 
+DEFAULT_ENDPOINT_QPS: dict[str, float] = {
+    "/open_api/oauth2/advertiser/get/": 1.0,
+    "/open_api/v1.0/qianchuan/shop/advertiser/list/": 2.0,
+    "/open_api/2/ebp/advertiser/list/": 2.0,
+    "/open_api/2/advertiser/public_info/": 2.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/list/": 15.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/detail/": 6.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/material/get/": 6.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/product/get/": 10.0,
+    "/open_api/v1.0/qianchuan/report/uni_promotion/config/get/": 3.0,
+    "/open_api/v1.0/qianchuan/report/uni_promotion/data/get/": 20.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/list/": 4.0,
+    "/open_api/v1.0/qianchuan/tools/log_search/": 10.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/create/": 1.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/update/": 1.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/status/update/": 1.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/budget/update/": 1.0,
+    "/open_api/v1.0/qianchuan/uni_promotion/ad/control_task/duration/update/": 1.0,
+}
+
+
 class EndpointRateLimiter:
-    """分层节流：应用 8 QPS、单账户 4 QPS，并保留 endpoint 级保护。"""
+    """按已核实的官方配额分层节流，并预留安全余量。"""
 
     def __init__(
         self,
-        requests_per_second: float = 8.0,
+        requests_per_second: float = 12.0,
         *,
-        account_requests_per_second: float = 4.0,
-        endpoint_requests_per_second: float = 8.0,
+        account_requests_per_second: float = 2.0,
+        endpoint_requests_per_second: float = 4.0,
+        endpoint_requests_per_second_map: Optional[Mapping[str, float]] = None,
     ) -> None:
         self.interval = 1.0 / max(0.1, float(requests_per_second))
         self.account_interval = 1.0 / max(
@@ -77,6 +99,20 @@ class EndpointRateLimiter:
         self.endpoint_interval = 1.0 / max(
             0.1, float(endpoint_requests_per_second)
         )
+        endpoint_qps = dict(DEFAULT_ENDPOINT_QPS)
+        endpoint_qps.update(
+            {
+                str(key): float(value)
+                for key, value in dict(
+                    endpoint_requests_per_second_map or {}
+                ).items()
+                if str(key) and float(value) > 0
+            }
+        )
+        self.endpoint_intervals = {
+            key: 1.0 / max(0.1, value)
+            for key, value in endpoint_qps.items()
+        }
         self._next: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -92,9 +128,12 @@ class EndpointRateLimiter:
     def wait_for_request(self, endpoint: str, advertiser_id: Any = "") -> None:
         """Atomically reserve all applicable quota lanes for one request."""
         account = str(advertiser_id or "").strip()
+        endpoint_interval = self.endpoint_intervals.get(
+            str(endpoint or ""), self.endpoint_interval
+        )
         lanes: list[tuple[str, float]] = [
             ("application", self.interval),
-            (f"endpoint:{endpoint}", self.endpoint_interval),
+            (f"endpoint:{endpoint}", endpoint_interval),
         ]
         if account:
             lanes.append((f"account:{account}", self.account_interval))
@@ -236,13 +275,20 @@ class QianchuanOpenApiClient:
             "http_status": http_status,
             "retry_after": retry_after,
         }
-        if (
-            http_status == 429
-            or code == "40100"
-            or "rate" in message.lower()
-            or "频控" in message
-            or "请求频繁" in message
-        ):
+        lowered_message = message.lower()
+        explicit_rate_limit = any(
+            marker in lowered_message
+            for marker in (
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "request frequency exceeded",
+            )
+        ) or any(
+            marker in message
+            for marker in ("频控", "请求频繁", "请求过于频繁", "频率超限")
+        )
+        if http_status == 429 or code == "40110" or explicit_rate_limit:
             raise ApiRateLimitError(message, **kwargs)
         if http_status == 401:
             raise ApiTokenError(message, **kwargs)

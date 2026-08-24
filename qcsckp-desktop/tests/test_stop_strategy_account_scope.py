@@ -110,6 +110,21 @@ class StopStrategyAccountScopeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("尚未取得停投资格", message)
 
+    def test_waiting_live_plan_can_save_enabled_stop_strategy(self):
+        ok, message = bind_and_validate_strategy_targets(
+            self._config(),
+            {
+                "target-one": self._target(
+                    stop_eligible=False,
+                    promotion_scene="live",
+                    platform_status="waiting_live",
+                    verification_state="verified",
+                )
+            },
+            {"account-one": {"account_uid": "account-one", "enabled": True}},
+        )
+        self.assertTrue(ok, message)
+
     def test_disabled_config_can_be_saved_even_if_old_target_disappeared(self):
         config = self._config()
         config["enabled"] = False

@@ -24,6 +24,7 @@ from .rule_retargeting_config import (
     _normalize_json_whole_floats,
     _owner_config_path,
     _read_json,
+    target_allows_advance_strategy_configuration,
 )
 
 FILENAME = "rule_regulation.json"
@@ -398,7 +399,9 @@ def bind_and_validate_strategy_targets(
                 return False, f"“{title}”选择的监控计划尚未勾选监控"
             if not bool(target.get("monitor_eligible")):
                 return False, f"“{title}”选择的计划当前不可监控"
-            if not bool(target.get("stop_eligible")):
+            if not target_allows_advance_strategy_configuration(
+                target, "stop_eligible"
+            ):
                 return False, f"“{title}”选择的计划尚未取得停投资格"
     return True, ""
 

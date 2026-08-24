@@ -215,6 +215,24 @@ def _target_capability(target: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _official_api_error_detail(exc: BaseException) -> str:
+    """生成可直接展示给用户的脱敏官方错误证据。"""
+    parts = [str(exc or "千川官方 API 请求失败").strip()]
+    endpoint = str(getattr(exc, "endpoint", "") or "").strip()
+    code = str(getattr(exc, "code", "") or "").strip()
+    request_id = str(getattr(exc, "request_id", "") or "").strip()
+    http_status = getattr(exc, "http_status", None)
+    if endpoint:
+        parts.append(f"接口 {endpoint}")
+    if code:
+        parts.append(f"错误码 {code}")
+    if http_status not in (None, ""):
+        parts.append(f"HTTP {http_status}")
+    if request_id:
+        parts.append(f"request_id {request_id}")
+    return "；".join(part for part in parts if part)[:2000]
+
+
 def _phase_is_due(
     capability: Mapping[str, Any],
     timestamp_key: str,
@@ -240,6 +258,11 @@ def _collection_phase_plan(
     cached_units = capability.get("report_metric_units")
     if not isinstance(cached_units, Mapping):
         cached_units = {}
+    waiting_live = (
+        str(target.get("promotion_scene") or "").strip().lower() == "live"
+        and str(target.get("platform_status") or "").strip().lower()
+        == "waiting_live"
+    )
     return {
         "capability": capability,
         "cached_units": dict(cached_units),
@@ -257,12 +280,16 @@ def _collection_phase_plan(
             PRODUCT_CATALOG_INTERVAL_SECONDS,
             now=now,
         ),
-        "refresh_plan_detail": _phase_is_due(
+        # 直播计划未开播时仍可配置策略；每轮复核开播状态，
+        # 一旦平台返回投放中立即恢复真实写入资格。
+        "refresh_plan_detail": waiting_live
+        or _phase_is_due(
             capability,
             "plan_detail_synced_at",
             PLAN_DETAIL_INTERVAL_SECONDS,
             now=now,
         ),
+        "force_plan_detail": waiting_live,
         "refresh_control_history": _phase_is_due(
             capability,
             "control_history_synced_at",
@@ -279,6 +306,8 @@ def _rotating_maintenance_phase(phase_plan: Mapping[str, Any]) -> str:
     heavier, lower-frequency reads rotate so a coincident 20/30/60 minute
     boundary cannot make every plan perform all expensive pagination at once.
     """
+    if bool(phase_plan.get("force_plan_detail")):
+        return "plan_detail"
     phases = (
         # Product relations and historical control rows are both optional for
         # the core metrics pass and occur after the material request.  Refresh
@@ -496,6 +525,7 @@ def _set_account_backoff(
     *,
     db: Optional[SQLiteStore] = None,
     include_application: bool = False,
+    error: str = "rate_limit",
 ) -> None:
     with _ACTIVE_LOCK:
         _ACCOUNT_BACKOFF_UNTIL[account_key] = max(
@@ -510,6 +540,7 @@ def _set_account_backoff(
             scope_id=account_key,
             seconds=seconds,
             db=db,
+            error=error,
         )
         if include_application:
             _persist_quota_backoff(
@@ -518,6 +549,7 @@ def _set_account_backoff(
                 scope_id="official_api",
                 seconds=seconds,
                 db=db,
+                error=error,
             )
 
 
@@ -1455,8 +1487,8 @@ def collect_target(
         "application_worker_limit": _adaptive_worker_limit(
             COLLECTION_MAX_WORKERS
         ),
-        "application_qps_limit": 8,
-        "account_qps_limit": 4,
+        "application_qps_limit": 12,
+        "account_qps_limit": 2,
         **detail_capability_updates,
     }
     if rotate_maintenance and maintenance_phase:
@@ -1856,10 +1888,18 @@ def _collect_target_safely(
         with _account_collection_slot(account_key):
             backoff_seconds = _account_backoff_remaining(account_key, db=db)
             if backoff_seconds > 0:
+                previous_detail = str(
+                    _target_capability(target).get("collection_error_detail")
+                    or ""
+                ).strip()
+                cooldown_message = (
+                    f"接口冷却中，剩余约 {backoff_seconds} 秒"
+                    + (f"；上次原因：{previous_detail}" if previous_detail else "")
+                )
                 patch_target_sync_state(
                     target_uid,
                     status="rate_limited",
-                    error="同一千川账户正在限流冷却，工具将自动重试",
+                    error=cooldown_message,
                     synced=False,
                     capability_updates={
                         "collection_error_kind": "account_backoff",
@@ -1875,7 +1915,7 @@ def _collect_target_safely(
                 return {
                     "success": False,
                     "target_uid": target_uid,
-                    "message": "同一千川账户正在限流冷却，工具将自动重试",
+                    "message": cooldown_message,
                     "error_kind": "account_backoff",
                     "retry_seconds": backoff_seconds,
                     "deferred": True,
@@ -1937,6 +1977,7 @@ def _collect_target_safely(
             )
         except (TypeError, ValueError):
             consecutive_failures = 1
+        error_detail = _official_api_error_detail(exc)
         error_kind = (
             "rate_limit"
             if isinstance(exc, ApiRateLimitError)
@@ -1963,9 +2004,13 @@ def _collect_target_safely(
             )
         )
         if isinstance(exc, ApiRateLimitError):
+            developer_throttle = (
+                str(getattr(exc, "code", "") or "") == "40110"
+                or int(getattr(exc, "http_status", 0) or 0) == 429
+            )
             retry_seconds = max(
                 int(math.ceil(float(getattr(exc, "retry_after", 0) or 0))),
-                30,
+                300 if developer_throttle else 30,
                 min(
                     interval_seconds,
                     120 * (2 ** min(2, consecutive_failures - 1)),
@@ -1977,6 +2022,7 @@ def _collect_target_safely(
                 account_key,
                 retry_seconds,
                 db=db,
+                error=error_detail,
                 include_application=(
                     error_kind == "rate_limit"
                     and _should_escalate_application_backoff(account_key)
@@ -2000,13 +2046,21 @@ def _collect_target_safely(
         patch_target_sync_state(
             target_uid,
             status=target_status,
-            error=str(exc),
+            error=error_detail,
             synced=False,
             capability_updates={
                 "source": "qianchuan_open_api",
                 "material_sync_complete": False,
                 "collection_error_at": _now(),
                 "collection_error_kind": error_kind,
+                "collection_error_detail": error_detail,
+                "collection_error_endpoint": str(
+                    getattr(exc, "endpoint", "") or ""
+                ),
+                "collection_error_code": str(getattr(exc, "code", "") or ""),
+                "collection_error_request_id": str(
+                    getattr(exc, "request_id", "") or ""
+                ),
                 "collection_duration_ms": duration_ms,
                 "collection_retry_seconds": retry_seconds,
                 "collection_consecutive_failures": consecutive_failures,
@@ -2024,7 +2078,7 @@ def _collect_target_safely(
         return {
             "success": False,
             "target_uid": target_uid,
-            "message": str(exc),
+            "message": error_detail,
             "error_kind": error_kind,
             "retry_seconds": retry_seconds,
         }
@@ -2426,8 +2480,8 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
         "global_worker_max": COLLECTION_MAX_WORKERS,
         "account_concurrency": ACCOUNT_MAX_CONCURRENT_PLANS,
         "degraded_account_count": degraded_accounts,
-        "application_qps_limit": 8,
-        "account_qps_limit": 4,
+        "application_qps_limit": 12,
+        "account_qps_limit": 2,
     }
 
 

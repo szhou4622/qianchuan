@@ -1149,7 +1149,7 @@
                             </label>
                         </div>
                         <p id="strategyTargetScene" class="text-[11px] text-slate-500">
-                            这里只显示已启用账户下已勾选监控的计划；追投资格尚未采集完成时可先保存停用草稿。
+                            这里只显示已启用账户下已勾选监控的计划；直播未开播时也可提前启用策略，实际执行前会再次复核。
                         </p>
                     </div>
                 </section>
@@ -1860,6 +1860,13 @@
         /** 正在改名的策略下标，非 null 时该 Tab 显示为输入框 */
         let strategyRenameIndex = null;
 
+        function targetAllowsAdvanceConfiguration(target, field) {
+            if (!target) return false;
+            if (!!target[field]) return true;
+            return !!target.monitor_eligible && target.promotion_scene === 'live' &&
+                target.platform_status === 'waiting_live' && target.verification_state === 'verified';
+        }
+
         function defaultStrategyTitle(index) {
             return '策略 ' + (index + 1);
         }
@@ -1902,8 +1909,9 @@
             const target = promotionTargetsState.find(x => x.target_uid === uid);
             const hint = document.getElementById('strategyTargetScene');
             if (hint) {
+                const waitingLive = target && target.promotion_scene === 'live' && target.platform_status === 'waiting_live';
                 hint.textContent = target
-                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${target.retarget_eligible ? '' : ' · 追投资格待采集，可先保存停用草稿'}`
+                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${waitingLive ? ' · 未开播，策略可提前启用，开播复核后执行' : target.retarget_eligible ? '' : ' · 追投能力尚未核验，可先保存停用草稿'}`
                     : document.getElementById('strategyAccountUid')?.value
                         ? '该账户下暂无已勾选监控的计划，请先到“千川账户管理”启用计划。'
                         : '请先选择监控账户。';
@@ -2046,8 +2054,10 @@
             select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + targets.map(target => {
                 const scene = target.promotion_scene === 'product' ? '推商品' : target.promotion_scene === 'live' ? '推直播' : '场景待确认';
                 const system = target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '乘方' : '体系待确认';
-                const unavailable = !target.retarget_eligible;
-                const suffix = unavailable ? '｜追投资格待采集' : '';
+                const waitingLive = target.promotion_scene === 'live' && target.platform_status === 'waiting_live';
+                const suffix = waitingLive
+                    ? '｜未开播，可提前配置'
+                    : target.retarget_eligible ? '' : '｜追投能力尚未核验';
                 return `<option value="${rrHtmlEsc(target.target_uid)}">${system}｜${scene}｜${rrHtmlEsc(target.plan_name || target.ad_id)}｜${rrHtmlEsc(target.ad_id)}${suffix}</option>`;
             }).join('');
             if (selectedTargetUid && targets.some(target => target.target_uid === selectedTargetUid)) {
@@ -2625,7 +2635,7 @@
                 const targetUid = document.getElementById('strategyTargetUid')?.value || '';
                 const selectedTarget = promotionTargetsState.find(x => x.target_uid === targetUid);
                 const configEnabled = !!document.getElementById('cfgEnabled')?.checked;
-                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || (configEnabled && !selectedTarget.retarget_eligible)) {
+                if (!accountUid || !selectedTarget || selectedTarget.account_uid !== accountUid || (configEnabled && !targetAllowsAdvanceConfiguration(selectedTarget, 'retarget_eligible'))) {
                     renderStrategyTabs();
                     const accountEl = document.getElementById('strategyAccountUid');
                     const targetEl = document.getElementById('strategyTargetUid');
@@ -2635,7 +2645,7 @@
                             ? '请先为策略选择该账户下的监控计划'
                             : selectedTarget.account_uid !== accountUid
                                 ? '监控账户与监控计划不一致，请重新选择'
-                                : configEnabled && !selectedTarget.retarget_eligible
+                                : configEnabled && !targetAllowsAdvanceConfiguration(selectedTarget, 'retarget_eligible')
                                     ? `该监控计划暂不可追投：${selectedTarget.ineligible_reason || '能力待验证'}`
                                     : '监控计划无效，请重新选择';
                     return {

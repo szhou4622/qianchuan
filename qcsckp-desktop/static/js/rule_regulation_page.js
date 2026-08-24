@@ -323,6 +323,13 @@
     let activeStrategyIndex = 0;
     let strategyRenameIndex = null;
 
+    function targetAllowsAdvanceConfiguration(target, field) {
+        if (!target) return false;
+        if (!!target[field]) return true;
+        return !!target.monitor_eligible && target.promotion_scene === 'live' &&
+            target.platform_status === 'waiting_live' && target.verification_state === 'verified';
+    }
+
     function defaultStrategyTitle(index) {
         return '策略 ' + (index + 1);
     }
@@ -344,8 +351,9 @@
         const target = promotionTargetsState.find((x) => x.target_uid === uid);
         const hint = document.getElementById('regStrategyTargetScene');
         if (hint) {
+            const waitingLive = target && target.promotion_scene === 'live' && target.platform_status === 'waiting_live';
             hint.textContent = target
-                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${target.stop_eligible ? '' : ' · 停投资格待采集，可先保存停用草稿'}`
+                ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${waitingLive ? ' · 未开播，策略可提前启用，开播复核后执行' : target.stop_eligible ? '' : ' · 停投能力尚未核验，可先保存停用草稿'}`
                 : accountUid
                     ? '该账户下暂无具备停投资格的已监控计划，请先到“千川账户管理”勾选计划并完成采集。'
                     : '请先选择监控账户。';
@@ -393,9 +401,11 @@
         const plans = promotionTargetsState
             .filter((target) => String(target.account_uid || '') === String(accountUid || ''))
             .sort(regulationTargetSort);
-        select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + plans.map((target) =>
-            `<option value="${escapeTargetHtml(target.target_uid)}">${target.plan_system === 'chengfang' ? '乘方' : '全域'}｜${target.promotion_scene === 'live' ? '推直播' : '推商品'}｜${escapeTargetHtml(target.plan_name || target.ad_id)}｜${escapeTargetHtml(target.ad_id)}${target.stop_eligible ? '' : '｜停投资格待采集'}</option>`
-        ).join('');
+        select.innerHTML = `<option value="">${accountUid ? '请选择监控计划' : '请先选择监控账户'}</option>` + plans.map((target) => {
+            const waitingLive = target.promotion_scene === 'live' && target.platform_status === 'waiting_live';
+            const suffix = waitingLive ? '｜未开播，可提前配置' : target.stop_eligible ? '' : '｜停投能力尚未核验';
+            return `<option value="${escapeTargetHtml(target.target_uid)}">${target.plan_system === 'chengfang' ? '乘方' : '全域'}｜${target.promotion_scene === 'live' ? '推直播' : '推商品'}｜${escapeTargetHtml(target.plan_name || target.ad_id)}｜${escapeTargetHtml(target.ad_id)}${suffix}</option>`;
+        }).join('');
         if (selectedTargetUid && plans.some((target) => target.target_uid === selectedTargetUid)) {
             select.value = selectedTargetUid;
         }
