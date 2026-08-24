@@ -729,7 +729,9 @@ class QianchuanOfficialApiService:
         if not wanted_name:
             return None
         wanted_budget = Decimal(str(budget))
-        wanted_duration = Decimal(str(duration))
+        wanted_duration = (
+            None if duration in (None, "") else Decimal(str(duration))
+        )
         for task in tasks:
             # Existing control tasks are valid business objects, not implicit
             # duplicates.  Only the stable name generated for this exact local
@@ -740,7 +742,12 @@ class QianchuanOfficialApiService:
                 continue
             existing = set(stable_material_set(task.get("material_ids") or []))
             try:
-                same_numbers = Decimal(str(task.get("budget"))) == wanted_budget and Decimal(str(task.get("duration"))) == wanted_duration
+                same_numbers = Decimal(str(task.get("budget"))) == wanted_budget
+                if wanted_duration is not None:
+                    same_numbers = (
+                        same_numbers
+                        and Decimal(str(task.get("duration"))) == wanted_duration
+                    )
             except Exception:
                 same_numbers = False
             # The name, frozen group and parameters must all identify the same
@@ -771,10 +778,12 @@ class QianchuanOfficialApiService:
         if not 1 <= len(materials) <= 20:
             raise ValueError("每条追投调控任务必须包含 1 至 20 条视频素材")
         money = Decimal(str(budget))
-        hours = Decimal(str(duration))
+        hours = None if duration in (None, "") else Decimal(str(duration))
         if money < Decimal("100"):
             raise ValueError("追投预算不得低于 100 元")
-        if hours < Decimal("0.5") or hours > Decimal("24"):
+        if hours is not None and (
+            hours < Decimal("0.5") or hours > Decimal("24")
+        ):
             raise ValueError("追投时长须为 0.5 至 24 小时")
         duplicate = self.find_duplicate_control_task(
             aid,
@@ -801,10 +810,11 @@ class QianchuanOfficialApiService:
             "name": task_name,
             "scene": "MATERIAL_ADD_BUDGET",
             "budget": float(money),
-            "duration": float(hours),
             "material_type": "VIDEO",
             "material_ids": [id_number(value, "material_id") for value in materials],
         }
+        if hours is not None:
+            body["duration"] = float(hours)
         for key, value in dict(extra or {}).items():
             if key not in body and key not in {"task_ids", "opt_type", "scene"}:
                 body[key] = value

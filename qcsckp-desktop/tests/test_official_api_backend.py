@@ -78,6 +78,7 @@ from services.official_api_execution import (
     OfficialApiRetargetingService,
     _configured_control_task_base_name,
     _material_is_writable,
+    _retarget_params,
     _unique_control_task_name,
     _verify_control_task,
     _verify_control_task_eventually,
@@ -2865,6 +2866,39 @@ class OfficialApiBackendTests(unittest.TestCase):
         self.assertEqual(response.data["id"], "1")
         self.assertEqual(mocked.call_count, 2)
 
+    def test_get_downstream_dependency_error_is_retried(self):
+        class _Response:
+            status = 200
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
+
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            max_get_attempts=3,
+            sleep=lambda _: None,
+        )
+        with patch(
+            "services.qianchuan_open_api.client.urlopen",
+            side_effect=[
+                _Response({"code": 40000, "message": "下游依赖服务相关错误"}),
+                _Response({"code": 0, "message": "OK", "data": {"id": "1"}}),
+            ],
+        ) as mocked:
+            response = client.get("/open_api/v1.0/test/")
+        self.assertEqual("1", response.data["id"])
+        self.assertEqual(2, mocked.call_count)
+
     def test_get_structured_5xxxx_business_error_is_retried(self):
         class _Response:
             status = 200
@@ -2952,6 +2986,68 @@ class OfficialApiBackendTests(unittest.TestCase):
         self.assertEqual(body["material_ids"][0], 90071992547409931)
         self.assertNotIn('"1234567890123456789"', json.dumps(body))
         self.assertEqual(str(response.data["task_id"]), "9876543210123456789")
+
+    def test_live_retarget_parameters_follow_official_smart_bid_contract(self):
+        budget, duration, extra = _retarget_params(
+            {
+                "method": "volume",
+                "volume": {"total_budget_yuan": 100, "duration_hours": 24},
+            },
+            "live",
+        )
+        self.assertEqual(Decimal("100"), budget)
+        self.assertEqual(Decimal("24"), duration)
+        self.assertEqual("SMART_BID_CONSERVATIVE", extra["smart_bid_type"])
+
+        budget, duration, extra = _retarget_params(
+            {
+                "method": "cost_control",
+                "cost_control": {
+                    "optimization_goal": "net_roi",
+                    "net_roi": {"daily_budget_yuan": 100, "net_roi_target": 6},
+                },
+            },
+            "live",
+        )
+        self.assertEqual(Decimal("100"), budget)
+        self.assertIsNone(duration)
+        self.assertEqual("SMART_BID_CUSTOM", extra["smart_bid_type"])
+        self.assertEqual(
+            "AD_CONVERT_TYPE_LIVE_SUCCESSORDER_PAY", extra["external_action"]
+        )
+        self.assertEqual(
+            "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI", extra["deep_external_action"]
+        )
+        self.assertEqual(6.0, extra["roi2_goal"])
+
+    def test_live_cost_control_create_omits_duration_and_sends_required_mode(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client, allow_writes=True)
+        service.create_material_control_task(
+            "1843497131079815",
+            ad_id="1864075957558361",
+            marketing_goal="LIVE_PROM_GOODS",
+            name="控成本追投",
+            budget=Decimal("100"),
+            duration=None,
+            material_ids=["7675637085972447295"],
+            extra={
+                "smart_bid_type": "SMART_BID_CUSTOM",
+                "external_action": "AD_CONVERT_TYPE_LIVE_SUCCESSORDER_PAY",
+                "deep_external_action": "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI",
+                "roi2_goal": 6.0,
+            },
+        )
+        body = client.posts[0][1]
+        self.assertNotIn("duration", body)
+        self.assertEqual("SMART_BID_CUSTOM", body["smart_bid_type"])
+        self.assertEqual(
+            "AD_CONVERT_TYPE_LIVE_SUCCESSORDER_PAY", body["external_action"]
+        )
+        self.assertEqual(
+            "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI", body["deep_external_action"]
+        )
+        self.assertEqual(6.0, body["roi2_goal"])
 
     def test_overlapping_groups_are_not_treated_as_duplicates(self):
         client = _CaptureClient(

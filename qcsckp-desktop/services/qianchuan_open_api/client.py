@@ -244,6 +244,7 @@ class QianchuanOpenApiClient:
                 "稍后重试",
                 "服务繁忙",
                 "服务异常",
+                "下游依赖服务相关错误",
                 "system busy",
                 "service unavailable",
                 "temporarily unavailable",
@@ -362,6 +363,11 @@ class QianchuanOpenApiClient:
                                 "request_id": self._request_id(decoded, response.headers),
                                 "status": "failed",
                                 "error_code": code or str(status),
+                                "response": {
+                                    "code": code or str(status),
+                                    "message": str(decoded.get("message") or decoded.get("msg") or ""),
+                                    "help_message": str(decoded.get("help_message") or ""),
+                                },
                                 "permission_status": (
                                     "denied"
                                     if status in {401, 403}
@@ -420,6 +426,11 @@ class QianchuanOpenApiClient:
                         "request_id": request_id,
                         "status": "failed",
                         "error_code": error_code,
+                        "response": {
+                            "code": error_code,
+                            "message": str(decoded.get("message") or decoded.get("msg") or ""),
+                            "help_message": str(decoded.get("help_message") or ""),
+                        },
                         "permission_status": (
                             "denied"
                             if int(exc.code) in {401, 403}

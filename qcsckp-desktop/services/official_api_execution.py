@@ -349,30 +349,57 @@ def _check_plan(
     return detail
 
 
-def _retarget_params(retargeting: Mapping[str, Any]) -> tuple[Decimal, Decimal, dict[str, Any]]:
+def _retarget_params(
+    retargeting: Mapping[str, Any],
+    promotion_scene: str = "product",
+) -> tuple[Decimal, Optional[Decimal], dict[str, Any]]:
     method = str(retargeting.get("method") or "volume").lower()
+    is_live = str(promotion_scene or "").strip().lower() == "live"
     extra: dict[str, Any] = {}
     if method == "volume":
         volume = retargeting.get("volume") if isinstance(retargeting.get("volume"), Mapping) else {}
+        if is_live:
+            extra["smart_bid_type"] = "SMART_BID_CONSERVATIVE"
         return (
             Decimal(str(volume.get("total_budget_yuan"))),
             Decimal(str(volume.get("duration_hours"))),
             extra,
         )
+    if not is_live:
+        raise ValueError("推商品计划当前仅支持放量追投")
     control = retargeting.get("cost_control") if isinstance(retargeting.get("cost_control"), Mapping) else {}
     goal = str(control.get("optimization_goal") or "net_roi").lower()
+    extra.update(
+        {
+            "smart_bid_type": "SMART_BID_CUSTOM",
+            "external_action": "AD_CONVERT_TYPE_LIVE_SUCCESSORDER_PAY",
+        }
+    )
     if goal == "net_roi":
         block = control.get("net_roi") if isinstance(control.get("net_roi"), Mapping) else {}
+        extra["deep_external_action"] = "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI"
         extra["roi2_goal"] = float(Decimal(str(block.get("net_roi_target"))))
         budget = Decimal(str(block.get("daily_budget_yuan")))
     else:
         block = control.get("live_room") if isinstance(control.get("live_room"), Mapping) else {}
         extra["bid"] = float(Decimal(str(block.get("bid_per_conversion_yuan"))))
         budget = Decimal(str(block.get("daily_budget_yuan")))
-    # The official control task endpoint still requires a duration.  Existing
-    # cost-control UI has no duration field, so its documented maximum window
-    # is used and frozen in the execution audit.
-    return budget, Decimal("24"), extra
+    # 直播控成本素材追投不支持 duration，平台按长期有效处理。
+    return budget, None, extra
+
+
+def _public_api_error(exc: BaseException) -> str:
+    """Keep the platform message and append identifiers needed for support."""
+
+    message = str(exc) or "千川官方 API 请求失败"
+    details: list[str] = []
+    code = str(getattr(exc, "code", "") or "").strip()
+    request_id = str(getattr(exc, "request_id", "") or "").strip()
+    if code:
+        details.append(f"错误码 {code}")
+    if request_id:
+        details.append(f"request_id {request_id}")
+    return message + (f"（{'，'.join(details)}）" if details else "")
 
 
 class OfficialApiRetargetingService:
@@ -484,7 +511,7 @@ class OfficialApiRetargetingService:
                 if not _material_is_writable(current.get(mid) or {}):
                     raise RuntimeError(f"素材 {mid} 的投放或审核状态未明确可用，已禁止追投")
 
-            budget, duration, extra = _retarget_params(rdict)
+            budget, duration, extra = _retarget_params(rdict, promotion_scene)
             if intent_key:
                 from services.official_api_reconciliation import reserve_execution_intent
 
@@ -500,7 +527,7 @@ class OfficialApiRetargetingService:
                         "promotion_scene": promotion_scene,
                         "material_ids": mids,
                         "budget": str(budget),
-                        "duration": str(duration),
+                        "duration": str(duration) if duration is not None else "",
                         "execution_uid": intent_key,
                     },
                 )
@@ -592,7 +619,7 @@ class OfficialApiRetargetingService:
             )
         except ApiWriteOutcomeUnknown as exc:
             try:
-                budget, duration, _ = _retarget_params(rdict)
+                budget, duration, _ = _retarget_params(rdict, promotion_scene)
                 duplicate = await asyncio.to_thread(
                     service.find_duplicate_control_task,
                     aavid,
@@ -639,13 +666,13 @@ class OfficialApiRetargetingService:
                     finish_execution_intent(
                         intent_key,
                         status="unknown_requires_review",
-                        error=str(exc),
+                        error=_public_api_error(exc),
                     )
             return RetargetingRunResult(
                 success=bool(task_id),
                 message="官方 API 已找到对应调控任务，正在继续核验" if task_id else "官方 API 创建结果未知，已禁止自动重试",
                 step="submitted_verifying" if task_id else "unknown_requires_review",
-                detail=str(exc),
+                detail=_public_api_error(exc),
                 aavid=text_id(aavid),
                 ad_id=text_id(ad_id),
                 material_id=text_id(material_id),
@@ -662,11 +689,11 @@ class OfficialApiRetargetingService:
                 finish_execution_intent(
                     intent_key,
                     status="confirmed_failed",
-                    error=str(exc),
+                    error=_public_api_error(exc),
                 )
             return RetargetingRunResult(
                 success=False,
-                message=str(exc),
+                message=_public_api_error(exc),
                 step="official_api",
                 detail=traceback.format_exc()[:8000],
                 aavid=text_id(aavid),
