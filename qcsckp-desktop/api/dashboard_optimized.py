@@ -521,3 +521,142 @@ class OptimizedDashboardQueries:
                     }
                 )
         return {"success": True, "data": result, "total": len(result)}
+
+    def get_scope_history(
+        self,
+        *,
+        aavid: Any = "",
+        target_uid: Any = "",
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return cumulative curves for the current dashboard scope.
+
+        Metric snapshots are intentionally sparse: a row is written only when
+        one of the material metrics changes.  Summing each bucket directly
+        would therefore under-count unchanged materials.  The query first
+        turns every material's sparse cumulative values into deltas, then sums
+        those deltas by five-minute bucket and rebuilds the scope totals.
+        """
+
+        owner = self._owner()
+        account_id = str(aavid or "").strip()
+        target_id = str(target_uid or "").strip()
+        limit = max(1, min(200, int(limit or 200)))
+        today = datetime.now().strftime("%Y-%m-%d 00:00:00")
+
+        clauses = [
+            "s.account_username=?",
+            "a.owner_username=?",
+            "a.enabled=1",
+            "t.enabled=1",
+            "COALESCE(l.delivery_state,'delivering')='delivering'",
+            # ``account_username,collected_at`` is indexed for the all-account
+            # dashboard path; bucket_key is still used for five-minute grouping.
+            "s.collected_at>=?",
+        ]
+        params: list[Any] = [owner, owner, today]
+        if account_id:
+            clauses.append("a.aavid=?")
+            params.append(account_id)
+        if target_id:
+            clauses.append("t.target_uid=?")
+            params.append(target_id)
+
+        rows = self.db.execute(
+            "WITH scoped AS ("
+            " SELECT s.id,s.target_uid,s.material_id,s.bucket_key,s.collected_at,"
+            " COALESCE(s.stat_cost,0) AS stat_cost,"
+            " COALESCE(s.pay_gmv_include_coupon,0) AS gmv"
+            " FROM pmc_material_metric_snapshot s"
+            " INNER JOIN promotion_target t ON t.target_uid=s.target_uid"
+            " INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid"
+            " INNER JOIN pmc_promotion_material_latest l"
+            " ON l.target_uid=s.target_uid AND l.material_id=s.material_id"
+            " WHERE "
+            + " AND ".join(clauses)
+            + "), dedup AS ("
+            " SELECT *,ROW_NUMBER() OVER ("
+            " PARTITION BY target_uid,material_id,bucket_key"
+            " ORDER BY collected_at DESC,id DESC) AS rn"
+            " FROM scoped"
+            "), changes AS ("
+            " SELECT bucket_key,target_uid,material_id,"
+            " stat_cost-COALESCE(LAG(stat_cost) OVER ("
+            " PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_cost,"
+            " gmv-COALESCE(LAG(gmv) OVER ("
+            " PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_gmv"
+            " FROM dedup WHERE rn=1"
+            "), bucketed AS ("
+            " SELECT bucket_key,SUM(delta_cost) AS delta_cost,"
+            " SUM(delta_gmv) AS delta_gmv FROM changes GROUP BY bucket_key"
+            "), running AS ("
+            " SELECT bucket_key,"
+            " SUM(delta_cost) OVER (ORDER BY bucket_key) AS total_cost,"
+            " SUM(delta_gmv) OVER (ORDER BY bucket_key) AS total_gmv"
+            " FROM bucketed"
+            ") SELECT bucket_key,total_cost,total_gmv FROM running"
+            " ORDER BY bucket_key DESC LIMIT ?",
+            (*params, limit),
+            fetch=True,
+        ) or []
+        rows = list(reversed(rows))
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            bucket = str(row.get("bucket_key") or "")
+            if not bucket:
+                continue
+            try:
+                observed = datetime.strptime(bucket, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            cost = float(row.get("total_cost") or 0)
+            amount = float(row.get("total_gmv") or 0)
+            result.append(
+                {
+                    "time": observed.strftime("%m-%d %H:%M"),
+                    "timestamp": int(observed.timestamp() * 1000),
+                    "cost": round(cost, 4),
+                    "roi": round(amount / cost, 4) if cost > 0 else 0.0,
+                    "amount": round(amount, 4),
+                }
+            )
+
+        # ``latest`` is refreshed on every successful collection even when no
+        # metric changed.  Append/replace a final point so the aggregate curve
+        # reaches the same fresh value shown by the table and summary cards.
+        scope_where, scope_params = self._scope_where(account_id, target_id)
+        latest_rows = self.db.execute(
+            "SELECT MAX(l.collected_at) AS collected_at,"
+            "SUM(COALESCE(l.stat_cost,0)) AS total_cost,"
+            "SUM(COALESCE(l.pay_gmv_include_coupon,0)) AS total_gmv "
+            "FROM pmc_promotion_material_latest l "
+            "INNER JOIN promotion_target t ON t.target_uid=l.target_uid "
+            "INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+            f"WHERE {scope_where}",
+            (owner, *scope_params),
+            fetch=True,
+        ) or []
+        if latest_rows and latest_rows[0].get("collected_at"):
+            latest = latest_rows[0]
+            latest_at = str(latest.get("collected_at") or "")
+            try:
+                observed = datetime.strptime(latest_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                observed = None
+            if observed is not None:
+                cost = float(latest.get("total_cost") or 0)
+                amount = float(latest.get("total_gmv") or 0)
+                point = {
+                    "time": observed.strftime("%m-%d %H:%M"),
+                    "timestamp": int(observed.timestamp() * 1000),
+                    "cost": round(cost, 4),
+                    "roi": round(amount / cost, 4) if cost > 0 else 0.0,
+                    "amount": round(amount, 4),
+                }
+                if result and result[-1]["time"] == point["time"]:
+                    result[-1] = point
+                elif not result or point["timestamp"] > result[-1]["timestamp"]:
+                    result.append(point)
+
+        result = result[-limit:]
+        return {"success": True, "data": result, "total": len(result)}

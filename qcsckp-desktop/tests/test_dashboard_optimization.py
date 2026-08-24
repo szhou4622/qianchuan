@@ -201,6 +201,45 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertEqual(80.0, result["data"][0]["cost"])
         self.assertEqual(100.0, result["data"][-1]["cost"])
 
+    def test_scope_history_aggregates_enabled_accounts_and_respects_filters(self):
+        all_accounts = self.queries.get_scope_history()
+        account = self.queries.get_scope_history(aavid="1001")
+        plan = self.queries.get_scope_history(target_uid="target-2")
+
+        self.assertTrue(all_accounts["success"])
+        self.assertEqual(260.0, all_accounts["data"][0]["cost"])
+        self.assertEqual(300.0, all_accounts["data"][-1]["cost"])
+        self.assertEqual(2.0, all_accounts["data"][-1]["roi"])
+        self.assertEqual(600.0, all_accounts["data"][-1]["amount"])
+        self.assertEqual(80.0, account["data"][0]["cost"])
+        self.assertEqual(100.0, account["data"][-1]["cost"])
+        self.assertEqual(180.0, plan["data"][0]["cost"])
+        self.assertEqual(200.0, plan["data"][-1]["cost"])
+
+    def test_scope_history_reconstructs_sparse_material_snapshots(self):
+        observed = self.now - timedelta(minutes=30)
+        self.db.insert(
+            "pmc_material_metric_snapshot",
+            {
+                "account_username": "dashboard-owner",
+                "account_uid": "account-1",
+                "aadvid": "1001",
+                "target_uid": "target-1",
+                "ad_id": "2001",
+                "material_id": "3001",
+                "bucket_key": observed.strftime("%Y-%m-%d %H:%M:00"),
+                "collected_at": observed.strftime("%Y-%m-%d %H:%M:%S"),
+                "stat_date": observed.strftime("%Y-%m-%d"),
+                "stat_cost": 90,
+                "pay_gmv_include_coupon": 180,
+                "prepay_pay_order_count": 2.0,
+            },
+        )
+
+        result = self.queries.get_scope_history()
+        costs = [row["cost"] for row in result["data"]]
+        self.assertEqual([260.0, 270.0, 300.0], costs)
+
     def test_legacy_rows_backfill_latest_and_narrow_snapshot(self):
         observed = self.now - timedelta(minutes=10)
         self.db.insert(

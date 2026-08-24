@@ -2505,8 +2505,38 @@
             document.getElementById('selectedMaterialId').textContent = `ID: ${item.id}`;
             document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${item.id}`;
             document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${item.id}`;
+            document.getElementById('clearSelection').classList.remove('hidden');
             renderTable(processData()); // 重新渲染表格以更新选中状态
             startHistoryPolling(item.id, item.targetUid);
+        }
+
+        function getScopeHistoryLabel() {
+            if (selectedDashboardTargetUid) {
+                const plan = (dashboardScopeOptions.plans || []).find(
+                    item => String(item.target_uid || '') === selectedDashboardTargetUid
+                );
+                return `范围：${(plan && (plan.plan_name || plan.ad_id)) || '当前监控计划'}`;
+            }
+            if (selectedDashboardAavid) {
+                const account = (dashboardScopeOptions.accounts || []).find(
+                    item => String(item.aavid || '') === selectedDashboardAavid
+                );
+                return `范围：${(account && (account.account_name || account.aavid)) || '当前千川账户'}`;
+            }
+            return '范围：全部启用账户';
+        }
+
+        function applyScopeHistoryLabels() {
+            const label = getScopeHistoryLabel();
+            ['selectedMaterialId', 'selectedMaterialIdPayRoi', 'selectedMaterialIdAmount']
+                .forEach(id => {
+                    const element = document.getElementById(id);
+                    if (element) {
+                        element.textContent = label;
+                        element.title = label;
+                    }
+                });
+            document.getElementById('clearSelection').classList.add('hidden');
         }
 
         function stopHistoryPolling() {
@@ -2533,6 +2563,40 @@
             historyPollTimer = setInterval(() => {
                 refreshHistoryOnce(materialId);
             }, HISTORY_POLL_MS);
+        }
+
+        function startScopeHistoryPolling() {
+            const historyKey = `scope:${selectedDashboardAavid || ''}:${selectedDashboardTargetUid || ''}`;
+            if (historyActiveMaterialId === historyKey && historyPollTimer) return;
+
+            stopHistoryPolling();
+            historyActiveMaterialId = historyKey;
+            applyScopeHistoryLabels();
+            refreshScopeHistoryOnce();
+            historyPollTimer = setInterval(refreshScopeHistoryOnce, HISTORY_POLL_MS);
+        }
+
+        async function refreshScopeHistoryOnce() {
+            const token = ++historyRequestToken;
+            try {
+                const api = await waitForAPI();
+                if (!api || !api.getScopeHistoryRecent) return;
+                const res = await api.getScopeHistoryRecent(
+                    selectedDashboardAavid || null,
+                    selectedDashboardTargetUid || null,
+                    HISTORY_LIMIT
+                );
+                if (token !== historyRequestToken || selectedMaterial) return;
+                if (res && res.success && Array.isArray(res.data)) {
+                    const historyData = res.data;
+                    renderLineChart({ id: 'scope', historyData });
+                    renderPayRoiLineChart(historyData);
+                    renderAmountLineChart(historyData);
+                    applyScopeHistoryLabels();
+                }
+            } catch (e) {
+                console.error('刷新筛选范围汇总曲线失败', e);
+            }
         }
 
         async function refreshHistoryOnce(materialId) {
@@ -2568,30 +2632,28 @@
             if (lineChartInstance) { lineChartInstance.dispose(); lineChartInstance = null; }
             if (payRoiChartInstance) { payRoiChartInstance.dispose(); payRoiChartInstance = null; }
             if (amountChartInstance) { amountChartInstance.dispose(); amountChartInstance = null; }
-            document.getElementById('selectedMaterialId').textContent = '';
-            document.getElementById('selectedMaterialIdPayRoi').textContent = '';
-            document.getElementById('selectedMaterialIdAmount').textContent = '';
-            document.getElementById('clearSelection').classList.add('hidden');
+            applyScopeHistoryLabels();
             document.getElementById('lineChart').innerHTML = `
                 <div id="lineChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
-                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
-                    <span class="text-sm">点击右侧素材查看消耗曲线</span>
+                    <i data-lucide="loader-circle" class="w-8 h-8 mb-2 opacity-50 animate-spin"></i>
+                    <span class="text-sm">正在加载筛选范围汇总曲线</span>
                 </div>
             `;
             document.getElementById('payRoiChart').innerHTML = `
                 <div id="payRoiChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
-                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
-                    <span class="text-sm">点击右侧素材查看曲线</span>
+                    <i data-lucide="loader-circle" class="w-8 h-8 mb-2 opacity-50 animate-spin"></i>
+                    <span class="text-sm">正在加载筛选范围汇总曲线</span>
                 </div>
             `;
             document.getElementById('amountChart').innerHTML = `
                 <div id="amountChartPlaceholder" class="h-full flex flex-col items-center justify-center text-slate-500">
-                    <i data-lucide="mouse-pointer-2" class="w-8 h-8 mb-2 opacity-50"></i>
-                    <span class="text-sm">点击右侧素材查看曲线</span>
+                    <i data-lucide="loader-circle" class="w-8 h-8 mb-2 opacity-50 animate-spin"></i>
+                    <span class="text-sm">正在加载筛选范围汇总曲线</span>
                 </div>
             `;
             lucide.createIcons();
             renderTable(processData()); // 重新渲染表格以更新选中状态
+            startScopeHistoryPolling();
         }
 
         function renderLineChart(item) {
@@ -2599,8 +2661,6 @@
             if (placeholder) {
                 placeholder.remove();
             }
-            document.getElementById('clearSelection').classList.remove('hidden');
-
             if (!lineChartInstance) {
                 lineChartInstance = echarts.init(document.getElementById('lineChart'), 'dark');
             }
@@ -2682,8 +2742,6 @@
         function renderPayRoiLineChart(historyData) {
             const placeholder = document.getElementById('payRoiChartPlaceholder');
             if (placeholder) placeholder.remove();
-            document.getElementById('clearSelection').classList.remove('hidden');
-
             if (!payRoiChartInstance) {
                 payRoiChartInstance = echarts.init(document.getElementById('payRoiChart'), 'dark');
             }
@@ -2757,8 +2815,6 @@
         function renderAmountLineChart(historyData) {
             const placeholder = document.getElementById('amountChartPlaceholder');
             if (placeholder) placeholder.remove();
-            document.getElementById('clearSelection').classList.remove('hidden');
-
             if (!amountChartInstance) {
                 amountChartInstance = echarts.init(document.getElementById('amountChart'), 'dark');
             }
@@ -3021,18 +3077,9 @@
             }
 
             const sortedData = processData();
-            // 默认选中第一条数据
-            if (sortedData.length > 0) {
-                selectedMaterial = sortedData[0];
-                document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
-                document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${selectedMaterial.id}`;
-                document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${selectedMaterial.id}`;
-            }
             renderTable(sortedData);
-            // 初始化默认选中第一条：同时启动折线图查询/轮询
-            if (selectedMaterial && selectedMaterial.id) {
-                startHistoryPolling(selectedMaterial.id, selectedMaterial.targetUid);
-            }
+            // 默认展示当前账户/计划筛选范围的汇总曲线；点击素材后才切换为单素材曲线。
+            startScopeHistoryPolling();
             // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
             await renderPieChart();
             if (assistPanelOpen) await fetchAssistRows();
@@ -3104,17 +3151,14 @@
                 } else {
                     clearMaterialSelection();
                 }
-            } else if (sortedData.length > 0) {
-                selectedMaterial = sortedData[0];
-                document.getElementById('selectedMaterialId').textContent = `ID: ${selectedMaterial.id}`;
-                document.getElementById('selectedMaterialIdPayRoi').textContent = `ID: ${selectedMaterial.id}`;
-                document.getElementById('selectedMaterialIdAmount').textContent = `ID: ${selectedMaterial.id}`;
             }
 
             // 渲染表格
             renderTable(sortedData);
             if (selectedMaterial && selectedMaterial.id) {
                 startHistoryPolling(selectedMaterial.id, selectedMaterial.targetUid);
+            } else {
+                startScopeHistoryPolling();
             }
 
             // Top20 饼图 + 最新采集消耗：单独调用后端 API 获取
@@ -3157,6 +3201,8 @@
                             await queryAndUpdateData(true);
                             if (selectedMaterial && selectedMaterial.id) {
                                 await refreshHistoryOnce(selectedMaterial.id);
+                            } else {
+                                await refreshScopeHistoryOnce();
                             }
                         })()
                     ]);

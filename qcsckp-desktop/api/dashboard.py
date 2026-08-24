@@ -60,6 +60,17 @@ class DashboardApi:
         return self.optimized.get_material_history(
             material_id, target_uid=target_uid or "", limit=limit
         )
+
+    def get_scope_history_recent(
+        self,
+        aavid: str = "",
+        target_uid: str = "",
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """获取当前账户/计划筛选范围的汇总历史曲线。"""
+        return self.optimized.get_scope_history(
+            aavid=aavid or "", target_uid=target_uid or "", limit=limit
+        )
         try:
             limit = int(limit) if limit else 200
             if limit <= 0 or limit > 200:

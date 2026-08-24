@@ -53,6 +53,14 @@ class DashboardFilterBootstrapTests(unittest.TestCase):
         self.assertIn("def getDashboardBootstrap(self):", self.gui)
         self.assertIn("return self.api.get_dashboard_bootstrap()", self.gui)
 
+    def test_default_curves_follow_scope_and_material_click_switches_detail(self):
+        self.assertIn("def getScopeHistoryRecent", self.gui)
+        self.assertIn("function startScopeHistoryPolling()", self.dashboard)
+        self.assertIn("api.getScopeHistoryRecent(", self.dashboard)
+        self.assertIn("范围：全部启用账户", self.dashboard)
+        self.assertIn("startHistoryPolling(item.id, item.targetUid)", self.dashboard)
+        self.assertIn("startScopeHistoryPolling();", self.dashboard)
+
     def test_scope_change_requeries_materials_and_restarts_selected_curve(self):
         self.assertNotIn("clearSelectionAndCharts()", self.dashboard)
         self.assertGreaterEqual(

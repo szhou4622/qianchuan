@@ -110,6 +110,17 @@ class Api:
         """获取素材最近 N 条历史点（按 created_at）"""
         return self.dashboard.get_material_history_recent(material_id, limit, target_uid)
 
+    def get_scope_history_recent(
+        self,
+        aavid: str = None,
+        target_uid: str = None,
+        limit: int = 200,
+    ):
+        """获取当前大屏筛选范围的汇总历史曲线。"""
+        return self.dashboard.get_scope_history_recent(
+            aavid or "", target_uid or "", limit
+        )
+
     def get_table_data(self, period: str = "1h", sort_by: str = "costDiff", sort_order: str = "desc",
                       page: int = 1, page_size: int = 50, target_uid: str = None,
                       aavid: str = None):

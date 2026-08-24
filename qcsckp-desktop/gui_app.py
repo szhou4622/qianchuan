@@ -780,6 +780,9 @@ class JSApi:
     def getMaterialHistoryRecent(self, material_id, limit=200, targetUid=None):
         return self.api.get_material_history_recent(material_id, limit, targetUid)
 
+    def getScopeHistoryRecent(self, aavid=None, targetUid=None, limit=200):
+        return self.api.get_scope_history_recent(aavid, targetUid, limit)
+
     def getDashboardScopeOptions(self):
         return self.api.get_dashboard_scope_options()
 
