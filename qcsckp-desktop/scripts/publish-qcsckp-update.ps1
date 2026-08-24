@@ -42,7 +42,12 @@ $manifest = [ordered]@{
 
 $outputDir = Split-Path -Parent $zip
 $manifestPath = Join-Path $outputDir "QCSCKP-v$Version-update-manifest.json"
-$manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+$manifestJson = $manifest | ConvertTo-Json -Depth 6
+[IO.File]::WriteAllText(
+    $manifestPath,
+    $manifestJson,
+    [Text.UTF8Encoding]::new($false)
+)
 
 $scp = "$env:SystemRoot\System32\OpenSSH\scp.exe"
 $ssh = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
@@ -65,7 +70,7 @@ foreach ($pair in @(
     if ($LASTEXITCODE -ne 0) { throw "Upload failed: $($pair[0])" }
 }
 
-$remoteCommand = "set -eu; chmod 700 '$remoteDeploy'; bash '$remoteDeploy' '$Version' '$remoteZip' '$remoteManifest' '$sha256'; rm -f -- '$remoteZip' '$remoteManifest' '$remoteDeploy'"
+$remoteCommand = "set +e; chmod 700 '$remoteDeploy'; bash '$remoteDeploy' '$Version' '$remoteZip' '$remoteManifest' '$sha256'; rc=`$?; rm -f -- '$remoteZip' '$remoteManifest' '$remoteDeploy'; exit `$rc"
 & $ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -p $ServerPort "${ServerUser}@${ServerHost}" $remoteCommand
 if ($LASTEXITCODE -ne 0) { throw "Server deployment failed" }
 
@@ -77,8 +82,8 @@ if ([string]$published.app_name -ne "QCSCKP" -or [string]$published.version -ne 
 if ([string]$published.sha256.windows_x64 -ne $sha256) {
     throw "Published SHA256 mismatch"
 }
-$head = Invoke-WebRequest -Uri $published.download_url.windows_x64 -Method Head -TimeoutSec 30
-if ([int]$head.StatusCode -ne 200) { throw "Published ZIP is unavailable" }
+& curl.exe -sS -f -I --max-time 30 ([string]$published.download_url.windows_x64) | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Published ZIP is unavailable" }
 
 Write-Output "MANIFEST_PATH=$manifestPath"
 Write-Output "DOWNLOAD_URL=$($published.download_url.windows_x64)"
