@@ -217,8 +217,6 @@ class QianchuanOpenApiClient:
     @staticmethod
     def _is_token_error(code: str, message: str) -> bool:
         text = f"{code} {message}".lower()
-        if str(code or "").strip().startswith("5"):
-            return True
         return any(word in text for word in ("access_token", "access token", "token expired", "token失效", "token过期"))
 
     @staticmethod
@@ -237,7 +235,7 @@ class QianchuanOpenApiClient:
         """
 
         text = f"{code} {message}".lower()
-        return any(
+        return str(code or "").strip().startswith("5") or any(
             phrase in text
             for phrase in (
                 "系统开小差",
@@ -477,6 +475,36 @@ class QianchuanOpenApiClient:
                 raise
             except ApiRequestError as exc:
                 last_error = exc
+                if verb == "POST" and self._is_transient_service_error(
+                    exc.code, str(exc)
+                ):
+                    # The platform accepted the HTTP request but its downstream
+                    # service timed out.  The write may already exist, so never
+                    # resubmit it; persist an unknown outcome for read-only
+                    # reconciliation by the caller.
+                    self._audit(
+                        {
+                            "request_uid": local_request_uid,
+                            "endpoint": endpoint,
+                            "method": verb,
+                            "aavid": str(advertiser_id or ""),
+                            "request": {"query": query or {}, "body": body or {}},
+                            "request_id": exc.request_id,
+                            "status": "unknown",
+                            "error_code": exc.code or "transient_service",
+                            "response": {
+                                "code": exc.code,
+                                "message": str(exc),
+                            },
+                        }
+                    )
+                    raise ApiWriteOutcomeUnknown(
+                        "千川官方 API 内部处理超时，禁止重复提交，正在查询是否已创建",
+                        code=exc.code,
+                        request_id=exc.request_id,
+                        endpoint=endpoint,
+                        request_uid=local_request_uid,
+                    ) from exc
                 if (
                     verb == "GET"
                     and attempt < attempts

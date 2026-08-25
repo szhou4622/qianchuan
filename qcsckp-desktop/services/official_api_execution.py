@@ -526,6 +526,7 @@ class OfficialApiRetargetingService:
                         "ad_id": ad_id,
                         "promotion_scene": promotion_scene,
                         "material_ids": mids,
+                        "task_name": control_task_name,
                         "budget": str(budget),
                         "duration": str(duration) if duration is not None else "",
                         "execution_uid": intent_key,
@@ -591,6 +592,7 @@ class OfficialApiRetargetingService:
                     "promotion_scene": promotion_scene,
                     "task_id": task_id,
                     "material_ids": mids,
+                    "task_name": control_task_name,
                     "budget": budget,
                     "duration": duration,
                     "execution_uid": str(execution_uid or ""),
@@ -641,37 +643,38 @@ class OfficialApiRetargetingService:
                     response=duplicate or {},
                 )
             if intent_reserved and intent_key:
-                if task_id:
-                    _start_control_task_reconciliation(
-                        service,
-                        request_uid=str(exc.request_uid or ""),
-                        request_id="",
-                        task_id=task_id,
-                        task_uid=str(reconciliation_task_uid or execution_uid or ""),
-                        idempotency_key=intent_key,
-                        verify_kwargs={
-                            "aavid": aavid,
-                            "ad_id": ad_id,
-                            "promotion_scene": promotion_scene,
-                            "task_id": task_id,
-                            "material_ids": mids,
-                            "budget": budget,
-                            "duration": duration,
-                            "execution_uid": intent_key,
-                        },
-                    )
-                else:
-                    from services.official_api_reconciliation import finish_execution_intent
-
-                    finish_execution_intent(
-                        intent_key,
-                        status="unknown_requires_review",
-                        error=_public_api_error(exc),
-                    )
+                _start_control_task_reconciliation(
+                    service,
+                    request_uid=str(exc.request_uid or ""),
+                    request_id=str(exc.request_id or ""),
+                    task_id=task_id,
+                    task_uid=str(reconciliation_task_uid or execution_uid or ""),
+                    idempotency_key=intent_key,
+                    verify_kwargs={
+                        "aavid": aavid,
+                        "ad_id": ad_id,
+                        "promotion_scene": promotion_scene,
+                        "task_id": task_id,
+                        "material_ids": mids,
+                        "task_name": control_task_name,
+                        "budget": budget,
+                        "duration": duration,
+                        "execution_uid": intent_key,
+                    },
+                )
+            pending_verification = bool(task_id or (intent_reserved and intent_key))
             return RetargetingRunResult(
-                success=bool(task_id),
-                message="官方 API 已找到对应调控任务，正在继续核验" if task_id else "官方 API 创建结果未知，已禁止自动重试",
-                step="submitted_verifying" if task_id else "unknown_requires_review",
+                success=pending_verification,
+                message=(
+                    "官方 API 已找到对应调控任务，正在继续核验"
+                    if task_id
+                    else "千川内部处理超时，已禁止重复提交，正在查询是否已创建"
+                ),
+                step=(
+                    "submitted_verifying"
+                    if pending_verification
+                    else "unknown_requires_review"
+                ),
                 detail=_public_api_error(exc),
                 aavid=text_id(aavid),
                 ad_id=text_id(ad_id),

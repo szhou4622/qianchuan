@@ -388,18 +388,57 @@ def _retry(store: SQLiteStore, row: Mapping[str, Any], error: str) -> None:
 
 
 def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
+    row = dict(row)
     data = _payload(row.get("payload_json"))
     try:
         action_type = str(row.get("action_type") or "retarget")
         if action_type == "retarget":
             from services.official_api_execution import _verify_control_task
 
+            service = get_official_api_service()
+            task_id = str(row.get("control_task_id") or "").strip()
+            if not task_id:
+                # A transient POST response can omit the created task ID even
+                # though the downstream service completed the write.  Search
+                # only by the immutable execution name, frozen material group
+                # and parameters; never resubmit the POST.
+                found = service.find_duplicate_control_task(
+                    row.get("aavid"),
+                    ad_id=row.get("ad_id"),
+                    marketing_goal=(
+                        "LIVE_PROM_GOODS"
+                        if str(data.get("promotion_scene") or "").lower() == "live"
+                        else "VIDEO_PROM_GOODS"
+                    ),
+                    task_name=str(data.get("task_name") or ""),
+                    budget=data.get("budget"),
+                    duration=data.get("duration") or None,
+                    material_ids=data.get("material_ids") or [],
+                )
+                task_id = str((found or {}).get("task_id") or "").strip()
+                if not task_id:
+                    raise RuntimeError("平台暂未查询到本次追投任务，稍后继续核验")
+                changed = store.execute(
+                    "UPDATE execution_reconciliation SET control_task_id=?,updated_at=? "
+                    "WHERE reconciliation_uid=? AND status='verifying' "
+                    "AND lease_owner=? AND fencing_token=?",
+                    (
+                        task_id,
+                        _now(),
+                        str(row.get("reconciliation_uid") or ""),
+                        str(row.get("lease_owner") or ""),
+                        int(row.get("fencing_token") or 0),
+                    ),
+                )
+                if int(changed or 0) != 1:
+                    raise RuntimeError("对账任务租约已经变化，本轮结果已丢弃")
+                row["control_task_id"] = task_id
             verified = _verify_control_task(
-                get_official_api_service(),
+                service,
                 aavid=row.get("aavid"),
                 ad_id=row.get("ad_id"),
                 promotion_scene=data.get("promotion_scene"),
-                task_id=row.get("control_task_id"),
+                task_id=task_id,
                 material_ids=data.get("material_ids") or [],
                 budget=data.get("budget"),
                 duration=data.get("duration"),

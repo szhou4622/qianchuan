@@ -83,6 +83,7 @@ from services.official_api_execution import (
     _verify_control_task,
     _verify_control_task_eventually,
 )
+from services.official_api_reconciliation import _verify_one
 from services.official_api_controller import OfficialApiController
 from unittest.mock import MagicMock, Mock
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -1558,6 +1559,9 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "promotion_scene": "product",
                 "task_id": "1873333931211978",
                 "material_ids": ["7643772216392564762"],
+                "task_name": _unique_control_task_name(
+                    "策略 1", "abdcf523-b1d0-45e5-992e-f023ffdc13e9"
+                ),
                 "budget": Decimal("100"),
                 "duration": Decimal("24"),
                 "execution_uid": "abdcf523-b1d0-45e5-992e-f023ffdc13e9",
@@ -2961,6 +2965,158 @@ class OfficialApiBackendTests(unittest.TestCase):
             with self.assertRaises(ApiRequestError):
                 client.post("/open_api/v1.0/test/", {"advertiser_id": 1})
         self.assertEqual(mocked.call_count, 1)
+
+    def test_post_internal_timeout_is_unknown_and_keeps_request_identity(self):
+        class _Response:
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "code": 51010,
+                        "message": "Internal service timed out. Please retry in sometime.",
+                        "request_id": "req-51010",
+                    }
+                ).encode("utf-8")
+
+        client = QianchuanOpenApiClient(
+            InjectedTokenProvider(AccessTokenBundle("token")),
+            max_get_attempts=4,
+            sleep=lambda _: None,
+        )
+        with patch(
+            "services.qianchuan_open_api.client.urlopen",
+            return_value=_Response(),
+        ) as mocked:
+            with self.assertRaises(ApiWriteOutcomeUnknown) as caught:
+                client.post("/open_api/v1.0/test/", {"advertiser_id": 1})
+        self.assertEqual(1, mocked.call_count)
+        self.assertEqual("51010", caught.exception.code)
+        self.assertEqual("req-51010", caught.exception.request_id)
+
+    def test_create_timeout_without_task_id_enters_persistent_reconciliation(self):
+        service = Mock()
+        service.list_plan_materials.return_value = (
+            [
+                {
+                    "material_id": "7675637085972447295",
+                    "material_status": "DELIVERY_OK",
+                    "audit_status": "PASS",
+                }
+            ],
+            ["req-material"],
+        )
+        service.create_material_control_task.side_effect = ApiWriteOutcomeUnknown(
+            "千川官方 API 内部处理超时",
+            code="51010",
+            request_id="req-timeout",
+            request_uid="write-uid",
+        )
+        service.find_duplicate_control_task.return_value = None
+        reconcile = Mock()
+        runner = OfficialApiRetargetingService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan",
+            return_value={},
+        ), patch(
+            "services.official_api_execution._start_control_task_reconciliation",
+            reconcile,
+        ), patch(
+            "services.official_api_execution._existing_reconciliation",
+            return_value=None,
+        ), patch(
+            "services.official_api_reconciliation.reserve_execution_intent",
+            return_value=({}, True),
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=1843497131079815,
+                    ad_id=1864075957558361,
+                    material_id="7675637085972447295",
+                    retargeting={
+                        "method": "cost_control",
+                        "cost_control": {
+                            "optimization_goal": "net_roi",
+                            "net_roi": {
+                                "daily_budget_yuan": 100,
+                                "net_roi_target": 6,
+                            },
+                        },
+                    },
+                    strategy_title="策略 1",
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                    execution_uid="timeout-execution",
+                )
+            )
+        self.assertTrue(result.success)
+        self.assertEqual("submitted_verifying", result.step)
+        self.assertIn("正在查询", result.message)
+        call = reconcile.call_args.kwargs
+        self.assertEqual("", call["task_id"])
+        self.assertEqual("req-timeout", call["request_id"])
+        self.assertTrue(call["verify_kwargs"]["task_name"])
+
+    def test_reconciliation_can_discover_timeout_write_by_immutable_name(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"QCSCKP_SESSION_OWNER": "reconcile-owner"}
+        ):
+            database = os.path.join(temp, "reconcile.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            store.insert(
+                "execution_reconciliation",
+                {
+                    "reconciliation_uid": "recon-1",
+                    "account_username": "reconcile-owner",
+                    "task_uid": "",
+                    "action_type": "retarget",
+                    "aavid": "1843497131079815",
+                    "ad_id": "1864075957558361",
+                    "control_task_id": "",
+                    "idempotency_key": "timeout-execution",
+                    "status": "verifying",
+                    "lease_owner": "lease-1",
+                    "fencing_token": 1,
+                    "payload_json": json.dumps(
+                        {
+                            "promotion_scene": "live",
+                            "task_name": "策略1-timeout",
+                            "material_ids": ["7675637085972447295"],
+                            "budget": "100",
+                            "duration": "",
+                        }
+                    ),
+                },
+            )
+            row = store.select_one(
+                "execution_reconciliation", where={"reconciliation_uid": "recon-1"}
+            )
+            service = Mock()
+            service.find_duplicate_control_task.return_value = {"task_id": "188"}
+            with patch(
+                "services.official_api_reconciliation.get_official_api_service",
+                return_value=service,
+            ), patch(
+                "services.official_api_execution._verify_control_task",
+                return_value={"task_id": "188", "status": "ENABLE"},
+            ):
+                _verify_one(store, row)
+            saved = store.select_one(
+                "execution_reconciliation", where={"reconciliation_uid": "recon-1"}
+            )
+            self.assertEqual("188", saved["control_task_id"])
+            self.assertEqual("confirmed_succeeded", saved["status"])
 
     def test_real_writes_are_disabled_by_default(self):
         service = QianchuanOfficialApiService(_CaptureClient(), allow_writes=False)
