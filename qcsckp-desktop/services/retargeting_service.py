@@ -209,6 +209,8 @@ class RetargetingRunResult:
     retargeting_json: str = ""
     finished_at: str = ""
     headless: bool = False
+    retryable: bool = False
+    retry_after_seconds: int = 0
 
     def to_log_dict(self) -> Dict[str, Any]:
         """
@@ -227,6 +229,8 @@ class RetargetingRunResult:
             "retargeting_json": self.retargeting_json,
             "finished_at": self.finished_at,
             "headless": self.headless,
+            "retryable": self.retryable,
+            "retry_after_seconds": self.retry_after_seconds,
         }
 
     def asdict(self) -> Dict[str, Any]:

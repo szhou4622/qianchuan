@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Optional
 
 from services.plan_system import normalize_plan_system
-from services.qianchuan_open_api.errors import ApiWriteOutcomeUnknown
+from services.qianchuan_open_api.errors import ApiRateLimitError, ApiWriteOutcomeUnknown
 from services.qianchuan_open_api.audit import OfficialApiAuditStore
 from services.qianchuan_open_api.normalizers import (
     first,
@@ -686,6 +686,12 @@ class OfficialApiRetargetingService:
                 headless=True,
             )
         except Exception as exc:
+            retryable = isinstance(exc, ApiRateLimitError)
+            retry_after_seconds = (
+                max(60, int(getattr(exc, "retry_after", 0) or 0))
+                if retryable
+                else 0
+            )
             if intent_reserved and intent_key:
                 from services.official_api_reconciliation import finish_execution_intent
 
@@ -706,6 +712,8 @@ class OfficialApiRetargetingService:
                 retargeting_json=json.dumps(rdict, ensure_ascii=False, separators=(",", ":")),
                 finished_at=_now(),
                 headless=True,
+                retryable=retryable,
+                retry_after_seconds=retry_after_seconds,
             )
 
 

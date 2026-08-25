@@ -1273,73 +1273,112 @@ async def _execute_task(
         return failure
     svc = QianChuanRetargetingService.from_rule_file_dict(cfg)
     results: List[Any] = []
+    attempt_history: List[Dict[str, Any]] = []
+    submission_attempts = 0
     rate_recorded_under_lock = False
     try:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
-        async with exclusive_browser_operation(
-            f"飞书确认追投:{target_uid}:{','.join(material_ids)}",
-            priority=10,
-        ):
-            # 排队期间账户、计划、登录、策略、指标和限频都可能变化；
-            # 必须在获得唯一浏览器写锁后重新做完整复核。
-            cfg, strategy, rows = await asyncio.to_thread(
-                _validate_task,
-                task,
-                db,
-            )
-            # 推商品和推直播统一按“一个素材组＝一条追投计划”提交；
-            # 单素材组仍是原有的单素材追投，多素材组最多20条。
-            locked_result = await svc.run(
-                aavid=int(aavid),
-                ad_id=int(ad_id),
-                material_id=material_id,
-                material_ids=material_ids,
-                retargeting=retargeting,
-                strategy_title=strategy_name,
-                execution_uid=task_uid,
-                reconciliation_task_uid=str(
-                    task.get("parent_task_uid") or task_uid
-                ),
-                target_uid=target_uid,
-                promotion_scene=promotion_scene,
-                plan_system=plan_system,
-                source_url=target.get("sanitized_page_url") or None,
-                reuse_session=False,
-                close_session=False,
-            )
-            results.append(locked_result)
-            if locked_result.success:
-                try:
-                    for current_material_id in material_ids:
-                        if bool(cfg.get("per_strategy_rate_limit")):
-                            ws, mc = _interval_window_and_max(retargeting)
-                            rate_limit_strategy_record_success(
+        for attempt in range(1, 4):
+            submission_attempts = attempt
+            async with exclusive_browser_operation(
+                f"飞书确认追投:{target_uid}:{','.join(material_ids)}",
+                priority=10,
+            ):
+                # 每一次允许的提交尝试前都重新复核完整业务状态。重试等待
+                # 发生在锁外，不能阻塞其他账户的采集和写任务。
+                cfg, strategy, rows = await asyncio.to_thread(
+                    _validate_task,
+                    task,
+                    db,
+                )
+                attempt_execution_uid = f"{task_uid}:attempt:{attempt}"
+                locked_result = await svc.run(
+                    aavid=int(aavid),
+                    ad_id=int(ad_id),
+                    material_id=material_id,
+                    material_ids=material_ids,
+                    retargeting=retargeting,
+                    strategy_title=strategy_name,
+                    execution_uid=attempt_execution_uid,
+                    reconciliation_task_uid=str(
+                        task.get("parent_task_uid") or task_uid
+                    ),
+                    target_uid=target_uid,
+                    promotion_scene=promotion_scene,
+                    plan_system=plan_system,
+                    source_url=target.get("sanitized_page_url") or None,
+                    reuse_session=False,
+                    close_session=False,
+                )
+                results = [locked_result]
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        **locked_result.asdict(),
+                    }
+                )
+                if locked_result.success:
+                    try:
+                        for current_material_id in material_ids:
+                            if bool(cfg.get("per_strategy_rate_limit")):
+                                ws, mc = _interval_window_and_max(retargeting)
+                                rate_limit_strategy_record_success(
+                                    db,
+                                    current_material_id,
+                                    str(strategy.get("id") or ""),
+                                    ws,
+                                    mc,
+                                    target_uid,
+                                )
+                            root_ws, root_mc = _interval_from_root_cfg(cfg)
+                            rate_limit_record_success(
                                 db,
                                 current_material_id,
-                                str(strategy.get("id") or ""),
-                                ws,
-                                mc,
+                                root_ws,
+                                root_mc,
                                 target_uid,
                             )
-                        root_ws, root_mc = _interval_from_root_cfg(cfg)
-                        rate_limit_record_success(
-                            db,
-                            current_material_id,
-                            root_ws,
-                            root_mc,
+                    except Exception as rate_exc:
+                        logger.exception(
+                            "追投成功后记录限频失败，已暂停目标 target=%s",
                             target_uid,
                         )
-                except Exception as rate_exc:
-                    logger.exception(
-                        "追投成功后记录限频失败，已暂停目标 target=%s",
-                        target_uid,
-                    )
-                    block_target_after_rate_record_failure(
-                        db,
-                        target_uid,
-                        rate_exc,
-                    )
-                rate_recorded_under_lock = True
+                        block_target_after_rate_record_failure(
+                            db,
+                            target_uid,
+                            rate_exc,
+                        )
+                    rate_recorded_under_lock = True
+            if (
+                locked_result.success
+                or not bool(getattr(locked_result, "retryable", False))
+                or attempt >= 3
+            ):
+                break
+            default_delay = 60 if attempt == 1 else 120
+            retry_delay = max(
+                default_delay,
+                int(getattr(locked_result, "retry_after_seconds", 0) or 0),
+            )
+            await asyncio.to_thread(
+                report_retarget_task,
+                str(task.get("parent_task_uid") or task_uid),
+                str(task.get("claim_token") or ""),
+                "executing",
+                message=(
+                    f"第{attempt}次追投已明确失败，未创建任务；"
+                    f"将在{retry_delay}秒后进行第{attempt + 1}次尝试"
+                ),
+                detail=str(locked_result.message or ""),
+                result={
+                    "success": False,
+                    "step": "retry_waiting",
+                    "attempt": attempt,
+                    "max_attempts": 3,
+                    "retry_after_seconds": retry_delay,
+                },
+            )
+            await asyncio.sleep(retry_delay)
     except Exception as exc:
         results = []
         failure = {"success": False, "message": "追投执行异常", "detail": traceback.format_exc(), "step": "exception"}
@@ -1383,6 +1422,18 @@ async def _execute_task(
             payload["detail"] = _json(result_payloads)
             payload["step"] = "partial_failure"
         regulate_task_id = regulate_task_ids[0] if regulate_task_ids else ""
+    payload["attempt_count"] = submission_attempts
+    payload["max_attempts"] = 3
+    payload["attempt_history"] = attempt_history
+    if (
+        results
+        and not payload.get("success")
+        and bool(getattr(results[0], "retryable", False))
+        and submission_attempts >= 3
+    ):
+        payload["message"] = (
+            f"{str(payload.get('message') or '追投失败')}（已达到3次尝试上限）"
+        )
     payload["materials"] = materials
     payload["material_count"] = len(materials)
     trigger_snapshot = task.get("trigger_snapshot") or {}

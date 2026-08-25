@@ -8,7 +8,7 @@ import unittest
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from api.operation_events import (
     _normalize_occurred_at,
@@ -1590,6 +1590,172 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             ["m1", "m2"],
             [call.args[1] for call in record_limit.call_args_list],
         )
+
+    def test_retryable_explicit_failure_retries_at_most_three_total_attempts(self):
+        task = {
+            **self.task,
+            "task_uid": "task-retryable",
+            "claim_token": "claim-retryable",
+            "target_uid": "target-product",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "materials": [{"material_id": "m1", "material_name": "素材1"}],
+            "trigger_snapshot": {},
+            "query_snapshot": {},
+        }
+        cfg = {
+            "enabled": True,
+            "browser_headless": True,
+            "per_strategy_rate_limit": False,
+        }
+
+        class FakeResult:
+            def __init__(self, success, attempt):
+                self.success = success
+                self.regulate_task_id = "regulate-ok" if success else ""
+                self.retryable = not success
+                self.retry_after_seconds = 0
+                self.message = "追投成功" if success else "官方明确拒绝且允许重试"
+                self.step = "done" if success else "official_api"
+
+            def asdict(self):
+                return {
+                    "success": self.success,
+                    "message": self.message,
+                    "detail": "",
+                    "step": self.step,
+                    "headless": True,
+                    "retryable": self.retryable,
+                    "retry_after_seconds": self.retry_after_seconds,
+                }
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResult(len(self.calls) == 3, len(self.calls))
+
+            async def close(self):
+                return None
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                if table == "promotion_target":
+                    return {"sanitized_page_url": "https://example.test/product"}
+                return None
+
+        service = FakeService()
+        sleeper = AsyncMock()
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}]),
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ), patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retarget_task_worker._insert_run",
+        ), patch(
+            "services.retarget_task_worker._interval_from_root_cfg",
+            return_value=(3600, 5),
+        ), patch(
+            "services.retarget_task_worker.rate_limit_record_success",
+        ), patch(
+            "services.retarget_task_worker.report_retarget_task",
+        ) as report, patch(
+            "services.retarget_task_worker.asyncio.sleep",
+            new=sleeper,
+        ):
+            result = asyncio.run(
+                retarget_task_worker._execute_task(task, FakeStore())
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(3, result["attempt_count"])
+        self.assertEqual(3, len(service.calls))
+        self.assertEqual(
+            [
+                "task-retryable:attempt:1",
+                "task-retryable:attempt:2",
+                "task-retryable:attempt:3",
+            ],
+            [call["execution_uid"] for call in service.calls],
+        )
+        self.assertEqual([60, 120], [call.args[0] for call in sleeper.await_args_list])
+        self.assertEqual(2, report.call_count)
+
+    def test_nonretryable_failure_is_submitted_only_once(self):
+        task = {
+            **self.task,
+            "task_uid": "task-nonretryable",
+            "target_uid": "target-product",
+            "promotion_scene": "product",
+            "plan_system": "global",
+            "materials": [{"material_id": "m1", "material_name": "素材1"}],
+            "trigger_snapshot": {},
+            "query_snapshot": {},
+        }
+        cfg = {"enabled": True, "browser_headless": True, "per_strategy_rate_limit": False}
+
+        class FakeResult:
+            success = False
+            regulate_task_id = ""
+            retryable = False
+            retry_after_seconds = 0
+            message = "参数错误"
+            step = "official_api"
+
+            def asdict(self):
+                return {
+                    "success": False,
+                    "message": self.message,
+                    "detail": "",
+                    "step": self.step,
+                    "headless": True,
+                    "retryable": False,
+                    "retry_after_seconds": 0,
+                }
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeResult()
+
+            async def close(self):
+                return None
+
+        class FakeStore:
+            def select_one(self, table, **_kwargs):
+                return {"sanitized_page_url": ""} if table == "promotion_target" else None
+
+        service = FakeService()
+        sleeper = AsyncMock()
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            return_value=(cfg, copy.deepcopy(self.strategy), [{"id": "m1"}]),
+        ), patch(
+            "services.retarget_task_worker.consume_live_retarget_batch_once",
+        ), patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict",
+            return_value=service,
+        ), patch(
+            "services.retarget_task_worker._insert_run",
+        ), patch(
+            "services.retarget_task_worker.asyncio.sleep",
+            new=sleeper,
+        ):
+            result = asyncio.run(retarget_task_worker._execute_task(task, FakeStore()))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(1, result["attempt_count"])
+        self.assertEqual(1, len(service.calls))
+        sleeper.assert_not_awaited()
 
     def test_three_overlapping_groups_submit_three_product_retargets(self):
         material_map = {
