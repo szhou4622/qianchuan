@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from api.rule_regulation_config import (
     _normalize_full,
@@ -14,11 +14,38 @@ from api.rule_regulation_config import (
 from api.views import Api
 from services.regulation_rule_runner import (
     _revalidate_stop_candidate,
+    _send_auto_stop_submitted_notification,
     _stop_strategy_snapshot,
 )
 
 
 class StopStrategyAccountScopeTests(unittest.TestCase):
+    def test_auto_stop_submission_sends_verifying_card(self):
+        with patch(
+            "services.qianchuan_accounts.resolve_account_feishu_targets",
+            return_value=[("open_id", "ou_owner")],
+        ), patch(
+            "services.local_feishu_bridge.send_local_feishu_bound_card"
+        ) as send:
+            _send_auto_stop_submitted_notification(
+                Mock(),
+                owner="owner-a",
+                aavid="10001",
+                account_name="测试账户",
+                plan_name="测试计划",
+                ad_id="20002",
+                promotion_scene="live",
+                plan_system="chengfang",
+                task_name="测试调控任务",
+                assist_task_id="30003",
+                stop_action="delete",
+                message="官方 API 停投已提交，正在核验平台最终状态",
+            )
+        card = send.call_args.args[0]
+        self.assertIn("已提交，正在核验", card["header"]["title"]["content"])
+        self.assertIn("结束调控", card["elements"][0]["text"]["content"])
+        self.assertFalse(send.call_args.kwargs["require_connected"])
+
     def _config(self, **strategy_overrides):
         strategy = {
             "id": "stop-one",

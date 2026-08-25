@@ -75,6 +75,7 @@ from services.official_api_collection import (
     request_official_api_collection,
 )
 from services.official_api_execution import (
+    OfficialApiRegulationStopService,
     OfficialApiRetargetingService,
     _configured_control_task_base_name,
     _material_is_writable,
@@ -83,7 +84,7 @@ from services.official_api_execution import (
     _verify_control_task,
     _verify_control_task_eventually,
 )
-from services.official_api_reconciliation import _verify_one
+from services.official_api_reconciliation import _finish, _verify_one
 from services.official_api_controller import OfficialApiController
 from unittest.mock import MagicMock, Mock
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -1483,6 +1484,152 @@ class _PublicInfoClient(_CaptureClient):
 
 
 class OfficialApiBackendTests(unittest.TestCase):
+    def test_stop_rate_limit_retries_at_most_three_attempts(self):
+        service = Mock()
+        service.update_control_status.side_effect = [
+            ApiRateLimitError("rate limited", retry_after=1),
+            ApiRateLimitError("rate limited", retry_after=1),
+            ApiResponse(
+                data={},
+                raw={"code": 0},
+                request_id="req-stop",
+                request_uid="write-stop",
+            ),
+        ]
+        runner = OfficialApiRegulationStopService()
+
+        async def no_sleep(_seconds):
+            return None
+
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan",
+            return_value={},
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={
+                "task_id": "30003",
+                "scene": "MATERIAL_ADD_BUDGET",
+                "status": "PROCESSING",
+            },
+        ), patch(
+            "services.official_api_reconciliation.reserve_execution_intent",
+            return_value=({}, True),
+        ), patch(
+            "services.official_api_reconciliation.enqueue_execution_reconciliation"
+        ), patch(
+            "services.official_api_reconciliation.start_official_api_reconciliation_background_thread"
+        ), patch(
+            "services.official_api_execution.asyncio.sleep",
+            side_effect=no_sleep,
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                    execution_uid="stop-retry-1",
+                )
+            )
+        self.assertTrue(result.success)
+        self.assertEqual("submitted_verifying", result.step)
+        self.assertEqual(3, service.update_control_status.call_count)
+
+    def test_stop_deterministic_failure_is_not_retried(self):
+        service = Mock()
+        service.update_control_status.side_effect = ApiRequestError(
+            "invalid parameter",
+            code="400154",
+            request_id="req-invalid-stop",
+        )
+        runner = OfficialApiRegulationStopService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan",
+            return_value={},
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={
+                "task_id": "30003",
+                "scene": "MATERIAL_ADD_BUDGET",
+                "status": "PROCESSING",
+            },
+        ), patch(
+            "services.official_api_reconciliation.reserve_execution_intent",
+            return_value=({}, True),
+        ), patch(
+            "services.official_api_reconciliation.finish_execution_intent"
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="chengfang",
+                    execution_uid="stop-fail-1",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("400154", result.message)
+        self.assertEqual(1, service.update_control_status.call_count)
+
+    def test_auto_stop_reconciliation_sends_terminal_notification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = os.path.join(temp, "auto-stop-reconcile.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            store.insert(
+                "execution_reconciliation",
+                {
+                    "reconciliation_uid": "stop-recon-1",
+                    "account_username": "stop-owner",
+                    "task_uid": "auto-stop-execution",
+                    "action_type": "stop",
+                    "aavid": "10001",
+                    "ad_id": "20002",
+                    "control_task_id": "30003",
+                    "idempotency_key": "auto-stop-execution",
+                    "status": "verifying",
+                    "lease_owner": "lease-1",
+                    "fencing_token": 1,
+                    "payload_json": json.dumps(
+                        {
+                            "promotion_scene": "live",
+                            "expected_status": "PAUSE",
+                            "execution_uid": "auto-stop-execution",
+                        }
+                    ),
+                },
+            )
+            row = store.select_one(
+                "execution_reconciliation",
+                where={"reconciliation_uid": "stop-recon-1"},
+            )
+            with patch(
+                "services.official_api_reconciliation._notify_reconciled_auto_stop"
+            ) as notify:
+                changed = _finish(
+                    store,
+                    row,
+                    status="confirmed_succeeded",
+                    verified={"task_id": "30003", "status": "PAUSE"},
+                )
+            self.assertTrue(changed)
+            notify.assert_called_once()
+            self.assertEqual(
+                "confirmed_succeeded",
+                notify.call_args.kwargs["status"],
+            )
+
     def test_persisted_token_without_expiry_is_not_trusted_forever(self):
         bundle = AccessTokenBundle(access_token="token", expires_at=0)
         self.assertFalse(bundle.usable())

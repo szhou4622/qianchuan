@@ -817,7 +817,7 @@ def _retarget_method_summary(retargeting: Dict[str, Any]) -> str:
     roi = cost.get("net_roi") if isinstance(cost.get("net_roi"), dict) else {}
     return (
         f"控成本追投｜日预算 {roi.get('daily_budget_yuan', '未填写')} 元"
-        f"｜净成交ROI {roi.get('net_roi_target', '未填写')}"
+        f"｜综合营销ROI {roi.get('net_roi_target', '未填写')}"
     )
 
 
@@ -1249,6 +1249,7 @@ def build_stop_task_card(
         "approved_queued": "已批准，等待工具执行",
         "claimed": "工具已领取",
         "executing": "正在停投",
+        "verifying": "已提交，正在核验",
         "succeeded": "停投成功",
         "failed": "停投失败",
         "rejected": "已暂不停投",
@@ -1273,7 +1274,7 @@ def build_stop_task_card(
         "unknown": "待确认",
     }.get(str(task.get("plan_system") or "unknown"), "待确认")
     stop_action = (
-        "删除调控任务"
+        "结束调控"
         if str(task.get("regulation_stop_action") or "pause") == "delete"
         else "暂停调控"
     )
@@ -2538,12 +2539,13 @@ def send_local_feishu_bound_card(
     card: Dict[str, Any],
     *,
     targets: Optional[List[Tuple[str, str]]] = None,
+    require_connected: bool = True,
 ) -> List[Dict[str, str]]:
     bridge = _MANAGER.bridge()
     if bridge is None:
         raise FeishuApiError("请先登录工具账号并连接飞书")
     status = bridge.status()
-    if not status.get("connected"):
+    if require_connected and not status.get("connected"):
         raise FeishuApiError("飞书长连接尚未连接")
     return bridge.send_bound_card(card, targets=targets)
 

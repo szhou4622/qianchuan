@@ -418,7 +418,10 @@ def _spend_percentage_error_msg(raw: Any) -> Optional[str]:
 
 
 def _net_roi_target_error_msg(raw: Any) -> Optional[str]:
-    """净成交 ROI 目标，与前端 netRoiTargetErrorMsg 一致。"""
+    """综合营销 ROI 目标，与前端 netRoiTargetErrorMsg 一致。
+
+    ``net_roi`` 仅作为旧配置兼容键保留，不再作为用户可见业务名称。
+    """
     if raw is None:
         return None
     if isinstance(raw, bool):

@@ -747,7 +747,7 @@ def _send_auto_stop_result_notification(
 
     scene = "推商品" if promotion_scene == "product" else "推直播"
     system = "乘方" if plan_system == "chengfang" else "全域"
-    action = "删除任务" if stop_action == "delete" else "暂停调控"
+    action = "结束调控" if stop_action == "delete" else "暂停调控"
     card = {
         "config": {
             "wide_screen_mode": True,
@@ -786,7 +786,78 @@ def _send_auto_stop_result_notification(
         owner_username=owner,
         db=db,
     )
-    send_local_feishu_bound_card(card, targets=targets or None)
+    # 结果通知只依赖飞书 REST 发信能力，不依赖卡片回调长连接在线。
+    # REST 临时失败时 LocalFeishuBridge 会把消息写入持久化 outbox 重试。
+    send_local_feishu_bound_card(
+        card,
+        targets=targets or None,
+        require_connected=False,
+    )
+
+
+def _send_auto_stop_submitted_notification(
+    db: SQLiteStore,
+    *,
+    owner: str,
+    aavid: str,
+    account_name: str,
+    plan_name: str,
+    ad_id: str,
+    promotion_scene: str,
+    plan_system: str,
+    task_name: str,
+    assist_task_id: str,
+    stop_action: str,
+    message: str,
+) -> None:
+    """Notify immediately after an automatic stop POST is accepted."""
+
+    from services.local_feishu_bridge import send_local_feishu_bound_card
+    from services.qianchuan_accounts import resolve_account_feishu_targets
+
+    scene = "推商品" if promotion_scene == "product" else "推直播"
+    system = "乘方" if plan_system == "chengfang" else "全域"
+    action = "结束调控" if stop_action == "delete" else "暂停调控"
+    card = {
+        "config": {"wide_screen_mode": True, "enable_forward": False},
+        "header": {
+            "template": "orange",
+            "title": {
+                "tag": "plain_text",
+                "content": f"千川自动停投 · {system} · {scene} · 已提交，正在核验",
+            },
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "plain_text",
+                    "content": "\n".join(
+                        [
+                            f"千川账户：{account_name or aavid}",
+                            f"账户ID：{aavid}",
+                            f"计划名称：{plan_name or '未命名计划'}",
+                            f"计划ID：{ad_id}",
+                            f"调控任务：{task_name or '未命名任务'}",
+                            f"调控任务ID：{assist_task_id}",
+                            f"动作：{action}",
+                            f"当前状态：{message or '官方 API 已受理，正在查询平台最终状态'}",
+                        ]
+                    ),
+                },
+            }
+        ],
+    }
+    targets = resolve_account_feishu_targets(
+        aavid,
+        owner_username=owner,
+        db=db,
+    )
+    send_local_feishu_bound_card(
+        card,
+        targets=targets or None,
+        require_connected=False,
+    )
 
 
 async def run_one_cycle(db: SQLiteStore) -> None:
@@ -1475,6 +1546,38 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             result.step,
                         )
                         if result.step == "submitted_verifying":
+                            try:
+                                account_row = db.select_one(
+                                    "qianchuan_account",
+                                    where={
+                                        "account_uid": str(
+                                            target.get("account_uid") or ""
+                                        )
+                                    },
+                                ) or {}
+                                await asyncio.to_thread(
+                                    _send_auto_stop_submitted_notification,
+                                    db,
+                                    owner=cycle_owner,
+                                    aavid=aavid,
+                                    account_name=str(
+                                        account_row.get("account_name") or ""
+                                    ),
+                                    plan_name=str(target.get("plan_name") or ""),
+                                    ad_id=ad_id,
+                                    promotion_scene=promotion_scene,
+                                    plan_system=plan_system,
+                                    task_name=task_name,
+                                    assist_task_id=assist_task_id,
+                                    stop_action=stop_action,
+                                    message=result.message,
+                                )
+                            except Exception as notify_error:
+                                logger.warning(
+                                    "%s 自动停投提交状态通知发送失败：%s",
+                                    _tag,
+                                    notify_error,
+                                )
                             continue
                         try:
                             account_row = db.select_one(

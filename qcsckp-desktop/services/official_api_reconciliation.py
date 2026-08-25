@@ -47,6 +47,80 @@ def _payload(value: Any) -> dict[str, Any]:
         return {}
 
 
+def _notify_reconciled_auto_stop(
+    store: SQLiteStore,
+    row: Mapping[str, Any],
+    data: Mapping[str, Any],
+    *,
+    status: str,
+    error: str = "",
+) -> None:
+    """Send the terminal notification for an auto-stop reconciliation.
+
+    Confirmation-mode stops already own a local card. Auto stops have no
+    ``local_retarget_task`` row, so their submitted result previously became
+    silent as soon as it entered background verification.
+    """
+
+    aavid = str(row.get("aavid") or "").strip()
+    ad_id = str(row.get("ad_id") or "").strip()
+    task_id = str(row.get("control_task_id") or data.get("task_id") or "").strip()
+    owner = str(row.get("account_username") or "").strip().casefold()
+    target_rows = store.execute(
+        "SELECT * FROM promotion_target WHERE aadvid=? AND ad_id=? "
+        "ORDER BY updated_at DESC,id DESC LIMIT 1",
+        (aavid, ad_id),
+        fetch=True,
+    ) or []
+    target = dict(target_rows[0]) if target_rows else {}
+    account = store.select_one(
+        "qianchuan_account",
+        where={"owner_username": owner, "aavid": aavid},
+    ) or {}
+    assist = (
+        store.select_one(
+            "pmc_roi2_assist_task",
+            where={
+                "target_uid": str(target.get("target_uid") or ""),
+                "assist_task_id": task_id,
+            },
+        )
+        if target
+        else None
+    ) or {}
+    succeeded = status == "confirmed_succeeded"
+    if succeeded:
+        message = "官方 API 停投已核验成功"
+    elif status == "confirmed_failed":
+        message = "官方 API 停投核验失败"
+    else:
+        message = "官方 API 停投结果无法确认，请人工检查"
+    if error:
+        message += f"：{str(error)[:500]}"
+    expected = str(data.get("expected_status") or "PAUSE").strip().upper()
+    from services.regulation_rule_runner import _send_auto_stop_result_notification
+
+    _send_auto_stop_result_notification(
+        store,
+        owner=owner,
+        aavid=aavid,
+        account_name=str(account.get("account_name") or ""),
+        plan_name=str(target.get("plan_name") or ""),
+        ad_id=ad_id,
+        promotion_scene=str(
+            data.get("promotion_scene")
+            or target.get("promotion_scene")
+            or "live"
+        ),
+        plan_system=str(target.get("plan_system") or "unknown"),
+        task_name=str(assist.get("task_name") or ""),
+        assist_task_id=task_id,
+        stop_action="pause" if expected == "PAUSE" else "delete",
+        success=succeeded,
+        message=message,
+    )
+
+
 def enqueue_execution_reconciliation(
     *,
     task_uid: str,
@@ -344,24 +418,52 @@ def _finish(
             return True
         succeeded = bool(sibling_statuses) and sibling_statuses == {"confirmed_succeeded"}
         aggregate_status = "confirmed_succeeded" if succeeded else "unknown_requires_review"
-        try:
-            from services.local_feishu_bridge import finalize_reconciled_local_task
+        local_task = store.select_one(
+            "local_retarget_task",
+            fields="task_uid,action_type",
+            where={
+                "task_uid": task_uid,
+                "account_username": str(row.get("account_username") or ""),
+            },
+        )
+        if local_task:
+            try:
+                from services.local_feishu_bridge import finalize_reconciled_local_task
 
-            finalize_reconciled_local_task(
-                task_uid,
-                succeeded=succeeded,
-                message=("官方 API 追投已核验成功" if succeeded else "官方 API 追投核验失败，请人工检查"),
-                detail=str(error or ""),
-                regulate_task_id=str(row.get("control_task_id") or ""),
-                result={
-                    "success": succeeded,
-                    "step": aggregate_status,
-                    "regulate_task_id": str(row.get("control_task_id") or ""),
-                    "verification": dict(verified or {}),
-                },
-            )
-        except Exception:
-            logger.exception("官方 API 对账完成后更新飞书任务失败 task=%s", task_uid)
+                label = "停投" if is_stop else "追投"
+                finalize_reconciled_local_task(
+                    task_uid,
+                    succeeded=succeeded,
+                    message=(
+                        f"官方 API {label}已核验成功"
+                        if succeeded
+                        else f"官方 API {label}核验失败，请人工检查"
+                    ),
+                    detail=str(error or ""),
+                    regulate_task_id=str(row.get("control_task_id") or ""),
+                    result={
+                        "success": succeeded,
+                        "step": aggregate_status,
+                        "regulate_task_id": str(row.get("control_task_id") or ""),
+                        "verification": dict(verified or {}),
+                    },
+                )
+            except Exception:
+                logger.exception("官方 API 对账完成后更新飞书任务失败 task=%s", task_uid)
+        elif is_stop:
+            try:
+                _notify_reconciled_auto_stop(
+                    store,
+                    row,
+                    data,
+                    status=status,
+                    error=error,
+                )
+            except Exception:
+                logger.exception(
+                    "官方 API 自动停投对账完成后发送通知失败 task=%s",
+                    task_uid,
+                )
     return True
 
 

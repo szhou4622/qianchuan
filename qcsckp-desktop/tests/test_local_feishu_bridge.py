@@ -79,6 +79,15 @@ class FakeFeishuBridge:
             }
         ]
 
+    def send_bound_card(self, _card, **_kwargs):
+        return [
+            {
+                "receive_type": "open_id",
+                "receive_id": "ou_owner",
+                "message_id": "om_notice",
+            }
+        ]
+
     def update_task_cards(self, task_uid: str, **_kwargs):
         self.updated.append(task_uid)
 
@@ -196,6 +205,20 @@ class LocalFeishuTaskTests(unittest.TestCase):
         for item in reversed(self.patches):
             item.stop()
         self.temp.cleanup()
+
+    def test_result_notification_can_send_when_long_connection_is_offline(self):
+        self.manager.instance.status = lambda: {
+            "success": True,
+            "connected": False,
+            "status": "reconnecting",
+        }
+        with self.assertRaises(bridge.FeishuApiError):
+            bridge.send_local_feishu_bound_card({"elements": []})
+        sent = bridge.send_local_feishu_bound_card(
+            {"elements": []},
+            require_connected=False,
+        )
+        self.assertEqual("om_notice", sent[0]["message_id"])
 
     def test_local_task_is_deduplicated_and_executes_only_once(self):
         first = bridge.create_local_retarget_task(task_payload())

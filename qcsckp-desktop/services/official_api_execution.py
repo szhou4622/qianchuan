@@ -815,12 +815,29 @@ class OfficialApiRegulationStopService:
                     _now(),
                     True,
                 )
-            response = await asyncio.to_thread(
-                service.update_control_status,
-                aavid,
-                [assist_task_id],
-                action=opt_type,
-            )
+            # A rate-limit response is an explicit rejection before the write
+            # is accepted, so retrying is safe. Other parameter, permission or
+            # state errors are deterministic and must never be retried.
+            response = None
+            for attempt in range(1, 4):
+                try:
+                    response = await asyncio.to_thread(
+                        service.update_control_status,
+                        aavid,
+                        [assist_task_id],
+                        action=opt_type,
+                    )
+                    break
+                except ApiRateLimitError as exc:
+                    if attempt >= 3:
+                        raise
+                    retry_after = max(
+                        1.0,
+                        float(getattr(exc, "retry_after", 0) or 60),
+                    )
+                    await asyncio.sleep(retry_after)
+            if response is None:
+                raise RuntimeError("官方 API 停投提交未返回结果")
             if response.request_uid:
                 OfficialApiAuditStore().mark_reconciled(
                     response.request_uid,
@@ -934,5 +951,20 @@ class OfficialApiRegulationStopService:
             if intent_reserved:
                 from services.official_api_reconciliation import finish_execution_intent
 
-                finish_execution_intent(intent_key, status="confirmed_failed", error=str(exc))
-            return RegulationRunResult(False, str(exc), "official_api", traceback.format_exc()[:8000], text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
+                finish_execution_intent(
+                    intent_key,
+                    status="confirmed_failed",
+                    error=_public_api_error(exc),
+                )
+            return RegulationRunResult(
+                False,
+                _public_api_error(exc),
+                "official_api",
+                traceback.format_exc()[:8000],
+                text_id(aavid),
+                text_id(ad_id),
+                text_id(assist_task_id),
+                action,
+                _now(),
+                True,
+            )
