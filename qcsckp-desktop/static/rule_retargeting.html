@@ -1439,23 +1439,14 @@
             }
         })();
 
-        // 与数据大屏 dashboard.html allColumns 中指标字段一致（便于与「数据大屏」列对齐）
+        // 规则化追投固定使用六项千川官方素材报表指标。
         const METRICS = [
-            { key: 'costDiff', label: '素材流速（时段流速）' },
-            { key: 'currentCost', label: '整体消耗' },
-            { key: 'estimatedEcpm', label: '预估ECPM' },
-            { key: 'netRoi', label: '净成交ROI' },
-            { key: 'netAmount', label: '净成交金额' },
-            { key: 'overallPayRoi', label: '整体支付ROI' },
-            { key: 'overallAmount', label: '整体成交金额' },
-            { key: 'hourRefundRate', label: '1h退款率' },
-            { key: 'netSettleRate', label: '净成交结算率' },
-            { key: 'netOrderCount', label: '净成交订单数' },
-            { key: 'overallOrderCount', label: '整体成交订单数' },
-            { key: 'overallShowCount', label: '整体展现次数' },
-            { key: 'overallClickCount', label: '整体点击次数' },
-            { key: 'overallCtr', label: '整体点击率' },
-            { key: 'overallConversionRate', label: '整体转化率' },
+            { key: 'currentCost', label: '整体消耗', officialField: 'stat_cost_for_roi2' },
+            { key: 'netAmount', label: '净成交金额', officialField: 'total_order_settle_amount_for_roi2_1h' },
+            { key: 'netRoi', label: '净成交ROI', officialField: 'total_prepay_and_pay_settle_roi2_1h' },
+            { key: 'netOrderCount', label: '净成交订单数', officialField: 'total_order_settle_count_for_roi2_1h' },
+            { key: 'overallAmount', label: '整体成交金额', officialField: 'total_pay_order_gmv_include_coupon_for_roi2' },
+            { key: 'overallPayRoi', label: '整体支付ROI', officialField: 'total_prepay_and_pay_order_roi2' },
         ];
         const ASSIST_TASK_METRICS = [
             { key: 'assistCost', label: '调控任务消耗' },
@@ -1468,7 +1459,18 @@
         }
 
         function metricsForCurrentTaskAction() {
-            return currentTaskAction() === 'increase_budget' ? ASSIST_TASK_METRICS : METRICS;
+            if (currentTaskAction() === 'increase_budget') return ASSIST_TASK_METRICS;
+            const targetUid = document.getElementById('strategyTargetUid')?.value || '';
+            const target = promotionTargetsState.find((item) => item.target_uid === targetUid);
+            const units = target?.capability?.report_metric_units;
+            const hasOfficialConfig = !!units && typeof units === 'object' && Object.keys(units).length > 0;
+            return METRICS.map((metric) => ({
+                ...metric,
+                disabled: hasOfficialConfig && !(metric.officialField in units),
+                reason: hasOfficialConfig && !(metric.officialField in units)
+                    ? '当前计划官方接口未提供该指标'
+                    : '',
+            }));
         }
         /** 率类阈值在 JSON 中存百分数字面量 0~100（如 0.25 表示 0.25%，22 表示 22%）；回填不再把 |x|≤1 当小数比例乘 100 */
         const RATE_METRICS = new Set([
@@ -1590,13 +1592,13 @@
             if (opt.hiddenClass) hidden.className = opt.hiddenClass;
             hidden.value = value;
 
-            const cur = items.find((x) => x.value === value) || items[0];
+            const cur = items.find((x) => x.value === value) || items.find((x) => !x.disabled) || items[0];
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'rr-dd-trigger';
             btn.innerHTML =
                 '<span class="rr-dd-label">' +
-                escapeHtml(cur.label) +
+                escapeHtml(cur.label + (cur.disabled ? '（不可用）' : '')) +
                 '</span><i data-lucide="chevron-down" class="rr-dd-chevron w-3.5 h-3.5 shrink-0 opacity-70"></i>';
 
             const panel = document.createElement('div');
@@ -1608,8 +1610,13 @@
                 const ob = document.createElement('button');
                 ob.type = 'button';
                 ob.className = 'rr-dd-opt' + (item.value === value ? ' rr-dd-opt--active' : '');
-                ob.textContent = item.label;
+                ob.disabled = !!item.disabled;
+                ob.classList.toggle('opacity-45', !!item.disabled);
+                ob.classList.toggle('cursor-not-allowed', !!item.disabled);
+                ob.title = item.reason || '';
+                ob.textContent = item.label + (item.disabled ? '（当前计划接口未提供）' : '');
                 ob.addEventListener('click', (e) => {
+                    if (item.disabled) return;
                     e.stopPropagation();
                     hidden.value = item.value;
                     const lab = btn.querySelector('.rr-dd-label');
@@ -1879,19 +1886,19 @@
         function defaultTriggerPayload() {
             return {
                 group_combine: 'or',
-                groups: [{ join: 'and', conditions: [{ metric: 'costDiff', op: 'gt', value: 0 }] }],
+                groups: [{ join: 'and', conditions: [{ metric: 'currentCost', op: 'gt', value: 0 }] }],
             };
         }
 
         function defaultCandidateTriggerPayload() {
             return {
                 group_combine: 'or',
-                groups: [{ join: 'and', conditions: [{ metric: 'costDiff', op: 'gt', value: 0 }] }],
+                groups: [{ join: 'and', conditions: [{ metric: 'currentCost', op: 'gt', value: 0 }] }],
             };
         }
 
         function candidateTriggerFromDom() {
-            const metric = document.getElementById('candidateMetric')?.value || 'costDiff';
+            const metric = document.getElementById('candidateMetric')?.value || 'currentCost';
             const op = document.getElementById('candidateOp')?.value || 'gt';
             const raw = parseFloat(document.getElementById('candidateValue')?.value || '0');
             return {
@@ -1901,7 +1908,7 @@
         }
 
         function firstCandidateCondition(trigger) {
-            return trigger?.groups?.[0]?.conditions?.[0] || { metric: 'costDiff', op: 'gt', value: 0 };
+            return trigger?.groups?.[0]?.conditions?.[0] || { metric: 'currentCost', op: 'gt', value: 0 };
         }
 
         function syncProductStrategyVisibility() {
@@ -1910,8 +1917,10 @@
             const hint = document.getElementById('strategyTargetScene');
             if (hint) {
                 const waitingLive = target && target.promotion_scene === 'live' && target.platform_status === 'waiting_live';
+                const metricState = target ? metricsForCurrentTaskAction() : [];
+                const unavailableMetrics = metricState.filter((metric) => metric.disabled).map((metric) => metric.label);
                 hint.textContent = target
-                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${waitingLive ? ' · 未开播，策略可提前启用，开播复核后执行' : target.retarget_eligible ? '' : ' · 追投能力尚未核验，可先保存停用草稿'}`
+                    ? `${target.promotion_scene === 'product' ? '推商品' : '推直播'} · ${target.plan_system === 'global' ? '全域' : target.plan_system === 'chengfang' ? '千川乘方' : '体系待确认'} · 账户 ${target.account_name || target.aadvid}（${target.aadvid}） · 计划ID ${target.ad_id}${waitingLive ? ' · 未开播，策略可提前启用，开播复核后执行' : target.retarget_eligible ? '' : ' · 追投能力尚未核验，可先保存停用草稿'}${unavailableMetrics.length ? ` · 不可用指标：${unavailableMetrics.join('、')}` : ''}`
                     : document.getElementById('strategyAccountUid')?.value
                         ? '该账户下暂无已勾选监控的计划，请先到“千川账户管理”启用计划。'
                         : '请先选择监控账户。';
@@ -2764,10 +2773,15 @@
             let firstScrollEl = null;
             condRows.forEach((row) => {
                 const inp = row.querySelector('input.cond-val');
-                const metric = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                const metric = row.querySelector('input.cond-metric')?.value || 'currentCost';
                 const errEl = row.querySelector('.cond-val-err');
                 if (!inp) return;
-                const msg = triggerCondValueErrorMsg(inp.value, metric);
+                const metricOption = metricsForCurrentTaskAction().find((item) => item.key === metric);
+                const msg = !metricOption
+                    ? '该监控指标已不在当前支持范围，请重新选择'
+                    : metricOption.disabled
+                        ? `${metricOption.label}：当前计划官方接口未提供该指标`
+                        : triggerCondValueErrorMsg(inp.value, metric);
                 if (msg) {
                     setCondValFieldError(inp, errEl, msg);
                     ok = false;
@@ -3078,7 +3092,7 @@
         function defaultCondition() {
             return currentTaskAction() === 'increase_budget'
                 ? { metric: 'assistCost', op: 'gt', value: 0 }
-                : { metric: 'costDiff', op: 'gt', value: 0 };
+                : { metric: 'currentCost', op: 'gt', value: 0 };
         }
         function defaultGroup() {
             return { join: 'and', conditions: [defaultCondition()] };
@@ -3177,7 +3191,7 @@
                     const op = cel.querySelector('input.cond-op')?.value;
                     const raw = cel.querySelector('.cond-val')?.value;
                     let val = parseFloat(raw);
-                    const m = metric || 'costDiff';
+                    const m = metric || 'currentCost';
                     if (isRateMetric(m)) val = clampRatePercentUi(val);
                     else if (!Number.isFinite(val)) val = 0;
                     conditions.push({
@@ -3256,10 +3270,22 @@
                     inp.step = 'any';
                     inp.className =
                         'cond-val num-input rr-input rr-input--flush w-28 max-w-full text-xs py-1.5 tabular-nums pr-2';
-                    const availableMetrics = metricsForCurrentTaskAction();
+                    let availableMetrics = metricsForCurrentTaskAction();
                     const availableMetricKeys = new Set(availableMetrics.map((item) => item.key));
-                    const fallbackMetric = availableMetrics[0]?.key || 'costDiff';
-                    const m0 = availableMetricKeys.has(c.metric) ? c.metric : fallbackMetric;
+                    const fallbackMetric = availableMetrics.find((item) => !item.disabled)?.key || 'currentCost';
+                    let m0 = availableMetricKeys.has(c.metric) ? c.metric : fallbackMetric;
+                    if (c.metric && !availableMetricKeys.has(c.metric)) {
+                        m0 = c.metric;
+                        availableMetrics = [
+                            {
+                                key: c.metric,
+                                label: `旧指标 ${c.metric}`,
+                                disabled: true,
+                                reason: '该指标已不在当前支持范围，请重新选择',
+                            },
+                            ...availableMetrics,
+                        ];
+                    }
                     inp.value = formatCondValForInput(m0, c.value);
                     applyCondValInputRules(inp, m0);
 
@@ -3291,7 +3317,12 @@
                     setRateChrome(m0);
 
                     const ms = createCustomDropdown(
-                        availableMetrics.map((m) => ({ value: m.key, label: m.label })),
+                        availableMetrics.map((m) => ({
+                            value: m.key,
+                            label: m.label,
+                            disabled: !!m.disabled,
+                            reason: m.reason || '',
+                        })),
                         m0,
                         {
                             hiddenClass: 'cond-metric',
@@ -3311,13 +3342,13 @@
                     );
 
                     const syncRateOnBlur = () => {
-                        const m = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                        const m = row.querySelector('input.cond-metric')?.value || 'currentCost';
                         if (!isRateMetric(m)) return;
                         inp.value = formatRatePercentFieldValue(parseFloat(inp.value));
                     };
                     const onCondValBlur = () => {
                         syncRateOnBlur();
-                        const m = row.querySelector('input.cond-metric')?.value || 'costDiff';
+                        const m = row.querySelector('input.cond-metric')?.value || 'currentCost';
                         const msg = triggerCondValueErrorMsg(inp.value, m);
                         setCondValFieldError(inp, errP, msg);
                     };
@@ -4066,7 +4097,9 @@
         document.getElementById('strategyTargetUid')?.addEventListener('change', () => {
             const filter = document.getElementById('strategyProductFilter');
             if (filter) filter.value = '';
+            syncTriggerGroupsFromDom();
             syncProductStrategyVisibility();
+            renderTriggerGroups(_groupsRef);
             rrScheduleDirtyCheck();
         });
         document.getElementById('strategyTriggerLevel')?.addEventListener('change', () => {

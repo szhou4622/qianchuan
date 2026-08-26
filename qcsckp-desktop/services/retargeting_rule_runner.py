@@ -37,6 +37,8 @@ from api.rule_retargeting_config import (
     build_trigger_evaluation_snapshot,
     evaluate_trigger,
     load_rule_retargeting_config,
+    target_report_metric_units,
+    unsupported_strategy_monitor_metrics,
 )
 from config import CURRENT_VERSION, TEST_MODE
 from services.cloud_retarget_client import create_retarget_task
@@ -1541,6 +1543,19 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             task_action = str(
                 st.get("task_action") or "create_retarget"
             ).strip().lower()
+            if task_action != "increase_budget":
+                report_units = target_report_metric_units(target)
+                unsupported_metrics = unsupported_strategy_monitor_metrics(st, target)
+                if not report_units or unsupported_metrics:
+                    logger.warning(
+                        "%s 策略 %s 的官方监控指标尚未就绪或已失效，"
+                        "本轮不生成候选、不执行追投：target=%s unsupported=%s",
+                        _log_sched,
+                        st.get("id"),
+                        target_uid,
+                        ",".join(unsupported_metrics) or "report_metric_units_missing",
+                    )
+                    return
             if task_action == "increase_budget":
                 sync_ready, sync_error = assist_task_sync_ready(
                     target,

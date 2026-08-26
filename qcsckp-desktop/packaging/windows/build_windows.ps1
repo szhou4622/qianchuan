@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.63"
+    [string]$Version = "0.1.64"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +12,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $pyinstaller = Join-Path $projectRoot ".venv\Scripts\pyinstaller.exe"
-$entry = Join-Path $projectRoot "gui_app.py"
+$entry = Join-Path $projectRoot "startup_bootstrap.py"
 $icon = Join-Path $projectRoot "logo.ico"
 $staticDir = Join-Path $projectRoot "static"
 $contactConfig = Join-Path $projectRoot "services\contact_config.py"
@@ -25,9 +25,10 @@ $licenseManager = Join-Path $projectRoot "services\license_manager.py"
 $licensePage = Join-Path $staticDir "license.html"
 $licenseManagementPage = Join-Path $staticDir "license_management.html"
 $usageFile = Join-Path $scriptDir "README-Windows.txt"
+$diagnosticLauncher = Join-Path $scriptDir "QCSCKP-Startup-Diagnostics.cmd"
 $privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $privacyVerifier)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $privacyVerifier)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
@@ -101,20 +102,10 @@ if (Test-Path -LiteralPath $releaseDir) {
 }
 Move-Item -LiteralPath $builtDir -Destination $releaseDir
 Copy-Item -LiteralPath $usageFile -Destination (Join-Path $releaseDir "README-Windows.txt") -Force
+Copy-Item -LiteralPath $diagnosticLauncher -Destination (Join-Path $releaseDir "QCSCKP-Startup-Diagnostics.cmd") -Force
 
 foreach ($writableDir in @("data", "logs", "temp")) {
     New-Item -ItemType Directory -Path (Join-Path $releaseDir $writableDir) -Force | Out-Null
-}
-
-# A public package must start with a completely blank local runtime. In
-# particular, never ship another Windows user's DPAPI ciphertext: it cannot be
-# decrypted on the recipient's computer and would make API setup appear broken.
-# Sanitize the fully staged release before zipping. Local Feishu profiles and
-# bindings, DPAPI blobs, tokens, cookies, databases, logs, and history are
-# removed automatically. The command then verifies that none remain.
-& $python $privacyVerifier --sanitize $releaseDir
-if ($LASTEXITCODE -ne 0) {
-    throw "Release privacy cleanup or verification failed with exit code $LASTEXITCODE"
 }
 
 $repoRoot = Split-Path -Parent $projectRoot
@@ -128,6 +119,60 @@ $versionInfo = @(
     "Target: Windows x64"
 )
 Set-Content -LiteralPath (Join-Path $releaseDir "VERSION.txt") -Value $versionInfo -Encoding UTF8
+
+# Ship Microsoft's small Evergreen bootstrapper. The application asks for user
+# confirmation and runs it only when WebView2 is genuinely absent. Never accept
+# an unsigned or non-Microsoft binary in a public release.
+$runtimeDir = Join-Path $releaseDir "runtime"
+New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+$webViewBootstrapper = Join-Path $runtimeDir "MicrosoftEdgeWebview2Setup.exe"
+Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $webViewBootstrapper -UseBasicParsing
+$webViewSignature = Get-AuthenticodeSignature -FilePath $webViewBootstrapper
+if ($webViewSignature.Status -ne "Valid" -or -not $webViewSignature.SignerCertificate -or $webViewSignature.SignerCertificate.Subject -notmatch "Microsoft Corporation") {
+    throw "The downloaded WebView2 bootstrapper is not validly signed by Microsoft Corporation."
+}
+
+$criticalRelativePaths = @(
+    "QCSCKP.exe",
+    "VERSION.txt",
+    "bin\python312.dll",
+    "bin\static\index.html",
+    "bin\static\license.html",
+    "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
+    "runtime\MicrosoftEdgeWebview2Setup.exe"
+)
+$criticalFiles = foreach ($relative in $criticalRelativePaths) {
+    $absolute = Join-Path $releaseDir $relative
+    if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
+        throw "Critical release file is missing: $relative"
+    }
+    [ordered]@{
+        path = ($relative -replace "\\", "/")
+        size = (Get-Item -LiteralPath $absolute).Length
+        sha256 = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+$packageManifest = [ordered]@{
+    app_name = "QCSCKP"
+    version = $Version
+    critical_files = @($criticalFiles)
+}
+[IO.File]::WriteAllText(
+    (Join-Path $releaseDir "PACKAGE-MANIFEST.json"),
+    ($packageManifest | ConvertTo-Json -Depth 5),
+    [Text.UTF8Encoding]::new($false)
+)
+
+# A public package must start with a completely blank local runtime. In
+# particular, never ship another Windows user's DPAPI ciphertext: it cannot be
+# decrypted on the recipient's computer and would make API setup appear broken.
+# Sanitize the fully staged release before zipping. Local Feishu profiles and
+# bindings, DPAPI blobs, tokens, cookies, databases, logs, and history are
+# removed automatically. The command then verifies that none remain.
+& $python $privacyVerifier --sanitize $releaseDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Release privacy cleanup or verification failed with exit code $LASTEXITCODE"
+}
 
 $exePath = Join-Path $releaseDir "$appName.exe"
 if (-not (Test-Path -LiteralPath $exePath)) {

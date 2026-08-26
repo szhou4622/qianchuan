@@ -17,6 +17,24 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 DASHBOARD_CONTRACT_VERSION = 2
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class OptimizedDashboardQueries:
     def __init__(self, db: SQLiteStore) -> None:
         self.db = db
@@ -343,15 +361,15 @@ class OptimizedDashboardQueries:
                     "cover": str(row.get("cover_url") or ""),
                     "duration": row.get("video_duration"),
                     "createTime": str(row.get("video_create_time") or ""),
-                    "currentCost": float(row.get("stat_cost") or 0),
+                    "currentCost": _optional_float(row.get("stat_cost")),
                     "costDiff": float(row.get("stat_cost_diff") or 0),
-                    "netRoi": float(row.get("prepay_pay_settle_1h") or 0),
-                    "netAmount": float(row.get("order_settle_amount_1h") or 0),
+                    "netRoi": _optional_float(row.get("prepay_pay_settle_1h")),
+                    "netAmount": _optional_float(row.get("order_settle_amount_1h")),
                     "hourRefundRate": float(row.get("refund_rate_1h") or 0),
-                    "overallPayRoi": float(row.get("prepay_pay_order_count") or 0),
-                    "overallAmount": float(row.get("pay_gmv_include_coupon") or 0),
+                    "overallPayRoi": _optional_float(row.get("prepay_pay_order_count")),
+                    "overallAmount": _optional_float(row.get("pay_gmv_include_coupon")),
                     "netSettleRate": float(row.get("order_settle_rate_1h") or 0),
-                    "netOrderCount": int(row.get("order_settle_count_1h") or 0),
+                    "netOrderCount": _optional_int(row.get("order_settle_count_1h")),
                     "overallOrderCount": int(row.get("overall_order_count") or 0),
                     "overallShowCount": int(row.get("overall_show_count") or 0),
                     "overallClickCount": int(row.get("overall_click_count") or 0),

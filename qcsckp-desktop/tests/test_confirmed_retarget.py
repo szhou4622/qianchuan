@@ -86,6 +86,14 @@ def _retarget_capability_json(
         "retarget_target_uid": target_uid,
         "retarget_aavid": aavid,
         "retarget_ad_id": ad_id,
+        "report_metric_units": {
+            "stat_cost_for_roi2": "3",
+            "total_order_settle_amount_for_roi2_1h": "3",
+            "total_prepay_and_pay_settle_roi2_1h": "3",
+            "total_order_settle_count_for_roi2_1h": "0",
+            "total_pay_order_gmv_include_coupon_for_roi2": "3",
+            "total_prepay_and_pay_order_roi2": "3",
+        },
     }
     if batch:
         capability.update(
@@ -857,6 +865,14 @@ class RetargetConfigTests(unittest.TestCase):
             "monitor_eligible": 1,
             "retarget_eligible": 1,
             "automation_write_blocked": 0,
+            "capability_json": _retarget_capability_json(
+                target_uid="target-product",
+                aavid="10001",
+                ad_id="30001",
+                scene="product",
+                plan_system="global",
+                batch=True,
+            ),
         }
         rows = [
             {"targetUid": "target-product", "aadvid": "10001", "id": "m1", "netRoi": 3, "currentCost": 10},

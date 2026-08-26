@@ -16,6 +16,15 @@ import threading
 import time
 import json
 from functools import wraps
+from startup_bootstrap import (
+    install_exception_hooks,
+    mark_normal_exit,
+    mark_startup_phase,
+    mark_window_ready,
+    recover_stuck_instance_if_requested,
+    start_window_watchdog,
+    window_ready_was_reached,
+)
 import webview
 from ctypes.util import find_library
 from api import Api
@@ -134,7 +143,7 @@ class SingleInstanceChecker:
         self._command_mtime = None
         self._lease_handle = None
 
-    def acquire_runtime_lease(self) -> bool:
+    def acquire_runtime_lease(self, _recovery_attempted: bool = False) -> bool:
         """按数据目录加跨进程锁，源码运行和打包运行都只能启动一个实例。"""
         if self._lease_handle is not None:
             return True
@@ -159,7 +168,14 @@ class SingleInstanceChecker:
         except (OSError, IOError):
             handle.close()
             self._write_show_window_command()
-            self.activate_existing_instance()
+            activated = self.activate_existing_instance()
+            if (
+                not activated
+                and not _recovery_attempted
+                and recover_stuck_instance_if_requested(sys.executable)
+            ):
+                time.sleep(0.5)
+                return self.acquire_runtime_lease(_recovery_attempted=True)
             return False
         self._lease_handle = handle
         return True
@@ -1392,6 +1408,8 @@ def _cleanup_data_temp_dir():
 
 
 def main():
+    install_exception_hooks()
+    mark_startup_phase("app_main")
     contact_server = None
     license_manager = None
     js_api = None
@@ -1486,6 +1504,13 @@ def main():
             js_api=js_api
         )
         js_api._window = window
+        try:
+            window.events.loaded += mark_window_ready
+        except AttributeError:
+            # Old pywebview builds should still be diagnosable.  The watchdog
+            # will surface the missing readiness event instead of leaving a
+            # silent background process.
+            print("[!] 当前 WebView 不支持 loaded 事件，将由启动看门狗检查")
 
         # ===== 创建托盘 =====
         tray_app = None
@@ -1562,6 +1587,8 @@ def main():
 
         # ===== 启动 webview =====
         print("[START] 启动窗口...")
+        mark_startup_phase("webview_start")
+        start_window_watchdog(window)
         webview.start(debug=False, http_server=False, private_mode=False, storage_path=storage_path)
 
     except KeyboardInterrupt:
@@ -1586,6 +1613,8 @@ def main():
         except Exception:
             pass
         single_instance_checker.release_runtime_lease()
+        if window_ready_was_reached():
+            mark_normal_exit()
         print("程序已退出")
 
 

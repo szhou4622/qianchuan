@@ -358,6 +358,10 @@ def _retarget_params(
     extra: dict[str, Any] = {}
     if method == "volume":
         volume = retargeting.get("volume") if isinstance(retargeting.get("volume"), Mapping) else {}
+        if volume.get("total_budget_yuan") in (None, ""):
+            raise ValueError("放量追投必须填写调控预算")
+        if volume.get("duration_hours") in (None, ""):
+            raise ValueError("放量追投必须填写调控时长")
         if is_live:
             extra["smart_bid_type"] = "SMART_BID_CONSERVATIVE"
         return (
@@ -377,15 +381,53 @@ def _retarget_params(
     )
     if goal == "net_roi":
         block = control.get("net_roi") if isinstance(control.get("net_roi"), Mapping) else {}
+        if block.get("daily_budget_yuan") in (None, ""):
+            raise ValueError("控成本追投必须填写调控日预算")
+        if block.get("net_roi_target") in (None, ""):
+            raise ValueError("控成本追投必须填写综合营销ROI目标")
         extra["deep_external_action"] = "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI"
         extra["roi2_goal"] = float(Decimal(str(block.get("net_roi_target"))))
         budget = Decimal(str(block.get("daily_budget_yuan")))
     else:
         block = control.get("live_room") if isinstance(control.get("live_room"), Mapping) else {}
+        if block.get("daily_budget_yuan") in (None, ""):
+            raise ValueError("直播间成交追投必须填写调控日预算")
+        if block.get("bid_per_conversion_yuan") in (None, ""):
+            raise ValueError("直播间成交追投必须填写转化出价")
         extra["bid"] = float(Decimal(str(block.get("bid_per_conversion_yuan"))))
         budget = Decimal(str(block.get("daily_budget_yuan")))
     # 直播控成本素材追投不支持 duration，平台按长期有效处理。
     return budget, None, extra
+
+
+def _plan_budget_limit(detail: Mapping[str, Any]) -> Optional[Decimal]:
+    raw = detail.get("raw") if isinstance(detail.get("raw"), Mapping) else {}
+    plan_row = raw.get("ad_info") if isinstance(raw.get("ad_info"), Mapping) else raw
+    for key in (
+        "budget",
+        "daily_budget",
+        "dailyBudget",
+        "total_budget",
+        "totalBudget",
+    ):
+        value = plan_row.get(key) if isinstance(plan_row, Mapping) else None
+        if value in (None, "", "不限", "UNLIMITED"):
+            continue
+        try:
+            number = Decimal(str(value))
+        except Exception:
+            continue
+        if number.is_finite() and number > 0:
+            return number
+    return None
+
+
+def _validate_budget_against_plan(detail: Mapping[str, Any], budget: Decimal) -> None:
+    limit = _plan_budget_limit(detail)
+    if limit is not None and budget > limit:
+        raise ValueError(
+            f"追投预算 {budget} 元不能高于主计划当前预算 {limit} 元"
+        )
 
 
 def _public_api_error(exc: BaseException) -> str:
@@ -485,7 +527,7 @@ class OfficialApiRetargetingService:
                 True,
             )
         try:
-            await asyncio.to_thread(
+            plan_detail = await asyncio.to_thread(
                 _check_plan,
                 service,
                 aavid=aavid,
@@ -493,6 +535,8 @@ class OfficialApiRetargetingService:
                 promotion_scene=promotion_scene,
                 plan_system=plan_system,
             )
+            budget, duration, extra = _retarget_params(rdict, promotion_scene)
+            _validate_budget_against_plan(plan_detail, budget)
             start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             end_date = datetime.now().strftime("%Y-%m-%d")
             materials, _ = await asyncio.to_thread(
@@ -511,7 +555,6 @@ class OfficialApiRetargetingService:
                 if not _material_is_writable(current.get(mid) or {}):
                     raise RuntimeError(f"素材 {mid} 的投放或审核状态未明确可用，已禁止追投")
 
-            budget, duration, extra = _retarget_params(rdict, promotion_scene)
             if intent_key:
                 from services.official_api_reconciliation import reserve_execution_intent
 

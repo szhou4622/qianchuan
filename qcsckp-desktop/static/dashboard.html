@@ -2036,7 +2036,14 @@
                     window.totalDataCount = result.total || 0;
                     totalPages = result.totalPages || 1;
 
-                    // 将后端字段转换为前端需要的格式
+                    function optionalMetricNumber(value) {
+                        if (value === null || value === undefined || value === '') return null;
+                        const parsed = Number(value);
+                        return Number.isFinite(parsed) ? parsed : null;
+                    }
+
+                    // 将后端字段转换为前端需要的格式。六项规则指标的
+                    // NULL 必须保留，不能把“官方接口未提供”伪装成真实 0。
                     return result.data.map(mat => {
                         const id = mat.id ?? mat.material_id;
                         const title = mat.title ?? mat.video_name ?? '未命名';
@@ -2063,7 +2070,7 @@
                         const maxCostTime = maxCostTimeRaw ? String(maxCostTimeRaw).replace(' ', '\n') : null;
                         const minCostTime = minCostTimeRaw ? String(minCostTimeRaw).replace(' ', '\n') : null;
 
-                        const currentCost = mat.currentCost ?? mat.stat_cost ?? 0;
+                        const currentCost = optionalMetricNumber(mat.currentCost ?? mat.stat_cost);
 
                         return {
                             id,
@@ -2079,13 +2086,13 @@
                             maxCostTime,
                             minCostTime,
                             currentCost,
-                            netRoi: Number(mat.netRoi ?? 0) || 0,
-                            netAmount: Number(mat.netAmount ?? 0) || 0,
+                            netRoi: optionalMetricNumber(mat.netRoi),
+                            netAmount: optionalMetricNumber(mat.netAmount),
                             hourRefundRate: Number(mat.hourRefundRate ?? 0) || 0,
-                            overallPayRoi: Number(mat.overallPayRoi ?? 0) || 0,
-                            overallAmount: Number(mat.overallAmount ?? 0) || 0,
+                            overallPayRoi: optionalMetricNumber(mat.overallPayRoi),
+                            overallAmount: optionalMetricNumber(mat.overallAmount),
                             netSettleRate: Number(mat.netSettleRate ?? 0) || 0,
-                            netOrderCount: Number(mat.netOrderCount ?? 0) || 0,
+                            netOrderCount: optionalMetricNumber(mat.netOrderCount),
                             overallOrderCount: Number(mat.overallOrderCount ?? mat.overall_order_count ?? 0) || 0,
                             overallShowCount: Number(mat.overallShowCount ?? mat.overall_show_count ?? 0) || 0,
                             overallClickCount: Number(mat.overallClickCount ?? mat.overall_click_count ?? 0) || 0,
@@ -2352,7 +2359,13 @@
                 const tagInfo = videoTypeTagMap[item.videoType] || { bg: 'bg-slate-500/20', text: 'text-slate-300', border: 'border-slate-500/30', label: '其他' };
                 const tagStr = `<span class="px-1.5 py-0.5 ${tagInfo.bg} ${tagInfo.text} text-[10px] rounded border ${tagInfo.border} flex-none leading-none">${tagInfo.label}</span>`;
 
-                const netRoiClass = parseFloat(item.netRoi) >= 2 ? 'text-rose-400 font-bold' : (parseFloat(item.netRoi) >= 1 ? 'text-emerald-400' : 'text-slate-500');
+                const netRoiClass = item.netRoi == null
+                    ? 'text-slate-500'
+                    : parseFloat(item.netRoi) >= 2
+                        ? 'text-rose-400 font-bold'
+                        : parseFloat(item.netRoi) >= 1
+                            ? 'text-emerald-400'
+                            : 'text-slate-500';
                 const refundRateClass = parseFloat(item.hourRefundRate) > 10 ? 'text-rose-400' : (parseFloat(item.hourRefundRate) > 5 ? 'text-yellow-400' : 'text-emerald-400');
 
                 const materialCellClass = `p-2 border-b border-slate-800/50 ${isSelected ? 'border-l-2 border-l-blue-500' : ''}`;
@@ -2383,7 +2396,7 @@
                         <span class="text-slate-400 text-xs">${item.createTime}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="currentCost">
-                        <span class="text-slate-200 font-mono text-xs">¥${item.currentCost.toLocaleString()}</span>
+                        <span class="text-slate-200 font-mono text-xs">${item.currentCost == null ? '--' : '¥' + item.currentCost.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="velocity">
                         <div class="flex flex-col">
@@ -2402,16 +2415,16 @@
                         <span class="text-amber-400 font-mono text-xs">${item.minCostTime || '-'}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="netRoi">
-                        <span class="font-mono ${netRoiClass} text-xs">${item.netRoi}</span>
+                        <span class="font-mono ${netRoiClass} text-xs">${item.netRoi == null ? '--' : item.netRoi}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="netAmount">
-                        <span class="text-slate-300 font-mono text-xs">¥${item.netAmount.toLocaleString()}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.netAmount == null ? '--' : '¥' + item.netAmount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallPayRoi">
-                        <span class="text-slate-300 font-mono text-xs">${item.overallPayRoi}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallPayRoi == null ? '--' : item.overallPayRoi}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallAmount">
-                        <span class="text-slate-300 font-mono text-xs">¥${item.overallAmount.toLocaleString()}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallAmount == null ? '--' : '¥' + item.overallAmount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="hourRefundRate">
                         <span class="font-mono ${refundRateClass} text-xs">${item.hourRefundRate}%</span>
@@ -2420,7 +2433,7 @@
                         <span class="text-slate-300 font-mono text-xs">${item.netSettleRate}%</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="netOrderCount">
-                        <span class="text-slate-300 font-mono text-xs">${item.netOrderCount}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.netOrderCount == null ? '--' : item.netOrderCount}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallOrderCount">
                         <span class="text-slate-300 font-mono text-xs">${Number(item.overallOrderCount || 0).toLocaleString()}</span>

@@ -56,7 +56,7 @@ def _get_project_root() -> str:
 PROJECT_ROOT = _get_project_root()
 
 
-CURRENT_VERSION = "0.1.63"
+CURRENT_VERSION = "0.1.64"
 
 # The public application identity is also the PyInstaller product name used by
 # packaging/windows/build_windows.ps1.  Remote per-application services must

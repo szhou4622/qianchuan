@@ -65,7 +65,7 @@ class RetargetBudgetIncreaseConfigTests(unittest.TestCase):
         cfg = {"enabled": True, "strategies": [_strategy(task_action="create_retarget")]}
         ok, message = validate_rule_retargeting_config(cfg)
         self.assertFalse(ok)
-        self.assertIn("不能使用调控任务指标", message)
+        self.assertIn("只能使用整体消耗", message)
 
     def test_percentage_mode_validates_percentage(self):
         cfg = {

@@ -74,6 +74,27 @@ ALLOWED_TASK_ACTIONS = frozenset({"create_retarget", "increase_budget"})
 ALLOWED_BUDGET_INCREASE_MODES = frozenset({"fixed", "spend_percentage"})
 ASSIST_TASK_METRICS = frozenset({"assistCost", "assistRoi"})
 
+# The six user-facing material metrics are backed by the official Qianchuan
+# report-config contract.  The database keeps legacy column names for backward
+# compatibility, but strategy validation must use these exact official fields.
+MONITOR_METRIC_OFFICIAL_FIELDS = {
+    "currentCost": "stat_cost_for_roi2",
+    "netAmount": "total_order_settle_amount_for_roi2_1h",
+    "netRoi": "total_prepay_and_pay_settle_roi2_1h",
+    "netOrderCount": "total_order_settle_count_for_roi2_1h",
+    "overallAmount": "total_pay_order_gmv_include_coupon_for_roi2",
+    "overallPayRoi": "total_prepay_and_pay_order_roi2",
+}
+MONITOR_METRICS = frozenset(MONITOR_METRIC_OFFICIAL_FIELDS)
+MONITOR_METRIC_LABELS = {
+    "currentCost": "整体消耗",
+    "netAmount": "净成交金额",
+    "netRoi": "净成交ROI",
+    "netOrderCount": "净成交订单数",
+    "overallAmount": "整体成交金额",
+    "overallPayRoi": "整体支付ROI",
+}
+
 
 def target_allows_advance_strategy_configuration(
     target: Dict[str, Any], eligibility_field: str
@@ -166,7 +187,7 @@ def _normalize_json_whole_floats(obj: Any) -> Any:
 
 
 def _default_condition() -> Dict[str, Any]:
-    return {"metric": "costDiff", "op": "gt", "value": 0.0}
+    return {"metric": "currentCost", "op": "gt", "value": 0.0}
 
 
 def _default_group() -> Dict[str, Any]:
@@ -254,9 +275,9 @@ def _coerce_float(v: Any, default: float = 0.0) -> float:
 def _normalize_condition(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return _default_condition()
-    m = str(raw.get("metric") or "costDiff").strip()
+    m = str(raw.get("metric") or "currentCost").strip()
     if m not in ALLOWED_METRICS:
-        m = "costDiff"
+        m = "currentCost"
     op = str(raw.get("op") or "gt").strip().lower()
     if op not in ALLOWED_OPS:
         op = "gt"
@@ -908,48 +929,77 @@ def load_rule_retargeting_config() -> Dict[str, Any]:
         return out
 
 
-def _validate_retargeting_block(r: Dict[str, Any], *, validate_interval: bool) -> Tuple[bool, str]:
+def _validate_retargeting_block(
+    r: Dict[str, Any],
+    *,
+    validate_interval: bool,
+    require_create_values: bool = False,
+) -> Tuple[bool, str]:
     """校验单条调控任务（与旧版单规则 retargeting 字段一致）。"""
     method = str(r.get("method") or "volume").lower()
+    if method not in ALLOWED_METHOD:
+        return False, "追投方式无效"
     if method == "volume":
         vol = r.get("volume")
+        if not isinstance(vol, dict):
+            return False, "缺少放量追投设置"
         if isinstance(vol, dict):
             tb = vol.get("total_budget_yuan")
+            if require_create_values and (tb is None or str(tb).strip() == ""):
+                return False, "请填写调控预算"
             if tb is not None and str(tb).strip() != "":
                 err = _budget_yuan_error_msg(tb)
                 if err:
                     return False, err
             d = vol.get("duration_hours")
+            if require_create_values and (d is None or str(d).strip() == ""):
+                return False, "请填写调控时长"
             if d is not None:
                 err = _duration_hours_error_msg(d)
                 if err:
                     return False, err
     if method == "cost_control":
         cc = r.get("cost_control")
+        if not isinstance(cc, dict):
+            return False, "缺少控成本追投设置"
         if isinstance(cc, dict):
             og = str(cc.get("optimization_goal") or "").lower()
+            if og not in ALLOWED_GOAL:
+                return False, "控成本优化目标无效"
             if og == "net_roi":
                 nr = cc.get("net_roi")
+                if not isinstance(nr, dict):
+                    return False, "缺少综合营销ROI设置"
                 if isinstance(nr, dict):
                     x = nr.get("daily_budget_yuan")
+                    if require_create_values and (x is None or str(x).strip() == ""):
+                        return False, "请填写调控日预算"
                     if x is not None and str(x).strip() != "":
                         err = _budget_yuan_error_msg(x)
                         if err:
                             return False, err
                     y = nr.get("net_roi_target")
+                    if require_create_values and (y is None or str(y).strip() == ""):
+                        return False, "请填写综合营销ROI目标"
                     if y is not None and str(y).strip() != "":
                         err = _net_roi_target_error_msg(y)
                         if err:
                             return False, err
             if og == "live_room":
                 lr = cc.get("live_room")
+                if not isinstance(lr, dict):
+                    return False, "缺少直播间成交设置"
                 if isinstance(lr, dict):
                     x = lr.get("daily_budget_yuan")
+                    if require_create_values and (x is None or str(x).strip() == ""):
+                        return False, "请填写调控日预算"
                     if x is not None and str(x).strip() != "":
                         err = _budget_yuan_error_msg(x)
                         if err:
                             return False, err
                     b = lr.get("bid_per_conversion_yuan")
+                    if require_create_values and (b is None or str(b).strip() == ""):
+                        return False, "请填写直播间成交出价"
                     if b is not None and str(b).strip() != "":
                         err = _bid_per_conversion_error_msg(b, lr.get("daily_budget_yuan"))
                         if err:
@@ -1012,6 +1062,43 @@ def _trigger_metrics(trigger: Any) -> List[str]:
                 if metric:
                     metrics.append(metric)
     return metrics
+
+
+def target_report_metric_units(target: Dict[str, Any]) -> Dict[str, Any]:
+    capability = target.get("capability")
+    if not isinstance(capability, dict):
+        raw = target.get("capability_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed = {}
+            capability = parsed if isinstance(parsed, dict) else {}
+        else:
+            capability = {}
+    units = capability.get("report_metric_units")
+    return dict(units) if isinstance(units, dict) else {}
+
+
+def unsupported_strategy_monitor_metrics(
+    strategy: Dict[str, Any],
+    target: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    if str(strategy.get("task_action") or "create_retarget").strip().lower() == "increase_budget":
+        return []
+    metrics = _trigger_metrics(strategy.get("trigger"))
+    unsupported = [metric for metric in metrics if metric not in MONITOR_METRICS]
+    units = target_report_metric_units(target or {}) if isinstance(target, dict) else {}
+    # A waiting-live plan may be configured before its first report-config
+    # response. Execution remains blocked by the fresh-snapshot gate.
+    if units:
+        unsupported.extend(
+            metric
+            for metric in metrics
+            if metric in MONITOR_METRICS
+            and MONITOR_METRIC_OFFICIAL_FIELDS[metric] not in units
+        )
+    return list(dict.fromkeys(unsupported))
 
 
 def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
@@ -1089,12 +1176,20 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
             if task_action == "increase_budget":
                 if not metrics or any(metric not in ASSIST_TASK_METRICS for metric in metrics):
                     return False, f"策略{i + 1} 追加预算时只能使用调控消耗和调控ROI"
-            elif any(metric in ASSIST_TASK_METRICS for metric in metrics):
-                return False, f"策略{i + 1} 新建追投时不能使用调控任务指标"
+            elif not metrics or any(metric not in MONITOR_METRICS for metric in metrics):
+                return (
+                    False,
+                    f"策略{i + 1} 新建追投时只能使用整体消耗、净成交金额、"
+                    "净成交ROI、净成交订单数、整体成交金额或整体支付ROI",
+                )
             r = st.get("retargeting")
             if not isinstance(r, dict):
                 return False, f"策略{i + 1} 缺少调控任务"
-            ok, msg = _validate_retargeting_block(r, validate_interval=per_str)
+            ok, msg = _validate_retargeting_block(
+                r,
+                validate_interval=per_str,
+                require_create_values=task_action != "increase_budget",
+            )
             if not ok:
                 return False, msg
             if task_action == "increase_budget":
@@ -1105,7 +1200,11 @@ def validate_rule_retargeting_config(data: Dict[str, Any]) -> Tuple[bool, str]:
 
     r = data.get("retargeting")
     if r is not None and isinstance(r, dict):
-        ok, msg = _validate_retargeting_block(r, validate_interval=not per_str)
+        ok, msg = _validate_retargeting_block(
+            r,
+            validate_interval=not per_str,
+            require_create_values=True,
+        )
         if not ok:
             return False, msg
     return True, ""
@@ -1155,6 +1254,18 @@ def validate_strategy_target_compatibility(
             # the matched control-task row; the source-plan scene does not use
             # the create-retarget method restriction below.
             continue
+        unsupported_metrics = unsupported_strategy_monitor_metrics(strategy, target)
+        if unsupported_metrics:
+            title = str(strategy.get("title") or f"策略{index + 1}").strip()
+            labels = "、".join(
+                MONITOR_METRIC_LABELS.get(metric, metric)
+                for metric in unsupported_metrics
+            )
+            return (
+                False,
+                f"“{title}”使用的监控指标当前不可用：{labels}；"
+                "请等待该计划完成官方字段采集或更换指标",
+            )
         method = str(retargeting.get("method") or "volume").strip().lower()
         if scene == "product" and method == "cost_control":
             title = str(strategy.get("title") or f"策略{index + 1}").strip()

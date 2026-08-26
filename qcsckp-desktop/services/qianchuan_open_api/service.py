@@ -27,6 +27,164 @@ from .normalizers import (
 )
 
 
+CONTROL_CREATE_EXTRA_FIELDS = frozenset(
+    {
+        "smart_bid_type",
+        "external_action",
+        "deep_external_action",
+        "roi2_goal",
+        "bid",
+    }
+)
+
+
+def _validated_decimal(
+    value: Any,
+    label: str,
+    *,
+    minimum: Decimal,
+    maximum: Optional[Decimal] = None,
+    max_decimal_places: int = 2,
+    step: Optional[Decimal] = None,
+) -> Decimal:
+    try:
+        number = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{label}必须是有效数字") from exc
+    if not number.is_finite():
+        raise ValueError(f"{label}必须是有效数字")
+    if number < minimum:
+        raise ValueError(f"{label}不得低于 {minimum} 元" if "预算" in label else f"{label}不得低于 {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{label}不得高于 {maximum} 元" if "预算" in label or "出价" in label else f"{label}不得高于 {maximum}")
+    decimal_places = max(0, -number.as_tuple().exponent)
+    if decimal_places > max_decimal_places:
+        raise ValueError(f"{label}最多支持{max_decimal_places}位小数")
+    if step is not None and (number - minimum) % step != 0:
+        raise ValueError(f"{label}必须按 {step} 递增")
+    return number
+
+
+def build_material_control_task_body(
+    *,
+    advertiser_id: Any,
+    ad_id: Any,
+    marketing_goal: str,
+    name: str,
+    budget: Any,
+    duration: Any,
+    material_ids: Iterable[Any],
+    extra: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build one strict official control-task request without passthrough fields."""
+    aid = require_digit_id(advertiser_id, "advertiser_id")
+    pid = require_digit_id(ad_id, "ad_id")
+    goal = str(marketing_goal or "").strip().upper()
+    if goal not in {"LIVE_PROM_GOODS", "VIDEO_PROM_GOODS"}:
+        raise ValueError("marketing_goal 仅支持推直播或推商品")
+    task_name = str(name or "").strip()
+    if not 1 <= len(task_name) <= 50:
+        raise ValueError("追投任务名称须为1至50个字符")
+    materials = stable_material_set(material_ids)
+    if not 1 <= len(materials) <= 20:
+        raise ValueError("每条追投调控任务必须包含 1 至 20 条视频素材")
+    money = _validated_decimal(
+        budget,
+        "追投预算",
+        minimum=Decimal("100"),
+        max_decimal_places=2,
+    )
+    hours = None
+    if duration not in (None, ""):
+        hours = _validated_decimal(
+            duration,
+            "追投时长",
+            minimum=Decimal("0.5"),
+            maximum=Decimal("24"),
+            max_decimal_places=1,
+            step=Decimal("0.5"),
+        )
+    supplied_extra = dict(extra or {})
+    unknown = sorted(set(supplied_extra) - CONTROL_CREATE_EXTRA_FIELDS)
+    if unknown:
+        raise ValueError("追投请求包含官方接口未声明的字段：" + ",".join(unknown))
+    clean_extra = {
+        key: value
+        for key, value in supplied_extra.items()
+        if key in CONTROL_CREATE_EXTRA_FIELDS and value not in (None, "")
+    }
+
+    smart_bid_type = str(clean_extra.get("smart_bid_type") or "").strip().upper()
+    cost_fields = {
+        key for key in ("external_action", "deep_external_action", "roi2_goal", "bid")
+        if key in clean_extra
+    }
+    if goal == "VIDEO_PROM_GOODS":
+        if hours is None:
+            raise ValueError("推商品放量追投必须填写调控时长")
+        if clean_extra:
+            raise ValueError("推商品放量追投不能携带直播控成本参数")
+    else:
+        if smart_bid_type == "SMART_BID_CONSERVATIVE":
+            if hours is None:
+                raise ValueError("推直播放量追投必须填写调控时长")
+            if cost_fields:
+                raise ValueError("推直播放量追投不能携带ROI、出价或转化目标字段")
+        elif smart_bid_type == "SMART_BID_CUSTOM":
+            if hours is not None:
+                raise ValueError("推直播控成本追投不能携带调控时长")
+            if clean_extra.get("external_action") != "AD_CONVERT_TYPE_LIVE_SUCCESSORDER_PAY":
+                raise ValueError("推直播控成本追投的转化目标参数不正确")
+            has_roi = "roi2_goal" in clean_extra
+            has_bid = "bid" in clean_extra
+            if has_roi == has_bid:
+                raise ValueError("推直播控成本追投必须且只能填写综合营销ROI或直播间成交出价")
+            if has_roi:
+                if clean_extra.get("deep_external_action") not in {
+                    "AD_CONVERT_TYPE_LIVE_PAY_ROI",
+                    "AD_CONVERT_TYPE_LIVE_PURE_PAY_ROI",
+                }:
+                    raise ValueError("综合营销ROI对应的深度转化目标参数不正确")
+                clean_extra["roi2_goal"] = float(
+                    _validated_decimal(
+                        clean_extra["roi2_goal"],
+                        "综合营销ROI目标",
+                        minimum=Decimal("0.01"),
+                        maximum=Decimal("100"),
+                        max_decimal_places=2,
+                    )
+                )
+            else:
+                if "deep_external_action" in clean_extra:
+                    raise ValueError("直播间成交出价不能携带ROI深度转化目标")
+                bid = _validated_decimal(
+                    clean_extra["bid"],
+                    "直播间成交出价",
+                    minimum=Decimal("0.1"),
+                    maximum=Decimal("10000"),
+                    max_decimal_places=2,
+                )
+                if bid > money:
+                    raise ValueError("直播间成交出价不能高于追投预算")
+                clean_extra["bid"] = float(bid)
+        else:
+            raise ValueError("推直播追投必须明确放量或控成本方式")
+
+    body: dict[str, Any] = {
+        "advertiser_id": id_number(aid, "advertiser_id"),
+        "ad_id": id_number(pid, "ad_id"),
+        "name": task_name,
+        "scene": "MATERIAL_ADD_BUDGET",
+        "budget": float(money),
+        "material_type": "VIDEO",
+        "material_ids": [id_number(value, "material_id") for value in materials],
+    }
+    if hours is not None:
+        body["duration"] = float(hours)
+    body.update(clean_extra)
+    return body
+
+
 class QianchuanOfficialApiService:
     AUTHORIZED_ADVERTISERS = "/open_api/oauth2/advertiser/get/"
     SHOP_ADVERTISERS = "/open_api/v1.0/qianchuan/shop/advertiser/list/"
@@ -775,16 +933,22 @@ class QianchuanOfficialApiService:
         materials = stable_material_set(material_ids)
         # 千川调控任务名称上限为50字符；唯一执行标识也计入该上限。
         task_name = str(name or "素材追投")[:50]
-        if not 1 <= len(materials) <= 20:
-            raise ValueError("每条追投调控任务必须包含 1 至 20 条视频素材")
-        money = Decimal(str(budget))
-        hours = None if duration in (None, "") else Decimal(str(duration))
-        if money < Decimal("100"):
-            raise ValueError("追投预算不得低于 100 元")
-        if hours is not None and (
-            hours < Decimal("0.5") or hours > Decimal("24")
-        ):
-            raise ValueError("追投时长须为 0.5 至 24 小时")
+        body = build_material_control_task_body(
+            advertiser_id=aid,
+            ad_id=pid,
+            marketing_goal=marketing_goal,
+            name=task_name,
+            budget=budget,
+            duration=duration,
+            material_ids=materials,
+            extra=extra,
+        )
+        money = Decimal(str(body["budget"]))
+        hours = (
+            None
+            if "duration" not in body
+            else Decimal(str(body["duration"]))
+        )
         duplicate = self.find_duplicate_control_task(
             aid,
             ad_id=pid,
@@ -804,20 +968,6 @@ class QianchuanOfficialApiService:
                 request_id="",
                 message="同一执行任务已存在，已完成幂等对账",
             )
-        body: dict[str, Any] = {
-            "advertiser_id": id_number(aid, "advertiser_id"),
-            "ad_id": id_number(pid, "ad_id"),
-            "name": task_name,
-            "scene": "MATERIAL_ADD_BUDGET",
-            "budget": float(money),
-            "material_type": "VIDEO",
-            "material_ids": [id_number(value, "material_id") for value in materials],
-        }
-        if hours is not None:
-            body["duration"] = float(hours)
-        for key, value in dict(extra or {}).items():
-            if key not in body and key not in {"task_ids", "opt_type", "scene"}:
-                body[key] = value
         return self.client.post(self.CONTROL_CREATE, body, advertiser_id=aid)
 
     def update_control_status(self, advertiser_id: Any, task_ids: Iterable[Any], *, action: str) -> ApiResponse:
