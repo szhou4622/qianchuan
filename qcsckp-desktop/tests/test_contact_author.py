@@ -156,6 +156,19 @@ class ContactAuthorTests(unittest.TestCase):
         self.assertIn("candidate.onload", html)
         self.assertNotIn("update.dadaozixun.com/api/contact", html)
 
+    def test_user_guide_is_above_contact_and_opens_in_system_browser(self):
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        tutorial = 'id="sidebarTutorialBtn"'
+        contact = 'id="sidebarContactSlot"'
+        self.assertIn(tutorial, html)
+        self.assertLess(html.index(tutorial), html.index(contact))
+        self.assertIn("使用教程", html)
+        self.assertIn(
+            "https://my.feishu.cn/docx/Lu9idLRe8o9cIFx71CGcI0cInox?from=from_copylink",
+            html,
+        )
+        self.assertIn("api.openUrlInBrowser(USER_GUIDE_URL)", html)
+
     def test_contact_is_available_before_activation_and_large_enough_to_scan(self):
         index_html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         license_html = (ROOT / "static" / "license.html").read_text(encoding="utf-8")

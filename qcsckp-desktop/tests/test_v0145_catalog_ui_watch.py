@@ -69,7 +69,13 @@ class CatalogUiWatchV0145Tests(unittest.TestCase):
     def test_each_account_plan_list_has_local_search(self):
         self.assertIn('data-account-plan-search', self.html)
         self.assertIn('在此账户内搜索计划名称或ID', self.html)
-        self.assertIn('data-plan-search-text', self.html)
+        self.assertIn('data-plan-name=', self.html)
+        self.assertIn('data-plan-id=', self.html)
+        self.assertIn('planMatchesSearch(', self.html)
+        self.assertIn("idDigits.includes(tokenDigits)", self.html)
+        self.assertIn("compactName.includes(compactToken)", self.html)
+        self.assertIn("replace(/计划\\s*id", self.html)
+        self.assertIn('.plan[hidden],.plan-group[hidden]{display:none!important}', self.html)
         self.assertIn("group.hidden=!Array.from(group.querySelectorAll('.plan'))", self.html)
 
     def test_plan_groups_put_chengfang_and_live_first(self):

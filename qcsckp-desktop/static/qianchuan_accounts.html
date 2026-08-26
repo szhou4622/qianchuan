@@ -29,7 +29,7 @@
     .check{display:flex;gap:8px;align-items:flex-start;color:#cbd5e1;font-size:12px;line-height:1.5;margin-top:8px}.check input{margin-top:2px}
     .group-list{max-height:130px;overflow:auto}.group-empty{color:#71839b;font-size:11px}.sync{margin-top:11px;padding:9px;border-radius:8px;background:#07101d;color:#8494aa;font-size:10px;line-height:1.7}
     .plans{min-height:0;display:grid;align-content:start;gap:8px;overflow-y:auto;overscroll-behavior:contain;padding-right:6px;scrollbar-color:#334b6c #091322;scrollbar-width:thin}.plans::-webkit-scrollbar,.settings-panel::-webkit-scrollbar{width:8px}.plans::-webkit-scrollbar-thumb,.settings-panel::-webkit-scrollbar-thumb{background:#334b6c;border-radius:99px}.plan{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px;border:1px solid #26364e;border-radius:9px;background:#101b2d}
-    .plan-group{margin-top:12px}.plan-group:first-child{margin-top:0}.plan-group-title{display:flex;justify-content:space-between;color:#7dd3fc;font-size:11px;font-weight:700;margin-bottom:7px}.plan.ineligible{opacity:.65}.plan input:disabled{cursor:not-allowed}
+    .plan-group{margin-top:12px}.plan-group:first-child{margin-top:0}.plan-group-title{display:flex;justify-content:space-between;color:#7dd3fc;font-size:11px;font-weight:700;margin-bottom:7px}.plan.ineligible{opacity:.65}.plan input:disabled{cursor:not-allowed}.plan[hidden],.plan-group[hidden]{display:none!important}
     .plan-name{color:#e2e8f0;font-size:12px;font-weight:600;word-break:break-all}.plan-meta{margin-top:4px;color:#71839b;font-size:10px;line-height:1.55}.plan-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.plan-actions button{height:28px;min-height:28px;padding:0 9px;font-size:10px}.plan-state{white-space:nowrap;font-size:10px}.plan-state.wait{color:#fbbf24}.plan-state.late{color:#fda4af}.plan-state.active{color:#86efac}
     .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:13px}.actions [data-save].pending{background:#0284c7;color:#fff;box-shadow:0 0 0 2px #38bdf833}.danger{background:#7f1d1d;color:#fecaca}.empty{padding:70px 20px;border:1px dashed #2b3b54;border-radius:14px;text-align:center;color:#71839b}
     .account-picker-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:#020617cc;backdrop-filter:blur(5px)}
@@ -210,11 +210,42 @@
     $('oeAppId').value='';$('oeAppSecret').value='';await loadApiConfig();await load();
   }
 
+  function normalizedPlanSearchText(value){
+    const raw=String(value??'');
+    const normalized=typeof raw.normalize==='function'?raw.normalize('NFKC'):raw;
+    return normalized.trim().toLocaleLowerCase('zh-CN');
+  }
+
+  function compactPlanSearchText(value){
+    return normalizedPlanSearchText(value).replace(/[\s_\-—·.，,。:：/\\()\[\]【】]+/g,'');
+  }
+
+  function planMatchesSearch(planName,planId,rawQuery){
+    const query=normalizedPlanSearchText(rawQuery)
+      .replace(/计划\s*id\s*[:：]?/gi,' ')
+      .replace(/\bid\s*[:：]?/gi,' ')
+      .trim();
+    if(!query)return true;
+    const name=normalizedPlanSearchText(planName);
+    const compactName=compactPlanSearchText(planName);
+    const id=normalizedPlanSearchText(planId);
+    const idDigits=id.replace(/\D/g,'');
+    const tokens=query.split(/\s+/).filter(Boolean);
+    return tokens.every(token=>{
+      const compactToken=compactPlanSearchText(token);
+      const tokenDigits=token.replace(/\D/g,'');
+      return name.includes(token)
+        || (!!compactToken&&compactName.includes(compactToken))
+        || id.includes(token)
+        || (!!tokenDigits&&idDigits.includes(tokenDigits));
+    });
+  }
+
   function filteredPlans(plans){
     const query=($('planSearch')?.value||'').trim().toLowerCase();
     const status=$('planStatus')?.value||'current';
     return plans.filter(p=>{
-      if(query&&!`${p.plan_name||''} ${p.ad_id||''}`.toLowerCase().includes(query))return false;
+      if(!planMatchesSearch(p.plan_name||'',p.ad_id||'',query))return false;
       if(status!=='all'&&p.verification_state==='missing')return false;
       if(status==='eligible'&&!p.monitor_eligible)return false;
       if(status==='unverified'&&p.monitor_eligible)return false;
@@ -249,8 +280,7 @@
         const collectingLabel=collectionStage==='scanning_active_materials'?'正在扫描投放中素材':collectionStage==='updating_metrics'?'正在更新指标':collectionStage==='materials'?'正在采集素材':'正在核验计划';
         const stateLabel=waitingRestore?'已选择，待核验恢复':!eligible?'禁止自动化':blocked?'自动写入已封锁':!accountEnabled&&selected?'账户已停用':!selected?'未参与监控':collectionBackoff?'接口限流等待':lastCollectionStatus==='pagination_error'?'分页异常，已保留上次数据':collectionFailed?'数据延迟，自动重试中':collecting?collectingLabel:collectionQueued?'等待采集':waitingLive&&firstRun?'等待开播并持续监控':firstRun?'等待采集':late?'数据延迟':capText(state);
         const disabled=(!eligible&&!p.enabled)||(!accountEnabled&&!p.enabled);
-        const searchText=`${p.plan_name||''} ${p.ad_id||''}`.toLowerCase();
-        return `<label class="plan ${eligible?'':'ineligible'}" data-plan-search-text="${esc(searchText)}"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)} · ${platformStatus(p.platform_status)}<br>计划ID ${esc(p.ad_id||'')} · ${verificationText(p.verification_state)}${selected?`<br>最近采集：${esc(p.last_sync_at||'尚无成功数据')} · 数据年龄：${esc(dataAge(p.last_lag_seconds))}`:''}${reason?`<br>不可启用：${esc(reason)}`:''}${p.last_verification_error?`<br>最近核验：${esc(p.last_verification_error)}`:''}${(collectionFailed||collectionBackoff)&&p.last_error?`<br>采集异常：${esc(p.last_error)}`:''}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span class="plan-actions"><input type="checkbox" data-target="${esc(p.target_uid)}" data-eligible="${eligible?'1':'0'}" data-persisted-enabled="${p.enabled?'1':'0'}" ${p.enabled?'checked':''} ${disabled?'disabled':''}><span class="plan-state ${blocked||late||collectionFailed||collectionBackoff||!eligible?'late':firstRun||state==='capacity_waiting'?'wait':selected&&state==='active'?'active':''}" data-enabled-label="${esc(stateLabel)}">${!accountEnabled&&eligible&&!p.enabled?'先启用账户':stateLabel}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
+        return `<label class="plan ${eligible?'':'ineligible'}" data-plan-name="${esc(p.plan_name||'')}" data-plan-id="${esc(String(p.ad_id||''))}"><span><span class="plan-name">${esc(p.plan_name||'未命名计划')}</span><span class="plan-meta">${scene(p.promotion_scene)} · ${system(p.plan_system)} · ${platformStatus(p.platform_status)}<br>计划ID ${esc(p.ad_id||'')} · ${verificationText(p.verification_state)}${selected?`<br>最近采集：${esc(p.last_sync_at||'尚无成功数据')} · 数据年龄：${esc(dataAge(p.last_lag_seconds))}`:''}${reason?`<br>不可启用：${esc(reason)}`:''}${p.last_verification_error?`<br>最近核验：${esc(p.last_verification_error)}`:''}${(collectionFailed||collectionBackoff)&&p.last_error?`<br>采集异常：${esc(p.last_error)}`:''}${blocked?`<br>自动写入封锁：${esc(p.write_block_reason||'请人工核对')}`:''}</span></span><span class="plan-actions"><input type="checkbox" data-target="${esc(p.target_uid)}" data-eligible="${eligible?'1':'0'}" data-persisted-enabled="${p.enabled?'1':'0'}" ${p.enabled?'checked':''} ${disabled?'disabled':''}><span class="plan-state ${blocked||late||collectionFailed||collectionBackoff||!eligible?'late':firstRun||state==='capacity_waiting'?'wait':selected&&state==='active'?'active':''}" data-enabled-label="${esc(stateLabel)}">${!accountEnabled&&eligible&&!p.enabled?'先启用账户':stateLabel}</span>${blocked?`<button type="button" data-unblock="${esc(p.target_uid)}">核对后解除</button>`:''}</span></label>`;
       }).join('')}</div>`;
     }).join('');
   }
@@ -340,7 +370,11 @@
       const panel=input.closest('.plans-panel');
       const query=String(input.value||'').trim().toLowerCase();
       panel?.querySelectorAll('.plan').forEach(plan=>{
-        plan.hidden=!!query&&!String(plan.dataset.planSearchText||'').includes(query);
+        plan.hidden=!planMatchesSearch(
+          plan.dataset.planName||'',
+          plan.dataset.planId||'',
+          query,
+        );
       });
       panel?.querySelectorAll('.plan-group').forEach(group=>{
         group.hidden=!Array.from(group.querySelectorAll('.plan')).some(plan=>!plan.hidden);

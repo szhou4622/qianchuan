@@ -600,6 +600,17 @@
                 <span>授权管理</span>
             </div>
         </nav>
+        <div class="sidebar-contact-slot" id="sidebarTutorialSlot">
+            <button
+                type="button"
+                class="sidebar-contact-btn"
+                id="sidebarTutorialBtn"
+                title="使用教程"
+            >
+                <i data-lucide="book-open" aria-hidden="true"></i>
+                <span class="sidebar-contact-label">使用教程</span>
+            </button>
+        </div>
         <div class="sidebar-contact-slot" id="sidebarContactSlot">
             <button
                 type="button"
@@ -1119,6 +1130,28 @@
                 setMainFramePage(page);
             });
         });
+
+        // ---------- 使用教程：通过受控后端桥接交给系统默认浏览器 ----------
+        const sidebarTutorialBtn = document.getElementById('sidebarTutorialBtn');
+        const USER_GUIDE_URL = 'https://my.feishu.cn/docx/Lu9idLRe8o9cIFx71CGcI0cInox?from=from_copylink';
+        if (sidebarTutorialBtn) {
+            sidebarTutorialBtn.addEventListener('click', async () => {
+                const api = window.pywebview?.api || window.pywebviewAPI;
+                if (!api?.openUrlInBrowser) {
+                    window.alert('本地服务尚未就绪，请稍后再试。');
+                    return;
+                }
+                try {
+                    const result = await api.openUrlInBrowser(USER_GUIDE_URL);
+                    if (!result?.success) {
+                        window.alert(result?.message || '使用教程打开失败，请稍后重试。');
+                    }
+                } catch (error) {
+                    console.warn('打开使用教程失败', error);
+                    window.alert('使用教程打开失败，请稍后重试。');
+                }
+            });
+        }
 
         // ---------- 联系作者（首次悬停/聚焦/点击才访问本地接口）----------
         const sidebarContactSlot = document.getElementById('sidebarContactSlot');
