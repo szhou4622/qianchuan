@@ -251,6 +251,7 @@ def normalize_product(row: Mapping[str, Any]) -> dict[str, Any]:
 def normalize_control_task(row: Mapping[str, Any]) -> dict[str, Any]:
     task_id = text_id(first(row, "task_id", "control_task_id", "assist_task_id", "id"))
     material_ids = first(row, "material_ids", "materialIds", "materials", "material_list", default=[])
+    metrics = first(row, "metrics", "stats_info", "statsInfo", "stats", default={})
     return {
         "task_id": task_id,
         "assist_task_id": task_id,
@@ -263,6 +264,7 @@ def normalize_control_task(row: Mapping[str, Any]) -> dict[str, Any]:
         "material_ids": _id_list(material_ids, "material_id", "materialId", "id"),
         "create_time": str(first(row, "create_time", "createTime")).strip(),
         "modify_time": str(first(row, "modify_time", "modifyTime")).strip(),
+        "metrics": dict(metrics) if isinstance(metrics, Mapping) else {},
         "raw": dict(row),
     }
 

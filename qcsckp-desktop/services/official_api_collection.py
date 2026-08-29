@@ -705,7 +705,10 @@ def _metric_block(stats: Mapping[str, Any], *names: str) -> tuple[Any, Any]:
             continue
         value = stats.get(name)
         if isinstance(value, Mapping):
-            return value.get("value"), first(value, "unit", "unit_type", "unitType")
+            return (
+                first(value, "value", "Value", "value_str", "ValueStr", default=None),
+                first(value, "unit", "Unit", "unit_type", "unitType", default=None),
+            )
         return value, None
     return None, None
 
@@ -829,7 +832,12 @@ def _control_snapshot(
     units: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     raw = _mapping(task.get("raw"))
-    stats = _mapping(first(raw, "stats_info", "statsInfo", "stats", "metrics", default={}))
+    stats: dict[str, Any] = {}
+    raw_stats = _mapping(
+        first(raw, "stats_info", "statsInfo", "stats", "metrics", default={})
+    )
+    stats.update(raw_stats)
+    stats.update(_mapping(task.get("metrics")))
     material_ids = [text_id(item) for item in (task.get("material_ids") or []) if text_id(item)]
     materials = [{"material_id": item, "title": ""} for item in material_ids]
 
@@ -871,12 +879,41 @@ def _control_snapshot(
             if task.get("duration") not in (None, "")
             else None
         ),
-        "stat_cost_for_roi2_assist": raw_metric("stat_cost_for_roi2_assist", "statCostForRoi2Assist"),
-        "total_pay_order_count_for_roi2_assist": raw_metric("total_pay_order_count_for_roi2_assist", "totalPayOrderCountForRoi2Assist"),
-        "total_pay_order_gmv_include_coupon_for_roi2_assist": raw_metric("total_pay_order_gmv_include_coupon_for_roi2_assist", "totalPayOrderGmvIncludeCouponForRoi2Assist"),
-        "total_prepay_and_pay_order_roi2_assist": raw_metric("total_prepay_and_pay_order_roi2_assist", "totalPrepayAndPayOrderRoi2Assist"),
-        "total_order_settle_amount_for_roi2_1h_assist": raw_metric("total_order_settle_amount_for_roi2_1h_assist", "totalOrderSettleAmountForRoi21HAssist"),
-        "total_prepay_and_pay_settle_roi2_1h_assist": raw_metric("total_prepay_and_pay_settle_roi2_1h_assist", "totalPrepayAndPaySettleRoi21HAssist"),
+        "stat_cost_for_roi2_assist": raw_metric(
+            "stat_cost_for_roi2_assist",
+            "additional_delivery_stat_cost_for_roi2_assist",
+            "statCostForRoi2Assist",
+        ),
+        "total_pay_order_count_for_roi2_assist": raw_metric(
+            "total_pay_order_count_for_roi2_assist",
+            "additional_delivery_total_pay_order_count_for_roi2_assist",
+            "totalPayOrderCountForRoi2Assist",
+        ),
+        "total_pay_order_gmv_include_coupon_for_roi2_assist": raw_metric(
+            "total_pay_order_gmv_include_coupon_for_roi2_assist",
+            "additional_delivery_total_pay_order_gmv_include_coupon_for_roi2_assist",
+            "totalPayOrderGmvIncludeCouponForRoi2Assist",
+        ),
+        "total_prepay_and_pay_order_roi2_assist": raw_metric(
+            "total_prepay_and_pay_order_roi2_assist",
+            "additional_delivery_total_prepay_and_pay_order_roi2_assist",
+            "totalPrepayAndPayOrderRoi2Assist",
+        ),
+        "total_order_settle_amount_for_roi2_1h_assist": raw_metric(
+            "total_order_settle_amount_for_roi2_1h_assist",
+            "additional_delivery_total_order_settle_amount_for_roi2_1h_assist",
+            "totalOrderSettleAmountForRoi21HAssist",
+        ),
+        "total_prepay_and_pay_settle_roi2_1h_assist": raw_metric(
+            "total_prepay_and_pay_settle_roi2_1h_assist",
+            "additional_delivery_total_prepay_and_pay_settle_roi2_1h_assist",
+            "totalPrepayAndPaySettleRoi21HAssist",
+        ),
+        "total_order_settle_count_for_roi2_1h_assist": raw_metric(
+            "total_order_settle_count_for_roi2_1h_assist",
+            "additional_delivery_total_order_settle_count_for_roi2_1h_assist",
+            "totalOrderSettleCountForRoi21HAssist",
+        ),
         "assist_materials_json": json.dumps(materials, ensure_ascii=False, separators=(",", ":")),
         "data_source": "qianchuan_open_api",
         "api_request_id": str(request_id or "")[:256],
@@ -1615,6 +1652,7 @@ def collect_target(
             "total_prepay_and_pay_order_roi2_assist",
             "total_order_settle_amount_for_roi2_1h_assist",
             "total_prepay_and_pay_settle_roi2_1h_assist",
+            "total_order_settle_count_for_roi2_1h_assist",
         ):
             if (
                 effective_control.get(field) is None

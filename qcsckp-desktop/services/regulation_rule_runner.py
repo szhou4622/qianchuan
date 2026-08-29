@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-规则化停投调度：按固定间隔（默认 10 分钟）从 pmc_roi2_assist_task（与 DashboardApi.get_roi2_assist_table_data 一致）
+规则化停投调度：按固定间隔（默认 5 分钟）从 pmc_roi2_assist_task（与 DashboardApi.get_roi2_assist_table_data 一致）
 拉取「ad_delivery_type=0 调控中、updated_at 近 N 分钟（默认 30，见 REGULATION_ASSIST_UPDATED_WITHIN_MINUTES；传 0 则仍按近 1 天）」任务，
 按 stat_cost_for_roi2_assist 降序；再按每条策略的 trigger（ROI2 调控指标）筛选，
-对任务执行暂停或删除（见 regulation_service）。写入 pmc_regulation_run（停投不做素材级限频）。
+对任务执行暂停或结束（见 regulation_service）。写入 pmc_regulation_run（停投不做素材级限频）。
 多策略并行默认最多 3 路（环境变量 REGULATION_STRATEGY_PARALLEL）。
 """
 
@@ -40,7 +40,7 @@ from services.promotion_capability import (
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
-DEFAULT_INTERVAL_SEC = 600
+DEFAULT_INTERVAL_SEC = 300
 MAX_STRATEGY_PARALLEL = 3
 _DASHBOARD_PAGE_SIZE = 20_000
 # 停投调度拉取调控任务时：仅处理「入库更新时间」近 N 分钟内有变动的行，减少对已停滞数据的重复跳过；0=沿用大屏默认（近 1 天）
@@ -48,6 +48,15 @@ _DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
 _RUNNER_LOCK = threading.Lock()
 _RUNNER_THREAD: Optional[threading.Thread] = None
 _RUNNER_STOP = threading.Event()
+
+
+def _shadow_mode_enabled() -> bool:
+    return str(os.environ.get("QCSCKP_REGULATION_SHADOW_MODE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _target_assist_sync_ready(
@@ -969,6 +978,16 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
     async def process_strategy(st: Dict[str, Any]) -> None:
         async with sem:
+            validation_error = str(st.get("validation_error") or "").strip()
+            if validation_error:
+                logger.warning(
+                    "%s 策略已暂停：%s",
+                    regulation_log_tag(
+                        strategy_title=str(st.get("title") or st.get("id") or "?")[:64]
+                    ),
+                    validation_error,
+                )
+                return
             trigger = st.get("trigger") or {}
             if not isinstance(trigger, dict):
                 logger.warning("%s 策略 trigger 非法，跳过", _log_sched)
@@ -1011,6 +1030,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 return
 
             hit_rows: List[Dict[str, Any]] = []
+            evaluated_rows = 0
+            missing_metrics: Dict[str, int] = {}
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -1019,11 +1040,43 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                     and str(row.get("target_uid") or "") != strategy_target_uid
                 ):
                     continue
-                if evaluate_trigger_roi2_assist(trigger, row):
+                evaluated_rows += 1
+                evaluation = build_trigger_evaluation_snapshot_roi2_assist(
+                    trigger, row
+                )
+                for group in evaluation.get("groups") or []:
+                    for condition in group.get("conditions") or []:
+                        if condition.get("actual") is None:
+                            metric = str(condition.get("metric") or "unknown")
+                            missing_metrics[metric] = missing_metrics.get(metric, 0) + 1
+                logger.debug(
+                    "%s 调控任务评估 assist_task_id=%s evaluation=%s",
+                    _tag,
+                    row.get("assist_task_id"),
+                    _json_dumps(evaluation),
+                )
+                if bool(evaluation.get("passed")):
                     hit_rows.append(row)
 
-            logger.info("%s 命中调控任务数=%s", _tag, len(hit_rows))
+            logger.info(
+                "%s 评估调控任务=%s 命中=%s 指标缺失=%s",
+                _tag,
+                evaluated_rows,
+                len(hit_rows),
+                missing_metrics or "无",
+            )
             if not hit_rows:
+                return
+            if _shadow_mode_enabled():
+                logger.warning(
+                    "%s 影子模式命中%s个调控任务，仅记录判断，不发飞书卡片且不执行停投 task_ids=%s",
+                    _tag,
+                    len(hit_rows),
+                    ",".join(
+                        str(row.get("assist_task_id") or "")
+                        for row in hit_rows[:20]
+                    ),
+                )
                 return
 
             svc = QianChuanRegulationStopService.from_rule_file_dict(cfg)

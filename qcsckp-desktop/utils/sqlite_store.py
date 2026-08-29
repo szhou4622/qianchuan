@@ -1014,6 +1014,7 @@ class SQLiteStore:
                 'pay_convert_cost_for_roi2_assist': 'REAL',
                 'pay_convert_cnt_for_roi2_assist': 'REAL',
                 'total_order_settle_amount_for_roi2_1h_assist': 'REAL',
+                'total_order_settle_count_for_roi2_1h_assist': 'REAL',
                 'total_refund_order_gmv_for_roi2_1h_rate_assist': 'REAL',
                 'total_prepay_and_pay_settle_roi2_1h_assist': 'REAL',
                 'total_pay_order_gmv_for_roi2_assist': 'REAL',

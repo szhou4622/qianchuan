@@ -546,7 +546,10 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
                 duration=data.get("duration"),
             )
         elif action_type == "stop":
-            from services.official_api_execution import _find_control_task
+            from services.official_api_execution import (
+                _find_control_task,
+                classify_stop_status,
+            )
 
             verified = _find_control_task(
                 get_official_api_service(),
@@ -559,19 +562,26 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
                 raise RuntimeError("官方 API 暂未返回待核验的调控任务")
             expected = str(data.get("expected_status") or "PAUSE").upper()
             actual = str(verified.get("status") or "").upper()
-            allowed = (
-                {"PAUSE", "PAUSED"}
-                if expected == "PAUSE"
-                else {"DISABLE", "DISABLED", "FINISHED", "ENDED"}
-            )
-            if actual not in allowed:
-                raise RuntimeError(f"平台任务状态尚未变更为 {expected}，当前为 {actual or 'unknown'}")
+            stop_outcome, stop_message = classify_stop_status(expected, actual)
+            if stop_outcome == "pending":
+                raise RuntimeError(stop_message)
+            verified = dict(verified)
+            verified["verification_outcome"] = stop_outcome
+            verified["verification_message"] = stop_message
+            if stop_outcome == "terminal_natural":
+                data["verification_note"] = stop_message
         else:
             raise RuntimeError("暂不支持的对账动作")
     except Exception as exc:
         _retry(store, row, str(exc))
         return
-    _finish(store, row, status="confirmed_succeeded", verified=verified)
+    _finish(
+        store,
+        row,
+        status="confirmed_succeeded",
+        error=str(data.get("verification_note") or ""),
+        verified=verified,
+    )
 
 
 def _loop() -> None:

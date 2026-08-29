@@ -38,6 +38,21 @@ CONTROL_CREATE_EXTRA_FIELDS = frozenset(
 )
 
 
+# ``control_task/list`` only populates ``task_list[].metrics`` when the
+# requested metric fields are explicit.  These seven fields are the verified
+# task-scoped inputs used by the stop-rule page and must travel together so a
+# partially populated task can never be evaluated as a complete snapshot.
+CONTROL_TASK_METRIC_FIELDS = (
+    "stat_cost_for_roi2_assist",
+    "total_pay_order_count_for_roi2_assist",
+    "total_pay_order_gmv_include_coupon_for_roi2_assist",
+    "total_prepay_and_pay_order_roi2_assist",
+    "total_order_settle_amount_for_roi2_1h_assist",
+    "total_prepay_and_pay_settle_roi2_1h_assist",
+    "total_order_settle_count_for_roi2_1h_assist",
+)
+
+
 def _validated_decimal(
     value: Any,
     label: str,
@@ -839,6 +854,7 @@ class QianchuanOfficialApiService:
         end_time: str,
         scene: str = "MATERIAL_ADD_BUDGET",
         active_only: bool = False,
+        fields: Optional[Iterable[str]] = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         pid = require_digit_id(ad_id, "ad_id")
@@ -849,6 +865,7 @@ class QianchuanOfficialApiService:
             "start_time": start_time,
             "end_time": end_time,
             "scene": scene,
+            "fields": list(fields or CONTROL_TASK_METRIC_FIELDS),
         }
         if active_only:
             # The live contract enumerates PROCESSING as the only running
@@ -861,7 +878,16 @@ class QianchuanOfficialApiService:
             advertiser_id=aid,
             page_size=100,
         )
-        return [normalize_control_task(row) for row in rows], request_ids
+        normalized = [normalize_control_task(row) for row in rows]
+        if active_only:
+            # The server already accepted the exact PROCESSING filter.  Some
+            # task rows still return ``task_status=null``; only in this scoped
+            # request may the missing echo inherit the filter value.  Never
+            # infer a state for the unfiltered history query.
+            for item in normalized:
+                if not str(item.get("status") or "").strip():
+                    item["status"] = "PROCESSING"
+        return normalized, request_ids
 
     def find_duplicate_control_task(
         self,

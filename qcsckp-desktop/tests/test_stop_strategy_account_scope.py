@@ -10,16 +10,80 @@ from unittest.mock import Mock, patch
 from api.rule_regulation_config import (
     _normalize_full,
     bind_and_validate_strategy_targets,
+    evaluate_trigger_roi2_assist,
+    validate_rule_regulation_config,
 )
 from api.views import Api
 from services.regulation_rule_runner import (
+    DEFAULT_INTERVAL_SEC,
     _revalidate_stop_candidate,
     _send_auto_stop_submitted_notification,
+    _shadow_mode_enabled,
     _stop_strategy_snapshot,
 )
 
 
 class StopStrategyAccountScopeTests(unittest.TestCase):
+    def test_stop_rule_interval_is_five_minutes(self):
+        self.assertEqual(300, DEFAULT_INTERVAL_SEC)
+
+    def test_stop_shadow_mode_is_explicit_and_off_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QCSCKP_REGULATION_SHADOW_MODE", None)
+            self.assertFalse(_shadow_mode_enabled())
+        with patch.dict(os.environ, {"QCSCKP_REGULATION_SHADOW_MODE": "1"}):
+            self.assertTrue(_shadow_mode_enabled())
+
+    def test_unsupported_legacy_metric_is_preserved_and_blocks_enable(self):
+        config = self._config()
+        config["strategies"][0]["trigger"]["groups"][0]["conditions"][0][
+            "metric"
+        ] = "show_cnt_for_roi2_assist"
+        normalized = _normalize_full(config)
+        strategy = normalized["strategies"][0]
+        condition = strategy["trigger"]["groups"][0]["conditions"][0]
+        self.assertEqual("show_cnt_for_roi2_assist", condition["metric"])
+        self.assertIn("不支持的指标", strategy["validation_error"])
+        ok, message = validate_rule_regulation_config(normalized)
+        self.assertFalse(ok)
+        self.assertIn("不是当前官方调控接口支持", message)
+
+    def test_net_settled_order_count_is_supported(self):
+        config = self._config()
+        config["strategies"][0]["trigger"]["groups"][0]["conditions"][0][
+            "metric"
+        ] = "total_order_settle_count_for_roi2_1h_assist"
+        normalized = _normalize_full(config)
+        ok, message = validate_rule_regulation_config(normalized)
+        self.assertTrue(ok, message)
+
+    def test_all_seven_task_metrics_can_trigger_and_null_cannot(self):
+        metrics = (
+            "stat_cost_for_roi2_assist",
+            "total_pay_order_count_for_roi2_assist",
+            "total_pay_order_gmv_include_coupon_for_roi2_assist",
+            "total_prepay_and_pay_order_roi2_assist",
+            "total_order_settle_amount_for_roi2_1h_assist",
+            "total_prepay_and_pay_settle_roi2_1h_assist",
+            "total_order_settle_count_for_roi2_1h_assist",
+        )
+        for metric in metrics:
+            with self.subTest(metric=metric):
+                trigger = {
+                    "group_combine": "or",
+                    "groups": [
+                        {
+                            "join": "and",
+                            "conditions": [
+                                {"metric": metric, "op": "gt", "value": 1}
+                            ],
+                        }
+                    ],
+                }
+                self.assertTrue(evaluate_trigger_roi2_assist(trigger, {metric: 2}))
+                self.assertFalse(evaluate_trigger_roi2_assist(trigger, {metric: None}))
+                self.assertFalse(evaluate_trigger_roi2_assist(trigger, {}))
+
     def test_auto_stop_submission_sends_verifying_card(self):
         with patch(
             "services.qianchuan_accounts.resolve_account_feishu_targets",

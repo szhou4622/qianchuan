@@ -157,6 +157,28 @@ def _control_window() -> tuple[str, str]:
     )
 
 
+def classify_stop_status(expected_status: Any, actual_status: Any) -> tuple[str, str]:
+    """Classify one read-only control-task status after a stop submission.
+
+    PAUSE is an update action, not a task-list state.  Verified platform
+    history records a successful pause as DISABLE.  OFFLINE_TIME means the
+    task naturally expired while verification was pending; the stop objective
+    is complete but must not be described as a confirmed pause action.
+    """
+
+    expected = str(expected_status or "PAUSE").strip().upper()
+    actual = str(actual_status or "").strip().upper()
+    if actual == "OFFLINE_TIME":
+        return "terminal_natural", "调控任务已自然到期"
+    if actual in {"DISABLE", "DISABLED", "FINISHED", "ENDED"}:
+        if expected == "PAUSE":
+            return "confirmed", "调控任务已暂停，平台状态为 DISABLE"
+        return "confirmed", "调控任务已结束"
+    if actual == "PROCESSING":
+        return "pending", "平台任务仍在调控中"
+    return "pending", f"平台任务状态尚未完成停投核验，当前为 {actual or 'unknown'}"
+
+
 def _find_control_task(
     service: Any,
     *,
@@ -818,10 +840,11 @@ class OfficialApiRegulationStopService:
             ):
                 raise RuntimeError("调控任务缺少场景证据，且本地没有10分钟内的素材追投记录，已禁止操作")
             current_status = str(exact.get("status") or "").upper()
-            if current_status in {"PAUSE", "PAUSED"} and opt_type == "PAUSE":
-                return RegulationRunResult(True, "调控任务已经暂停", "done_already_paused", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
             if current_status in {"DISABLE", "DISABLED", "FINISHED", "ENDED"}:
-                return RegulationRunResult(True, "调控任务已经结束", "done_already_paused", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
+                message = "调控任务已经暂停" if opt_type == "PAUSE" else "调控任务已经结束"
+                return RegulationRunResult(True, message, "done_already_paused", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
+            if current_status == "OFFLINE_TIME":
+                return RegulationRunResult(True, "调控任务已自然到期", "done_naturally_expired", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
             from services.official_api_reconciliation import reserve_execution_intent
 
             intent, intent_reserved = reserve_execution_intent(
@@ -937,10 +960,8 @@ class OfficialApiRegulationStopService:
             except Exception:
                 exact = None
             status = str((exact or {}).get("status") or "").upper()
-            reconciled = (
-                (opt_type == "PAUSE" and status in {"PAUSE", "PAUSED"})
-                or (opt_type == "DISABLE" and status in {"DISABLE", "DISABLED", "FINISHED", "ENDED"})
-            )
+            stop_outcome, stop_message = classify_stop_status(opt_type, status)
+            reconciled = stop_outcome in {"confirmed", "terminal_natural"}
             if exc.request_uid:
                 OfficialApiAuditStore().mark_reconciled(
                     exc.request_uid,
@@ -980,7 +1001,7 @@ class OfficialApiRegulationStopService:
                     finish_execution_intent(intent_key, status="unknown_requires_review", error=str(exc))
             return RegulationRunResult(
                 reconciled,
-                "官方 API 已观察到目标状态，正在继续核验" if reconciled else "官方 API 停投结果未知，已禁止自动重试",
+                stop_message if reconciled else "官方 API 停投结果未知，已禁止自动重试",
                 "submitted_verifying" if reconciled else "unknown_requires_review",
                 str(exc),
                 text_id(aavid),

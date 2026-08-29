@@ -29,7 +29,10 @@ from services.qianchuan_open_api.normalizers import (
     stable_material_set,
 )
 from api.promotion_targets import target_eligibility
-from services.qianchuan_open_api.service import QianchuanOfficialApiService
+from services.qianchuan_open_api.service import (
+    CONTROL_TASK_METRIC_FIELDS,
+    QianchuanOfficialApiService,
+)
 from services.qianchuan_open_api.token_provider import (
     AccessTokenBundle,
     DefaultTokenProvider,
@@ -78,6 +81,7 @@ from services.official_api_execution import (
     OfficialApiRegulationStopService,
     OfficialApiRetargetingService,
     _configured_control_task_base_name,
+    classify_stop_status,
     _material_is_writable,
     _retarget_params,
     _unique_control_task_name,
@@ -271,6 +275,54 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         )
         self.assertEqual(3.778, row["total_prepay_and_pay_order_roi2_assist"])
         self.assertEqual(0, row["ad_delivery_type"])
+
+    def test_control_snapshot_reads_value_value_str_zero_and_null(self):
+        row = _control_snapshot(
+            {
+                "task_id": "task-seven-metrics",
+                "status": "PROCESSING",
+                "metrics": {
+                    "stat_cost_for_roi2_assist": {"Value": 0},
+                    "total_pay_order_count_for_roi2_assist": {"ValueStr": "3"},
+                    "total_pay_order_gmv_include_coupon_for_roi2_assist": {"Value": "88.6"},
+                    "total_prepay_and_pay_order_roi2_assist": {"ValueStr": "2.5"},
+                    "total_order_settle_amount_for_roi2_1h_assist": {"Value": "70.2"},
+                    "total_prepay_and_pay_settle_roi2_1h_assist": None,
+                    "total_order_settle_count_for_roi2_1h_assist": {"ValueStr": "2"},
+                },
+                "raw": {},
+            },
+            target={
+                "target_uid": "target-seven",
+                "account_uid": "account-seven",
+                "aadvid": "1001",
+                "ad_id": "2001",
+                "promotion_scene": "live",
+                "plan_system": "chengfang",
+            },
+            request_id="control-seven-request",
+            units={},
+        )
+        self.assertEqual(0.0, row["stat_cost_for_roi2_assist"])
+        self.assertEqual(3.0, row["total_pay_order_count_for_roi2_assist"])
+        self.assertEqual(88.6, row["total_pay_order_gmv_include_coupon_for_roi2_assist"])
+        self.assertEqual(2.5, row["total_prepay_and_pay_order_roi2_assist"])
+        self.assertEqual(70.2, row["total_order_settle_amount_for_roi2_1h_assist"])
+        self.assertIsNone(row["total_prepay_and_pay_settle_roi2_1h_assist"])
+        self.assertEqual(2.0, row["total_order_settle_count_for_roi2_1h_assist"])
+
+    def test_assist_schema_contains_net_settled_order_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = os.path.join(temp, "assist-schema.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            columns = {
+                str(row.get("name") or "")
+                for row in store.execute(
+                    "PRAGMA table_info(pmc_roi2_assist_task)", fetch=True
+                )
+            }
+        self.assertIn("total_order_settle_count_for_roi2_1h_assist", columns)
 
     def test_product_material_metrics_use_product_report_fields(self):
         row = _material_snapshot(
@@ -1086,9 +1138,9 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual(["3001"], [row["material_id"] for row in rows])
 
     def test_hot_control_list_requests_only_processing_scene2_tasks(self):
-        client = _CaptureClient()
+        client = _CaptureClient(tasks=[{"id": "3001", "task_status": None}])
         service = QianchuanOfficialApiService(client)
-        service.list_control_tasks(
+        rows, _ = service.list_control_tasks(
             "1001",
             ad_id="2001",
             marketing_goal="VIDEO_PROM_GOODS",
@@ -1100,6 +1152,21 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertIn("control_task/list", endpoint)
         self.assertEqual("MATERIAL_ADD_BUDGET", query["scene"])
         self.assertEqual("PROCESSING", query["filtering"]["task_status"])
+        self.assertEqual(list(CONTROL_TASK_METRIC_FIELDS), query["fields"])
+        self.assertEqual("PROCESSING", rows[0]["status"])
+
+    def test_unfiltered_control_history_does_not_infer_missing_status(self):
+        client = _CaptureClient(tasks=[{"id": "3001", "task_status": None}])
+        service = QianchuanOfficialApiService(client)
+        rows, _ = service.list_control_tasks(
+            "1001",
+            ad_id="2001",
+            marketing_goal="VIDEO_PROM_GOODS",
+            start_time="2026-08-14 00:00:00",
+            end_time="2026-08-22 23:59:59",
+            active_only=False,
+        )
+        self.assertEqual("", rows[0]["status"])
 
     def test_material_report_uses_data_endpoint_and_required_video_filter(self):
         client = _CaptureClient()
@@ -1621,7 +1688,7 @@ class OfficialApiBackendTests(unittest.TestCase):
                     store,
                     row,
                     status="confirmed_succeeded",
-                    verified={"task_id": "30003", "status": "PAUSE"},
+                    verified={"task_id": "30003", "status": "DISABLE"},
                 )
             self.assertTrue(changed)
             notify.assert_called_once()
@@ -1629,6 +1696,17 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "confirmed_succeeded",
                 notify.call_args.kwargs["status"],
             )
+
+    def test_pause_verification_uses_disable_and_recognizes_natural_expiry(self):
+        self.assertEqual(
+            ("confirmed", "调控任务已暂停，平台状态为 DISABLE"),
+            classify_stop_status("PAUSE", "DISABLE"),
+        )
+        self.assertEqual(
+            ("terminal_natural", "调控任务已自然到期"),
+            classify_stop_status("PAUSE", "OFFLINE_TIME"),
+        )
+        self.assertEqual("pending", classify_stop_status("PAUSE", "PROCESSING")[0])
 
     def test_persisted_token_without_expiry_is_not_trusted_forever(self):
         bundle = AccessTokenBundle(access_token="token", expires_at=0)

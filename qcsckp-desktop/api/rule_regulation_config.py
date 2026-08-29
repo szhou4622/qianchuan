@@ -31,25 +31,16 @@ from .rule_retargeting_config import (
 FILENAME = "rule_regulation.json"
 _lock = threading.RLock()
 
-# 与 dashboard.html ASSIST_METRIC_COLUMNS、schema_pmc_roi2_assist_task 指标列一致（snake_case）
+# 官方 control_task/list 已验证可按任务返回的七项停投指标。
 ALLOWED_METRICS_ROI2_ASSIST = frozenset(
     {
-        "show_cnt_for_roi2_assist",
-        "click_cnt_for_roi2_assist",
-        "ctr_for_roi2_assist",
-        "convert_rate_for_roi2_assist",
         "stat_cost_for_roi2_assist",
         "total_pay_order_count_for_roi2_assist",
         "total_pay_order_gmv_include_coupon_for_roi2_assist",
         "total_prepay_and_pay_order_roi2_assist",
-        "total_cost_per_pay_order_for_roi2_assist",
-        "pay_convert_cost_for_roi2_assist",
-        "pay_convert_cnt_for_roi2_assist",
         "total_order_settle_amount_for_roi2_1h_assist",
-        "total_refund_order_gmv_for_roi2_1h_rate_assist",
         "total_prepay_and_pay_settle_roi2_1h_assist",
-        "total_pay_order_gmv_for_roi2_assist",
-        "total_pay_order_coupon_amount_for_roi2_assist",
+        "total_order_settle_count_for_roi2_1h_assist",
     }
 )
 
@@ -93,9 +84,10 @@ def _default_trigger_roi2() -> Dict[str, Any]:
 def _normalize_condition_roi2(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return _default_condition_roi2()
+    # Preserve old/unknown metric names so an upgraded client can report and
+    # pause the affected strategy.  Silently rewriting an unsupported metric
+    # to cost would change the user's stop intent.
     m = str(raw.get("metric") or "stat_cost_for_roi2_assist").strip()
-    if m not in ALLOWED_METRICS_ROI2_ASSIST:
-        m = "stat_cost_for_roi2_assist"
     op = str(raw.get("op") or "gt").strip().lower()
     if op not in ALLOWED_OPS:
         op = "gt"
@@ -152,6 +144,7 @@ def _default_strategy(index: int = 0) -> Dict[str, Any]:
         "trigger": _normalize_trigger_roi2(None),
         "regulation_stop_action": "pause",
         "action_mode": "card_confirm",
+        "validation_error": "",
     }
 
 
@@ -184,6 +177,22 @@ def _normalize_strategy_entry(
     if len(title) > _STRATEGY_TITLE_MAX_LEN:
         title = title[:_STRATEGY_TITLE_MAX_LEN]
     trig = _normalize_trigger_roi2(raw.get("trigger"))
+    unsupported = sorted(
+        {
+            str(condition.get("metric") or "").strip()
+            for group in trig.get("groups") or []
+            if isinstance(group, dict)
+            for condition in group.get("conditions") or []
+            if isinstance(condition, dict)
+            and str(condition.get("metric") or "").strip()
+            not in ALLOWED_METRICS_ROI2_ASSIST
+        }
+    )
+    validation_error = (
+        "该策略包含当前官方调控接口不支持的指标：" + "、".join(unsupported)
+        if unsupported
+        else ""
+    )
     if raw.get("regulation_stop_action") is not None:
         rsa_src = raw.get("regulation_stop_action")
     elif legacy_stop is not None:
@@ -203,6 +212,7 @@ def _normalize_strategy_entry(
             raw.get("action_mode"),
             legacy=legacy_existing and "action_mode" not in raw,
         ),
+        "validation_error": validation_error,
     }
 
 
@@ -336,6 +346,11 @@ def validate_rule_regulation_config(data: Dict[str, Any]) -> Tuple[bool, str]:
                     if not isinstance(c, dict):
                         continue
                     m = str(c.get("metric") or "")
+                    if m not in ALLOWED_METRICS_ROI2_ASSIST:
+                        return False, (
+                            f"策略{i + 1}：指标“{m or '空'}”不是当前官方调控接口支持的停投指标，"
+                            "请重新选择"
+                        )
                     op = str(c.get("op") or "gt").strip().lower()
                     v = _coerce_float(c.get("value"), 0.0)
                     if not _cond_value_ok(m, v):

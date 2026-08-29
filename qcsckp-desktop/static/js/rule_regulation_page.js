@@ -9,18 +9,9 @@
         { key: 'total_pay_order_count_for_roi2_assist', label: '调控成交订单数' },
         { key: 'total_pay_order_gmv_include_coupon_for_roi2_assist', label: '调控成交金额' },
         { key: 'total_prepay_and_pay_order_roi2_assist', label: '调控支付ROI' },
-        { key: 'show_cnt_for_roi2_assist', label: '调控展示次数' },
-        { key: 'click_cnt_for_roi2_assist', label: '调控点击次数' },
-        { key: 'ctr_for_roi2_assist', label: '调控点击率' },
-        { key: 'convert_rate_for_roi2_assist', label: '调控转化率' },
-        { key: 'total_cost_per_pay_order_for_roi2_assist', label: '调控成交订单成本' },
-        { key: 'pay_convert_cost_for_roi2_assist', label: '调控成交成本' },
-        { key: 'pay_convert_cnt_for_roi2_assist', label: '调控成交人数' },
         { key: 'total_order_settle_amount_for_roi2_1h_assist', label: '调控净成交金额' },
-        { key: 'total_refund_order_gmv_for_roi2_1h_rate_assist', label: '调控1小时内退款率' },
         { key: 'total_prepay_and_pay_settle_roi2_1h_assist', label: '调控净成交ROI' },
-        { key: 'total_pay_order_gmv_for_roi2_assist', label: '调控用户实际支付金额' },
-        { key: 'total_pay_order_coupon_amount_for_roi2_assist', label: '调控成交智能优惠券金额' },
+        { key: 'total_order_settle_count_for_roi2_1h_assist', label: '调控净成交订单数' },
     ];
     const RATE_METRICS = new Set([
         'ctr_for_roi2_assist',
@@ -972,14 +963,18 @@
                 return;
             }
             const tag = document.createElement('div');
-            tag.className = TAG_SHELL + ' ' + (isActive ? TAG_ON : TAG_OFF);
+            const invalid = !!String(st.validation_error || '').trim();
+            tag.className = TAG_SHELL + ' ' + (invalid
+                ? 'bg-red-500/10 text-red-300 border-red-500/40'
+                : (isActive ? TAG_ON : TAG_OFF));
 
             const main = document.createElement('button');
             main.type = 'button';
             main.className =
                 'rr-strategy-tag-main py-1.5 truncate ' +
                 (strategiesState.length > 1 ? 'pl-2 pr-0.5' : 'px-2');
-            main.textContent = (st.title && String(st.title).trim()) || defaultStrategyTitle(idx);
+            main.textContent = (invalid ? '⚠ ' : '') + ((st.title && String(st.title).trim()) || defaultStrategyTitle(idx));
+            if (invalid) main.title = String(st.validation_error || '当前策略不可执行');
             main.setAttribute('data-strategy-index', String(idx));
             main.addEventListener('click', () => {
                 const j = parseInt(main.getAttribute('data-strategy-index'), 10);
@@ -1115,6 +1110,17 @@
         renderTriggerGroups(_groupsRef);
         applyStopActionToDom(s.regulation_stop_action);
         applyActionModeToDom(s.action_mode);
+        let warning = document.getElementById('regStrategyValidationWarning');
+        if (!warning) {
+            warning = document.createElement('div');
+            warning.id = 'regStrategyValidationWarning';
+            warning.className = 'mt-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300';
+            const tabs = document.getElementById('strategyTabsBar');
+            if (tabs && tabs.parentNode) tabs.parentNode.insertBefore(warning, tabs.nextSibling);
+        }
+        const validationError = String(s.validation_error || '').trim();
+        warning.textContent = validationError;
+        warning.classList.toggle('hidden', !validationError);
     }
 
     function applyData(data) {
@@ -1144,6 +1150,7 @@
                 trigger: s.trigger || defaultTriggerPayload(),
                 regulation_stop_action: normStrategyStopAct(s.regulation_stop_action),
                 action_mode: s.action_mode === 'card_confirm' ? 'card_confirm' : 'auto_execute',
+                validation_error: s.validation_error || '',
             }));
         } else {
             const t = data.trigger || defaultTriggerPayload();
