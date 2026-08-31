@@ -42,13 +42,8 @@ class StartupAbort(RuntimeError):
 
 
 def _runtime_root() -> Path:
-    override = str(os.getenv("QCSCKP_DATA_DIR") or "").strip()
-    if override:
-        return Path(os.path.expandvars(os.path.expanduser(override))).resolve()
-    if getattr(sys, "frozen", False) and sys.platform == "win32":
-        local = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
-        return Path(local) / APP_NAME / "official-api-v1"
-    return Path(__file__).resolve().parent
+    from channel_runtime import layout
+    return layout().profile
 
 
 def _logs_dir() -> Path:
@@ -171,6 +166,9 @@ def mark_startup_phase(phase: str, detail: str = "") -> None:
     except OSError:
         pass
     startup_log(f"phase={phase}" + (f" detail={detail}" if detail else ""))
+    if phase == "failed":
+        from services.diagnostics import record_event
+        record_event("failed", "startup_failure")
 
 
 def mark_window_ready() -> None:
@@ -221,12 +219,16 @@ def install_exception_hooks() -> None:
         _FAULT_HANDLE = None
 
     def main_hook(exc_type: Any, exc: BaseException, tb: Any) -> None:
+        from services.diagnostics import record_event
+        record_event("runtime", "runtime_failure", exception=exc)
         detail = _exception_text(exc_type, exc, tb)
         startup_log("unhandled_exception\n" + detail)
         mark_startup_phase("failed", str(exc))
         _show_fatal_error("软件启动失败。", str(exc))
 
     def thread_hook(args: Any) -> None:
+        from services.diagnostics import record_event
+        record_event("runtime", "runtime_failure", exception=args.exc_value)
         detail = _exception_text(args.exc_type, args.exc_value, args.exc_traceback)
         startup_log(f"thread_exception name={getattr(args.thread, 'name', '')}\n{detail}")
 
@@ -544,11 +546,36 @@ def _run_diagnostics() -> int:
     return 0
 
 
-def main() -> int:
+def _repair_license_connection() -> int:
+    """Standalone entry: no WebView, credential store or business runtime."""
+    try:
+        from services.license_transport import LicenseTransport
+
+        result = LicenseTransport().diagnose_and_repair()
+        detail = "\n".join(step["message"] for step in result.get("steps", []))
+        native_message(
+            result["message"] + "\n\n" + detail
+            + "\n\n脱敏日志：" + str(result.get("log_path") or "")
+            + "\n\n检测不代表激活成功。请重新打开软件，使用原有授权在线验证。",
+            error=not result["success"],
+        )
+        return 0 if result["success"] else 2
+    except Exception as exc:
+        from services.license_transport import describe_network_error
+
+        detail = describe_network_error(exc)
+        startup_log("license_repair_failed=" + detail["kind"])
+        native_message("授权连接修复未完成：" + detail["message"] + "。原激活凭证未改动。")
+        return 2
+
+
+def _main_impl() -> int:
     install_exception_hooks()
     mark_startup_phase("bootstrap", f"frozen={bool(getattr(sys, 'frozen', False))}")
     if "--diagnose-startup" in sys.argv[1:]:
         return _run_diagnostics()
+    if "--repair-license-connection" in sys.argv[1:]:
+        return _repair_license_connection()
     try:
         mark_startup_phase("package_integrity")
         issues = validate_package_integrity()
@@ -568,6 +595,8 @@ def main() -> int:
         _show_fatal_error("软件无法启动。", str(exc))
         return 2
     except Exception as exc:
+        from services.diagnostics import record_event
+        record_event("bootstrap", "startup_failure", exception=exc)
         detail = traceback.format_exc()
         startup_log("startup_failed\n" + detail)
         mark_startup_phase("failed", str(exc))
@@ -576,6 +605,35 @@ def main() -> int:
     finally:
         if not _WINDOW_READY.is_set():
             startup_log("bootstrap_exit_before_window_ready")
+
+
+def main() -> int:
+    from channel_runtime import InstanceLease, prepare_profile
+    from release_identity import CHANNEL, CHANNELS, DISPLAY_VERSION
+    from services.diagnostics import diagnostic_status, set_consent, start_worker, stop_worker
+    lease = InstanceLease()
+    if not lease.acquire():
+        native_message("QCSCKP 另一版本仍在运行，请先从托盘完全退出。不会强制结束进程。")
+        return 2
+    try:
+        prepare_profile(lambda source, channel: native_confirm(
+            f"即将首次运行{CHANNELS[channel]}。\n是否复制当前版本的配置与历史数据？\n"
+            "原数据会先备份并保留；新副本独立使用，不自动合并。\n选择否将建立空白业务配置。"))
+        if CHANNEL == "development" and not diagnostic_status()["asked"]:
+            set_consent(native_confirm("是否开启开发版自动脱敏错误上报？\n"
+                "仅发送版本、错误阶段、类型、耗时和代码位置，不上传激活码、密钥、业务数据库或素材。\n"
+                "服务器保留30天，可在版本与诊断页关闭。网络或授权不可用时只保存在本机。"))
+        start_worker()
+        startup_log(DISPLAY_VERSION)
+        return _main_impl()
+    except Exception as exc:
+        from services.diagnostics import record_event
+        record_event("switch", "switch_failure", exception=exc)
+        native_message("安全切版未完成，原数据已保留。\n" + str(exc))
+        return 2
+    finally:
+        stop_worker()
+        lease.close()
 
 
 if __name__ == "__main__":

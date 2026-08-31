@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "auto-py-to-exe>=2.50.0",
     "baseopensdk",
+    "certifi>=2025.1.31",
     "lark-oapi==1.7.1",
     "keyring>=25.6.0; sys_platform == 'darwin'",
     "pillow>=12.1.1",

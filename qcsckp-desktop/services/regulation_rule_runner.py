@@ -364,6 +364,14 @@ def has_completed_stop(
     target_uid: str,
     assist_task_id: str,
 ) -> bool:
+    shared = db.execute(
+        "SELECT e.id FROM execution_reconciliation e JOIN promotion_target p "
+        "ON p.ad_id=e.ad_id AND p.aadvid=e.aavid WHERE e.control_task_id=? "
+        "AND p.target_uid=? AND e.action_type='stop' AND e.status='confirmed_succeeded' LIMIT 1",
+        (str(assist_task_id or ""), str(target_uid or "legacy_unscoped")), fetch=True,
+    ) or []
+    if shared:
+        return True
     rows = db.execute(
         "SELECT id FROM pmc_regulation_run "
         "WHERE target_uid=? AND assist_task_id=? AND status IN (1,2) "

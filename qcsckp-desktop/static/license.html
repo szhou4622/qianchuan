@@ -65,6 +65,7 @@
         .hint { margin: 14px 0 0; color: #64748b; font-size: 11px; line-height: 1.65; }
         .machine-info { margin-top: 13px; padding: 10px 12px; border: 1px solid #334155; border-radius: 10px; color: #94a3b8; background: rgba(15,23,42,.55); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
         .machine-info strong { color: #cbd5e1; }
+        .connection-report { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.65; color: #cbd5e1; margin-top: 12px; }
         .license-summary { display: none; margin-top: 14px; color: #94a3b8; font-size: 12px; line-height: 1.7; }
         .license-summary strong { color: #e2e8f0; }
         .contact-link { width: 100%; margin-top: 12px; background: transparent; }
@@ -101,6 +102,9 @@
             </form>
             <div class="machine-info"><strong>本机机器码：</strong><span id="machineCode">正在读取…</span></div>
             <div class="license-summary" id="licenseSummary"></div>
+            <button class="contact-link" id="repairConnectionButton" type="button">诊断并修复连接</button>
+            <div class="connection-report" id="connectionReport" role="status" hidden></div>
+            <button class="contact-link" type="button" onclick="location.href='channel_settings.html'">版本与诊断 · 导出脱敏报告</button>
             <button class="contact-link" id="contactButton" type="button" aria-expanded="false">联系作者</button>
             <div class="contact-panel" id="contactPanel">
                 <img id="contactImage" alt="联系作者二维码">
@@ -115,6 +119,8 @@
         const input = document.getElementById('activationCode');
         const activateButton = document.getElementById('activateButton');
         const retryButton = document.getElementById('retryButton');
+        const repairConnectionButton = document.getElementById('repairConnectionButton');
+        const connectionReport = document.getElementById('connectionReport');
         const machineCode = document.getElementById('machineCode');
         const summary = document.getElementById('licenseSummary');
         const contactButton = document.getElementById('contactButton');
@@ -148,6 +154,7 @@
             busy = !!value;
             activateButton.disabled = busy;
             retryButton.disabled = busy;
+            repairConnectionButton.disabled = busy;
             input.disabled = busy;
             activateButton.textContent = busy ? (label || '处理中…') : '立即激活';
         }
@@ -225,6 +232,35 @@
             }
         });
         retryButton.addEventListener('click', checkAuthorization);
+        repairConnectionButton.addEventListener('click', async () => {
+            if (busy) return;
+            setBusy(true, '正在检测…');
+            repairConnectionButton.textContent = '正在检测安全连接…';
+            connectionReport.hidden = false;
+            connectionReport.textContent = '正在检测授权连接并尝试安全恢复，通常需要10～40秒。不会清除激活凭证、关闭证书校验或修改系统网络设置。';
+            setStatus('正在诊断授权连接…');
+            let recheck = false;
+            try {
+                api = api || await waitForApi();
+                if (!api || typeof api.diagnoseLicenseConnection !== 'function') throw new Error('本地诊断模块未就绪，请重启软件');
+                const result = await api.diagnoseLicenseConnection();
+                const labels = { default: '默认HTTPS', bundled_ca: '补充内置可信证书', windows_https: 'Windows系统HTTPS' };
+                const lines = (result.steps || []).map(step => (labels[step.mode] || step.mode) + '：' + step.message);
+                if (result.probe_id) lines.push('诊断编号：' + result.probe_id);
+                if (result.log_path) lines.push('脱敏日志：' + result.log_path);
+                connectionReport.textContent = lines.join('\n') || result.message;
+                setStatus(result.message, result.success ? 'ok' : 'error');
+                // A credential-free 401 only verifies transport, never access.
+                // Only the normal server-side license check can open the app.
+                recheck = !!result.success;
+            } catch (error) {
+                setStatus(error && error.message ? error.message : '诊断未完成，请重试；本地凭证未改动', 'error');
+            } finally {
+                repairConnectionButton.textContent = '诊断并修复连接';
+                setBusy(false);
+            }
+            if (recheck) await checkAuthorization();
+        });
         contactButton.addEventListener('click', async () => {
             if (contactPanel.classList.contains('show')) {
                 contactPanel.classList.remove('show');

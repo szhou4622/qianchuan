@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from config import APP_NAME, CURRENT_VERSION
+from release_identity import CHANNEL, BUILD_REVISION
 
 
 UPDATE_LATEST_ENDPOINT = "https://update.dadaozixun.com/api/update/latest"
@@ -67,7 +68,7 @@ def check_for_update(
     key = platform_key()
     if not key:
         return {"success": False, "message": "当前系统不支持在线更新"}
-    url = UPDATE_LATEST_ENDPOINT + "?" + urlencode({"app_name": APP_NAME})
+    url = UPDATE_LATEST_ENDPOINT + "?" + urlencode({"app_name": APP_NAME, "channel": CHANNEL})
     request = Request(
         url,
         headers={
@@ -100,12 +101,19 @@ def check_for_update(
         raise RuntimeError("更新服务暂时无法连接，请稍后重试") from exc
     if not isinstance(payload, Mapping) or str(payload.get("app_name") or "") != APP_NAME:
         raise RuntimeError("更新配置的软件标识不匹配")
+    returned_channel = payload.get("channel", "production")
+    if returned_channel != CHANNEL:
+        raise RuntimeError("更新配置的发布渠道不匹配，已阻止跨渠道更新")
     latest = str(payload.get("version") or "").strip()
     if not latest or _version_parts(latest) == (0,):
         raise RuntimeError("更新配置缺少有效版本号")
     download_url = _platform_value(payload.get("download_url"), key)
     checksum = _platform_value(payload.get("sha256"), key).lower()
-    has_update = _newer(latest, current)
+    revision = payload.get("build_revision", 1)
+    if type(revision) is not int or revision < 1:
+        raise RuntimeError("更新构建号无效")
+    has_update = CHANNEL != "stable" and (_newer(latest, current) or
+        (latest == current and revision > BUILD_REVISION))
     if has_update:
         _validate_artifact_url(download_url)
         if not _SHA256_RE.fullmatch(checksum):
@@ -127,6 +135,8 @@ def check_for_update(
             "force": bool(payload.get("force")) if has_update else False,
             "min_supported_version": str(payload.get("min_supported_version") or ""),
             "platform": key,
+            "channel": CHANNEL,
+            "build_revision": revision,
         },
     }
 

@@ -1121,7 +1121,13 @@ class SQLiteStore:
                     "uri",
                 )
             }
+            from services.channel_ledger import managed_database, GuardConnection, attach
+            shared_ledger = managed_database(self.config['database'])
+            if shared_ledger:
+                connect_kw['factory'] = GuardConnection
             connection = sqlite3.connect(**connect_kw)
+            if shared_ledger:
+                attach(connection, self.TABLE_SCHEMAS)
             # 设置Row工厂，使得查询结果可以通过列名访问
             connection.row_factory = Row
             # 启用外键约束

@@ -28,6 +28,7 @@ FORBIDDEN_NAMES = {
     "license_device_code.dpapi",
     "license_machine_code.dpapi",
     "license_metadata.json",
+    "license_transport.json",
     "live_retarget_consumed.json",
     "operation_daily_report.json",
     "promotion_readonly_probe.json",

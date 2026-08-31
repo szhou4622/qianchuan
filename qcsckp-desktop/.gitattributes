@@ -1,0 +1,4 @@
+*.sh text eol=lf
+server/*.py text eol=lf
+server/*.conf text eol=lf
+server/*.service text eol=lf

@@ -1,5 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
+    [Parameter(Mandatory = $true)][ValidateSet('production','development','stable')][string]$Channel,
+    [int]$BuildRevision = 1,
     [Parameter(Mandatory = $true)][string]$ZipPath,
     [Parameter(Mandatory = $true)][string]$NotesFile,
     [string]$MinSupportedVersion = "0.1.58",
@@ -16,7 +18,9 @@ $zip = (Resolve-Path -LiteralPath $ZipPath).Path
 $notes = (Resolve-Path -LiteralPath $NotesFile).Path
 $key = (Resolve-Path -LiteralPath $IdentityFile).Path
 $sha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-$fileName = "QCSCKP-v$Version-Windows-x64.zip"
+$fileName = "QCSCKP-v$Version-$Channel-r$BuildRevision-Windows-x64.zip"
+if ($BuildRevision -lt 1) { throw 'Invalid build revision' }
+if ($Channel -eq 'stable' -and $Force) { throw 'Stable channel cannot force updates' }
 if ([IO.Path]::GetFileName($zip) -ne $fileName) {
     throw "Unexpected ZIP name: $([IO.Path]::GetFileName($zip))"
 }
@@ -31,9 +35,12 @@ if ($noteLines.Count -eq 0) { throw "Release notes contain no bullet items" }
 $manifest = [ordered]@{
     app_name = "QCSCKP"
     version = $Version
+    channel = $Channel
+    build_revision = $BuildRevision
+    source_commit = (& git -C $PSScriptRoot rev-parse HEAD).Trim()
     min_supported_version = $MinSupportedVersion
     download_url = [ordered]@{
-        windows_x64 = "https://update.dadaozixun.com/downloads/QCSCKP/$Version/$fileName"
+        windows_x64 = "https://update.dadaozixun.com/downloads/QCSCKP/$Channel/$Version/r$BuildRevision/$fileName"
     }
     sha256 = [ordered]@{ windows_x64 = $sha256 }
     notes = $noteLines
@@ -41,7 +48,7 @@ $manifest = [ordered]@{
 }
 
 $outputDir = Split-Path -Parent $zip
-$manifestPath = Join-Path $outputDir "QCSCKP-v$Version-update-manifest.json"
+$manifestPath = Join-Path $outputDir "QCSCKP-v$Version-$Channel-r$BuildRevision-update-manifest.json"
 $manifestJson = $manifest | ConvertTo-Json -Depth 6
 [IO.File]::WriteAllText(
     $manifestPath,
@@ -55,7 +62,7 @@ foreach ($tool in @($scp, $ssh)) {
     if (-not (Test-Path -LiteralPath $tool)) { throw "Windows OpenSSH is required" }
 }
 
-$remotePrefix = "/tmp/qcsckp-update-$Version"
+$remotePrefix = "/tmp/qcsckp-update-$Version-$Channel-r$BuildRevision-$([guid]::NewGuid().ToString('N'))"
 $remoteZip = "$remotePrefix.zip"
 $remoteManifest = "$remotePrefix.json"
 $remoteDeploy = "$remotePrefix.sh"
@@ -70,13 +77,13 @@ foreach ($pair in @(
     if ($LASTEXITCODE -ne 0) { throw "Upload failed: $($pair[0])" }
 }
 
-$remoteCommand = "set +e; chmod 700 '$remoteDeploy'; bash '$remoteDeploy' '$Version' '$remoteZip' '$remoteManifest' '$sha256'; rc=`$?; rm -f -- '$remoteZip' '$remoteManifest' '$remoteDeploy'; exit `$rc"
+$remoteCommand = "set +e; chmod 700 '$remoteDeploy'; bash '$remoteDeploy' '$Version' '$remoteZip' '$remoteManifest' '$sha256' '$Channel' '$BuildRevision'; rc=`$?; rm -f -- '$remoteZip' '$remoteManifest' '$remoteDeploy'; exit `$rc"
 & $ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -p $ServerPort "${ServerUser}@${ServerHost}" $remoteCommand
 if ($LASTEXITCODE -ne 0) { throw "Server deployment failed" }
 
-$endpoint = "https://update.dadaozixun.com/api/update/latest?app_name=QCSCKP"
+$endpoint = "https://update.dadaozixun.com/api/update/latest?app_name=QCSCKP&channel=$Channel"
 $published = Invoke-RestMethod -Uri $endpoint -Method Get -TimeoutSec 30 -Headers @{ "Cache-Control" = "no-store" }
-if ([string]$published.app_name -ne "QCSCKP" -or [string]$published.version -ne $Version) {
+if ([string]$published.app_name -ne "QCSCKP" -or [string]$published.version -ne $Version -or [string]$published.channel -ne $Channel -or [int]$published.build_revision -ne $BuildRevision) {
     throw "Published manifest mismatch"
 }
 if ([string]$published.sha256.windows_x64 -ne $sha256) {

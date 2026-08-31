@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>版本与诊断</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0b1423;color:#e2e8f0;margin:0;padding:32px}main{max-width:880px;margin:auto}h1{font-size:24px}section{background:#172235;border:1px solid #334155;border-radius:12px;padding:22px;margin:18px 0}p{line-height:1.8;color:#a6b6ce}button{background:#38bdf8;color:#082032;border:0;border-radius:7px;padding:12px 18px;cursor:pointer;margin:6px 8px 6px 0;font-weight:600}button:disabled{opacity:.5}code{color:#7dd3fc;overflow-wrap:anywhere}#result{white-space:pre-wrap}a{color:#7dd3fc}.warn{color:#fbbf24}</style>
+</head><body><main><h1>版本与诊断</h1><p id="identity">正在读取…</p>
+<section><h2>安全切版</h2><p id="switchState"></p><p>三渠道共用原激活码，业务数据独立。切回原渠道不会自动合并其他渠道的新数据。平台核验只读，不会创建、停止或修改投放任务。</p><button id="verify">核验平台状态并解除切版保护</button></section>
+<section><h2>故障诊断</h2><p>诊断编号：<code id="diagnosticId"></code></p><p>仅记录版本、错误阶段、类型、请求耗时与代码位置。不上传激活码、密钥、Cookie、业务数据库或素材。自动上报需网络与有效授权，服务器保留30天；无授权时可导出后手动发送。</p><label><input id="consent" type="checkbox"> 自动上报脱敏错误（可随时关闭）</label><p><button id="export">导出脱敏诊断报告</button></p></section>
+<p id="result" role="status"></p><a href="javascript:history.back()">返回上一页</a></main>
+<script>
+let api;
+async function refresh(){const r=await api.getReleaseDiagnostics();document.getElementById('identity').textContent=r.display_version+' · 源码 '+r.release.source_commit;document.getElementById('diagnosticId').textContent=r.diagnostics.diagnostic_id;document.getElementById('consent').checked=r.diagnostics.enabled;document.getElementById('switchState').textContent=r.switch.pending?'切版保护已开启：自动任务保持关闭，请先核验。':'切版保护已解除；是否开启自动投放由策略设置决定。';document.getElementById('verify').disabled=!r.switch.pending;}
+async function connect(){api=(window.pywebview&&window.pywebview.api)||(window.top.pywebview&&window.top.pywebview.api);if(!api){setTimeout(connect,150);return;}try{await refresh();}catch(e){document.getElementById('result').textContent='读取失败，请重试';}}
+document.getElementById('consent').onchange=async e=>{await api.setDiagnosticsConsent(e.target.checked);await refresh();};
+document.getElementById('verify').onclick=async e=>{e.target.disabled=true;document.getElementById('result').textContent='正在只读核验，请稍候…';try{const r=await api.resumeChannelWrites();document.getElementById('result').textContent=r.message;}finally{await refresh();}};
+document.getElementById('export').onclick=async()=>{const r=await api.exportDiagnostics();document.getElementById('result').textContent='报告已保存：'+r.path;};connect();
+</script></body></html>

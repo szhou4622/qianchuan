@@ -1,0 +1,23 @@
+[Unit]
+Description=QCSCKP redacted diagnostics collector
+After=network.target ovdt-license.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=qcsckp-diagnostics
+ExecStart=/usr/bin/python3 /opt/qcsckp-diagnostics/diagnostics_server.py --port 8797
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=128M
+CPUQuota=30%
+
+[Install]
+WantedBy=multi-user.target

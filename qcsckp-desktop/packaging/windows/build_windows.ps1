@@ -1,5 +1,8 @@
 param(
-    [string]$Version = "0.1.65"
+    [Parameter(Mandatory=$true)][string]$Version,
+    [Parameter(Mandatory=$true)][ValidateSet('production','development','stable')][string]$Channel,
+    [int]$BuildRevision = 1,
+    [string]$PythonPath = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,7 +14,8 @@ if ($env:OS -ne "Windows_NT") {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$pyinstaller = Join-Path $projectRoot ".venv\Scripts\pyinstaller.exe"
+if ($PythonPath) { $python = (Resolve-Path -LiteralPath $PythonPath).Path }
+$pyinstaller = Join-Path (Split-Path -Parent $python) "pyinstaller.exe"
 $entry = Join-Path $projectRoot "startup_bootstrap.py"
 $icon = Join-Path $projectRoot "logo.ico"
 $staticDir = Join-Path $projectRoot "static"
@@ -26,28 +30,35 @@ $licensePage = Join-Path $staticDir "license.html"
 $licenseManagementPage = Join-Path $staticDir "license_management.html"
 $usageFile = Join-Path $scriptDir "README-Windows.txt"
 $diagnosticLauncher = Join-Path $scriptDir "QCSCKP-Startup-Diagnostics.cmd"
+$licenseRepairLauncher = Join-Path $scriptDir "QCSCKP-License-Repair.cmd"
 $privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $privacyVerifier)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $licenseRepairLauncher, $privacyVerifier)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
 }
 
-$outputRoot = Join-Path $projectRoot "output\windows\v$Version"
+if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $BuildRevision -lt 1) { throw 'Invalid release identity' }
+$outputRoot = Join-Path $projectRoot "output\windows\v$Version\$Channel\r$BuildRevision"
 $distRoot = Join-Path $outputRoot "dist"
 $workRoot = Join-Path $outputRoot "build"
 $specRoot = Join-Path $outputRoot "spec"
 
 $safeOutputParent = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "output\windows"))
 $resolvedOutput = [System.IO.Path]::GetFullPath($outputRoot)
-if (-not $resolvedOutput.StartsWith($safeOutputParent, [System.StringComparison]::OrdinalIgnoreCase)) {
+if (-not $resolvedOutput.StartsWith($safeOutputParent + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clean an unexpected path: $resolvedOutput"
 }
 if (Test-Path -LiteralPath $outputRoot) {
-    Remove-Item -LiteralPath $outputRoot -Recurse -Force
+    throw "Release build path already exists; refusing overwrite: $outputRoot"
 }
 New-Item -ItemType Directory -Path $distRoot, $workRoot, $specRoot -Force | Out-Null
+$sourceCommit = (& git -C $projectRoot rev-parse HEAD).Trim()
+$metadataPath = Join-Path $outputRoot 'release.json'
+$releaseIdentity = [ordered]@{app_name='QCSCKP';version=$Version;channel=$Channel;build_revision=$BuildRevision;source_commit=$sourceCommit;business_baseline='0.1.65'}
+[IO.File]::WriteAllText($metadataPath, ($releaseIdentity | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+$updateHelper = Join-Path $scriptDir 'apply_channel_update.ps1'
 
 $appName = "QCSCKP"
 $pyinstallerArgs = @(
@@ -59,12 +70,15 @@ $pyinstallerArgs = @(
     "--name", $appName,
     "--icon", $icon,
     "--add-data", "$staticDir;static",
+    "--add-data", "$metadataPath;.",
+    "--add-data", "$updateHelper;.",
     "--collect-all", "playwright",
     "--collect-all", "webview",
     "--collect-all", "lark_oapi",
     "--collect-all", "baseopensdk",
     "--collect-all", "pystray",
     "--collect-all", "PIL",
+    "--collect-data", "certifi",
     "--hidden-import", "webview.platforms.edgechromium",
     "--hidden-import", "services.contact_config",
     "--hidden-import", "services.contact_http",
@@ -82,7 +96,7 @@ $pyinstallerArgs = @(
 
 Push-Location $projectRoot
 try {
-    & $pyinstaller @pyinstallerArgs
+    & $python -m PyInstaller @pyinstallerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }
@@ -92,17 +106,18 @@ finally {
 }
 
 $builtDir = Join-Path $distRoot $appName
-$releaseName = "$appName-v$Version-Windows-x64"
+$releaseName = "$appName-v$Version-$Channel-r$BuildRevision-Windows-x64"
 $releaseDir = Join-Path $distRoot $releaseName
 if (-not (Test-Path -LiteralPath $builtDir)) {
     throw "PyInstaller output directory was not found: $builtDir"
 }
 if (Test-Path -LiteralPath $releaseDir) {
-    Remove-Item -LiteralPath $releaseDir -Recurse -Force
+    throw "Release directory already exists: $releaseDir"
 }
 Move-Item -LiteralPath $builtDir -Destination $releaseDir
 Copy-Item -LiteralPath $usageFile -Destination (Join-Path $releaseDir "README-Windows.txt") -Force
 Copy-Item -LiteralPath $diagnosticLauncher -Destination (Join-Path $releaseDir "QCSCKP-Startup-Diagnostics.cmd") -Force
+Copy-Item -LiteralPath $licenseRepairLauncher -Destination (Join-Path $releaseDir "QCSCKP-License-Repair.cmd") -Force
 
 foreach ($writableDir in @("data", "logs", "temp")) {
     New-Item -ItemType Directory -Path (Join-Path $releaseDir $writableDir) -Force | Out-Null
@@ -113,6 +128,8 @@ $commit = (& git -C $repoRoot rev-parse --short HEAD 2>$null)
 $branch = (& git -C $repoRoot branch --show-current 2>$null)
 $versionInfo = @(
     "Application version: $Version",
+    "Channel: $Channel",
+    "Build revision: $BuildRevision",
     "Git branch: $branch",
     "Git commit: $commit",
     "Build time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
@@ -136,8 +153,11 @@ $criticalRelativePaths = @(
     "QCSCKP.exe",
     "VERSION.txt",
     "bin\python312.dll",
+    "bin\release.json",
+    "bin\apply_channel_update.ps1",
     "bin\static\index.html",
     "bin\static\license.html",
+    "bin\static\channel_settings.html",
     "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
     "runtime\MicrosoftEdgeWebview2Setup.exe"
 )
@@ -155,6 +175,9 @@ $criticalFiles = foreach ($relative in $criticalRelativePaths) {
 $packageManifest = [ordered]@{
     app_name = "QCSCKP"
     version = $Version
+    channel = $Channel
+    build_revision = $BuildRevision
+    source_commit = $sourceCommit
     critical_files = @($criticalFiles)
 }
 [IO.File]::WriteAllText(

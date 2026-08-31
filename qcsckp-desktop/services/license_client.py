@@ -10,7 +10,9 @@ import uuid
 from typing import Any, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from services.license_transport import LicenseTransport, describe_network_error
 
 from config import (
     CURRENT_VERSION,
@@ -42,10 +44,14 @@ class LicenseServiceError(RuntimeError):
 
 
 class LicenseNetworkError(LicenseServiceError):
-    def __init__(self) -> None:
+    def __init__(self, details=None) -> None:
+        self.details = dict(details or {})
+        message = "授权服务器暂时无法连接，请重试"
+        if self.details:
+            message += "：" + self.details["message"] + "。请点击“诊断并修复连接”"
         super().__init__(
             "license_service_unavailable",
-            "授权服务器暂时无法连接，请重试",
+            message,
             retryable=True,
         )
 
@@ -121,8 +127,14 @@ class LicenseHttpClient:
         self.base_url = str(base_url).rstrip("/")
         self.timeout_seconds = max(2.0, float(timeout_seconds))
         self.status_attempts = max(1, min(3, int(status_attempts)))
-        self._opener = opener or urlopen
+        self._transport = LicenseTransport(base_url=self.base_url) if opener is None else None
+        self._opener = opener or self._transport
         self._sleep = sleeper or time.sleep
+
+    def diagnose_and_repair(self) -> dict[str, Any]:
+        if self._transport is None:
+            return {"success": False, "message": "当前连接不支持自动修复"}
+        return self._transport.diagnose_and_repair()
 
     def _request(
         self,
@@ -139,6 +151,8 @@ class LicenseHttpClient:
             "User-Agent": f"QCSCKP-Desktop/{CURRENT_VERSION}",
             "X-Client-Request-ID": uuid.uuid4().hex,
         }
+        from release_identity import CHANNEL
+        headers["X-Release-Channel"] = CHANNEL
         payload_bytes = None
         if body is not None:
             payload_bytes = json.dumps(
@@ -156,6 +170,27 @@ class LicenseHttpClient:
             )
 
         for attempt in range(1, max(1, attempts) + 1):
+            started = time.monotonic()
+            facts = {
+                "event": "request",
+                "request_id": headers["X-Client-Request-ID"],
+                "path": path.split("?", 1)[0],
+                "method": method.upper(),
+                "attempt": attempt,
+            }
+
+            def record(**details):
+                if details.get("kind") or int(details.get("http_status", 0)) >= 400:
+                    from services.diagnostics import record_event
+                    record_event("license", details.get("kind") or "http_error",
+                                 request_id=facts["request_id"], http_status=details.get("http_status", 0),
+                                 elapsed_ms=(time.monotonic() - started) * 1000)
+                if self._transport is not None:
+                    self._transport.record(
+                        **facts, **details, mode=self._transport.mode,
+                        elapsed_ms=round((time.monotonic() - started) * 1000),
+                    )
+
             request = Request(
                 url,
                 data=payload_bytes,
@@ -166,12 +201,16 @@ class LicenseHttpClient:
                 with self._opener(request, timeout=self.timeout_seconds) as response:
                     raw = response.read(1024 * 1024)
                     status = int(getattr(response, "status", 200) or 200)
+                record(http_status=status)
             except HTTPError as exc:
                 try:
                     error_payload = json.loads(exc.read(1024 * 1024).decode("utf-8"))
                 except Exception:
                     error_payload = {}
+                finally:
+                    exc.close()
                 status = int(getattr(exc, "code", 0) or 0)
+                record(http_status=status)
                 if status >= 500 and attempt < attempts:
                     self._sleep(0.35 * attempt + random.random() * 0.15)
                     continue
@@ -191,15 +230,19 @@ class LicenseHttpClient:
                     http_status=status,
                     retryable=status >= 500,
                 ) from exc
-            except (URLError, socket.timeout, TimeoutError, OSError):
+            except (URLError, socket.timeout, TimeoutError, OSError) as exc:
+                details = describe_network_error(exc)
+                record(**details)
                 if attempt < attempts:
                     self._sleep(0.35 * attempt + random.random() * 0.15)
                     continue
-                raise LicenseNetworkError()
+                raise LicenseNetworkError(details) from None
 
             try:
                 envelope = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, ValueError, TypeError) as exc:
+                from services.diagnostics import record_event
+                record_event("license", "invalid_response", request_id=facts["request_id"], http_status=status)
                 raise LicenseServiceError(
                     "invalid_response",
                     "授权服务器响应格式无效",
@@ -209,6 +252,8 @@ class LicenseHttpClient:
                 ok = envelope.get("ok")
                 success = envelope.get("success")
                 if ok is False or success is False:
+                    from services.diagnostics import record_event
+                    record_event("license", "business_error", request_id=facts["request_id"], http_status=status)
                     raise LicenseServiceError(
                         str(envelope.get("code") or "business_error"),
                         _message_from_payload(envelope, "授权请求失败，请重试"),

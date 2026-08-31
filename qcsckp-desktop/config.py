@@ -56,7 +56,8 @@ def _get_project_root() -> str:
 PROJECT_ROOT = _get_project_root()
 
 
-CURRENT_VERSION = "0.1.65"
+from release_identity import VERSION as CURRENT_VERSION
+from channel_runtime import layout as _channel_layout
 
 # The public application identity is also the PyInstaller product name used by
 # packaging/windows/build_windows.ps1.  Remote per-application services must
@@ -80,44 +81,16 @@ def _env_text(name: str) -> str:
 
 
 # 常用目录
-_data_dir_override = _env_text("QCSCKP_DATA_DIR")
-if _data_dir_override:
-    DATA_DIR = os.path.abspath(os.path.expandvars(os.path.expanduser(_data_dir_override)))
-    DATA_TEMP_DIR = os.path.join(DATA_DIR, "temp")
-    LOGS_DIR = os.path.join(DATA_DIR, "logs")
-else:
-    if getattr(sys, "frozen", False) and sys.platform == "win32":
-        local_root = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
-        runtime_root = os.path.join(local_root, "QCSCKP", "official-api-v1")
-        DATA_DIR = os.path.join(runtime_root, "data")
-        DATA_TEMP_DIR = os.path.join(runtime_root, "temp")
-        LOGS_DIR = os.path.join(runtime_root, "logs")
-        # v0.1.52 and earlier stored writable data beside the executable. Copy
-        # it once, never move/delete it, so rollback remains possible and an
-        # installed build no longer needs write access to Program Files.
-        legacy_data_dir = os.path.join(PROJECT_ROOT, "data")
-        if (
-            not os.path.exists(DATA_DIR)
-            and os.path.isdir(legacy_data_dir)
-        ):
-            try:
-                os.makedirs(runtime_root, exist_ok=True)
-                shutil.copytree(legacy_data_dir, DATA_DIR, dirs_exist_ok=False)
-            except (OSError, shutil.Error):
-                # The app can still start with a clean LOCALAPPDATA profile.
-                # Diagnostics will expose missing migrated data without ever
-                # falling back to writing secrets into the install directory.
-                pass
-    else:
-        DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-        DATA_TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
-        LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+_channel_paths = _channel_layout()
+DATA_DIR = str(_channel_paths.data)
+DATA_TEMP_DIR = str(_channel_paths.profile / "temp")
+LOGS_DIR = str(_channel_paths.profile / "logs")
 DB_FILE = os.path.join(DATA_DIR, "qianchuan.db")
 CONTACT_CONFIG_CACHE_FILE = os.path.join(DATA_DIR, "contact_config_cache.json")
-LICENSE_CREDENTIAL_FILE = os.path.join(DATA_DIR, "license_credentials.dpapi")
-LICENSE_MACHINE_CODE_FILE = os.path.join(DATA_DIR, "license_machine_code.dpapi")
-LICENSE_DEVICE_CODE_FILE = os.path.join(DATA_DIR, "license_device_code.dpapi")
-LICENSE_METADATA_FILE = os.path.join(DATA_DIR, "license_metadata.json")
+LICENSE_CREDENTIAL_FILE = str(_channel_paths.shared / "identity" / "license_credentials.dpapi")
+LICENSE_MACHINE_CODE_FILE = str(_channel_paths.shared / "identity" / "license_machine_code.dpapi")
+LICENSE_DEVICE_CODE_FILE = str(_channel_paths.shared / "identity" / "license_device_code.dpapi")
+LICENSE_METADATA_FILE = str(_channel_paths.shared / "identity" / "license_metadata.json")
 DASHBOARD_ACCOUNT_LABEL_FILE = os.path.join(DATA_DIR, "dashboard_config.json")
 QIANCHUAN_RUNTIME_SETTINGS_FILE = os.path.join(
     DATA_DIR,

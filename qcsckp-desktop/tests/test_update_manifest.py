@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest.mock import patch
 
 from config import APP_NAME
 from services.update_manifest import check_for_update
@@ -25,6 +26,13 @@ class _Response:
 
 
 class UpdateManifestTests(unittest.TestCase):
+    def setUp(self):
+        # Existing no-channel manifests belong to the backwards-compatible
+        # production endpoint, never to a development client.
+        self.channel = patch("services.update_manifest.CHANNEL", "production")
+        self.channel.start()
+        self.addCleanup(self.channel.stop)
+
     def test_selects_windows_artifact_and_checksum(self):
         checksum = "a" * 64
         payload = {
