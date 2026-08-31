@@ -905,6 +905,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "auto-py-to-exe" },
     { name = "baseopensdk" },
+    { name = "certifi" },
     { name = "keyring", marker = "sys_platform == 'darwin'" },
     { name = "lark-oapi" },
     { name = "pillow" },
@@ -922,6 +923,7 @@ dependencies = [
 requires-dist = [
     { name = "auto-py-to-exe", specifier = ">=2.50.0" },
     { name = "baseopensdk", url = "https://lf3-static.bytednsdoc.com/obj/eden-cn/lmeh7phbozvhoz/base-open-sdk/baseopensdk-0.0.13-py3-none-any.whl" },
+    { name = "certifi", specifier = ">=2025.1.31" },
     { name = "keyring", marker = "sys_platform == 'darwin'", specifier = ">=25.6.0" },
     { name = "lark-oapi", specifier = "==1.7.1" },
     { name = "pillow", specifier = ">=12.1.1" },

@@ -561,11 +561,8 @@ def _repair_license_connection() -> int:
         )
         return 0 if result["success"] else 2
     except Exception as exc:
-        from services.license_transport import describe_network_error
-
-        detail = describe_network_error(exc)
-        startup_log("license_repair_failed=" + detail["kind"])
-        native_message("授权连接修复未完成：" + detail["message"] + "。原激活凭证未改动。")
+        startup_log("license_repair_failed=" + type(exc).__name__)
+        native_message("授权连接修复未完成，请检查安装包完整性并联系作者。原激活凭证未改动。")
         return 2
 
 
@@ -608,6 +605,11 @@ def _main_impl() -> int:
 
 
 def main() -> int:
+    # The repair launcher must not switch profiles, copy business data, ask
+    # for telemetry consent, or depend on another channel having exited.
+    if "--repair-license-connection" in sys.argv[1:]:
+        install_exception_hooks()
+        return _repair_license_connection()
     from channel_runtime import InstanceLease, prepare_profile
     from release_identity import CHANNEL, CHANNELS, DISPLAY_VERSION
     from services.diagnostics import diagnostic_status, set_consent, start_worker, stop_worker

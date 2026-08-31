@@ -153,6 +153,10 @@ $criticalRelativePaths = @(
     "QCSCKP.exe",
     "VERSION.txt",
     "bin\python312.dll",
+    "bin\_ssl.pyd",
+    "bin\libssl-3.dll",
+    "bin\libcrypto-3.dll",
+    "bin\certifi\cacert.pem",
     "bin\release.json",
     "bin\apply_channel_update.ps1",
     "bin\static\index.html",
@@ -160,6 +164,7 @@ $criticalRelativePaths = @(
     "bin\static\channel_settings.html",
     "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
     "runtime\MicrosoftEdgeWebview2Setup.exe"
+    "QCSCKP-License-Repair.cmd"
 )
 $criticalFiles = foreach ($relative in $criticalRelativePaths) {
     $absolute = Join-Path $releaseDir $relative

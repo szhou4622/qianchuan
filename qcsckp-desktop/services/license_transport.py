@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, getproxies
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, getproxies, proxy_bypass
 
 from config import CURRENT_VERSION, DATA_DIR, LICENSE_SERVICE_BASE_URL, LOGS_DIR
 
@@ -40,6 +40,7 @@ _MESSAGES = {
     "certificate_invalid": "HTTPS证书校验失败，已阻止不可信连接",
     "tls": "HTTPS握手失败",
     "proxy": "代理连接失败，请检查代理设置",
+    "proxy_policy": "检测到自动代理脚本，未擅自绕过代理；请网络管理员检查代理配置",
     "connection_refused": "授权连接被拒绝",
     "connection_reset": "授权连接被中断",
     "network": "授权网络连接失败",
@@ -106,6 +107,7 @@ class _NoRedirect(HTTPRedirectHandler):
 
 def _python_opener(bundled_ca: bool = False):
     context = ssl.create_default_context()
+    context.keylog_filename = None
     if bundled_ca:
         import certifi
 
@@ -114,23 +116,29 @@ def _python_opener(bundled_ca: bool = False):
     return build_opener(_NoRedirect(), HTTPSHandler(context=context)).open
 
 
-def _proxy_configured() -> bool:
-    if any(value for key, value in getproxies().items() if key.lower() in {"https", "http", "all"}):
-        return True
+def _curl_proxy_options(host: str) -> list[str]:
+    """Use the same explicit proxy/bypass as urllib, not a hidden direct route."""
     if sys.platform == "win32":
         import winreg
 
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
-                for name in ("ProxyEnable", "AutoConfigURL", "AutoDetect"):
-                    try:
-                        if winreg.QueryValueEx(key, name)[0]:
-                            return True
-                    except OSError:
-                        pass
+                try:
+                    if winreg.QueryValueEx(key, "AutoConfigURL")[0]:
+                        raise TransportFailure("proxy_policy")
+                except FileNotFoundError:
+                    pass
+        except TransportFailure:
+            raise
         except OSError:
             pass
-    return False
+    proxies = getproxies()
+    proxy = str(proxies.get("https") or proxies.get("all") or "")
+    if proxy_bypass(host):
+        proxy = ""
+    # Disable curl's independent environment interpretation of no_proxy;
+    # proxy_bypass above already applies Python's current effective rules.
+    return ["proxy = " + _quote(proxy), 'noproxy = ""']
 
 
 def _system_curl_path() -> Path:
@@ -174,10 +182,7 @@ class WindowsHttpsOpener:
             raise TransportFailure("transport_unavailable")
 
     def __call__(self, request: Request, timeout: float):
-        # Do not silently bypass a company's proxy/PAC policy. The app does
-        # not change registry, firewall, DNS, proxy environment or system time.
-        if _proxy_configured():
-            raise TransportFailure("proxy")
+        # No registry, firewall, DNS, proxy or system-clock settings are edited.
         if urlsplit(request.full_url).scheme != "https":
             raise TransportFailure("transport_unavailable")
         lines = [
@@ -189,6 +194,7 @@ class WindowsHttpsOpener:
             f"request = {_quote(request.get_method())}",
             'write-out = "\\nQCSCKP_HTTP_STATUS:%{http_code}"',
         ]
+        lines.extend(_curl_proxy_options(urlsplit(request.full_url).hostname or ""))
         for key, value in request.header_items():
             if any(char in key + value for char in ('\r', '\n', '\0')):
                 raise TransportFailure("transport_unavailable")
@@ -231,6 +237,7 @@ class LicenseTransport:
         self.settings_file = Path(settings_file or Path(DATA_DIR) / "license_transport.json")
         self.log_file = Path(log_file or Path(LOGS_DIR) / "license-network.log")
         self._repair_lock = threading.Lock()
+        self._opener_lock = threading.RLock()
         self._openers = {}
         self.mode = "default"
         try:
@@ -241,9 +248,10 @@ class LicenseTransport:
             pass
 
     def _opener(self, mode):
-        if mode not in self._openers:
-            self._openers[mode] = WindowsHttpsOpener() if mode == "windows_https" else _python_opener(mode == "bundled_ca")
-        return self._openers[mode]
+        with self._opener_lock:
+            if mode not in self._openers:
+                self._openers[mode] = WindowsHttpsOpener() if mode == "windows_https" else _python_opener(mode == "bundled_ca")
+            return self._openers[mode]
 
     def __call__(self, request, timeout):
         url = urlsplit(request.full_url)
@@ -281,7 +289,10 @@ class LicenseTransport:
             return False
         finally:
             if name and os.path.exists(name):
-                os.unlink(name)
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
 
     def _probe(self, mode, probe_id):
         started = time.monotonic()
@@ -294,8 +305,10 @@ class LicenseTransport:
                     raw = response.read(_LIMIT)
             except HTTPError as exc:
                 step["http_status"] = int(exc.code)
-                raw = exc.read(_LIMIT)
-                exc.close()
+                try:
+                    raw = exc.read(_LIMIT)
+                finally:
+                    exc.close()
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeError):
@@ -320,13 +333,11 @@ class LicenseTransport:
         try:
             probe_id = uuid.uuid4().hex
             result = {"success": False, "repaired": False, "probe_id": probe_id, "steps": [], "log_path": str(self.log_file)}
-            self._openers.clear()  # reload current system trust/proxy settings
+            with self._opener_lock:
+                self._openers.clear()  # reload current system trust/proxy settings
             old_mode = self.mode
             modes = list(dict.fromkeys([old_mode, "default", "bundled_ca"] + (["windows_https"] if sys.platform == "win32" else [])))
             for mode in modes:
-                if mode == "windows_https" and _proxy_configured():
-                    result["steps"].append({"mode": mode, "kind": "proxy", "message": "检测到代理/PAC设置，未擅自切换系统直连；请管理员检查代理", "reachable": False})
-                    continue
                 step = self._probe(mode, probe_id)
                 result["steps"].append(step)
                 if step["reachable"]:

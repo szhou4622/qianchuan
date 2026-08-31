@@ -91,6 +91,7 @@ mkdir -p "$OUTPUT_ROOT/dist" "$OUTPUT_ROOT/build" "$OUTPUT_ROOT/spec"
   --collect-all pystray \
   --collect-all PIL \
   --collect-all keyring \
+  --collect-data certifi \
   --hidden-import services.contact_config \
   --hidden-import services.contact_http \
   --hidden-import services.license_client \
