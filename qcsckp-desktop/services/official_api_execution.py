@@ -559,8 +559,14 @@ class OfficialApiRetargetingService:
             )
             budget, duration, extra = _retarget_params(rdict, promotion_scene)
             _validate_budget_against_plan(plan_detail, budget)
-            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            # This is a current-state safety check, not a history backfill.
+            # Scanning 30 days of every material can traverse hundreds of
+            # irrelevant historical rows and lets a late-page platform error
+            # block an otherwise valid task.  The rule candidate was produced
+            # from today's fresh DELIVERY_OK snapshot, so re-read that same
+            # official scope immediately before POST.
             end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = end_date
             materials, _ = await asyncio.to_thread(
                 service.list_plan_materials,
                 aavid,
@@ -568,6 +574,7 @@ class OfficialApiRetargetingService:
                 start_date=start_date,
                 end_date=end_date,
                 fields=[],
+                delivery_only=True,
             )
             current = {text_id(item.get("material_id")): item for item in materials}
             missing = [mid for mid in mids if mid not in current]

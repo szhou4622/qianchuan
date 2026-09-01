@@ -1903,6 +1903,17 @@ class OfficialApiBackendTests(unittest.TestCase):
         self.assertEqual("submitted_verifying", result.step)
         self.assertIn("正在核验", result.message)
         service.create_material_control_task.assert_called_once()
+        material_call = service.list_plan_materials.call_args
+        self.assertEqual(
+            material_call.kwargs["start_date"],
+            material_call.kwargs["end_date"],
+        )
+        self.assertEqual(
+            datetime.now().strftime("%Y-%m-%d"),
+            material_call.kwargs["start_date"],
+        )
+        self.assertEqual([], material_call.kwargs["fields"])
+        self.assertIs(True, material_call.kwargs["delivery_only"])
         reconcile.assert_called_once_with(
             service,
             request_uid="write-uid",
