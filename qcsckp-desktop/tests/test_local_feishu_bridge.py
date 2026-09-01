@@ -422,6 +422,65 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertEqual(task_uid, pulled["task_uid"])
         self.assertEqual("tool-user-a", pulled["account_username"])
 
+    def test_stop_card_shows_complete_strategy_and_task_metric_snapshot(self):
+        payload = self._stop_payload()
+        trigger = payload["trigger"]
+        payload["rule_snapshot"]["trigger"] = trigger
+        payload["trigger_snapshot"] = {
+            "strategy_title": "低ROI停投",
+            "trigger_config": trigger,
+            "evaluation": {
+                "group_combine": "or",
+                "passed": True,
+                "groups": [
+                    {
+                        "join": "and",
+                        "passed": True,
+                        "conditions": [
+                            {
+                                "metric": "total_prepay_and_pay_order_roi2_assist",
+                                "op": "lt",
+                                "threshold": 1.5,
+                                "actual": 1.2,
+                                "passed": True,
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        payload["metrics_snapshot"] = {
+            "ad_delivery_name": "PROCESSING",
+            "stat_cost_for_roi2_assist": 88.5,
+            "total_pay_order_count_for_roi2_assist": 2,
+            "total_pay_order_gmv_include_coupon_for_roi2_assist": 160,
+            "total_prepay_and_pay_order_roi2_assist": 1.2,
+            "total_order_settle_amount_for_roi2_1h_assist": 120,
+            "total_prepay_and_pay_settle_roi2_1h_assist": 0.9,
+            "total_order_settle_count_for_roi2_1h_assist": 1,
+            "updated_at": "2026-09-01 22:22:36",
+        }
+
+        created = bridge.create_local_stop_task(payload)
+        self.assertTrue(created["success"])
+        row = bridge._task_row(created["data"]["task_uid"], "tool-user-a")
+        card = bridge.build_local_task_card(bridge._task_payload(row))
+        raw = json.dumps(card, ensure_ascii=False)
+
+        self.assertIn("命中策略明细", raw)
+        self.assertIn("触发层级：调控任务级", raw)
+        self.assertIn("调控支付ROI < 1.5", raw)
+        self.assertIn("当前调控任务：整体命中", raw)
+        self.assertIn("调控支付ROI：实际 1.2 < 阈值 1.5 → 命中", raw)
+        self.assertIn("停投参数：** 暂停调控", raw)
+        self.assertIn("策略检查：** 每5分钟一轮", raw)
+        self.assertIn("调控任务指标快照", raw)
+        self.assertIn("平台状态：PROCESSING", raw)
+        self.assertIn("调控消耗：88.5 元", raw)
+        self.assertIn("调控成交订单数：2 单", raw)
+        self.assertIn("调控净成交ROI：0.9", raw)
+        self.assertLess(len(raw.encode("utf-8")), 30000)
+
     def test_expired_execution_lease_recovers_while_card_is_still_valid(self):
         created = bridge.create_local_stop_task(self._stop_payload())
         task_uid = created["data"]["task_uid"]

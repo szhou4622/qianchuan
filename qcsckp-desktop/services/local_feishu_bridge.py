@@ -860,6 +860,13 @@ _TRIGGER_METRIC_LABELS = {
     "netOrderCount": "净成交订单数",
     "overallAmount": "整体成交金额",
     "overallPayRoi": "整体支付ROI",
+    "stat_cost_for_roi2_assist": "调控消耗",
+    "total_pay_order_count_for_roi2_assist": "调控成交订单数",
+    "total_pay_order_gmv_include_coupon_for_roi2_assist": "调控成交金额",
+    "total_prepay_and_pay_order_roi2_assist": "调控支付ROI",
+    "total_order_settle_amount_for_roi2_1h_assist": "调控净成交金额",
+    "total_prepay_and_pay_settle_roi2_1h_assist": "调控净成交ROI",
+    "total_order_settle_count_for_roi2_1h_assist": "调控净成交订单数",
 }
 _TRIGGER_OP_LABELS = {
     "gt": ">",
@@ -875,7 +882,25 @@ def _metric_value_text(metric: Any, value: Any) -> str:
     if value in (None, ""):
         return "未返回"
     key = str(metric or "")
-    suffix = " 元" if key in {"currentCost", "netAmount", "overallAmount"} else ""
+    suffix = (
+        " 元"
+        if key
+        in {
+            "currentCost",
+            "netAmount",
+            "overallAmount",
+            "stat_cost_for_roi2_assist",
+            "total_pay_order_gmv_include_coupon_for_roi2_assist",
+            "total_order_settle_amount_for_roi2_1h_assist",
+        }
+        else " 单"
+        if key
+        in {
+            "total_pay_order_count_for_roi2_assist",
+            "total_order_settle_count_for_roi2_1h_assist",
+        }
+        else ""
+    )
     return f"{value}{suffix}"
 
 
@@ -889,8 +914,14 @@ def _strategy_trigger_detail(
     if not config and isinstance(rule.get("trigger"), dict):
         config = rule["trigger"]
     evaluations: List[Dict[str, Any]] = []
+    is_stop = str(task.get("action_type") or "retarget") == "stop"
     if isinstance(trigger.get("evaluation"), dict):
-        evaluations.append({"label": "当前触发对象", "evaluation": trigger["evaluation"]})
+        evaluations.append(
+            {
+                "label": "当前调控任务" if is_stop else "当前触发对象",
+                "evaluation": trigger["evaluation"],
+            }
+        )
     candidates = _candidate_materials(task)
     candidate_indexes = {
         str(item.get("material_id") or ""): index + 1
@@ -914,7 +945,7 @@ def _strategy_trigger_detail(
     lines = [
         "**命中策略明细**",
         f"- 策略名称：{task.get('strategy_name') or trigger.get('strategy_title') or '未命名策略'}",
-        f"- 触发层级：{'商品级' if str(task.get('trigger_level') or trigger.get('trigger_level') or 'material') == 'product' else '素材级'}",
+        f"- 触发层级：{('调控任务级' if is_stop else ('商品级' if str(task.get('trigger_level') or trigger.get('trigger_level') or 'material') == 'product' else '素材级'))}",
         f"- 组间关系：{'全部条件组都满足（且）' if group_combine == 'and' else '任一条件组满足（或）'}",
     ]
     priority = rule.get("priority")
@@ -975,6 +1006,51 @@ def _strategy_trigger_detail(
     if len(rendered) > 9000:
         rendered = rendered[:8900] + "\n- 明细过长，已按飞书卡片限制截断"
     return rendered
+
+
+_STOP_METRIC_FIELDS = (
+    "stat_cost_for_roi2_assist",
+    "total_pay_order_count_for_roi2_assist",
+    "total_pay_order_gmv_include_coupon_for_roi2_assist",
+    "total_prepay_and_pay_order_roi2_assist",
+    "total_order_settle_amount_for_roi2_1h_assist",
+    "total_prepay_and_pay_settle_roi2_1h_assist",
+    "total_order_settle_count_for_roi2_1h_assist",
+)
+
+
+def _stop_metrics_snapshot_detail(task: Dict[str, Any]) -> str:
+    metrics = (
+        task.get("metrics_snapshot")
+        if isinstance(task.get("metrics_snapshot"), dict)
+        else {}
+    )
+    lines = ["**调控任务指标快照**"]
+    platform_status = str(
+        metrics.get("ad_delivery_name")
+        or metrics.get("task_status")
+        or metrics.get("control_task_status")
+        or ""
+    ).strip()
+    if platform_status:
+        lines.append(f"- 平台状态：{platform_status}")
+    for field in _STOP_METRIC_FIELDS:
+        lines.append(
+            f"- {_TRIGGER_METRIC_LABELS[field]}："
+            f"{_metric_value_text(field, metrics.get(field))}"
+        )
+    for label, field in (
+        ("任务预算", "budget"),
+        ("出价/目标", "bid"),
+        ("开始时间", "start_time"),
+        ("结束时间", "end_time"),
+        ("指标采集时间", "updated_at"),
+    ):
+        value = metrics.get(field)
+        if value not in (None, ""):
+            suffix = " 元" if field in {"budget", "bid"} else ""
+            lines.append(f"- {label}：{value}{suffix}")
+    return "\n".join(lines)
 
 
 def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str, Any]:
@@ -1407,6 +1483,17 @@ def build_stop_task_card(
         if isinstance(task.get("trigger_snapshot"), dict)
         else {}
     )
+    try:
+        evaluation_interval_seconds = max(
+            1, int(task.get("evaluation_interval_seconds") or 300)
+        )
+    except (TypeError, ValueError):
+        evaluation_interval_seconds = 300
+    evaluation_interval_text = (
+        f"{evaluation_interval_seconds // 60}分钟"
+        if evaluation_interval_seconds % 60 == 0
+        else f"{evaluation_interval_seconds}秒"
+    )
     elements: List[Dict[str, Any]] = [
         {
             "tag": "div",
@@ -1422,7 +1509,6 @@ def build_stop_task_card(
                         f"调控任务：{task.get('assist_task_name') or '未命名任务'}",
                         f"调控任务ID：{task.get('assist_task_id') or ''}",
                         f"停投动作：{stop_action}",
-                        f"策略：{task.get('strategy_name') or '停投策略命中'}",
                     ]
                 ),
             },
@@ -1430,10 +1516,17 @@ def build_stop_task_card(
         {
             "tag": "markdown",
             "content": (
-                f"**命中原因：** {_trigger_summary(trigger)}"
+                f"{_strategy_trigger_detail(task, trigger)}"
+                f"\n\n**停投参数：** {stop_action}"
+                f"\n**触发时间：** {task.get('triggered_at') or task.get('created_at') or '未记录'}"
+                f"\n**策略检查：** 每{evaluation_interval_text}一轮"
                 f"\n**有效期至：** {task.get('expires_at') or ''}"
                 f"\n**当前状态：** {status_text}"
             ),
+        },
+        {
+            "tag": "markdown",
+            "content": _stop_metrics_snapshot_detail(task),
         },
     ]
     if task.get("result_message"):
