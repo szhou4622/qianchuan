@@ -50,6 +50,13 @@ from services.qianchuan_open_api.token_provider import (
     save_api_credentials,
     save_token_bundle,
 )
+from services.qianchuan_open_api.runtime import (
+    get_official_api_service,
+    replace_official_api_service_for_tests,
+)
+from services.qianchuan_open_api.runtime_settings import (
+    persist_official_api_runtime,
+)
 from services.promotion_capability import check_target_capability
 from services.official_api_collection import (
     _ACCOUNT_RATE_LIMITED,
@@ -143,6 +150,42 @@ class _ReportConfigClient(_CaptureClient):
 
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
+
+    def test_runtime_restores_persisted_card_confirm_write_permission_after_restart(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-runtime-write-") as root, patch.dict(
+            os.environ,
+            {"QCSCKP_SESSION_OWNER": "card-owner"},
+        ), patch(
+            "services.qianchuan_open_api.runtime_settings.QIANCHUAN_RUNTIME_SETTINGS_FILE",
+            os.path.join(root, "runtime.json"),
+        ):
+            persist_official_api_runtime(
+                allow_live_writes=True,
+                apply_runtime=False,
+            )
+            replace_official_api_service_for_tests(None)
+            try:
+                service = get_official_api_service()
+                self.assertTrue(service.allow_writes)
+            finally:
+                replace_official_api_service_for_tests(None)
+
+    def test_runtime_does_not_inherit_another_local_users_write_permission(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-runtime-isolation-") as root, patch(
+            "services.qianchuan_open_api.runtime_settings.QIANCHUAN_RUNTIME_SETTINGS_FILE",
+            os.path.join(root, "runtime.json"),
+        ):
+            with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-a"}):
+                persist_official_api_runtime(
+                    allow_live_writes=True,
+                    apply_runtime=False,
+                )
+            replace_official_api_service_for_tests(None)
+            try:
+                with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-b"}):
+                    self.assertFalse(get_official_api_service().allow_writes)
+            finally:
+                replace_official_api_service_for_tests(None)
 
     def test_explicit_write_setting_is_not_blocked_by_unrelated_channel_page(self):
         service = QianchuanOfficialApiService(_CaptureClient(), allow_writes=True)

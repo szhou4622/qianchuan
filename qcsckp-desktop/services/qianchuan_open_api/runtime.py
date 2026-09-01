@@ -17,10 +17,27 @@ _SERVICE: Optional[QianchuanOfficialApiService] = None
 def get_official_api_service() -> QianchuanOfficialApiService:
     global _SERVICE
     with _LOCK:
+        import config as runtime_config
+        from .runtime_settings import load_runtime_settings
+
+        saved = load_runtime_settings()
+        if "allow_live_api_writes" in saved:
+            live_writes = bool(saved.get("allow_live_api_writes"))
+        else:
+            live_writes = bool(runtime_config.ALLOW_LIVE_OFFICIAL_API_WRITES)
+        # Resolve the active owner on every access. A tool-account switch must
+        # never inherit the previous owner's permission, while a restart must
+        # restore the choice that this owner explicitly saved with a strategy.
+        runtime_config.ALLOW_LIVE_OFFICIAL_API_WRITES = live_writes
         if _SERVICE is None:
             audit = OfficialApiAuditStore()
             client = QianchuanOpenApiClient(audit_sink=audit.record)
-            _SERVICE = QianchuanOfficialApiService(client)
+            _SERVICE = QianchuanOfficialApiService(
+                client,
+                allow_writes=live_writes,
+            )
+        else:
+            _SERVICE.allow_writes = live_writes
         return _SERVICE
 
 
