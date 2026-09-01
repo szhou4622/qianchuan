@@ -611,6 +611,12 @@
                 <span class="sidebar-contact-label">使用教程</span>
             </button>
         </div>
+        <div class="sidebar-contact-slot" id="sidebarFailureReportSlot">
+            <button type="button" class="sidebar-contact-btn" id="sidebarFailureReportBtn" title="导出故障报告">
+                <i data-lucide="file-warning" aria-hidden="true"></i>
+                <span class="sidebar-contact-label">导出故障报告</span>
+            </button>
+        </div>
         <div class="sidebar-contact-slot" id="sidebarContactSlot">
             <button
                 type="button"
@@ -1149,6 +1155,31 @@
                 } catch (error) {
                     console.warn('打开使用教程失败', error);
                     window.alert('使用教程打开失败，请稍后重试。');
+                }
+            });
+        }
+
+        // ---------- 故障报告：本地生成，由用户主动发送 ----------
+        const sidebarFailureReportBtn = document.getElementById('sidebarFailureReportBtn');
+        if (sidebarFailureReportBtn) {
+            sidebarFailureReportBtn.addEventListener('click', async () => {
+                if (sidebarFailureReportBtn.disabled) return;
+                sidebarFailureReportBtn.disabled = true;
+                const original = sidebarFailureReportBtn.querySelector('.sidebar-contact-label')?.textContent || '导出故障报告';
+                const label = sidebarFailureReportBtn.querySelector('.sidebar-contact-label');
+                if (label) label.textContent = '正在生成…';
+                try {
+                    const api = window.pywebview?.api || window.pywebviewAPI;
+                    if (!api || typeof api.saveFailureReport !== 'function') throw new Error('故障报告模块未就绪');
+                    const result = await api.saveFailureReport();
+                    if (!result?.success) window.alert(result?.message || '故障报告导出失败');
+                    else if (!result.cancelled) window.alert(result.message || '故障报告已保存');
+                } catch (error) {
+                    console.warn('导出故障报告失败', error);
+                    window.alert(error?.message || '故障报告导出失败');
+                } finally {
+                    sidebarFailureReportBtn.disabled = false;
+                    if (label) label.textContent = original;
                 }
             });
         }

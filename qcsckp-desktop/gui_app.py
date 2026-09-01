@@ -1255,6 +1255,31 @@ class JSApi:
         except Exception as exc:
             return {"success": False, "message": f"保存CSV失败：{exc}"}
 
+    def saveFailureReport(self):
+        """Generate a local-only sanitized JSON report selected by the user."""
+        try:
+            from services.failure_report import failure_report_json
+
+            if not webview.windows:
+                return {"success": False, "message": "桌面窗口尚未就绪"}
+            filename = "QCSCKP-故障报告-" + time.strftime("%Y%m%d-%H%M%S") + ".json"
+            selected = webview.windows[0].create_file_dialog(
+                webview.FileDialog.SAVE,
+                directory=str(Path.home() / "Desktop"),
+                save_filename=filename,
+                file_types=("JSON 文件 (*.json)", "所有文件 (*.*)"),
+            )
+            if not selected:
+                return {"success": True, "cancelled": True, "message": "已取消导出"}
+            path_text = str(selected[0] if isinstance(selected, (list, tuple)) else selected)
+            if not path_text.lower().endswith(".json"):
+                path_text += ".json"
+            destination = Path(path_text)
+            destination.write_text(failure_report_json(), encoding="utf-8", newline="")
+            return {"success": True, "cancelled": False, "path": str(destination), "message": f"故障报告已保存：{destination}"}
+        except Exception as exc:
+            return {"success": False, "message": f"故障报告导出失败：{type(exc).__name__}"}
+
     def startOperationRecordBrowser(self, aavid=None):
         return self.api.startOperationRecordBrowser(aavid)
 
