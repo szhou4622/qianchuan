@@ -935,6 +935,7 @@ def _strategy_trigger_detail(
         evaluations.append(
             {
                 "label": f"候选素材{display_index}",
+                "material_id": material_id,
                 "evaluation": item["evaluation"],
             }
         )
@@ -974,7 +975,49 @@ def _strategy_trigger_detail(
                 lines.append(f"    - {label} {op} {_metric_value_text(metric, threshold)}")
     else:
         lines.append("- 规则条件：历史任务未保存完整配置")
-    if evaluations:
+    material_evaluations = [entry for entry in evaluations if entry.get("material_id")]
+    if material_evaluations and not is_stop:
+        material_by_id = {
+            str(item.get("material_id") or ""): item
+            for item in candidates
+            if isinstance(item, dict) and str(item.get("material_id") or "")
+        }
+        matched = [
+            entry
+            for entry in material_evaluations
+            if entry["evaluation"].get("passed")
+        ]
+        lines.append(f"- 命中素材汇总（{len(matched)}条）：")
+        for display_index, entry in enumerate(matched, start=1):
+            material_id = str(entry.get("material_id") or "")
+            material = material_by_id.get(material_id) or {}
+            material_name = str(
+                material.get("material_name") or f"未命名素材{display_index}"
+            ).strip()
+            actual_values: List[str] = []
+            seen_metrics = set()
+            for group in entry["evaluation"].get("groups") or []:
+                if not isinstance(group, dict):
+                    continue
+                for condition in group.get("conditions") or []:
+                    if not isinstance(condition, dict):
+                        continue
+                    metric = str(condition.get("metric") or "")
+                    if not metric or metric in seen_metrics:
+                        continue
+                    seen_metrics.add(metric)
+                    label = _TRIGGER_METRIC_LABELS.get(metric, metric)
+                    actual_values.append(
+                        f"{label} {_metric_value_text(metric, condition.get('actual'))}"
+                    )
+            lines.append(
+                f"  {display_index}. {material_name}（素材ID：{material_id}）"
+            )
+            lines.append(
+                "     实际指标："
+                + ("；".join(actual_values) if actual_values else "未保存")
+            )
+    elif evaluations:
         lines.append("- 触发时实际数值：")
         for entry in evaluations:
             evaluation = entry["evaluation"]
@@ -1163,7 +1206,7 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         [
             "",
             (
-                f"候选素材（{len(material_lines)}条，"
+                f"本策略命中素材（{len(material_lines)}条，"
                 f"当前已选{len(selected_ids)}条）："
             ),
             "\n".join(material_lines),
