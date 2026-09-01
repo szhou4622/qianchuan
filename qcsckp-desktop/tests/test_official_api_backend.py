@@ -977,24 +977,38 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
     def test_cross_day_restart_backfills_yesterday_without_replacing_latest(self):
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        report_filter_context = {
+            "anchor_id": "8001",
+            "aggregate_smart_bid_type": "0",
+            "ecp_app_id": "1",
+        }
         target = {
             "target_uid": "target-recovery",
             "account_uid": "account-recovery",
             "aadvid": "1001",
             "ad_id": "2001",
-            "promotion_scene": "product",
+            "promotion_scene": "live",
             "plan_system": "global",
             "platform_status": "active",
             "last_sync_at": (datetime.now() - timedelta(days=2)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             ),
             "capability": {
-                "marketing_goal": "VIDEO_PROM_GOODS",
+                "marketing_goal": "LIVE_PROM_GOODS",
                 "report_metric_units": {"stat_cost_for_roi2": "3"},
                 "report_config_synced_at": now_text,
                 "plan_detail_synced_at": now_text,
                 "product_catalog_synced_at": now_text,
                 "control_history_synced_at": now_text,
+                "material_report_filter_context": report_filter_context,
+                "collection_error_at": "2026-09-02 00:01:00",
+                "collection_error_kind": "unknown",
+                "collection_error_detail": "旧错误",
+                "collection_error_endpoint": "旧接口",
+                "collection_error_code": "old-code",
+                "collection_error_request_id": "old-request",
+                "collection_retry_seconds": 300,
+                "collection_consecutive_failures": 3,
             },
         }
         service = MagicMock()
@@ -1020,9 +1034,16 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                 ["yesterday-request"],
             ),
         ]
+        service.list_material_report.side_effect = [
+            ([], ["today-report-request"]),
+            ([], ["yesterday-report-request"]),
+        ]
         service.list_control_tasks.return_value = ([], ["control-request"])
         store = MagicMock(config={"database": ":memory:"})
         store.select.return_value = []
+        store.execute.side_effect = lambda sql, *_args, **_kwargs: (
+            [{"count": 0}] if "COUNT(1) AS count" in str(sql) else []
+        )
         store.transaction.return_value.__enter__.return_value = MagicMock()
         with patch(
             "services.official_api_collection.get_official_api_service",
@@ -1034,14 +1055,46 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         ) as patch_state, patch(
             "services.official_api_collection._bulk_upsert_rows"
         ) as bulk_upsert, patch(
+            "services.official_api_collection._patch_target_sync_in_transaction"
+        ) as patch_atomic_state, patch(
             "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
         ):
             result = collect_target(target, db=store)
         self.assertTrue(result["success"])
         self.assertEqual(2, service.list_plan_materials.call_count)
+        self.assertEqual(2, service.list_material_report.call_count)
+        for call in service.list_material_report.call_args_list:
+            self.assertEqual(
+                report_filter_context,
+                call.kwargs["filter_context"],
+            )
+        self.assertEqual(
+            yesterday,
+            service.list_material_report.call_args_list[1].kwargs["start_date"],
+        )
+        self.assertEqual(
+            yesterday,
+            service.list_material_report.call_args_list[1].kwargs["end_date"],
+        )
         state = patch_state.call_args.kwargs["capability_updates"]
+        self.assertTrue(state["material_sync_complete"])
         self.assertEqual(yesterday, state["recovery_backfill_date"])
         self.assertEqual(1, state["recovery_backfill_count"])
+        self.assertEqual("ok", patch_state.call_args.kwargs["status"])
+        self.assertEqual("", patch_state.call_args.kwargs["error"])
+        removed = set(patch_atomic_state.call_args.kwargs["capability_remove_keys"])
+        self.assertTrue(
+            {
+                "collection_error_at",
+                "collection_error_kind",
+                "collection_error_detail",
+                "collection_error_endpoint",
+                "collection_error_code",
+                "collection_error_request_id",
+                "collection_retry_seconds",
+                "collection_consecutive_failures",
+            }.issubset(removed)
+        )
         recovery_rows = [
             row
             for call in bulk_upsert.call_args_list

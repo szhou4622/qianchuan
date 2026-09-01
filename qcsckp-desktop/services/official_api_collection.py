@@ -1275,6 +1275,7 @@ def collect_target(
                 start_date=recovery_date,
                 end_date=recovery_date,
                 metrics=supported_material_metrics,
+                filter_context=report_filter_context,
             )
             if (
                 isinstance(recovery_report_result, tuple)
@@ -1789,6 +1790,10 @@ def collect_target(
             capability_remove_keys=(
                 "collection_error_at",
                 "collection_error_kind",
+                "collection_error_detail",
+                "collection_error_endpoint",
+                "collection_error_code",
+                "collection_error_request_id",
                 "collection_retry_seconds",
                 "collection_consecutive_failures",
                 *(
