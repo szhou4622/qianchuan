@@ -519,6 +519,95 @@ class LocalFeishuTaskTests(unittest.TestCase):
             all(value.get("instance_uid") for value in action_values)
         )
 
+    def test_success_card_shows_frozen_strategy_rules_and_actual_values(self):
+        task = task_payload(2)
+        task.update(
+            {
+                "task_uid": "task-strategy-detail",
+                "status": "succeeded",
+                "action_nonce": "nonce-strategy-detail",
+                "strategy_name": "高ROI素材追投",
+                "trigger_level": "material",
+                "rule_snapshot": {
+                    "id": "strategy-1",
+                    "title": "高ROI素材追投",
+                    "priority": 1,
+                },
+                "trigger_snapshot": {
+                    "strategy_title": "高ROI素材追投",
+                    "trigger_level": "material",
+                    "trigger_config": {
+                        "group_combine": "or",
+                        "groups": [
+                            {
+                                "join": "and",
+                                "conditions": [
+                                    {"metric": "currentCost", "op": "gt", "value": 10},
+                                    {"metric": "overallPayRoi", "op": "gte", "value": 5},
+                                ],
+                            }
+                        ],
+                    },
+                    "materials": [
+                        {
+                            "material_id": "70000",
+                            "evaluation": {
+                                "group_combine": "or",
+                                "passed": True,
+                                "groups": [
+                                    {
+                                        "join": "and",
+                                        "passed": True,
+                                        "conditions": [
+                                            {"metric": "currentCost", "op": "gt", "threshold": 10, "actual": 31.91, "passed": True},
+                                            {"metric": "overallPayRoi", "op": "gte", "threshold": 5, "actual": 25.04, "passed": True},
+                                        ],
+                                    }
+                                ],
+                            },
+                        },
+                        {
+                            "material_id": "70001",
+                            "evaluation": {
+                                "group_combine": "or",
+                                "passed": True,
+                                "groups": [
+                                    {
+                                        "join": "and",
+                                        "passed": True,
+                                        "conditions": [
+                                            {"metric": "currentCost", "op": "gt", "threshold": 10, "actual": 18.2, "passed": True},
+                                            {"metric": "overallPayRoi", "op": "gte", "threshold": 5, "actual": 7.5, "passed": True},
+                                        ],
+                                    }
+                                ],
+                            },
+                        },
+                    ],
+                },
+                "result_message": "官方 API 追投已核验成功",
+                "triggered_at": "2026-09-01 21:46:20",
+                "expires_at": "2026-09-01 22:16:23",
+            }
+        )
+        card = bridge.build_task_card(task)
+        raw = json.dumps(card, ensure_ascii=False)
+        self.assertIn("命中策略明细", raw)
+        self.assertIn("策略名称：高ROI素材追投", raw)
+        self.assertIn("策略优先级：1", raw)
+        self.assertIn("触发层级：素材级", raw)
+        self.assertIn("组间关系：任一条件组满足（或）", raw)
+        self.assertIn("条件组1（全部条件都满足）", raw)
+        self.assertIn("整体消耗 > 10 元", raw)
+        self.assertIn("整体支付ROI ≥ 5", raw)
+        self.assertIn("候选素材1：整体命中", raw)
+        self.assertIn("候选素材2：整体命中", raw)
+        self.assertIn("整体消耗：实际 31.91 元 > 阈值 10 元 → 命中", raw)
+        self.assertIn("整体支付ROI：实际 25.04 ≥ 阈值 5 → 命中", raw)
+        self.assertNotIn("规则条件已命中", raw)
+        self.assertNotIn("currentCost", raw)
+        self.assertLess(len(raw.encode("utf-8")), 30000)
+
     def test_created_card_task_records_local_instance_and_trigger_time(self):
         payload = task_payload(1)
         payload["query_snapshot"] = {"query_at": "2026-08-14 21:00:05"}

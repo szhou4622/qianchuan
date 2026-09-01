@@ -853,6 +853,130 @@ def _trigger_summary(trigger: Dict[str, Any], *, expanded: bool = False) -> str:
     return "\n".join(lines) if expanded else ("；".join(lines) if lines else "规则条件已命中")
 
 
+_TRIGGER_METRIC_LABELS = {
+    "currentCost": "整体消耗",
+    "netAmount": "净成交金额",
+    "netRoi": "净成交ROI",
+    "netOrderCount": "净成交订单数",
+    "overallAmount": "整体成交金额",
+    "overallPayRoi": "整体支付ROI",
+}
+_TRIGGER_OP_LABELS = {
+    "gt": ">",
+    "gte": "≥",
+    "lt": "<",
+    "lte": "≤",
+    "eq": "=",
+    "between": "介于",
+}
+
+
+def _metric_value_text(metric: Any, value: Any) -> str:
+    if value in (None, ""):
+        return "未返回"
+    key = str(metric or "")
+    suffix = " 元" if key in {"currentCost", "netAmount", "overallAmount"} else ""
+    return f"{value}{suffix}"
+
+
+def _strategy_trigger_detail(
+    task: Dict[str, Any],
+    trigger: Dict[str, Any],
+) -> str:
+    """Frozen rule definition plus per-material values used for this card."""
+    rule = task.get("rule_snapshot") if isinstance(task.get("rule_snapshot"), dict) else {}
+    config = trigger.get("trigger_config") if isinstance(trigger.get("trigger_config"), dict) else {}
+    if not config and isinstance(rule.get("trigger"), dict):
+        config = rule["trigger"]
+    evaluations: List[Dict[str, Any]] = []
+    if isinstance(trigger.get("evaluation"), dict):
+        evaluations.append({"label": "当前触发对象", "evaluation": trigger["evaluation"]})
+    candidates = _candidate_materials(task)
+    candidate_indexes = {
+        str(item.get("material_id") or ""): index + 1
+        for index, item in enumerate(candidates)
+    }
+    for index, item in enumerate(trigger.get("materials") or []):
+        if not isinstance(item, dict) or not isinstance(item.get("evaluation"), dict):
+            continue
+        material_id = str(item.get("material_id") or "")
+        display_index = candidate_indexes.get(material_id, index + 1)
+        evaluations.append(
+            {
+                "label": f"候选素材{display_index}",
+                "evaluation": item["evaluation"],
+            }
+        )
+    group_combine = str(
+        config.get("group_combine")
+        or next((entry["evaluation"].get("group_combine") for entry in evaluations if entry["evaluation"].get("group_combine")), "or")
+    ).lower()
+    lines = [
+        "**命中策略明细**",
+        f"- 策略名称：{task.get('strategy_name') or trigger.get('strategy_title') or '未命名策略'}",
+        f"- 触发层级：{'商品级' if str(task.get('trigger_level') or trigger.get('trigger_level') or 'material') == 'product' else '素材级'}",
+        f"- 组间关系：{'全部条件组都满足（且）' if group_combine == 'and' else '任一条件组满足（或）'}",
+    ]
+    priority = rule.get("priority")
+    if priority not in (None, ""):
+        lines.append(f"- 策略优先级：{priority}")
+    groups = config.get("groups") if isinstance(config.get("groups"), list) else []
+    if groups:
+        lines.append("- 规则条件：")
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            join = str(group.get("join") or "and").lower()
+            lines.append(
+                f"  - 条件组{group_index + 1}（"
+                f"{'全部条件都满足' if join == 'and' else '任一条件满足'}）"
+            )
+            for condition in group.get("conditions") or []:
+                if not isinstance(condition, dict):
+                    continue
+                metric = str(condition.get("metric") or "")
+                label = _TRIGGER_METRIC_LABELS.get(metric, metric or "未知指标")
+                op = _TRIGGER_OP_LABELS.get(str(condition.get("op") or ""), str(condition.get("op") or ""))
+                threshold = condition.get("value")
+                if str(condition.get("op") or "") == "between":
+                    threshold = f"{condition.get('min', condition.get('value'))} 至 {condition.get('max', condition.get('value2'))}"
+                lines.append(f"    - {label} {op} {_metric_value_text(metric, threshold)}")
+    else:
+        lines.append("- 规则条件：历史任务未保存完整配置")
+    if evaluations:
+        lines.append("- 触发时实际数值：")
+        for entry in evaluations:
+            evaluation = entry["evaluation"]
+            lines.append(
+                f"  - {entry['label']}："
+                f"{'整体命中' if evaluation.get('passed') else '整体未命中'}"
+            )
+            for group_index, group in enumerate(evaluation.get("groups") or []):
+                if not isinstance(group, dict):
+                    continue
+                lines.append(
+                    f"    - 组{group_index + 1}："
+                    f"{'命中' if group.get('passed') else '未命中'}"
+                )
+                for condition in group.get("conditions") or []:
+                    if not isinstance(condition, dict):
+                        continue
+                    metric = str(condition.get("metric") or "")
+                    label = _TRIGGER_METRIC_LABELS.get(metric, metric or "未知指标")
+                    op = _TRIGGER_OP_LABELS.get(str(condition.get("op") or ""), str(condition.get("op") or ""))
+                    lines.append(
+                        f"      - {label}：实际 {_metric_value_text(metric, condition.get('actual'))} "
+                        f"{op} 阈值 {_metric_value_text(metric, condition.get('threshold'))} "
+                        f"→ {'命中' if condition.get('passed') else '未命中'}"
+                    )
+    else:
+        lines.append("- 触发时实际数值：历史任务未保存评估快照")
+    rendered = "\n".join(lines)
+    if len(rendered) > 9000:
+        rendered = rendered[:8900] + "\n- 明细过长，已按飞书卡片限制截断"
+    return rendered
+
+
 def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str, Any]:
     status = str(task.get("status") or "pending")
     preview_only = task.get("preview_only") is True
@@ -999,8 +1123,8 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         {
             "tag": "markdown",
             "content": (
-                f"**命中原因：** {_trigger_summary(trigger)}"
-                f"\n**追投参数：** {_retarget_method_summary(retargeting)}"
+                f"{_strategy_trigger_detail(task, trigger)}"
+                f"\n\n**追投参数：** {_retarget_method_summary(retargeting)}"
                 f"\n**触发时间：** {task.get('triggered_at') or task.get('created_at') or '未记录'}"
                 f"\n**策略检查：** 每{evaluation_interval_text}一轮"
                 f"\n**成功限频：** 同一素材{limit_window_text}内最多{limit_max_count}次"
@@ -1065,7 +1189,7 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 {"tag": "hr"},
                 {
                     "tag": "markdown",
-                    "content": f"**完整触发条件**\n{_trigger_summary(trigger, expanded=True)[:2500]}",
+                    "content": _strategy_trigger_detail(task, trigger),
                 },
                 {
                     "tag": "markdown",
