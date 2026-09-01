@@ -297,8 +297,6 @@ class QianchuanOfficialApiService:
         ] = None
 
     def _require_writes(self) -> None:
-        from channel_runtime import require_writes_resumed
-        require_writes_resumed()
         if not self.allow_writes:
             raise OfficialApiWriteDisabled(
                 "千川官方 API 真实写入未开启；当前只允许读取、规则判断和飞书确认排队"

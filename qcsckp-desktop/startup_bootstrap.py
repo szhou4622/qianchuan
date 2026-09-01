@@ -610,7 +610,7 @@ def _main_impl() -> int:
 def main() -> int:
     from channel_runtime import InstanceLease, prepare_profile
     from release_identity import CHANNEL, CHANNELS, DISPLAY_VERSION
-    from services.diagnostics import diagnostic_status, set_consent, start_worker, stop_worker
+    from services.diagnostics import start_worker, stop_worker
     lease = InstanceLease()
     if not lease.acquire():
         native_message("QCSCKP 另一版本仍在运行，请先从托盘完全退出。不会强制结束进程。")
@@ -619,10 +619,6 @@ def main() -> int:
         prepare_profile(lambda source, channel: native_confirm(
             f"即将首次运行{CHANNELS[channel]}。\n是否复制当前版本的配置与历史数据？\n"
             "原数据会先备份并保留；新副本独立使用，不自动合并。\n选择否将建立空白业务配置。"))
-        if CHANNEL == "development" and not diagnostic_status()["asked"]:
-            set_consent(native_confirm("是否开启开发版自动脱敏错误上报？\n"
-                "仅发送版本、错误阶段、类型、耗时和代码位置，不上传激活码、密钥、业务数据库或素材。\n"
-                "服务器保留30天，可在版本与诊断页关闭。网络或授权不可用时只保存在本机。"))
         start_worker()
         startup_log(DISPLAY_VERSION)
         return _main_impl()

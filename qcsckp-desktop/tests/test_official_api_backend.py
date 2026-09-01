@@ -144,6 +144,29 @@ class _ReportConfigClient(_CaptureClient):
 
 class OfficialApiCollectionMetricTests(unittest.TestCase):
 
+    def test_explicit_write_setting_is_not_blocked_by_unrelated_channel_page(self):
+        service = QianchuanOfficialApiService(_CaptureClient(), allow_writes=True)
+        with patch(
+            "channel_runtime.require_writes_resumed",
+            side_effect=AssertionError("global channel guard must not run"),
+        ) as obsolete_guard:
+            service._require_writes()
+        obsolete_guard.assert_not_called()
+
+    def test_regular_ui_has_no_version_diagnostics_page(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        index = open(
+            os.path.join(root, "static", "index.html"),
+            encoding="utf-8",
+        ).read()
+        license_page = open(
+            os.path.join(root, "static", "license.html"),
+            encoding="utf-8",
+        ).read()
+        self.assertNotIn("channel-settings", index)
+        self.assertNotIn("版本与诊断", index)
+        self.assertNotIn("channel_settings.html", license_page)
+
     def test_endpoint_rate_limits_follow_verified_quota_budget(self):
         limiter = EndpointRateLimiter()
         self.assertAlmostEqual(1 / 6, limiter.endpoint_intervals[

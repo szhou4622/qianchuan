@@ -720,27 +720,6 @@ class JSApi:
             return {"success": False, "message": "当前环境未启用在线授权"}
         return manager.client.diagnose_and_repair()
 
-    def getReleaseDiagnostics(self):
-        from services.channel_control import status
-        return status()
-
-    def setDiagnosticsConsent(self, enabled):
-        from services.diagnostics import set_consent
-        return {"success": True, "diagnostics": set_consent(bool(enabled))}
-
-    def exportDiagnostics(self):
-        from services.diagnostics import export_events
-        return {"success": True, "path": export_events()}
-
-    def resumeChannelWrites(self):
-        from services.channel_control import verify_and_resume
-        try:
-            return verify_and_resume()
-        except Exception as exc:
-            from services.diagnostics import record_event
-            record_event("switch", "switch_failure", exception=exc)
-            return {"success": False, "message": "平台核验未通过，切版保护仍开启。请检查千川授权和网络，或提供诊断编号。"}
-
     def enterLicensedApplication(self):
         manager = self.license_manager
         if manager is not None and not manager.is_runtime_authorized():
@@ -1289,9 +1268,6 @@ class JSApi:
 _LICENSE_GATE_METHODS = {
     "getLicenseBootstrapStatus",
     "diagnoseLicenseConnection",
-    "getReleaseDiagnostics",
-    "setDiagnosticsConsent",
-    "exportDiagnostics",
     "activateOnlineLicense",
     "enterLicensedApplication",
     "getLicenseManagementInfo",

@@ -157,7 +157,6 @@ $criticalRelativePaths = @(
     "bin\apply_channel_update.ps1",
     "bin\static\index.html",
     "bin\static\license.html",
-    "bin\static\channel_settings.html",
     "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
     "runtime\MicrosoftEdgeWebview2Setup.exe"
 )
