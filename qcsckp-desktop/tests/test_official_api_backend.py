@@ -32,6 +32,7 @@ from api.promotion_targets import target_eligibility
 from services.qianchuan_open_api.service import (
     CONTROL_TASK_METRIC_FIELDS,
     QianchuanOfficialApiService,
+    material_report_filter_context,
 )
 from services.qianchuan_open_api.token_provider import (
     AccessTokenBundle,
@@ -1188,6 +1189,137 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         )
         self.assertEqual("2026-08-21 00:00:00", query["start_time"])
         self.assertEqual(200, kwargs["page_size"])
+
+    def test_material_report_uses_exact_required_dimensions_for_all_four_topics(self):
+        cases = {
+            ("chengfang", "live"): (
+                "OVERALL_ROI_LIVE_MATERIAL_VIDEO",
+                ["material_id", "roi2_material_video_name"],
+            ),
+            ("chengfang", "product"): (
+                "OVERALL_ROI_PRODUCT_MATERIAL",
+                ["material_id", "roi2_material_video_name"],
+            ),
+            ("global", "live"): (
+                "SITE_PROMOTION_POST_DATA_VIDEO",
+                [
+                    "material_id",
+                    "roi2_material_video_name",
+                    "roi2_material_video_type",
+                ],
+            ),
+            ("global", "product"): (
+                "SITE_PROMOTION_PRODUCT_POST_DATA_VIDEO",
+                ["material_id", "roi2_material_video_name"],
+            ),
+        }
+        for (system, scene), (topic, dimensions) in cases.items():
+            with self.subTest(plan_system=system, promotion_scene=scene):
+                client = _CaptureClient()
+                service = QianchuanOfficialApiService(client)
+                service.list_material_report(
+                    "1001",
+                    plan_system=system,
+                    promotion_scene=scene,
+                    start_date="2026-09-01",
+                    end_date="2026-09-01",
+                    metrics=["stat_cost_for_roi2"],
+                    filter_context=(
+                        {
+                            "anchor_id": "8001",
+                            "aggregate_smart_bid_type": "0",
+                            "ecp_app_id": "1",
+                        }
+                        if (system, scene) == ("global", "live")
+                        else None
+                    ),
+                )
+                endpoint, query, kwargs = client.last_pages
+                self.assertTrue(endpoint.endswith("/report/uni_promotion/data/get/"))
+                self.assertEqual(topic, query["data_topic"])
+                self.assertEqual(dimensions, query["dimensions"])
+                self.assertEqual(
+                    {"material_id", "roi2_material_video_name"},
+                    set(query["dimensions"]) & {
+                        "material_id",
+                        "roi2_material_video_name",
+                    },
+                )
+                self.assertEqual(200, kwargs["page_size"])
+
+    def test_global_live_required_video_type_dimension_is_not_replaced_by_filter(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        service.list_material_report(
+            "1001",
+            plan_system="global",
+            promotion_scene="live",
+            start_date="2026-09-01",
+            end_date="2026-09-01",
+            metrics=["stat_cost_for_roi2"],
+            filter_context={
+                "anchor_id": "8001",
+                "aggregate_smart_bid_type": "0",
+                "ecp_app_id": "1",
+            },
+        )
+        _, query, _ = client.last_pages
+        self.assertIn("roi2_material_video_type", query["dimensions"])
+        self.assertEqual(
+            [
+                {"field": "anchor_id", "operator": 7, "values": ["8001"]},
+                {
+                    "field": "aggregate_smart_bid_type",
+                    "operator": 7,
+                    "values": ["0"],
+                },
+                {"field": "ecp_app_id", "operator": 7, "values": ["1"]},
+            ],
+            query["filters"],
+        )
+
+    def test_global_live_report_stops_before_api_when_plan_filters_are_missing(self):
+        client = _CaptureClient()
+        service = QianchuanOfficialApiService(client)
+        with self.assertRaisesRegex(ValueError, "缺少计划详情筛选证据"):
+            service.list_material_report(
+                "1001",
+                plan_system="global",
+                promotion_scene="live",
+                start_date="2026-09-01",
+                end_date="2026-09-01",
+                metrics=["stat_cost_for_roi2"],
+            )
+        self.assertFalse(hasattr(client, "last_pages"))
+
+    def test_global_live_report_context_comes_from_official_plan_detail(self):
+        context = material_report_filter_context(
+            {
+                "raw": {
+                    "anchor_info": {"anchor_id": 8001},
+                    "delivery_setting": {"smart_bid_type": "SMART_BID_CUSTOM"},
+                }
+            }
+        )
+        self.assertEqual(
+            {
+                "anchor_id": "8001",
+                "aggregate_smart_bid_type": "0",
+                "ecp_app_id": "1",
+            },
+            context,
+        )
+        self.assertEqual(
+            "7",
+            material_report_filter_context(
+                {
+                    "raw": {
+                        "anchor_id": "8002",
+                        "smart_bid_type": "SMART_BID_CONSERVATIVE",
+                    }
+                }
+            )["aggregate_smart_bid_type"],
+        )
 
     def test_authoritative_report_metrics_override_zero_material_list_metrics(self):
         merged = _merge_material_report(

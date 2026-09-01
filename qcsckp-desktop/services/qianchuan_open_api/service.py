@@ -53,6 +53,31 @@ CONTROL_TASK_METRIC_FIELDS = (
 )
 
 
+def material_report_filter_context(plan: Mapping[str, Any]) -> dict[str, str]:
+    """Extract the plan-scoped filters required by the global-live topic."""
+    raw = plan.get("raw") if isinstance(plan.get("raw"), Mapping) else plan
+    anchor_id = text_id(first(raw, "anchor_id", "aweme_id", "aweme_uid"))
+    smart_bid_type = str(first(raw, "smart_bid_type", "smartBidType")).strip().upper()
+    aggregate_smart_bid_type = {
+        "SMART_BID_CUSTOM": "0",
+        "0": "0",
+        "SMART_BID_CONSERVATIVE": "7",
+        "7": "7",
+    }.get(smart_bid_type, "")
+    # This Open API reads Qianchuan PC plans. Detail responses observed from
+    # the official endpoint omit ecp_app_id, whose config enum is 1=Qianchuan
+    # PC and 2=Douyin Shop easy promotion. Preserve a returned value if the
+    # contract starts exposing it; otherwise use the only applicable source.
+    ecp_app_id = text_id(first(raw, "ecp_app_id", "ecpAppId")) or "1"
+    if not anchor_id or not aggregate_smart_bid_type:
+        return {}
+    return {
+        "anchor_id": anchor_id,
+        "aggregate_smart_bid_type": aggregate_smart_bid_type,
+        "ecp_app_id": ecp_app_id,
+    }
+
+
 def _validated_decimal(
     value: Any,
     label: str,
@@ -225,6 +250,30 @@ class QianchuanOfficialApiService:
         ("chengfang", "product"): "OVERALL_ROI_PRODUCT_MATERIAL",
         ("global", "live"): "SITE_PROMOTION_POST_DATA_VIDEO",
         ("global", "product"): "SITE_PROMOTION_PRODUCT_POST_DATA_VIDEO",
+    }
+    # config/get is the contract source for each topic.  In particular,
+    # SITE_PROMOTION_POST_DATA_VIDEO marks all three entries below as required;
+    # omitting video_type returns business code 40000 even though HTTP is 200.
+    # Keep the exact required set per topic instead of adding a dimension to
+    # every class: global-product does not declare video_type as a dimension.
+    REPORT_MATERIAL_DIMENSIONS = {
+        ("chengfang", "live"): (
+            "material_id",
+            "roi2_material_video_name",
+        ),
+        ("chengfang", "product"): (
+            "material_id",
+            "roi2_material_video_name",
+        ),
+        ("global", "live"): (
+            "material_id",
+            "roi2_material_video_name",
+            "roi2_material_video_type",
+        ),
+        ("global", "product"): (
+            "material_id",
+            "roi2_material_video_name",
+        ),
     }
 
     def __init__(
@@ -772,6 +821,7 @@ class QianchuanOfficialApiService:
         start_date: str,
         end_date: str,
         metrics: Iterable[str],
+        filter_context: Optional[Mapping[str, Any]] = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Read authoritative material metrics for one account/topic/day.
 
@@ -783,7 +833,8 @@ class QianchuanOfficialApiService:
         system = str(plan_system or "").strip().lower()
         scene = str(promotion_scene or "").strip().lower()
         topic = self.REPORT_MATERIAL_TOPICS.get((system, scene))
-        if not topic:
+        dimensions = self.REPORT_MATERIAL_DIMENSIONS.get((system, scene))
+        if not topic or not dimensions:
             raise ValueError("计划体系或推广场景未确认，无法查询素材报表")
         metric_fields = [str(field) for field in metrics if str(field)]
         if not metric_fields:
@@ -799,12 +850,40 @@ class QianchuanOfficialApiService:
                     "values": ["3"],
                 }
             )
+        elif system == "global" and scene == "live":
+            context = {
+                str(key): str(value or "").strip()
+                for key, value in dict(filter_context or {}).items()
+            }
+            required = (
+                "anchor_id",
+                "aggregate_smart_bid_type",
+                "ecp_app_id",
+            )
+            missing = [field for field in required if not context.get(field)]
+            if missing:
+                raise ValueError(
+                    "全域推直播素材报表缺少计划详情筛选证据："
+                    + ",".join(missing)
+                )
+            if context["aggregate_smart_bid_type"] not in {"0", "7"}:
+                raise ValueError("全域推直播投放类型证据无效")
+            if context["ecp_app_id"] not in {"1", "2"}:
+                raise ValueError("全域推直播下单平台证据无效")
+            filters.extend(
+                {
+                    "field": field,
+                    "operator": 7,
+                    "values": [context[field]],
+                }
+                for field in required
+            )
         rows, request_ids = self.client.get_all_pages(
             self.REPORT_DATA,
             {
                 "advertiser_id": aid,
                 "data_topic": topic,
-                "dimensions": ["material_id", "roi2_material_video_name"],
+                "dimensions": list(dimensions),
                 "metrics": metric_fields,
                 "filters": filters,
                 "start_time": f"{str(start_date).strip()} 00:00:00",

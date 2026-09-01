@@ -165,6 +165,17 @@ def _capability(plan: dict[str, Any], target_uid: str) -> dict[str, Any]:
         "regulation_aavid": plan.get("aavid"),
         "regulation_ad_id": plan.get("ad_id"),
     }
+    if (
+        str(plan.get("plan_system") or "").strip().lower() == "global"
+        and str(plan.get("promotion_scene") or "").strip().lower() == "live"
+    ):
+        from services.qianchuan_open_api.service import (
+            material_report_filter_context,
+        )
+
+        filter_context = material_report_filter_context(plan)
+        if filter_context:
+            common["material_report_filter_context"] = filter_context
     return common
 
 

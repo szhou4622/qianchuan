@@ -1085,7 +1085,15 @@ def collect_target(
     detail_request_id = str(capability.get("plan_detail_request_id") or "")
     detail_status = str(target.get("platform_status") or "")
     detail_capability_updates: dict[str, Any] = {}
-    if refresh_plan_detail or not goal:
+    report_filter_context = capability.get("material_report_filter_context")
+    if not isinstance(report_filter_context, Mapping):
+        report_filter_context = {}
+    needs_global_live_context = (
+        expected_system == "global"
+        and expected_scene == "live"
+        and not report_filter_context
+    )
+    if refresh_plan_detail or not goal or needs_global_live_context:
         try:
             detail, detail_response = service.get_plan_detail(aavid, ad_id)
             actual_scene = normalize_promotion_scene(detail.get("marketing_goal"))
@@ -1112,6 +1120,11 @@ def collect_target(
             from services.official_api_catalog import _capability as catalog_capability
 
             detail_capability_updates = catalog_capability(detail, target_uid)
+            refreshed_context = detail_capability_updates.get(
+                "material_report_filter_context"
+            )
+            if isinstance(refreshed_context, Mapping):
+                report_filter_context = dict(refreshed_context)
         except (ApiTokenError, ApiPermissionError):
             raise
         except RuntimeError as exc:
@@ -1197,6 +1210,7 @@ def collect_target(
         start_date=start_date,
         end_date=end_date,
         metrics=supported_material_metrics,
+        filter_context=report_filter_context,
     )
     if isinstance(report_result, tuple) and len(report_result) == 2:
         material_report_rows, material_report_request_ids = report_result
