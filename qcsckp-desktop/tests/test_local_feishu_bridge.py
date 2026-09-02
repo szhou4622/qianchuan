@@ -547,6 +547,223 @@ class LocalFeishuTaskTests(unittest.TestCase):
             bridge._task_row(keep_uid, "tool-user-a")["status"],
         )
 
+    def test_grouped_result_is_rebuilt_and_finalized_without_losing_ids(self):
+        payload = task_payload(4)
+        created = bridge.create_local_retarget_task(payload)
+        self.assertTrue(created["success"])
+        task_uid = created["data"]["task_uid"]
+        row = bridge._task_row(task_uid, "tool-user-a")
+        saved_payload = json.loads(row["payload_json"])
+        groups = []
+        for index, material in enumerate(saved_payload["materials"], start=1):
+            groups.append(
+                {
+                    "group_uid": f"group-{index}",
+                    "material_ids": [material["material_id"]],
+                    "materials": [material],
+                }
+            )
+        saved_payload["retarget_groups"] = groups
+        success_ids = ["task-1", "task-3", "task-4"]
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='succeeded',payload_json=?,"
+                "result_json=?,regulate_task_id=? WHERE task_uid=?",
+                (
+                    json.dumps(saved_payload, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "success": True,
+                            "step": "confirmed_succeeded",
+                            "regulate_task_id": "task-4",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "task-4",
+                    task_uid,
+                ),
+            )
+            for index, material in enumerate(saved_payload["materials"], start=1):
+                succeeded = index != 2
+                task_id = f"task-{index}" if succeeded else ""
+                conn.execute(
+                    "INSERT INTO pmc_retargeting_run("
+                    "aavid,ad_id,material_id,materials_json,started_at,ended_at,"
+                    "status,step,message,regulate_task_id,trigger_source,"
+                    "execution_uid,execution_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "10001",
+                        "20002",
+                        material["material_id"],
+                        json.dumps([material], ensure_ascii=False),
+                        "2026-09-02 13:39:50",
+                        "2026-09-02 13:40:10",
+                        1 if succeeded else -1,
+                        "confirmed_succeeded" if succeeded else "official_api",
+                        (
+                            "官方 API 追投已核验成功"
+                            if succeeded
+                            else "待追投素材已不属于该计划"
+                        ),
+                        task_id,
+                        f"feishu_card:{task_uid}:group:{index}",
+                        f"{task_uid}:group:{index}:attempt:1",
+                        "confirmed_succeeded" if succeeded else "confirmed_failed",
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        legacy_row = bridge._task_row(task_uid, "tool-user-a")
+        legacy_task = bridge._task_payload(legacy_row)
+        self.assertEqual("partial_succeeded", legacy_task["status"])
+        self.assertEqual(success_ids, legacy_task["result"]["regulate_task_ids"])
+        self.assertEqual(3, legacy_task["result"]["successful_group_count"])
+        self.assertEqual(1, legacy_task["result"]["failed_group_count"])
+        self.assertEqual(
+            "succeeded",
+            bridge._task_row(task_uid, "tool-user-a")["status"],
+        )
+
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='verifying' WHERE task_uid=?",
+                (task_uid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        finalized = bridge.finalize_reconciled_local_task(
+            task_uid,
+            succeeded=True,
+            message="单组核验成功",
+            regulate_task_id="task-4",
+            result={"success": True, "regulate_task_id": "task-4"},
+        )
+        self.assertTrue(finalized["success"])
+        final_row = bridge._task_row(task_uid, "tool-user-a")
+        final_result = json.loads(final_row["result_json"])
+        self.assertEqual("partial_succeeded", final_row["status"])
+        self.assertEqual(success_ids, final_result["regulate_task_ids"])
+        self.assertIn("成功3组，失败1组", final_row["result_message"])
+        raw = json.dumps(
+            bridge.build_local_task_card(bridge._task_payload(final_row)),
+            ensure_ascii=False,
+        )
+        self.assertIn("追投部分成功", raw)
+        self.assertIn("成功3/4组，失败1组", raw)
+        self.assertIn("待追投素材已不属于该计划", raw)
+        self.assertIn("task-1", raw)
+        self.assertIn("task-3", raw)
+        self.assertIn("task-4", raw)
+        repeated = bridge.finalize_reconciled_local_task(
+            task_uid,
+            succeeded=True,
+            message="重复核验",
+            regulate_task_id="task-4",
+            result={"success": True, "regulate_task_id": "task-4"},
+        )
+        self.assertTrue(repeated["success"])
+        repeated_result = json.loads(
+            bridge._task_row(task_uid, "tool-user-a")["result_json"]
+        )
+        self.assertEqual(success_ids, repeated_result["regulate_task_ids"])
+
+    def test_grouped_result_status_matrix_and_out_of_order_rows(self):
+        payload = {
+            "retarget_groups": [
+                {
+                    "group_uid": "g1",
+                    "material_ids": ["m1"],
+                    "materials": [{"material_id": "m1", "material_name": "素材1"}],
+                },
+                {
+                    "group_uid": "g2",
+                    "material_ids": ["m2"],
+                    "materials": [{"material_id": "m2", "material_name": "素材2"}],
+                },
+            ]
+        }
+
+        class FakeCursor:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeConnection:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def execute(self, *_args, **_kwargs):
+                return FakeCursor(self.rows)
+
+            def close(self):
+                return None
+
+        def run(group1, group2, parent_status="verifying"):
+            # Deliberately reverse the returned order. Aggregation must bind by
+            # the immutable group number embedded in trigger_source.
+            rows = []
+            for index, item in reversed(list(enumerate((group1, group2), start=1))):
+                rows.append(
+                    {
+                        "trigger_source": f"feishu_card:parent:group:{index}",
+                        "status": item["numeric"],
+                        "step": item["step"],
+                        "message": item["message"],
+                        "regulate_task_id": item.get("task_id", ""),
+                        "material_id": f"m{index}",
+                        "materials_json": "[]",
+                        "execution_state": item["execution_state"],
+                    }
+                )
+            with patch.object(bridge, "_db", return_value=FakeConnection(rows)):
+                return bridge._grouped_result_from_runs(
+                    {"task_uid": "parent", "status": parent_status},
+                    payload,
+                    {},
+                )
+
+        succeeded = {
+            "numeric": 1,
+            "step": "confirmed_succeeded",
+            "execution_state": "confirmed_succeeded",
+            "message": "成功",
+            "task_id": "task-ok",
+        }
+        failed = {
+            "numeric": -1,
+            "step": "official_api",
+            "execution_state": "confirmed_failed",
+            "message": "明确失败",
+        }
+        unknown = {
+            "numeric": -1,
+            "step": "unknown_requires_review",
+            "execution_state": "unknown_requires_review",
+            "message": "无法确认",
+        }
+        pending = {
+            "numeric": 1,
+            "step": "submitted_verifying",
+            "execution_state": "submitted_verifying",
+            "message": "核验中",
+            "task_id": "task-pending",
+        }
+
+        self.assertEqual("succeeded", run(succeeded, succeeded)["status"])
+        self.assertEqual("failed", run(failed, failed)["status"])
+        self.assertEqual(
+            "unknown_requires_review",
+            run(succeeded, unknown)["status"],
+        )
+        self.assertEqual("verifying", run(succeeded, pending)["status"])
+
     def test_stop_card_shows_complete_strategy_and_task_metric_snapshot(self):
         payload = self._stop_payload()
         trigger = payload["trigger"]
@@ -595,7 +812,10 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertIn("命中策略明细", raw)
         self.assertIn("触发层级：调控任务级", raw)
         self.assertIn("调控支付ROI < 1.5", raw)
-        self.assertIn("当前调控任务：整体命中", raw)
+        self.assertIn(
+            "调控任务：调控任务A（任务ID：assist-30003）：整体命中",
+            raw,
+        )
         self.assertIn("调控支付ROI：实际 1.2 < 阈值 1.5 → 命中", raw)
         self.assertIn("停投参数：** 暂停调控", raw)
         self.assertIn("策略检查：** 每5分钟一轮", raw)

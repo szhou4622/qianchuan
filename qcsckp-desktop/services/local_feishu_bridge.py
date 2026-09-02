@@ -33,7 +33,9 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 PROFILE_FILE = os.path.join(DATA_DIR, "feishu_local_profiles.json")
 TERMINAL_STATUSES = {
     "succeeded",
+    "partial_succeeded",
     "failed",
+    "unknown_requires_review",
     "rejected",
     "expired",
     "cancelled",
@@ -369,6 +371,148 @@ def _task_row(task_uid: str, account_username: str = "") -> Optional[Dict[str, A
         conn.close()
 
 
+def _grouped_result_from_runs(
+    row: Dict[str, Any],
+    payload: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Rebuild a parent card result from immutable per-group run rows."""
+    groups = payload.get("retarget_groups")
+    if not isinstance(groups, list) or len(groups) <= 1:
+        return None
+    task_uid = str(row.get("task_uid") or "").strip()
+    if not task_uid:
+        return None
+    conn = _db()
+    try:
+        run_rows = conn.execute(
+            "SELECT trigger_source,status,step,message,regulate_task_id,"
+            "material_id,materials_json,execution_state FROM pmc_retargeting_run "
+            "WHERE trigger_source LIKE ? ORDER BY id",
+            (f"feishu_card:{task_uid}:group:%",),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_group: Dict[int, Dict[str, Any]] = {}
+    for run in run_rows:
+        source = str(run["trigger_source"] or "")
+        matched = re.search(r":group:(\d+)(?::|$)", source)
+        if not matched:
+            continue
+        group_index = int(matched.group(1))
+        by_group[group_index] = dict(run)
+    if not by_group:
+        return None
+
+    parent_status = str(row.get("status") or "")
+    terminal_parent = parent_status in TERMINAL_STATUSES
+    group_results: List[Dict[str, Any]] = []
+    task_ids: List[str] = []
+    success_count = 0
+    failure_count = 0
+    unknown_count = 0
+    pending_count = 0
+    for group_index, group in enumerate(groups, start=1):
+        group = group if isinstance(group, dict) else {}
+        run = by_group.get(group_index)
+        material_ids = [
+            str(value)
+            for value in group.get("material_ids") or []
+            if str(value or "").strip()
+        ]
+        materials = [
+            dict(item)
+            for item in group.get("materials") or []
+            if isinstance(item, dict)
+        ]
+        outcome = "unknown_requires_review"
+        message = "未找到该组的完整执行记录，请人工核对"
+        ids: List[str] = []
+        if run:
+            execution_state = str(run.get("execution_state") or "").strip()
+            step = str(run.get("step") or "").strip()
+            numeric_status = int(run.get("status") or 0)
+            task_id = str(run.get("regulate_task_id") or "").strip()
+            if task_id:
+                ids.append(task_id)
+            if execution_state == "confirmed_succeeded" or step == "confirmed_succeeded":
+                outcome = "succeeded"
+            elif execution_state in {"unknown_requires_review", "result_unknown"} or step in {
+                "unknown_requires_review",
+                "result_unknown",
+            }:
+                outcome = "unknown_requires_review"
+            elif numeric_status < 0:
+                outcome = "failed"
+            elif step == "submitted_verifying" and not terminal_parent:
+                outcome = "verifying"
+            elif numeric_status > 0 and task_id:
+                # Backward-compatible read repair for cards whose old finalizer
+                # overwrote the aggregate after every submitted group verified.
+                outcome = "succeeded"
+            else:
+                outcome = "unknown_requires_review"
+            message = str(run.get("message") or message)
+        if outcome == "succeeded":
+            success_count += 1
+            task_ids.extend(ids)
+        elif outcome == "failed":
+            failure_count += 1
+        elif outcome == "verifying":
+            pending_count += 1
+        else:
+            unknown_count += 1
+        group_results.append(
+            {
+                "group_index": group_index,
+                "group_uid": str(group.get("group_uid") or ""),
+                "material_ids": material_ids,
+                "materials": materials,
+                "success": outcome == "succeeded",
+                "status": outcome,
+                "message": message,
+                "regulate_task_ids": ids,
+            }
+        )
+    task_ids = list(dict.fromkeys(task_ids))
+    group_count = len(group_results)
+    if pending_count:
+        aggregate_status = "verifying"
+        aggregate_step = "submitted_verifying"
+        message = f"{pending_count}组仍在核验，已确认成功{success_count}组"
+    elif unknown_count:
+        aggregate_status = "unknown_requires_review"
+        aggregate_step = "unknown_requires_review"
+        message = f"多组追投存在{unknown_count}组结果无法确认，请人工核对"
+    elif success_count == group_count:
+        aggregate_status = "succeeded"
+        aggregate_step = "confirmed_succeeded"
+        message = f"{group_count}组追投全部核验成功"
+    elif success_count > 0:
+        aggregate_status = "partial_succeeded"
+        aggregate_step = "partial_succeeded"
+        message = f"多组追投完成：成功{success_count}组，失败{failure_count}组"
+    else:
+        aggregate_status = "failed"
+        aggregate_step = "confirmed_failed"
+        message = f"{group_count}组追投均未创建成功"
+    return {
+        **dict(result or {}),
+        "success": aggregate_status == "succeeded",
+        "status": aggregate_status,
+        "step": aggregate_step,
+        "message": message,
+        "regulate_task_id": task_ids[0] if task_ids else "",
+        "regulate_task_ids": task_ids,
+        "group_results": group_results,
+        "group_count": group_count,
+        "successful_group_count": success_count,
+        "failed_group_count": failure_count,
+        "unknown_group_count": unknown_count,
+        "pending_group_count": pending_count,
+    }
+
+
 def has_local_task(task_uid: str) -> bool:
     return _task_row(task_uid) is not None
 
@@ -389,6 +533,18 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         or created_at
         or ""
     )
+    result = _loads(row.get("result_json"), {})
+    if not isinstance(result, dict):
+        result = {}
+    grouped_result = _grouped_result_from_runs(row, payload, result)
+    display_status = str(row.get("status") or "pending")
+    display_result_message = str(row.get("result_message") or "")
+    if grouped_result:
+        result = grouped_result
+        display_status = str(grouped_result.get("status") or display_status)
+        display_result_message = str(
+            grouped_result.get("message") or display_result_message
+        )
     payload.update(
         {
             "task_uid": str(row.get("task_uid") or ""),
@@ -407,7 +563,7 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
                 or payload.get("action_type")
                 or "retarget"
             ),
-            "status": str(row.get("status") or "pending"),
+            "status": display_status,
             "action_nonce": str(row.get("action_nonce") or ""),
             "instance_uid": str(payload.get("instance_uid") or ""),
             "created_at": created_at,
@@ -415,10 +571,14 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
             "expires_at": str(row.get("expires_at") or ""),
             "clicker_open_id": str(row.get("approved_by") or ""),
             "claim_token": str(row.get("claim_token") or ""),
-            "result_message": str(row.get("result_message") or ""),
+            "result_message": display_result_message,
             "result_detail": str(row.get("result_detail") or ""),
-            "regulate_task_id": str(row.get("regulate_task_id") or ""),
-            "result": _loads(row.get("result_json"), {}),
+            "regulate_task_id": str(
+                result.get("regulate_task_id")
+                or row.get("regulate_task_id")
+                or ""
+            ),
+            "result": result,
         }
     )
     return payload
@@ -923,9 +1083,15 @@ def _strategy_trigger_detail(
     evaluations: List[Dict[str, Any]] = []
     is_stop = str(task.get("action_type") or "retarget") == "stop"
     if isinstance(trigger.get("evaluation"), dict):
+        stop_name = str(task.get("assist_task_name") or "未命名调控任务")
+        stop_id = str(task.get("assist_task_id") or "未记录")
         evaluations.append(
             {
-                "label": "当前调控任务" if is_stop else "当前触发对象",
+                "label": (
+                    f"调控任务：{stop_name}（任务ID：{stop_id}）"
+                    if is_stop
+                    else "当前触发对象"
+                ),
                 "evaluation": trigger["evaluation"],
             }
         )
@@ -1113,7 +1279,9 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         "executing": "正在追投",
         "verifying": "已提交，正在核验",
         "succeeded": "追投成功",
+        "partial_succeeded": "追投部分成功",
         "failed": "追投失败",
+        "unknown_requires_review": "追投结果无法确认",
         "invalidated": "策略已更新，本卡失效",
         "rejected": "已暂不追投",
         "expired": "已过期",
@@ -1125,7 +1293,11 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         elif status == "cancelled" and task.get("selection_snapshot"):
             status_text = "测试完成"
     template = "green" if status == "succeeded" else (
-        "orange" if status == "invalidated" else
+        "orange" if status in {
+            "invalidated",
+            "partial_succeeded",
+            "unknown_requires_review",
+        } else
         "red" if status in {"failed", "expired", "rejected"} else "blue"
     )
     if preview_only and status == "cancelled" and task.get("selection_snapshot"):
@@ -1289,6 +1461,30 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         )
     group_results = result.get("group_results")
     if isinstance(group_results, list) and group_results:
+        group_count = int(result.get("group_count") or len(group_results))
+        succeeded_count = int(
+            result.get("successful_group_count")
+            or sum(1 for item in group_results if item.get("success"))
+        )
+        failed_count = int(
+            result.get("failed_group_count")
+            or sum(
+                1
+                for item in group_results
+                if str(item.get("status") or "") == "failed"
+            )
+        )
+        unknown_count = int(result.get("unknown_group_count") or 0)
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**分组执行汇总：** 成功{succeeded_count}/{group_count}组"
+                    + (f"，失败{failed_count}组" if failed_count else "")
+                    + (f"，无法确认{unknown_count}组" if unknown_count else "")
+                ),
+            }
+        )
         result_lines: List[str] = []
         for item in group_results[:MAX_RETARGET_GROUPS]:
             if not isinstance(item, dict):
@@ -1299,9 +1495,39 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
                 for value in item.get("regulate_task_ids") or []
                 if str(value or "")
             )
+            group_status = str(item.get("status") or "").strip()
+            status_label = {
+                "succeeded": "成功",
+                "failed": "失败",
+                "verifying": "核验中",
+                "unknown_requires_review": "无法确认",
+            }.get(
+                group_status,
+                "成功" if item.get("success") else "失败",
+            )
+            material_parts: List[str] = []
+            item_materials = item.get("materials")
+            if isinstance(item_materials, list):
+                for material in item_materials:
+                    if not isinstance(material, dict):
+                        continue
+                    material_id = str(material.get("material_id") or "")
+                    material_name = str(
+                        material.get("material_name") or "未命名素材"
+                    )
+                    material_parts.append(
+                        f"{material_name}（{material_id}）" if material_id else material_name
+                    )
+            if not material_parts:
+                material_parts = [
+                    str(value)
+                    for value in item.get("material_ids") or []
+                    if str(value or "")
+                ]
             result_lines.append(
-                f"第{group_index}组：{'成功' if item.get('success') else '失败'}"
-                f"｜{item.get('message') or ''}"
+                f"第{group_index}组：{status_label}"
+                + (f"｜素材 {'、'.join(material_parts)}" if material_parts else "")
+                + f"｜{item.get('message') or ''}"
                 + (f"｜任务ID {group_ids}" if group_ids else "")
             )
         if result_lines:
@@ -1669,7 +1895,9 @@ def build_budget_increase_task_card(
         "claimed": "工具已领取",
         "executing": "正在复核并追加预算",
         "succeeded": "追加预算成功",
+        "partial_succeeded": "追加预算部分成功",
         "failed": "追加预算失败",
+        "unknown_requires_review": "追加预算结果无法确认",
         "invalidated": "策略已更新，本卡失效",
         "rejected": "已暂不追加",
         "expired": "已过期",
@@ -1677,7 +1905,11 @@ def build_budget_increase_task_card(
     }.get(status, status)
     template = (
         "green" if status == "succeeded"
-        else "orange" if status == "invalidated"
+        else "orange" if status in {
+            "invalidated",
+            "partial_succeeded",
+            "unknown_requires_review",
+        }
         else "red" if status in {"failed", "expired", "rejected"}
         else "blue"
     )
@@ -4256,7 +4488,20 @@ def finalize_reconciled_local_task(
     row = _task_row(task_uid)
     if not row:
         return {"success": False, "message": "本地任务不存在"}
-    expected = "succeeded" if succeeded else "failed"
+    final_result = dict(result or {})
+    payload = _loads(row.get("payload_json"), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    grouped_result = _grouped_result_from_runs(row, payload, final_result)
+    if grouped_result:
+        final_result = grouped_result
+        expected = str(grouped_result.get("status") or "failed")
+        message = str(grouped_result.get("message") or message)
+        regulate_task_id = str(
+            grouped_result.get("regulate_task_id") or regulate_task_id or ""
+        )
+    else:
+        expected = "succeeded" if succeeded else "failed"
     if str(row.get("status") or "") in TERMINAL_STATUSES:
         return {"success": str(row.get("status") or "") == expected}
     if str(row.get("status") or "") != "verifying":
@@ -4273,7 +4518,7 @@ def finalize_reconciled_local_task(
                 str(message or "")[:1000],
                 str(detail or "")[:4000],
                 str(regulate_task_id or "")[:128],
-                _json(result or {}),
+                _json(final_result),
                 now_text,
                 now_text,
                 task_uid,
