@@ -703,7 +703,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertTrue(capability["regulation_execute"])
         self.assertEqual("target-product", capability["retarget_target_uid"])
 
-    def test_resumed_inferred_task_triggers_unfiltered_explicit_status_read(self):
+    def test_resumed_filtered_task_triggers_unfiltered_explicit_status_read(self):
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         target = {
             "target_uid": "target-live",
@@ -739,7 +739,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                     {
                         "task_id": "3001",
                         "status": "PROCESSING",
-                        "status_source": "request_filter_inferred",
+                        "status_source": "api_filtered",
                         "metrics": {"stat_cost_for_roi2_assist": 10},
                     }
                 ],
@@ -1408,10 +1408,138 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertIn("log_search", endpoint)
         self.assertTrue(kwargs["verify_stability"])
         self.assertEqual(1, kwargs["parallel_workers"])
-        self.assertEqual(
-            "log-1",
-            kwargs["identity_getter"]({"log_id": "log-1"}),
+        first = kwargs["identity_getter"](
+            {
+                "log_id": "log-1",
+                "create_time": "2026-09-02 20:34:53",
+                "object_id": "2001",
+                "content_title": "修改",
+                "content_log": [
+                    "操作内容：素材追投，ID：3001",
+                    "调控状态：调控中 -> 已暂停",
+                ],
+            }
         )
+        same = kwargs["identity_getter"](
+            {
+                "log_id": "log-1",
+                "create_time": "2026-09-02 20:34:53",
+                "object_id": "2001",
+                "content_title": "修改",
+                "content_log": [
+                    "操作内容：素材追投，ID：3001",
+                    "调控状态：调控中 -> 已暂停",
+                ],
+            }
+        )
+        another_task = kwargs["identity_getter"](
+            {
+                "log_id": "log-1",
+                "create_time": "2026-09-02 20:34:53",
+                "object_id": "2001",
+                "content_title": "修改",
+                "content_log": [
+                    "操作内容：素材追投，ID：3002",
+                    "调控状态：调控中 -> 已暂停",
+                ],
+            }
+        )
+        self.assertTrue(first.startswith("log-1:"))
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, another_task)
+
+    def test_operation_log_page_accepts_shared_log_id_for_distinct_tasks(self):
+        class _SharedLogClient(QianchuanOpenApiClient):
+            def __init__(self):
+                super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
+
+            def get(self, endpoint, query=None, *, advertiser_id=""):
+                rows = [
+                    {
+                        "log_id": "shared-log",
+                        "create_time": "2026-09-02 20:34:53",
+                        "object_id": "2001",
+                        "content_title": "修改",
+                        "content_log": [
+                            f"操作内容：素材追投，ID：{task_id}",
+                            "调控状态：调控中 -> 调控手动关闭",
+                        ],
+                    }
+                    for task_id in ("3001", "3002", "3003", "3004")
+                ]
+                return ApiResponse(
+                    data={
+                        "list": rows,
+                        "page_info": {"total_page": 1, "total_number": 4},
+                    },
+                    raw={},
+                    request_id="shared-request",
+                )
+
+        rows, request_ids = QianchuanOfficialApiService(
+            _SharedLogClient()
+        ).list_operation_logs(
+            "1001",
+            start_time="2026-09-02 00:00:00",
+            end_time="2026-09-02 23:59:59",
+            object_type="AD",
+            object_id="2001",
+        )
+        self.assertEqual(4, len(rows))
+        self.assertEqual(["shared-request"], request_ids)
+        self.assertEqual(
+            ["3001", "3002", "3003", "3004"],
+            [row["control_task_id"] for row in rows],
+        )
+
+    def test_operation_log_page_rejects_exact_composite_duplicate(self):
+        class _ExactDuplicateClient(QianchuanOpenApiClient):
+            def __init__(self):
+                super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
+
+            def get(self, endpoint, query=None, *, advertiser_id=""):
+                row = {
+                    "log_id": "shared-log",
+                    "create_time": "2026-09-02 20:34:53",
+                    "object_id": "2001",
+                    "content_title": "修改",
+                    "content_log": [
+                        "操作内容：素材追投，ID：3001",
+                        "调控状态：调控中 -> 已暂停",
+                    ],
+                }
+                return ApiResponse(
+                    data={
+                        "list": [row, dict(row)],
+                        "page_info": {"total_page": 1, "total_number": 2},
+                    },
+                    raw={},
+                    request_id="duplicate-request",
+                )
+
+        with self.assertRaisesRegex(ApiRequestError, "重复记录"):
+            QianchuanOfficialApiService(
+                _ExactDuplicateClient()
+            ).list_operation_logs(
+                "1001",
+                start_time="2026-09-02 00:00:00",
+                end_time="2026-09-02 23:59:59",
+                object_type="AD",
+                object_id="2001",
+            )
+
+    def test_filtered_explicit_processing_is_not_unfiltered_resume_proof(self):
+        client = _CaptureClient(tasks=[{"id": "3001", "task_status": "PROCESSING"}])
+        rows, _ = QianchuanOfficialApiService(client).list_control_tasks(
+            "1001",
+            ad_id="2001",
+            marketing_goal="LIVE_PROM_GOODS",
+            start_time="2026-09-01 00:00:00",
+            end_time="2026-09-03 23:59:59",
+            active_only=True,
+        )
+        self.assertEqual("PROCESSING", rows[0]["status"])
+        self.assertEqual("api_filtered", rows[0]["status_source"])
 
     def test_inferred_processing_cannot_confirm_a_resumed_cycle(self):
         with tempfile.TemporaryDirectory(prefix="qcsckp-inferred-resume-") as root:

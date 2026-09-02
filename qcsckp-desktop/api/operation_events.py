@@ -13,6 +13,10 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from services.plan_system import normalize_plan_system
+from utils.operation_log_identity import (
+    operation_log_control_task_id,
+    operation_log_row_identity,
+)
 from utils.sqlite_store import (
     SQLiteStore,
     _sqlite_upsert_lock,
@@ -1055,6 +1059,7 @@ def ingest_platform_log_rows(
             )
         )
         action = normalize_action_type(description)
+        regulate_task_id = operation_log_control_task_id(raw)
         legacy_uid = (
             f"{normalized_source}:{aid}:{platform_id}"
             if platform_id
@@ -1062,30 +1067,38 @@ def ingest_platform_log_rows(
         )
         legacy_event = store.select_one(
             TABLE,
-            fields="account_uid",
+            fields="account_uid,summary,object_id,regulate_task_id,occurred_at",
             where={"event_uid": legacy_uid},
         )
-        if (
+        legacy_task_id = str((legacy_event or {}).get("regulate_task_id") or "")
+        same_task = bool(
+            legacy_task_id
+            and regulate_task_id
+            and legacy_task_id == str(regulate_task_id)
+        )
+        same_summary = (
+            " ".join(str((legacy_event or {}).get("summary") or "").split())
+            == " ".join(str(description or "").split())
+        )
+        legacy_matches = bool(
             legacy_event
-            and str(legacy_event.get("account_uid") or "")
-            not in {"", account_uid}
-        ):
-            uid = (
-                f"{normalized_source}:{account_uid}:{aid}:{platform_id}"
-                if platform_id
-                else make_event_uid(
-                    normalized_source,
-                    account_uid,
-                    aid,
-                    occurred_at,
-                    operator_id,
-                    description,
-                    object_id,
-                )
-            )
-        else:
-            # 保留既有单账号UID，避免升级后同一日志形成重复记录。
+            and str(legacy_event.get("account_uid") or "") in {"", account_uid}
+            and str(legacy_event.get("object_id") or "") == str(object_id or "")
+            and str(legacy_event.get("occurred_at") or "") == str(occurred_at or "")
+            and (same_task or (not legacy_task_id and not regulate_task_id and same_summary))
+        )
+        if legacy_matches:
+            # Reuse a matching pre-r17 event so an upgrade does not duplicate
+            # historical rows.  A different task/content sharing the same
+            # official log_id must receive its own composite identity.
             uid = legacy_uid
+        else:
+            uid = make_event_uid(
+                normalized_source,
+                account_uid,
+                aid,
+                operation_log_row_identity(raw),
+            )
         possible = False
         related = ""
         candidates = store.execute(
@@ -1158,7 +1171,7 @@ def ingest_platform_log_rows(
         plan_name = _first(raw, ("plan_name", "campaign_name", "planName", "adName"))
         material_id = _first(raw, ("material_id", "materialId"))
         material_name = _first(raw, ("material_name", "materialName"))
-        regulate_task_id = _first(
+        regulate_task_id = regulate_task_id or _first(
             raw,
             (
                 "regulate_task_id",

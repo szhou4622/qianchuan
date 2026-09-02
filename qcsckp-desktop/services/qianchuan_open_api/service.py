@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Optional
 
+from utils.operation_log_identity import operation_log_row_identity
+
 from .client import ApiResponse, QianchuanOpenApiClient
 from .errors import OfficialApiWriteDisabled
 from .normalizers import (
@@ -964,9 +966,13 @@ class QianchuanOfficialApiService:
         )
         normalized = [normalize_control_task(row) for row in rows]
         for item in normalized:
-            item["status_source"] = (
-                "api" if str(item.get("status") or "").strip() else "missing"
-            )
+            if str(item.get("status") or "").strip():
+                # A status echoed by a server-filtered PROCESSING request is
+                # explicit, but it is not the unfiltered observation required
+                # to open a new cycle after a confirmed stop.
+                item["status_source"] = "api_filtered" if active_only else "api"
+            else:
+                item["status_source"] = "missing"
         if active_only:
             # The server already accepted the exact PROCESSING filter.  Some
             # task rows still return ``task_status=null``; only in this scoped
@@ -1148,7 +1154,7 @@ class QianchuanOfficialApiService:
             query,
             advertiser_id=aid,
             page_size=20,
-            identity_getter=lambda row: text_id(first(row, "log_id", "logId", "id")),
+            identity_getter=operation_log_row_identity,
             verify_stability=True,
             parallel_workers=1,
         )

@@ -131,6 +131,7 @@ def _ingest_rows(
                 "operator_id": row.get("operator_id"),
                 "object_name": row.get("object_name"),
                 "object_id": row.get("object_id"),
+                "control_task_id": row.get("control_task_id"),
                 "contentTitle": row.get("content_title"),
                 "contentLog": [row.get("content_log")] if row.get("content_log") else [],
                 "opt_ip": row.get("opt_ip"),
@@ -425,6 +426,19 @@ def _event_count(account_uid: str, aavid: str, db: SQLiteStore) -> int:
         "SELECT COUNT(*) AS n FROM account_operation_event "
         "WHERE account_uid=? AND aavid=? AND source='qianchuan_open_api'",
         (account_uid, aavid),
+        fetch=True,
+    ) or []
+    return int((rows[0] if rows else {}).get("n") or 0)
+
+
+def _resume_event_count(target_uid: str, db: SQLiteStore) -> int:
+    if not str(target_uid or "").strip():
+        return 0
+    rows = db.execute(
+        "SELECT COUNT(*) AS n FROM account_operation_event "
+        "WHERE target_uid=? AND source='qianchuan_open_api' "
+        "AND action_type='control_resume' AND status='success'",
+        (str(target_uid).strip(),),
         fetch=True,
     ) or []
     return int((rows[0] if rows else {}).get("n") or 0)
@@ -770,6 +784,9 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
                 object_id=object_id,
             )
         before = _event_count(str(task.get("account_uid") or ""), aid, db)
+        before_resume = _resume_event_count(
+            str((target or {}).get("target_uid") or ""), db
+        )
         _ingest_rows(
             aid,
             rows,
@@ -778,7 +795,10 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
             db=db,
         )
         after = _event_count(str(task.get("account_uid") or ""), aid, db)
-        _finish_task(
+        after_resume = _resume_event_count(
+            str((target or {}).get("target_uid") or ""), db
+        )
+        finished = _finish_task(
             db,
             task,
             status="succeeded" if rows else "empty",
@@ -786,6 +806,26 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
             rows_inserted=max(0, after - before),
             request_ids=request_ids,
         )
+        if finished and target and after_resume > before_resume:
+            # A new official resume event must be followed by a fresh control
+            # task read.  The collection pipeline performs the explicit
+            # status observation and wakes the stop-rule runner only after the
+            # resulting snapshot commits.
+            try:
+                from services.official_api_collection import (
+                    request_official_api_collection,
+                )
+
+                request_official_api_collection(
+                    [str(target.get("target_uid") or "")], db=db
+                )
+            except Exception:
+                from utils.log import logger
+
+                logger.exception(
+                    "官方恢复调控日志入库后重新采集失败 target=%s",
+                    target.get("target_uid"),
+                )
     except Exception as exc:
         attempt = max(1, int(task.get("attempt_count") or 1))
         if isinstance(exc, (ApiTokenError, ApiPermissionError)):

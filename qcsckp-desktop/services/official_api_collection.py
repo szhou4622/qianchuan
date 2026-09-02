@@ -1471,7 +1471,7 @@ def collect_target(
                     existing = by_task.get(task_id) or {}
                     if (
                         str(item.get("status_source") or "")
-                        == "request_filter_inferred"
+                        in {"request_filter_inferred", "api_filtered"}
                         and str(existing.get("status_source") or "") == "api"
                     ):
                         continue

@@ -6,6 +6,11 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+from utils.operation_log_identity import (
+    operation_log_content_items,
+    operation_log_control_task_id,
+)
+
 
 def text_id(value: Any) -> str:
     if isinstance(value, bool) or value is None:
@@ -272,6 +277,7 @@ def normalize_control_task(row: Mapping[str, Any]) -> dict[str, Any]:
 def normalize_operation_log(row: Mapping[str, Any]) -> dict[str, Any]:
     log_id = text_id(first(row, "log_id", "logId", "id"))
     sub_logs = first(row, "sub_logs", "subLogs", default=[])
+    content_log = "；".join(operation_log_content_items(row))
     return {
         "log_id": log_id,
         "platform_event_id": log_id,
@@ -281,7 +287,8 @@ def normalize_operation_log(row: Mapping[str, Any]) -> dict[str, Any]:
         "object_name": str(first(row, "object_name", "objectName")).strip(),
         "object_id": text_id(first(row, "object_id", "objectId")),
         "content_title": str(first(row, "content_title", "contentTitle", "title")).strip(),
-        "content_log": str(first(row, "content_log", "contentLog", "description")).strip(),
+        "content_log": content_log,
+        "control_task_id": operation_log_control_task_id(row),
         "opt_ip": str(first(row, "opt_ip", "ip")).strip(),
         "sub_logs": sub_logs if isinstance(sub_logs, list) else [],
         "raw": dict(row),

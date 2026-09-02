@@ -211,6 +211,72 @@ class OfficialOperationLogWindowTests(unittest.TestCase):
         self.assertEqual(1, state["progress_completed"])
         self.assertEqual(1, state["progress_total"])
 
+    def test_new_official_resume_event_requeues_target_collection(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        start, end = _parse_manual_range("2026-09-02", "2026-09-02")
+        _enqueue_range(
+            account,
+            start,
+            end,
+            request_kind="manual",
+            db=self.db,
+            batch_uid="batch-resume",
+        )
+        service = MagicMock()
+        service.list_operation_logs.side_effect = [
+            ([], ["request-account"]),
+            (
+                [
+                    {
+                        "log_id": "resume-log",
+                        "occurred_at": "2026-09-02 20:34:24",
+                        "operator_name": "测试用户",
+                        "object_name": "监控计划 2001",
+                        "object_id": "2001",
+                        "content_title": "修改",
+                        "content_log": (
+                            "操作内容：素材追投，ID：3001；"
+                            "调控状态：已暂停 -> 调控中"
+                        ),
+                        "control_task_id": "3001",
+                        "raw": {
+                            "log_id": "resume-log",
+                            "object_id": "2001",
+                            "contentTitle": "修改",
+                            "contentLog": [
+                                "操作内容：素材追投，ID：3001",
+                                "调控状态：已暂停 -> 调控中",
+                            ],
+                            "create_time": "2026-09-02 20:34:24",
+                        },
+                    }
+                ],
+                ["request-plan"],
+            ),
+        ]
+        with patch(
+            "services.official_api_operation_logs.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_collection.request_official_api_collection"
+        ) as wake_collection:
+            account_task = _claim_window(self.db, "worker-account")
+            self.assertEqual("ACCOUNT", account_task["object_type"])
+            _process_window(self.db, account_task)
+            plan_task = _claim_window(self.db, "worker-plan")
+            self.assertEqual("AD", plan_task["object_type"])
+            _process_window(self.db, plan_task)
+        wake_collection.assert_called_once_with(
+            ["target-log-1001-2001"], db=self.db
+        )
+        event = self.db.select_one(
+            "account_operation_event",
+            where={"platform_event_id": "resume-log"},
+        )
+        self.assertEqual("control_resume", event["action_type"])
+        self.assertEqual("3001", event["regulate_task_id"])
+
     def test_manual_range_rejects_more_than_thirty_days(self):
         with self.assertRaisesRegex(ValueError, "最多同步 30 天"):
             _parse_manual_range("2026-07-01", "2026-08-20")

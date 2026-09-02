@@ -247,6 +247,100 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual("control_resume", event["action_type"])
         self.assertEqual("987654321", event["regulate_task_id"])
 
+    def test_shared_log_id_preserves_distinct_tasks_and_is_idempotent(self):
+        self._account()
+        rows = [
+            {
+                "id": "shared-platform-log",
+                "aavid": "1001",
+                "ad_id": "2001",
+                "object_id": "2001",
+                "contentTitle": "修改",
+                "contentLog": [
+                    f"操作内容：素材追投，ID：{task_id}",
+                    "调控状态：调控中 -> 调控手动关闭",
+                ],
+                "createTime": "2026-09-02 20:34:53",
+                "status": 1,
+            }
+            for task_id in ("3001", "3002", "3003", "3004")
+        ]
+        for _ in range(2):
+            ingest_platform_log_rows(
+                "1001",
+                rows,
+                owner_username="tool-owner",
+                db=self.db,
+                update_sync_state=False,
+                source="qianchuan_open_api",
+            )
+        saved = self.db.execute(
+            "SELECT event_uid,regulate_task_id FROM account_operation_event "
+            "WHERE platform_event_id='shared-platform-log' "
+            "ORDER BY regulate_task_id",
+            fetch=True,
+        )
+        self.assertEqual(4, len(saved))
+        self.assertEqual(4, len({row["event_uid"] for row in saved}))
+        self.assertEqual(
+            ["3001", "3002", "3003", "3004"],
+            [row["regulate_task_id"] for row in saved],
+        )
+
+    def test_matching_legacy_single_log_identity_is_reused(self):
+        account = self._account()
+        legacy_uid = "qianchuan_open_api:1001:legacy-log"
+        # r16 stored list-shaped content through ``str(list)``.  Matching the
+        # stable task/object/time tuple must reuse that legacy row even though
+        # r17 normalizes the display summary.
+        summary = (
+            "修改；['操作内容：素材追投，ID：3001', "
+            "'调控状态：已暂停 -> 调控中']"
+        )
+        self.db.insert(
+            "account_operation_event",
+            {
+                "event_uid": legacy_uid,
+                "account_uid": account["account_uid"],
+                "aavid": "1001",
+                "source": "qianchuan_open_api",
+                "action_type": "control_resume",
+                "object_id": "2001",
+                "regulate_task_id": "3001",
+                "status": "success",
+                "summary": summary,
+                "platform_event_id": "legacy-log",
+                "occurred_at": "2026-09-02 20:34:24",
+            },
+        )
+        ingest_platform_log_rows(
+            "1001",
+            [
+                {
+                    "id": "legacy-log",
+                    "aavid": "1001",
+                    "object_id": "2001",
+                    "contentTitle": "修改",
+                    "contentLog": [
+                        "操作内容：素材追投，ID：3001",
+                        "调控状态：已暂停 -> 调控中",
+                    ],
+                    "createTime": "2026-09-02 20:34:24",
+                    "status": 1,
+                }
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+            update_sync_state=False,
+            source="qianchuan_open_api",
+        )
+        saved = self.db.execute(
+            "SELECT event_uid FROM account_operation_event "
+            "WHERE platform_event_id='legacy-log'",
+            fetch=True,
+        )
+        self.assertEqual([{"event_uid": legacy_uid}], saved)
+
     def test_large_backfill_releases_writer_between_idempotent_chunks(self):
         self._account()
         rows = [
