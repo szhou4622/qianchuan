@@ -1035,6 +1035,12 @@ class OperationEventTests(unittest.TestCase):
     def test_action_normalization(self):
         self.assertEqual("retarget", normalize_action_type("创建素材追投任务"))
         self.assertEqual(
+            "control_resume",
+            normalize_action_type(
+                "操作内容：素材追投，调控状态：已暂停 -> 调控中"
+            ),
+        )
+        self.assertEqual(
             "stop",
             normalize_action_type(
                 "操作内容：素材追投，调控状态：调控中 -> 调控手动关闭"

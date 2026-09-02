@@ -333,6 +333,21 @@ def _finish(
     verified: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     now = _now()
+    submitted_at = str(row.get("created_at") or "")
+    verification_duration_seconds: Optional[float] = None
+    try:
+        verification_duration_seconds = max(
+            0.0,
+            round(
+                (
+                    datetime.strptime(now, "%Y-%m-%d %H:%M:%S")
+                    - datetime.strptime(submitted_at, "%Y-%m-%d %H:%M:%S")
+                ).total_seconds(),
+                3,
+            ),
+        )
+    except (TypeError, ValueError):
+        verification_duration_seconds = None
     changed = store.execute(
         "UPDATE execution_reconciliation SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
         "last_error=?,confirmed_at=?,card_update_state='pending',updated_at=? "
@@ -377,6 +392,29 @@ def _finish(
                     run_task_uid,
                 ),
             )
+            if succeeded:
+                actual_status = str(
+                    (verified or {}).get("status") or "DISABLE"
+                ).strip().upper()
+                if actual_status not in {
+                    "DISABLE",
+                    "DISABLED",
+                    "FINISHED",
+                    "ENDED",
+                }:
+                    actual_status = "DISABLE"
+                store.execute(
+                    "UPDATE pmc_roi2_assist_task SET ad_delivery_type=1,"
+                    "ad_delivery_name=?,reconciliation_status='confirmed',updated_at=? "
+                    "WHERE aadvid=? AND ad_id=? AND assist_task_id=?",
+                    (
+                        actual_status,
+                        now,
+                        str(row.get("aavid") or ""),
+                        str(row.get("ad_id") or ""),
+                        str(row.get("control_task_id") or ""),
+                    ),
+                )
         else:
             run_update = store.execute(
                 "UPDATE pmc_retargeting_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
@@ -470,6 +508,13 @@ def _finish(
                         "success": succeeded,
                         "step": aggregate_status,
                         "regulate_task_id": str(row.get("control_task_id") or ""),
+                        "request_id": str(row.get("request_id") or ""),
+                        "submitted_at": submitted_at,
+                        "confirmed_at": now,
+                        "verification_duration_seconds": verification_duration_seconds,
+                        "platform_status": str(
+                            (verified or {}).get("status") or ""
+                        ).strip().upper(),
                         "verification": dict(verified or {}),
                     },
                 )

@@ -377,9 +377,10 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertFalse(rejected["success"])
 
     def test_stop_card_is_authorized_deduplicated_and_pulled_separately(self):
-        created = bridge.create_local_stop_task(self._stop_payload())
+        payload = {**self._stop_payload(), "control_cycle_key": "cycle-1"}
+        created = bridge.create_local_stop_task(payload)
         self.assertTrue(created["success"])
-        duplicate = bridge.create_local_stop_task(self._stop_payload())
+        duplicate = bridge.create_local_stop_task(payload)
         self.assertTrue(duplicate["success"])
         self.assertTrue(duplicate["duplicate"])
         task_uid = created["data"]["task_uid"]
@@ -421,6 +422,67 @@ class LocalFeishuTaskTests(unittest.TestCase):
         pulled = bridge.pull_local_stop_task()["data"]
         self.assertEqual(task_uid, pulled["task_uid"])
         self.assertEqual("tool-user-a", pulled["account_username"])
+
+    def test_stop_card_dedupe_is_scoped_to_control_cycle(self):
+        first = bridge.create_local_stop_task(
+            {**self._stop_payload(), "control_cycle_key": "cycle-1"}
+        )
+        second = bridge.create_local_stop_task(
+            {**self._stop_payload(), "control_cycle_key": "cycle-2"}
+        )
+        self.assertTrue(first["success"])
+        self.assertTrue(second["success"])
+        self.assertFalse(second.get("duplicate", False))
+        self.assertNotEqual(first["data"]["task_uid"], second["data"]["task_uid"])
+
+    def test_stop_success_card_shows_official_verification_evidence(self):
+        task = {
+            **self._stop_payload(),
+            "action_type": "stop",
+            "status": "succeeded",
+            "result_message": "官方 API 停投已核验成功",
+            "result": {
+                "platform_status": "DISABLE",
+                "request_id": "request-stop-1",
+                "submitted_at": "2026-09-02 17:21:24",
+                "confirmed_at": "2026-09-02 17:21:27",
+                "verification_duration_seconds": 3,
+                "verification": {"status": "DISABLE"},
+            },
+        }
+        raw = json.dumps(bridge.build_stop_task_card(task), ensure_ascii=False)
+        self.assertIn("官方核验证据", raw)
+        self.assertIn("DISABLE", raw)
+        self.assertIn("request-stop-1", raw)
+        self.assertIn("3秒", raw)
+
+    def test_direct_card_update_marks_reconciliation_sent(self):
+        created = bridge.create_local_stop_task(self._stop_payload())
+        task_uid = created["data"]["task_uid"]
+        store = SQLiteStore(database=self.db_path)
+        store.insert(
+            "execution_reconciliation",
+            {
+                "reconciliation_uid": "stop-card-update-1",
+                "account_username": "tool-user-a",
+                "task_uid": task_uid,
+                "action_type": "stop",
+                "aavid": "10001",
+                "ad_id": "20002",
+                "control_task_id": "assist-30003",
+                "idempotency_key": "stop-card-update-1",
+                "status": "confirmed_succeeded",
+                "card_update_state": "pending",
+            },
+        )
+        actual_bridge = bridge.LocalFeishuBridge("tool-user-a")
+        with patch.object(actual_bridge, "_request", return_value={}):
+            actual_bridge.update_task_cards(task_uid)
+        reconciliation = store.select_one(
+            "execution_reconciliation",
+            where={"reconciliation_uid": "stop-card-update-1"},
+        )
+        self.assertEqual("sent", reconciliation["card_update_state"])
 
     def test_strategy_save_invalidates_old_card_and_releases_dedupe(self):
         payload = task_payload(2)

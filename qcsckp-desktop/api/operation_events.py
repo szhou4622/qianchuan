@@ -31,6 +31,7 @@ ALLOWED_SOURCES = {
 ALLOWED_ACTIONS = {
     "retarget",
     "stop",
+    "control_resume",
     "plan_create",
     "plan_copy",
     "plan_enable",
@@ -46,6 +47,7 @@ ALLOWED_STATUSES = {"requested", "executing", "success", "failed", "unknown"}
 ACTION_LABELS = {
     "retarget": "追投",
     "stop": "停投",
+    "control_resume": "恢复调控",
     "plan_create": "新建计划",
     "plan_copy": "复制计划",
     "plan_enable": "启用计划",
@@ -114,6 +116,15 @@ def normalize_action_type(text: Any) -> str:
     if not s:
         return "other"
     rules = (
+        (
+            "control_resume",
+            (
+                "已暂停 -> 调控中",
+                "已暂停 → 调控中",
+                "已暂停->调控中",
+                "已暂停→调控中",
+            ),
+        ),
         (
             "stop",
             (
@@ -1137,7 +1148,11 @@ def ingest_platform_log_rows(
             object_type = (
                 "material"
                 if action == "retarget"
-                else ("assist_task" if action == "stop" else ("plan" if action != "other" else ""))
+                else (
+                    "assist_task"
+                    if action in {"stop", "control_resume"}
+                    else ("plan" if action != "other" else "")
+                )
             )
         plan_id = _first(raw, ("plan_id", "campaign_id", "planId", "adId"))
         plan_name = _first(raw, ("plan_name", "campaign_name", "planName", "adName"))
@@ -1165,7 +1180,7 @@ def ingest_platform_log_rows(
                 "taskName",
             ),
         )
-        if not regulate_task_id and action in {"retarget", "stop"}:
+        if not regulate_task_id and action in {"retarget", "stop", "control_resume"}:
             task_match = re.search(
                 r"(?:素材追投|调控任务)[^；]*?ID\s*[:：]\s*(\d+)",
                 description,

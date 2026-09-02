@@ -216,6 +216,37 @@ class OperationLogSyncTests(unittest.TestCase):
         self.assertEqual("987654321", event["regulate_task_id"])
         self.assertEqual("", event["material_id"])
 
+    def test_resumed_retarget_log_is_classified_as_control_resume(self):
+        self._account()
+        ingest_platform_log_rows(
+            "1001",
+            [
+                {
+                    "id": "platform-resume-1",
+                    "aavid": "1001",
+                    "ad_id": "2001",
+                    "contentTitle": "修改",
+                    "contentLog": [
+                        "操作内容：素材追投，ID：987654321",
+                        "调控状态：已暂停 -> 调控中",
+                    ],
+                    "objectType": "单元",
+                    "objectName": "测试计划",
+                    "createTime": "2026-08-11 12:05:00",
+                    "status": 1,
+                }
+            ],
+            owner_username="tool-owner",
+            db=self.db,
+            update_sync_state=False,
+        )
+        event = self.db.select_one(
+            "account_operation_event",
+            where={"platform_event_id": "platform-resume-1"},
+        )
+        self.assertEqual("control_resume", event["action_type"])
+        self.assertEqual("987654321", event["regulate_task_id"])
+
     def test_large_backfill_releases_writer_between_idempotent_chunks(self):
         self._account()
         rows = [

@@ -371,6 +371,51 @@ def _task_row(task_uid: str, account_username: str = "") -> Optional[Dict[str, A
         conn.close()
 
 
+def _set_reconciliation_card_update_state(task_uid: str, state: str) -> None:
+    uid = str(task_uid or "").strip()
+    normalized = str(state or "").strip().lower()
+    if not uid or normalized not in {"sent", "queued", "failed"}:
+        return
+    try:
+        SQLiteStore(database=DB_FILE).execute(
+            "UPDATE execution_reconciliation SET card_update_state=?,updated_at=? "
+            "WHERE task_uid=? AND status IN "
+            "('confirmed_succeeded','confirmed_failed','unknown_requires_review')",
+            (normalized, _dt(_now()), uid),
+        )
+    except Exception:
+        logger.exception("更新飞书卡片对账状态失败 task=%s", uid)
+
+
+def _refresh_reconciliation_card_update_state(
+    store: SQLiteStore,
+    account_username: str,
+    task_uid: str,
+) -> None:
+    uid = str(task_uid or "").strip()
+    if not uid:
+        return
+    rows = store.execute(
+        "SELECT status,payload_json FROM feishu_outbox WHERE account_username=? "
+        "AND operation='update_card' ORDER BY id",
+        (_account_key(account_username),),
+        fetch=True,
+    ) or []
+    related = []
+    for row in rows:
+        payload = _loads(row.get("payload_json"), {})
+        if isinstance(payload, dict) and str(payload.get("task_uid") or "") == uid:
+            related.append(str(row.get("status") or ""))
+    state = (
+        "failed"
+        if "failed" in related
+        else "queued"
+        if any(item in {"queued", "sending"} for item in related)
+        else "sent"
+    )
+    _set_reconciliation_card_update_state(uid, state)
+
+
 def _grouped_result_from_runs(
     row: Dict[str, Any],
     payload: Dict[str, Any],
@@ -1875,6 +1920,40 @@ def build_stop_task_card(
                 "content": f"**执行结果：** {str(task.get('result_message'))[:500]}",
             }
         )
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    verification = (
+        result.get("verification")
+        if isinstance(result.get("verification"), dict)
+        else {}
+    )
+    platform_status = str(
+        result.get("platform_status") or verification.get("status") or ""
+    ).strip().upper()
+    request_id = str(result.get("request_id") or "").strip()
+    submitted_at = str(result.get("submitted_at") or "").strip()
+    confirmed_at = str(result.get("confirmed_at") or "").strip()
+    duration = result.get("verification_duration_seconds")
+    result_lines = []
+    if platform_status:
+        result_lines.append(f"**千川最终状态：** {platform_status}")
+    if request_id:
+        result_lines.append(f"**request_id：** `{request_id}`")
+    if submitted_at:
+        result_lines.append(f"**提交时间：** {submitted_at}")
+    if confirmed_at:
+        result_lines.append(f"**核验时间：** {confirmed_at}")
+    if duration not in (None, ""):
+        try:
+            result_lines.append(f"**核验耗时：** {float(duration):g}秒")
+        except (TypeError, ValueError):
+            pass
+    if result_lines:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": "**官方核验证据**\n" + "\n".join(result_lines),
+            }
+        )
     if expanded:
         elements.extend(
             [
@@ -2375,6 +2454,12 @@ class LocalFeishuBridge:
                     token,
                 ),
             )
+            if operation == "update_card":
+                _refresh_reconciliation_card_update_state(
+                    store,
+                    self.account_username,
+                    str(payload.get("task_uid") or ""),
+                )
         except Exception as exc:
             attempts = int(row.get("attempt_count") or 0) + 1
             failed = attempts >= 8
@@ -2393,6 +2478,12 @@ class LocalFeishuBridge:
                     token,
                 ),
             )
+            if operation == "update_card":
+                _refresh_reconciliation_card_update_state(
+                    store,
+                    self.account_username,
+                    str(payload.get("task_uid") or ""),
+                )
         return True
 
     def _start_outbox_worker(self) -> None:
@@ -2481,10 +2572,13 @@ class LocalFeishuBridge:
         card = build_local_task_card(task, expanded=expanded)
         content = json.dumps(card, ensure_ascii=False)
         messages = _loads(row.get("card_messages_json"), [])
+        attempted = 0
+        queued = False
         for message in messages if isinstance(messages, list) else []:
             message_id = str((message or {}).get("message_id") or "")
             if not message_id:
                 continue
+            attempted += 1
             try:
                 self._request(
                     "PATCH",
@@ -2498,6 +2592,11 @@ class LocalFeishuBridge:
                     message_id=message_id,
                     payload={"content": content, "task_uid": task_uid},
                 )
+                queued = True
+        _set_reconciliation_card_update_state(
+            task_uid,
+            "queued" if queued else "sent" if attempted else "failed",
+        )
 
     def send_test_card(self) -> Dict[str, Any]:
         try:
@@ -3751,7 +3850,8 @@ def create_local_stop_task(payload: Dict[str, Any]) -> Dict[str, Any]:
     dedupe = hashlib.sha256(
         (
             f"{account}|stop|{required['aavid']}|{required['ad_id']}|"
-            f"{required['assist_task_id']}|{required['strategy_id']}"
+            f"{required['assist_task_id']}|{required['strategy_id']}|"
+            f"{str(snapshot.get('control_cycle_key') or 'legacy')}"
         ).encode("utf-8")
     ).hexdigest()
     task_uid = str(uuid.uuid4())

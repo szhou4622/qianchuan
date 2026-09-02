@@ -68,6 +68,7 @@ from services.official_api_collection import (
     _control_snapshot,
     _fair_order_targets,
     _fixed_cadence_due,
+    _guard_control_snapshot_after_confirmed_stop,
     _material_snapshot,
     _merge_material_report,
     _metric,
@@ -787,7 +788,9 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             "services.official_api_collection.patch_target_sync_state"
         ) as patch_state, patch(
             "services.retargeting_rule_runner.request_retargeting_rule_evaluation"
-        ):
+        ), patch(
+            "services.regulation_rule_runner.request_regulation_rule_evaluation"
+        ) as regulation_wake:
             result = collect_target(target, rotate_maintenance=True, db=store)
 
         self.assertTrue(result["success"])
@@ -800,6 +803,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             "products:catalog timeout",
             state_kwargs["capability_updates"]["maintenance_error"],
         )
+        regulation_wake.assert_called_once_with("collection_completed")
 
     def test_missing_material_is_soft_removed_and_paused_history_is_retained(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1276,6 +1280,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual("PROCESSING", query["filtering"]["task_status"])
         self.assertEqual(list(CONTROL_TASK_METRIC_FIELDS), query["fields"])
         self.assertEqual("PROCESSING", rows[0]["status"])
+        self.assertEqual("request_filter_inferred", rows[0]["status_source"])
 
     def test_unfiltered_control_history_does_not_infer_missing_status(self):
         client = _CaptureClient(tasks=[{"id": "3001", "task_status": None}])
@@ -1289,6 +1294,66 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             active_only=False,
         )
         self.assertEqual("", rows[0]["status"])
+        self.assertEqual("missing", rows[0]["status_source"])
+
+    def test_confirmed_stop_overrides_processing_until_official_resume_event(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-cycle-guard-") as root:
+            database = os.path.join(root, "cycle.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            store.insert(
+                "pmc_regulation_run",
+                {
+                    "aavid": "1001",
+                    "ad_id": "2001",
+                    "target_uid": "target-1",
+                    "assist_task_id": "3001",
+                    "started_at": "2026-09-02 10:00:00",
+                    "ended_at": "2026-09-02 10:00:01",
+                    "status": 1,
+                    "execution_state": "confirmed_succeeded",
+                },
+            )
+            snapshot = {
+                "assist_task_id": "3001",
+                "ad_delivery_type": 0,
+                "ad_delivery_name": "PROCESSING",
+                "data_source": "qianchuan_open_api",
+            }
+            guarded = _guard_control_snapshot_after_confirmed_stop(
+                store,
+                "target-1",
+                snapshot,
+                observed_at="2026-09-02 10:05:00",
+            )
+            self.assertEqual(1, guarded["ad_delivery_type"])
+            self.assertEqual("DISABLE", guarded["ad_delivery_name"])
+            self.assertEqual("confirmed", guarded["reconciliation_status"])
+
+            store.insert(
+                "account_operation_event",
+                {
+                    "event_uid": "resume-1",
+                    "platform_event_id": "platform-resume-1",
+                    "aavid": "1001",
+                    "ad_id": "2001",
+                    "target_uid": "target-1",
+                    "source": "qianchuan_open_api",
+                    "action_type": "control_resume",
+                    "regulate_task_id": "3001",
+                    "status": "success",
+                    "summary": "调控状态：已暂停 -> 调控中",
+                    "occurred_at": "2026-09-02 10:06:00",
+                },
+            )
+            resumed = _guard_control_snapshot_after_confirmed_stop(
+                store,
+                "target-1",
+                snapshot,
+                observed_at="2026-09-02 10:07:00",
+            )
+            self.assertEqual(0, resumed["ad_delivery_type"])
+            self.assertEqual("PROCESSING", resumed["ad_delivery_name"])
 
     def test_material_report_uses_data_endpoint_and_required_video_filter(self):
         client = _CaptureClient()
@@ -2146,6 +2211,18 @@ class OfficialApiBackendTests(unittest.TestCase):
             init_sqlite_schema(database=database)
             store = SQLiteStore(database=database)
             store.insert(
+                "pmc_roi2_assist_task",
+                {
+                    "assist_task_id": "30003",
+                    "aadvid": "10001",
+                    "ad_id": "20002",
+                    "target_uid": "target-stop",
+                    "ad_delivery_type": 0,
+                    "ad_delivery_name": "PROCESSING",
+                    "data_source": "qianchuan_open_api",
+                },
+            )
+            store.insert(
                 "execution_reconciliation",
                 {
                     "reconciliation_uid": "stop-recon-1",
@@ -2187,6 +2264,75 @@ class OfficialApiBackendTests(unittest.TestCase):
                 "confirmed_succeeded",
                 notify.call_args.kwargs["status"],
             )
+            stopped = store.select_one(
+                "pmc_roi2_assist_task",
+                where={"target_uid": "target-stop", "assist_task_id": "30003"},
+            )
+            self.assertEqual(1, stopped["ad_delivery_type"])
+            self.assertEqual("DISABLE", stopped["ad_delivery_name"])
+            self.assertEqual("confirmed", stopped["reconciliation_status"])
+
+    def test_stop_reconciliation_passes_final_status_request_id_and_timing_to_card(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = os.path.join(temp, "stop-card-reconcile.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            store.insert(
+                "local_retarget_task",
+                {
+                    "task_uid": "stop-card-1",
+                    "account_username": "stop-owner",
+                    "action_type": "stop",
+                    "status": "verifying",
+                    "action_nonce": "nonce-stop-card-1",
+                    "payload_json": "{}",
+                    "expires_at": "2026-09-02 18:00:00",
+                },
+            )
+            store.insert(
+                "execution_reconciliation",
+                {
+                    "reconciliation_uid": "stop-card-recon-1",
+                    "account_username": "stop-owner",
+                    "task_uid": "stop-card-1",
+                    "action_type": "stop",
+                    "aavid": "10001",
+                    "ad_id": "20002",
+                    "control_task_id": "30003",
+                    "request_id": "request-stop-1",
+                    "idempotency_key": "stop-card-recon-1",
+                    "status": "verifying",
+                    "lease_owner": "lease-1",
+                    "fencing_token": 1,
+                    "payload_json": json.dumps(
+                        {
+                            "promotion_scene": "live",
+                            "expected_status": "PAUSE",
+                            "execution_uid": "stop-card-recon-1",
+                        }
+                    ),
+                },
+            )
+            row = store.select_one(
+                "execution_reconciliation",
+                where={"reconciliation_uid": "stop-card-recon-1"},
+            )
+            with patch(
+                "services.local_feishu_bridge.finalize_reconciled_local_task"
+            ) as finalize:
+                changed = _finish(
+                    store,
+                    row,
+                    status="confirmed_succeeded",
+                    verified={"task_id": "30003", "status": "DISABLE"},
+                )
+            self.assertTrue(changed)
+            result = finalize.call_args.kwargs["result"]
+            self.assertEqual("DISABLE", result["platform_status"])
+            self.assertEqual("request-stop-1", result["request_id"])
+            self.assertTrue(result["submitted_at"])
+            self.assertTrue(result["confirmed_at"])
+            self.assertIsNotNone(result["verification_duration_seconds"])
 
     def test_reconciliation_repairs_legacy_group_uid_without_attempt_suffix(self):
         with tempfile.TemporaryDirectory() as temp:

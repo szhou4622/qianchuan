@@ -958,6 +958,10 @@ class QianchuanOfficialApiService:
             page_size=100,
         )
         normalized = [normalize_control_task(row) for row in rows]
+        for item in normalized:
+            item["status_source"] = (
+                "api" if str(item.get("status") or "").strip() else "missing"
+            )
         if active_only:
             # The server already accepted the exact PROCESSING filter.  Some
             # task rows still return ``task_status=null``; only in this scoped
@@ -966,6 +970,7 @@ class QianchuanOfficialApiService:
             for item in normalized:
                 if not str(item.get("status") or "").strip():
                     item["status"] = "PROCESSING"
+                    item["status_source"] = "request_filter_inferred"
         return normalized, request_ids
 
     def find_duplicate_control_task(

@@ -37,6 +37,7 @@ from services.promotion_capability import (
     check_target_capability,
     parse_target_capability,
 )
+from services.control_task_cycle import stop_cycle_state
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -48,6 +49,7 @@ _DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
 _RUNNER_LOCK = threading.Lock()
 _RUNNER_THREAD: Optional[threading.Thread] = None
 _RUNNER_STOP = threading.Event()
+_RUNNER_WAKE = threading.Event()
 
 
 def _shadow_mode_enabled() -> bool:
@@ -363,23 +365,16 @@ def has_completed_stop(
     db: SQLiteStore,
     target_uid: str,
     assist_task_id: str,
+    assist_row: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    shared = db.execute(
-        "SELECT e.id FROM execution_reconciliation e JOIN promotion_target p "
-        "ON p.ad_id=e.ad_id AND p.aadvid=e.aavid WHERE e.control_task_id=? "
-        "AND p.target_uid=? AND e.action_type='stop' AND e.status='confirmed_succeeded' LIMIT 1",
-        (str(assist_task_id or ""), str(target_uid or "legacy_unscoped")), fetch=True,
-    ) or []
-    if shared:
-        return True
-    rows = db.execute(
-        "SELECT id FROM pmc_regulation_run "
-        "WHERE target_uid=? AND assist_task_id=? AND status IN (1,2) "
-        "ORDER BY id DESC LIMIT 1",
-        (str(target_uid or "legacy_unscoped"), str(assist_task_id or "")),
-        fetch=True,
-    ) or []
-    return bool(rows)
+    return bool(
+        stop_cycle_state(
+            db,
+            target_uid,
+            assist_task_id,
+            assist_row=assist_row,
+        ).get("blocked")
+    )
 
 
 def _insert_regulation_run(
@@ -617,18 +612,53 @@ async def _process_approved_stop_tasks(
                             message=f"执行前复核未通过：{error}",
                         )
                         continue
-                    if has_completed_stop(db, target_uid, assist_task_id):
+                    cycle_state = stop_cycle_state(
+                        db,
+                        target_uid,
+                        assist_task_id,
+                        assist_row=latest_row,
+                    )
+                    if cycle_state.get("blocked"):
+                        already_completed = (
+                            cycle_state.get("reason") == "stop_already_completed"
+                        )
                         report_local_stop_task(
                             task_uid,
                             claim_token,
-                            "succeeded",
-                            message="该调控任务已有成功停投流水，本次未重复执行",
-                            result={"idempotent": True},
+                            "succeeded" if already_completed else "failed",
+                            message=(
+                                "该调控任务已有成功停投流水，本次未重复执行"
+                                if already_completed
+                                else "调控任务已恢复，但尚未完成恢复后的新鲜采集，本卡未提交停投"
+                            ),
+                            result={
+                                "idempotent": already_completed,
+                                "control_cycle_key": cycle_state.get("cycle_key"),
+                                "cycle_reason": cycle_state.get("reason"),
+                            },
+                        )
+                        continue
+                    expected_cycle_key = str(task.get("control_cycle_key") or "")
+                    actual_cycle_key = str(cycle_state.get("cycle_key") or "")
+                    if (
+                        (expected_cycle_key and expected_cycle_key != actual_cycle_key)
+                        or (
+                            not expected_cycle_key
+                            and cycle_state.get("reason") == "resumed_cycle_ready"
+                        )
+                    ):
+                        report_local_stop_task(
+                            task_uid,
+                            claim_token,
+                            "failed",
+                            message="调控任务恢复周期已变化，本卡失效，未提交停投",
                         )
                         continue
                     cfg = load_rule_regulation_config()
                     svc = QianChuanRegulationStopService.from_rule_file_dict(cfg)
-                    execution_uid = f"stop-card:{task_uid}"
+                    execution_uid = (
+                        f"stop-card:{task_uid}:cycle:{actual_cycle_key}"
+                    )
                     result = await svc.run(
                         aavid=aavid_int,
                         ad_id=ad_id_int,
@@ -1184,14 +1214,25 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
                     task_lock = await _lock_for_assist_task(assist_task_id, target_uid)
                     async with task_lock:
-                        if has_completed_stop(db, target_uid, assist_task_id):
+                        cycle_state = stop_cycle_state(
+                            db,
+                            target_uid,
+                            assist_task_id,
+                            assist_row=row,
+                        )
+                        if cycle_state.get("blocked"):
                             logger.info(
-                                "%s 已有成功停投流水，幂等跳过 target=%s assist_task_id=%s",
+                                "%s 当前调控周期不可再停投，幂等跳过 "
+                                "reason=%s target=%s assist_task_id=%s",
                                 _tag,
+                                cycle_state.get("reason"),
                                 target_uid,
                                 assist_task_id,
                             )
                             continue
+                        control_cycle_key = str(
+                            cycle_state.get("cycle_key") or ""
+                        )
                         if target_uid != "legacy_unscoped":
                             target_matches = (
                                 bool(target)
@@ -1401,6 +1442,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     "metrics_snapshot": row,
                                     "query_snapshot": json.loads(query_snap),
                                     "regulation_stop_action": stop_action,
+                                    "control_cycle_key": control_cycle_key,
                                 }
                             )
                             if card_result.get("success"):
@@ -1457,12 +1499,17 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                         assist_task_id,
                                     )
                                     continue
-                                if has_completed_stop(
+                                latest_cycle_state = stop_cycle_state(
                                     db,
                                     target_uid,
                                     assist_task_id,
-                                ):
+                                    assist_row=latest_row,
+                                )
+                                if latest_cycle_state.get("blocked"):
                                     continue
+                                control_cycle_key = str(
+                                    latest_cycle_state.get("cycle_key") or ""
+                                )
                                 from services.qianchuan_session import (
                                     automation_session_ready,
                                 )
@@ -1503,7 +1550,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                 execution_uid = hashlib.sha256(
                                     (
                                         f"{cycle_owner}|{target_uid}|{assist_task_id}|"
-                                        f"{st.get('id') or st_label}|{stop_action}"
+                                        f"{st.get('id') or st_label}|{stop_action}|"
+                                        f"{control_cycle_key}"
                                     ).encode("utf-8")
                                 ).hexdigest()
                                 result = await svc.run(
@@ -1691,6 +1739,17 @@ def _interval_sec() -> int:
     return DEFAULT_INTERVAL_SEC
 
 
+def request_regulation_rule_evaluation(reason: str = "") -> bool:
+    """Request one immediate rule pass; repeated requests collapse safely."""
+    _RUNNER_WAKE.set()
+    logger.debug(
+        "%s 收到即时复核请求 reason=%s",
+        regulation_log_tag(scheduler=True),
+        str(reason or "manual"),
+    )
+    return True
+
+
 async def main_loop(interval_sec: Optional[int] = None) -> None:
     sec = int(interval_sec) if interval_sec is not None else _interval_sec()
     init_sqlite_schema()
@@ -1704,7 +1763,8 @@ async def main_loop(interval_sec: Optional[int] = None) -> None:
     next_rule_cycle_at = 0.0
     while not _RUNNER_STOP.is_set():
         try:
-            if time.monotonic() >= next_rule_cycle_at:
+            if _RUNNER_WAKE.is_set() or time.monotonic() >= next_rule_cycle_at:
+                _RUNNER_WAKE.clear()
                 await run_one_cycle(db)
                 next_rule_cycle_at = time.monotonic() + max(60, int(sec))
             else:
@@ -1746,6 +1806,7 @@ def start_regulation_rule_runner_background_thread() -> threading.Thread:
 def stop_regulation_rule_runner_background_thread(timeout: float = 8.0) -> None:
     global _RUNNER_THREAD
     _RUNNER_STOP.set()
+    _RUNNER_WAKE.set()
     with _RUNNER_LOCK:
         thread = _RUNNER_THREAD
     if thread and thread.is_alive() and thread is not threading.current_thread():

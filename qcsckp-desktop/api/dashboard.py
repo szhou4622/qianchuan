@@ -767,6 +767,7 @@ class DashboardApi:
                 total_pay_order_gmv_for_roi2_assist,
                 total_pay_order_coupon_amount_for_roi2_assist,
                 assist_materials_json,
+                data_source,
                 created_at,
                 updated_at
             FROM pmc_roi2_assist_task

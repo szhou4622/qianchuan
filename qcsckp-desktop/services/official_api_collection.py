@@ -30,6 +30,7 @@ from api.promotion_targets import (
     upsert_products,
 )
 from services.plan_system import normalize_plan_system
+from services.control_task_cycle import stop_cycle_state
 from services.qianchuan_accounts import (
     _owner_key,
     record_target_duration,
@@ -921,6 +922,30 @@ def _control_snapshot(
     }
 
 
+def _guard_control_snapshot_after_confirmed_stop(
+    store: SQLiteStore,
+    target_uid: str,
+    snapshot: Mapping[str, Any],
+    *,
+    observed_at: str,
+) -> dict[str, Any]:
+    guarded = dict(snapshot)
+    if guarded.get("ad_delivery_type") != 0:
+        return guarded
+    cycle_state = stop_cycle_state(
+        store,
+        target_uid,
+        guarded.get("assist_task_id"),
+        assist_row=guarded,
+        observed_at=observed_at,
+    )
+    if cycle_state.get("blocked"):
+        guarded["ad_delivery_type"] = 1
+        guarded["ad_delivery_name"] = "DISABLE"
+        guarded["reconciliation_status"] = "confirmed"
+    return guarded
+
+
 def _control_is_active(task: Mapping[str, Any]) -> bool:
     return str(task.get("status") or "").strip().upper() in {
         "ENABLE",
@@ -1436,17 +1461,34 @@ def collect_target(
             1 for item in raw_control_tasks if _control_is_active(item)
         )
     control_request_id = control_request_ids[-1] if control_request_ids else ""
-    control_rows = [
-        _control_snapshot(
+    control_observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    control_rows: list[dict[str, Any]] = []
+    for item in control_tasks:
+        task_id = text_id(item.get("task_id"))
+        if (
+            str(item.get("scene") or "").upper()
+            not in {"", "MATERIAL_ADD_BUDGET"}
+            or not task_id
+        ):
+            continue
+        snapshot = _control_snapshot(
             item,
             target=target,
             request_id=control_request_id,
             units=units,
         )
-        for item in control_tasks
-        if str(item.get("scene") or "").upper() in {"", "MATERIAL_ADD_BUDGET"}
-        and text_id(item.get("task_id"))
-    ]
+        # A completed stop is stronger than an active-only response.  The
+        # platform frequently omits task_status and the client then inherits
+        # PROCESSING from the request filter. Only a later official resume log
+        # may open a new active cycle.
+        control_rows.append(
+            _guard_control_snapshot_after_confirmed_stop(
+                store,
+                target_uid,
+                snapshot,
+                observed_at=control_observed_at,
+            )
+        )
 
     active_material_rows = store.execute(
         "SELECT COUNT(1) AS count FROM pmc_promotion_material_latest "
@@ -1888,6 +1930,15 @@ def collect_target(
             request_retargeting_rule_evaluation("collection_completed")
     except Exception:
         logger.exception("官方 API 采集完成后唤醒追投规则失败 target=%s", target_uid)
+    try:
+        from services.regulation_rule_runner import (
+            request_regulation_rule_evaluation,
+        )
+
+        if not any_suspicious_empty:
+            request_regulation_rule_evaluation("collection_completed")
+    except Exception:
+        logger.exception("官方 API 采集完成后唤醒停投规则失败 target=%s", target_uid)
     try:
         cached_product_count = int(capability.get("product_count") or 0)
     except (TypeError, ValueError):

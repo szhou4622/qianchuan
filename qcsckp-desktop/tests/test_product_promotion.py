@@ -4,9 +4,9 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 # This module validates the retained browser compatibility adapter. Keep the
 # result deterministic even when the developer machine has selected the
@@ -33,6 +33,7 @@ from api.promotion_targets import (
     upsert_promotion_target,
 )
 from api.views import Api
+from api.dashboard import DashboardApi
 from api.rule_regulation_config import validate_rule_regulation_config
 from api.rule_retargeting_config import validate_strategy_target_compatibility
 from services.fetcher import QianChuanFetcher, build_qianchuan_url_by_params
@@ -67,10 +68,14 @@ from services.retargeting_service import (
     retarget_capability_matches,
 )
 from services.regulation_rule_runner import (
+    _RUNNER_WAKE,
+    _process_approved_stop_tasks,
     _revalidate_stop_candidate,
     _target_assist_sync_ready,
     has_completed_stop,
+    request_regulation_rule_evaluation,
 )
+from services.control_task_cycle import stop_cycle_state
 from services.run_services import _sync_discovered_product_targets
 from services.qianchuan_accounts import ensure_qianchuan_account
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
@@ -111,6 +116,37 @@ class ProductPromotionTests(unittest.TestCase):
         for backend_patch in reversed(self.backend_patches):
             backend_patch.stop()
         self.tmp.cleanup()
+
+    def test_regulation_rule_runner_accepts_immediate_collection_wake(self):
+        _RUNNER_WAKE.clear()
+        try:
+            self.assertTrue(
+                request_regulation_rule_evaluation("collection_completed")
+            )
+            self.assertTrue(_RUNNER_WAKE.is_set())
+        finally:
+            _RUNNER_WAKE.clear()
+
+    def test_regulation_dashboard_rows_include_data_source(self):
+        self.db.insert(
+            "pmc_roi2_assist_task",
+            {
+                "assist_task_id": "assist-dashboard",
+                "aadvid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-dashboard",
+                "ad_delivery_type": 0,
+                "data_source": "qianchuan_open_api",
+            },
+        )
+        dashboard = DashboardApi.__new__(DashboardApi)
+        dashboard.db = self.db
+        result = dashboard.get_roi2_assist_table_data(
+            ad_delivery_type=0,
+            regulation_full_scan=True,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual("qianchuan_open_api", result["data"][0]["data_source"])
 
     def _target(self, index, *, enabled=True, scene="product"):
         ensure_qianchuan_account(
@@ -1910,6 +1946,260 @@ class ProductPromotionTests(unittest.TestCase):
         )
         self.assertTrue(has_completed_stop(self.db, "target-left", "assist-1"))
         self.assertFalse(has_completed_stop(self.db, "target-right", "assist-1"))
+
+    def test_resumed_control_task_opens_a_new_stop_cycle_after_fresh_collection(self):
+        self.db.insert(
+            "pmc_regulation_run",
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "assist_task_id": "assist-1",
+                "started_at": "2026-09-02 10:00:00",
+                "ended_at": "2026-09-02 10:00:01",
+                "status": 1,
+                "execution_uid": "stop-cycle-1",
+                "execution_state": "confirmed_succeeded",
+                "step": "confirmed_succeeded",
+            },
+        )
+        stopped = stop_cycle_state(self.db, "target-left", "assist-1")
+        self.assertTrue(stopped["blocked"])
+        self.db.insert(
+            "account_operation_event",
+            {
+                "event_uid": "resume-event-1",
+                "platform_event_id": "platform-resume-1",
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "source": "qianchuan_open_api",
+                "action_type": "control_resume",
+                "object_type": "assist_task",
+                "regulate_task_id": "assist-1",
+                "status": "success",
+                "summary": "调控状态：已暂停 -> 调控中",
+                "occurred_at": "2026-09-02 10:05:00",
+            },
+        )
+        self.db.insert(
+            "pmc_roi2_assist_task",
+            {
+                "assist_task_id": "assist-1",
+                "aadvid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "ad_delivery_type": 0,
+                "ad_delivery_name": "PROCESSING",
+                "data_source": "qianchuan_open_api",
+            },
+        )
+        self.db.execute(
+            "UPDATE pmc_roi2_assist_task SET updated_at='2026-09-02 10:06:00' "
+            "WHERE target_uid='target-left' AND assist_task_id='assist-1'"
+        )
+        resumed = stop_cycle_state(self.db, "target-left", "assist-1")
+        self.assertFalse(resumed["blocked"])
+        self.assertEqual("resumed_cycle_ready", resumed["reason"])
+        self.assertNotEqual(stopped["cycle_key"], resumed["cycle_key"])
+        self.assertFalse(
+            has_completed_stop(
+                self.db,
+                "target-left",
+                "assist-1",
+                self.db.select_one(
+                    "pmc_roi2_assist_task",
+                    where={"target_uid": "target-left", "assist_task_id": "assist-1"},
+                ),
+            )
+        )
+        resumed_from_dashboard_shape = stop_cycle_state(
+            self.db,
+            "target-left",
+            "assist-1",
+            assist_row={
+                "assist_task_id": "assist-1",
+                "ad_delivery_type": 0,
+                "updated_at": "2026-09-02 10:06:00",
+            },
+        )
+        self.assertFalse(resumed_from_dashboard_shape["blocked"])
+        self.db.insert(
+            "pmc_regulation_run",
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "assist_task_id": "assist-1",
+                "started_at": "2026-09-02 10:08:00",
+                "ended_at": "2026-09-02 10:08:01",
+                "status": 1,
+                "execution_uid": "stop-cycle-2",
+                "execution_state": "confirmed_succeeded",
+                "step": "confirmed_succeeded",
+            },
+        )
+        second_stop = stop_cycle_state(self.db, "target-left", "assist-1")
+        self.assertTrue(second_stop["blocked"])
+        self.db.insert(
+            "account_operation_event",
+            {
+                "event_uid": "resume-event-2",
+                "platform_event_id": "platform-resume-2",
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "source": "qianchuan_open_api",
+                "action_type": "control_resume",
+                "regulate_task_id": "assist-1",
+                "status": "success",
+                "summary": "调控状态：已暂停 -> 调控中",
+                "occurred_at": "2026-09-02 10:09:00",
+            },
+        )
+        second_resume = stop_cycle_state(
+            self.db,
+            "target-left",
+            "assist-1",
+            assist_row={
+                "ad_delivery_type": 0,
+                "data_source": "qianchuan_open_api",
+                "updated_at": "2026-09-02 10:10:00",
+            },
+        )
+        self.assertFalse(second_resume["blocked"])
+        self.assertNotEqual(resumed["cycle_key"], second_resume["cycle_key"])
+
+    def test_resume_before_stop_or_without_fresh_collection_does_not_reopen_cycle(self):
+        self.db.insert(
+            "account_operation_event",
+            {
+                "event_uid": "resume-before-stop",
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "source": "qianchuan_open_api",
+                "action_type": "control_resume",
+                "regulate_task_id": "assist-1",
+                "status": "success",
+                "summary": "调控状态：已暂停 -> 调控中",
+                "occurred_at": "2026-09-02 09:59:00",
+            },
+        )
+        self.db.insert(
+            "pmc_regulation_run",
+            {
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "assist_task_id": "assist-1",
+                "started_at": "2026-09-02 10:00:00",
+                "ended_at": "2026-09-02 10:00:01",
+                "status": 1,
+            },
+        )
+        self.assertTrue(has_completed_stop(self.db, "target-left", "assist-1"))
+        self.db.insert(
+            "account_operation_event",
+            {
+                "event_uid": "resume-after-stop",
+                "aavid": "10001",
+                "ad_id": "20001",
+                "target_uid": "target-left",
+                "source": "qianchuan_open_api",
+                "action_type": "control_resume",
+                "regulate_task_id": "assist-1",
+                "status": "success",
+                "summary": "调控状态：已暂停 -> 调控中",
+                "occurred_at": "2026-09-02 10:05:00",
+            },
+        )
+        stale = stop_cycle_state(
+            self.db,
+            "target-left",
+            "assist-1",
+            assist_row={
+                "ad_delivery_type": 0,
+                "data_source": "qianchuan_open_api",
+                "updated_at": "2026-09-02 10:04:59",
+            },
+        )
+        self.assertTrue(stale["blocked"])
+        self.assertEqual("resume_waiting_fresh_collection", stale["reason"])
+
+    def test_old_stop_card_from_previous_cycle_never_submits(self):
+        @asynccontextmanager
+        async def unlocked(*_args, **_kwargs):
+            yield
+
+        task = {
+            "task_uid": "old-stop-card",
+            "claim_token": "claim-1",
+            "rule_snapshot": {
+                "id": "strategy-1",
+                "title": "停投策略",
+                "trigger": trigger("stat_cost_for_roi2_assist", "gt", 100),
+                "regulation_stop_action": "pause",
+            },
+            "trigger": trigger("stat_cost_for_roi2_assist", "gt", 100),
+            "target_uid": "target-1",
+            "assist_task_id": "assist-1",
+            "aavid": "10001",
+            "ad_id": "20001",
+            "promotion_scene": "live",
+            "regulation_stop_action": "pause",
+            "account_username": "owner-a",
+            "qianchuan_session_epoch": 1,
+            "control_cycle_key": "old-cycle",
+        }
+        report = Mock()
+        with patch(
+            "services.local_feishu_bridge.pull_local_stop_task",
+            side_effect=[
+                {"success": True, "data": task},
+                {"success": True, "data": None},
+            ],
+        ), patch(
+            "services.local_feishu_bridge.report_local_stop_task",
+            report,
+        ), patch(
+            "services.qianchuan_session.current_session_owner",
+            return_value="owner-a",
+        ), patch(
+            "services.regulation_rule_runner._revalidate_stop_candidate",
+            return_value=(
+                {"sanitized_page_url": ""},
+                {
+                    "assist_task_id": "assist-1",
+                    "ad_delivery_type": 0,
+                    "data_source": "qianchuan_open_api",
+                    "updated_at": "2026-09-02 10:10:00",
+                },
+                "global",
+                "",
+            ),
+        ), patch(
+            "services.regulation_rule_runner.stop_cycle_state",
+            return_value={
+                "blocked": False,
+                "reason": "resumed_cycle_ready",
+                "cycle_key": "new-cycle",
+            },
+        ), patch(
+            "services.regulation_rule_runner.exclusive_browser_operation",
+            unlocked,
+        ), patch(
+            "services.regulation_rule_runner.QianChuanRegulationStopService.from_rule_file_dict"
+        ) as service_factory:
+            asyncio.run(_process_approved_stop_tasks(self.db, max_tasks=2))
+        service_factory.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args[2] == "failed"
+                and "恢复周期已变化" in call.kwargs.get("message", "")
+                for call in report.call_args_list
+            )
+        )
 
     def test_enabled_stop_strategy_requires_target(self):
         ok, message = validate_rule_regulation_config(
