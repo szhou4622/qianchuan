@@ -88,6 +88,8 @@ from services.official_api_collection import (
 from services.official_api_execution import (
     OfficialApiRegulationStopService,
     OfficialApiRetargetingService,
+    _MaterialRetargetEvidenceCheckError,
+    _cached_material_retarget_evidence,
     _configured_control_task_base_name,
     classify_stop_status,
     _material_is_writable,
@@ -1802,6 +1804,244 @@ class _PublicInfoClient(_CaptureClient):
 
 
 class OfficialApiBackendTests(unittest.TestCase):
+    @staticmethod
+    def _seed_material_retarget_evidence(database, *, data_source="qianchuan_open_api"):
+        init_sqlite_schema(database=database)
+        store = SQLiteStore(database=database)
+        store.insert(
+            "qianchuan_account",
+            {
+                "account_uid": "account-1",
+                "owner_username": "owner-a",
+                "aavid": "10001",
+                "account_name": "test",
+            },
+        )
+        store.insert(
+            "promotion_target",
+            {
+                "target_uid": "target-1",
+                "account_uid": "account-1",
+                "aadvid": "10001",
+                "ad_id": "20002",
+                "promotion_scene": "live",
+                "plan_system": "global",
+            },
+        )
+        store.insert(
+            "pmc_roi2_assist_task",
+            {
+                "assist_task_id": "30003",
+                "aadvid": "10001",
+                "account_uid": "account-1",
+                "ad_id": "20002",
+                "target_uid": "target-1",
+                "promotion_scene": "live",
+                "plan_system": "global",
+                "data_source": data_source,
+            },
+        )
+        return store
+
+    def test_cached_material_retarget_evidence_uses_exact_owner_chain(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-stop-evidence-") as root:
+            database = os.path.join(root, "evidence.db")
+            store = self._seed_material_retarget_evidence(database)
+            with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "OWNER-A"}), patch(
+                "utils.sqlite_store.DB_FILE", database
+            ):
+                self.assertTrue(
+                    _cached_material_retarget_evidence(
+                        aavid="10001", ad_id="20002", task_id="30003"
+                    )
+                )
+                for kwargs in (
+                    {"aavid": "99999", "ad_id": "20002", "task_id": "30003"},
+                    {"aavid": "10001", "ad_id": "99999", "task_id": "30003"},
+                    {"aavid": "10001", "ad_id": "20002", "task_id": "99999"},
+                ):
+                    with self.subTest(**kwargs):
+                        self.assertFalse(_cached_material_retarget_evidence(**kwargs))
+            with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-b"}), patch(
+                "utils.sqlite_store.DB_FILE", database
+            ):
+                self.assertFalse(
+                    _cached_material_retarget_evidence(
+                        aavid="10001", ad_id="20002", task_id="30003"
+                    )
+                )
+            store.execute(
+                "UPDATE pmc_roi2_assist_task SET data_source='browser_legacy'"
+            )
+            with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-a"}), patch(
+                "utils.sqlite_store.DB_FILE", database
+            ):
+                self.assertFalse(
+                    _cached_material_retarget_evidence(
+                        aavid="10001", ad_id="20002", task_id="30003"
+                    )
+                )
+
+    def test_cached_material_retarget_evidence_rejects_stale_record(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-stop-stale-") as root:
+            database = os.path.join(root, "evidence.db")
+            store = self._seed_material_retarget_evidence(database)
+            store.execute(
+                "UPDATE pmc_roi2_assist_task SET updated_at=?",
+                ((datetime.now() - timedelta(minutes=11)).strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-a"}), patch(
+                "utils.sqlite_store.DB_FILE", database
+            ):
+                self.assertFalse(
+                    _cached_material_retarget_evidence(
+                        aavid="10001", ad_id="20002", task_id="30003"
+                    )
+                )
+
+    def test_cached_material_retarget_evidence_surfaces_query_failure(self):
+        with patch.dict(os.environ, {"QCSCKP_SESSION_OWNER": "owner-a"}), patch(
+            "utils.sqlite_store.SQLiteStore.execute",
+            side_effect=RuntimeError("broken schema"),
+        ):
+            with self.assertRaisesRegex(
+                _MaterialRetargetEvidenceCheckError, "场景证据查询失败"
+            ):
+                _cached_material_retarget_evidence(
+                    aavid="10001", ad_id="20002", task_id="30003"
+                )
+
+    def test_stop_missing_scene_with_fresh_evidence_submits_once(self):
+        service = Mock()
+        service.update_control_status.return_value = ApiResponse(
+            data={}, raw={"code": 0}, request_id="req-stop", request_uid="write-stop"
+        )
+        runner = OfficialApiRegulationStopService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan", return_value={}
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={"task_id": "30003", "status": "PROCESSING"},
+        ), patch(
+            "services.official_api_execution._cached_material_retarget_evidence",
+            return_value=True,
+        ), patch(
+            "services.official_api_reconciliation.reserve_execution_intent",
+            return_value=({}, True),
+        ), patch(
+            "services.official_api_reconciliation.enqueue_execution_reconciliation"
+        ), patch(
+            "services.official_api_reconciliation.start_official_api_reconciliation_background_thread"
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="global",
+                    execution_uid="stop-missing-scene",
+                )
+            )
+        self.assertTrue(result.success)
+        self.assertEqual("submitted_verifying", result.step)
+        service.update_control_status.assert_called_once()
+
+    def test_stop_evidence_check_failure_is_distinct_and_never_submits(self):
+        service = Mock()
+        runner = OfficialApiRegulationStopService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan", return_value={}
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={"task_id": "30003", "status": "PROCESSING"},
+        ), patch(
+            "services.official_api_execution._cached_material_retarget_evidence",
+            side_effect=_MaterialRetargetEvidenceCheckError("broken schema"),
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="global",
+                    execution_uid="stop-evidence-error",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("场景证据校验异常", result.message)
+        service.update_control_status.assert_not_called()
+
+    def test_stop_missing_scene_without_fresh_evidence_never_submits(self):
+        service = Mock()
+        runner = OfficialApiRegulationStopService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan", return_value={}
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={"task_id": "30003", "status": "PROCESSING"},
+        ), patch(
+            "services.official_api_execution._cached_material_retarget_evidence",
+            return_value=False,
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="global",
+                    execution_uid="stop-missing-evidence",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("10分钟内的素材追投记录", result.message)
+        service.update_control_status.assert_not_called()
+
+    def test_stop_explicit_wrong_scene_never_submits(self):
+        service = Mock()
+        runner = OfficialApiRegulationStopService()
+        with patch(
+            "services.official_api_execution.get_official_api_service",
+            return_value=service,
+        ), patch(
+            "services.official_api_execution._check_plan", return_value={}
+        ), patch(
+            "services.official_api_execution._find_control_task",
+            return_value={
+                "task_id": "30003",
+                "scene": "OTHER_SCENE",
+                "status": "PROCESSING",
+            },
+        ):
+            result = asyncio.run(
+                runner.run(
+                    aavid=10001,
+                    ad_id=20002,
+                    assist_task_id="30003",
+                    stop_action="pause",
+                    promotion_scene="live",
+                    plan_system="global",
+                    execution_uid="stop-wrong-scene",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertIn("不是素材追投调控任务", result.message)
+        service.update_control_status.assert_not_called()
+
     def test_stop_rate_limit_retries_at_most_three_attempts(self):
         service = Mock()
         service.update_control_status.side_effect = [

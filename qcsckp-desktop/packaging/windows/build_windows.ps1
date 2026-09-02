@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$Version,
     [Parameter(Mandatory=$true)][ValidateSet('production','development','stable')][string]$Channel,
     [int]$BuildRevision = 1,
-    [string]$PythonPath = ''
+    [string]$PythonPath = '',
+    [switch]$SkipArchive
 )
 
 $ErrorActionPreference = "Stop"
@@ -200,6 +201,13 @@ if ($LASTEXITCODE -ne 0) {
 $exePath = Join-Path $releaseDir "$appName.exe"
 if (-not (Test-Path -LiteralPath $exePath)) {
     throw "The built executable was not found: $exePath"
+}
+
+if ($SkipArchive) {
+    Write-Output "RELEASE_DIR=$releaseDir"
+    Write-Output "EXE_PATH=$exePath"
+    Write-Output "ARCHIVE_SKIPPED=true"
+    return
 }
 
 $zipPath = Join-Path $outputRoot "$releaseName.zip"

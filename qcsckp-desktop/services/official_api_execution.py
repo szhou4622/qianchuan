@@ -30,6 +30,10 @@ from services.qianchuan_open_api.runtime import get_official_api_service
 CONTROL_TASK_NAME_MAX_LENGTH = 50
 
 
+class _MaterialRetargetEvidenceCheckError(RuntimeError):
+    """The local fail-closed scene evidence could not be evaluated safely."""
+
+
 def _existing_reconciliation(execution_uid: Optional[str]) -> Optional[dict[str, Any]]:
     """Return a previously submitted immutable execution, if any.
 
@@ -68,11 +72,14 @@ def _cached_material_retarget_evidence(
 
         owner = str(current_session_owner() or "").strip().casefold()
         if not owner:
-            return False
+            raise _MaterialRetargetEvidenceCheckError("当前工具账号为空")
         rows = SQLiteStore().execute(
             "SELECT t.updated_at FROM pmc_roi2_assist_task t "
             "JOIN promotion_target p ON p.target_uid=t.target_uid "
-            "WHERE p.account_username=? AND t.aadvid=? AND t.ad_id=? "
+            "JOIN qianchuan_account q ON q.account_uid=p.account_uid "
+            "WHERE LOWER(q.owner_username)=? "
+            "AND q.aavid=t.aadvid AND p.aadvid=t.aadvid AND p.ad_id=t.ad_id "
+            "AND t.aadvid=? AND t.ad_id=? "
             "AND t.assist_task_id=? AND t.data_source='qianchuan_open_api' "
             "ORDER BY t.updated_at DESC LIMIT 1",
             (owner, text_id(aavid), text_id(ad_id), text_id(task_id)),
@@ -82,8 +89,10 @@ def _cached_material_retarget_evidence(
             return False
         updated = datetime.strptime(str(rows[0].get("updated_at") or ""), "%Y-%m-%d %H:%M:%S")
         return datetime.now() - updated <= timedelta(minutes=10)
-    except Exception:
-        return False
+    except _MaterialRetargetEvidenceCheckError:
+        raise
+    except Exception as exc:
+        raise _MaterialRetargetEvidenceCheckError("本地素材追投场景证据查询失败") from exc
 
 
 def _now() -> str:
@@ -840,12 +849,19 @@ class OfficialApiRegulationStopService:
             exact_scene = str(exact.get("scene") or "").upper()
             if exact_scene and exact_scene != "MATERIAL_ADD_BUDGET":
                 raise RuntimeError("目标不是素材追投调控任务，已禁止操作")
-            if not exact_scene and not _cached_material_retarget_evidence(
-                aavid=aavid,
-                ad_id=ad_id,
-                task_id=assist_task_id,
-            ):
-                raise RuntimeError("调控任务缺少场景证据，且本地没有10分钟内的素材追投记录，已禁止操作")
+            if not exact_scene:
+                try:
+                    has_fresh_material_evidence = _cached_material_retarget_evidence(
+                        aavid=aavid,
+                        ad_id=ad_id,
+                        task_id=assist_task_id,
+                    )
+                except _MaterialRetargetEvidenceCheckError as exc:
+                    raise RuntimeError(
+                        "调控任务场景证据校验异常，未向千川提交停投"
+                    ) from exc
+                if not has_fresh_material_evidence:
+                    raise RuntimeError("调控任务缺少场景证据，且本地没有10分钟内的素材追投记录，已禁止操作")
             current_status = str(exact.get("status") or "").upper()
             if current_status in {"DISABLE", "DISABLED", "FINISHED", "ENDED"}:
                 message = "调控任务已经暂停" if opt_type == "PAUSE" else "调控任务已经结束"
