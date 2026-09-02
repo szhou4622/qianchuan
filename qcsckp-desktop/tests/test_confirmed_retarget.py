@@ -1413,8 +1413,33 @@ class RetargetWorkerValidationTests(unittest.TestCase):
     def test_strategy_change_blocks_execution(self):
         changed = copy.deepcopy(self.strategy)
         changed["retargeting"]["volume"]["total_budget_yuan"] = 200
-        with self.assertRaisesRegex(RuntimeError, "策略参数已经变更"):
+        with self.assertRaisesRegex(
+            retarget_task_worker.RetargetTaskInvalidated,
+            "策略参数已经变更",
+        ):
             self.validate(current_strategy=changed)
+
+    def test_strategy_change_returns_invalidated_without_platform_write(self):
+        with patch(
+            "services.retarget_task_worker._validate_task",
+            side_effect=retarget_task_worker.RetargetTaskInvalidated(
+                "追投策略参数已经变更"
+            ),
+        ), patch(
+            "services.retarget_task_worker._insert_run"
+        ) as insert_run, patch(
+            "services.retarget_task_worker.QianChuanRetargetingService.from_rule_file_dict"
+        ) as service_factory:
+            result = asyncio.run(
+                retarget_task_worker._execute_task(self.task, object())
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["invalidated"])
+        self.assertEqual("strategy_invalidated", result["step"])
+        self.assertIn("未向千川提交", result["message"])
+        insert_run.assert_not_called()
+        service_factory.assert_not_called()
 
     def test_account_mismatch_blocks_execution(self):
         with self.assertRaisesRegex(RuntimeError, "账户.*广告ID"):

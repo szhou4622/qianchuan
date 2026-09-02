@@ -422,6 +422,131 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertEqual(task_uid, pulled["task_uid"])
         self.assertEqual("tool-user-a", pulled["account_username"])
 
+    def test_strategy_save_invalidates_old_card_and_releases_dedupe(self):
+        payload = task_payload(2)
+        created = bridge.create_local_retarget_task(payload)
+        self.assertTrue(created["success"])
+        old_uid = created["data"]["task_uid"]
+        old_row = bridge._task_row(old_uid, "tool-user-a")
+
+        invalidated = bridge.invalidate_stale_local_retarget_tasks(
+            {"strategy-1": "b" * 64},
+            config_enabled=True,
+            account_username="tool-user-a",
+        )
+
+        self.assertTrue(invalidated["success"])
+        self.assertEqual(1, invalidated["count"])
+        saved = bridge._task_row(old_uid, "tool-user-a")
+        self.assertEqual("invalidated", saved["status"])
+        self.assertIsNone(saved["active_dedupe_key"])
+        self.assertIn("未向千川提交", saved["result_message"])
+        raw = json.dumps(
+            bridge.build_local_task_card(bridge._task_payload(saved)),
+            ensure_ascii=False,
+        )
+        self.assertIn("策略已更新，本卡失效", raw)
+        self.assertIn("未向千川提交", raw)
+        self.assertNotIn("确认追投", raw)
+
+        click_old = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=old_uid,
+            nonce=old_row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(click_old["success"])
+        self.assertIn("未向千川提交", click_old["message"])
+        self.assertIsNone(bridge.pull_local_retarget_task()["data"])
+
+        fresh_payload = {**payload, "strategy_hash": "b" * 64}
+        fresh = bridge.create_local_retarget_task(fresh_payload)
+        self.assertTrue(fresh["success"])
+        self.assertFalse(fresh.get("duplicate", False))
+        unchanged = bridge.invalidate_stale_local_retarget_tasks(
+            {"strategy-1": "b" * 64},
+            config_enabled=True,
+            account_username="tool-user-a",
+        )
+        self.assertEqual(0, unchanged["count"])
+        fresh_row = bridge._task_row(fresh["data"]["task_uid"], "tool-user-a")
+        self.assertEqual("pending", fresh_row["status"])
+
+    def test_strategy_invalidation_only_changes_safe_unclaimed_states(self):
+        def create(strategy_id: str, strategy_hash: str) -> tuple[str, dict]:
+            payload = {
+                **task_payload(1),
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_id,
+                "strategy_hash": strategy_hash,
+            }
+            result = bridge.create_local_retarget_task(payload)
+            self.assertTrue(result["success"])
+            task_uid = result["data"]["task_uid"]
+            return task_uid, bridge._task_row(task_uid, "tool-user-a")
+
+        approved_uid, approved_row = create("approved", "a" * 64)
+        approved = bridge.handle_local_card_action(
+            "tool-user-a",
+            task_uid=approved_uid,
+            nonce=approved_row["action_nonce"],
+            action="approve",
+            operator_open_id="ou_owner",
+        )
+        self.assertTrue(approved["success"])
+        claimed_uid, _ = create("claimed", "b" * 64)
+        verifying_uid, _ = create("verifying", "c" * 64)
+        keep_uid, _ = create("keep", "d" * 64)
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='claimed' WHERE task_uid=?",
+                (claimed_uid,),
+            )
+            conn.execute(
+                "UPDATE local_retarget_task SET status='verifying' WHERE task_uid=?",
+                (verifying_uid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = bridge.invalidate_stale_local_retarget_tasks(
+            {"keep": "d" * 64},
+            config_enabled=True,
+            account_username="tool-user-a",
+        )
+
+        self.assertEqual(1, result["count"])
+        self.assertEqual(
+            "invalidated",
+            bridge._task_row(approved_uid, "tool-user-a")["status"],
+        )
+        self.assertEqual(
+            "claimed",
+            bridge._task_row(claimed_uid, "tool-user-a")["status"],
+        )
+        self.assertEqual(
+            "verifying",
+            bridge._task_row(verifying_uid, "tool-user-a")["status"],
+        )
+        self.assertEqual(
+            "pending",
+            bridge._task_row(keep_uid, "tool-user-a")["status"],
+        )
+
+        disabled = bridge.invalidate_stale_local_retarget_tasks(
+            {"keep": "d" * 64},
+            config_enabled=False,
+            account_username="tool-user-a",
+        )
+        self.assertEqual(1, disabled["count"])
+        self.assertEqual(
+            "invalidated",
+            bridge._task_row(keep_uid, "tool-user-a")["status"],
+        )
+
     def test_stop_card_shows_complete_strategy_and_task_metric_snapshot(self):
         payload = self._stop_payload()
         trigger = payload["trigger"]

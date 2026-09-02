@@ -1497,18 +1497,47 @@ class Api:
                 }
         saved = merge_and_save(merged)
         runtime = None
+        invalidated_cards = 0
+        card_invalidation_warning = ""
         if QIANCHUAN_BACKEND == "official_api":
+            from services.local_feishu_bridge import (
+                invalidate_stale_local_retarget_tasks,
+            )
             from services.qianchuan_open_api.runtime_settings import (
                 enable_execution_for_saved_rules,
             )
+            from services.retarget_task_worker import _strategy_hash
             from services.retargeting_rule_runner import (
                 request_retargeting_rule_evaluation,
             )
+            from utils.log import logger
 
             runtime = enable_execution_for_saved_rules(saved)
+            try:
+                current_hashes = {
+                    str(strategy.get("id") or ""): _strategy_hash(strategy)
+                    for strategy in saved.get("strategies") or []
+                    if isinstance(strategy, dict)
+                    and str(strategy.get("id") or "").strip()
+                }
+                invalidation_result = invalidate_stale_local_retarget_tasks(
+                    current_hashes,
+                    config_enabled=bool(saved.get("enabled")),
+                )
+                invalidated_cards = int(
+                    invalidation_result.get("count") or 0
+                )
+            except Exception as exc:
+                card_invalidation_warning = (
+                    "策略已保存，但旧卡状态刷新失败；执行前仍会安全复核"
+                )
+                logger.exception("追投策略保存后刷新旧卡状态失败: %s", exc)
             request_retargeting_rule_evaluation("rule_saved")
         out = dict(saved)
         out["success"] = True
+        out["invalidatedCardCount"] = invalidated_cards
+        if card_invalidation_warning:
+            out["cardInvalidationWarning"] = card_invalidation_warning
         if runtime is not None:
             out["officialApiWritesEnabled"] = bool(
                 runtime.get("allow_live_api_writes")

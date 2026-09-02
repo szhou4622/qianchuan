@@ -206,6 +206,7 @@ class OfficialApiRuntimeSettingsTests(unittest.TestCase):
             "enabled": True,
             "strategies": [
                 {
+                    "id": "strategy-one",
                     "target_uid": "target-one",
                     "account_uid": "account-one",
                     "action_mode": "auto_execute",
@@ -246,6 +247,14 @@ class OfficialApiRuntimeSettingsTests(unittest.TestCase):
                 return_value={"allow_live_api_writes": True},
             ) as enable_writes,
             patch(
+                "services.retarget_task_worker._strategy_hash",
+                return_value="a" * 64,
+            ) as strategy_hash,
+            patch(
+                "services.local_feishu_bridge.invalidate_stale_local_retarget_tasks",
+                return_value={"success": True, "count": 2, "task_uids": ["1", "2"]},
+            ) as invalidate_cards,
+            patch(
                 "services.retargeting_rule_runner.request_retargeting_rule_evaluation",
                 return_value=True,
             ) as wake_runner,
@@ -254,7 +263,13 @@ class OfficialApiRuntimeSettingsTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertTrue(result["officialApiWritesEnabled"])
+        self.assertEqual(2, result["invalidatedCardCount"])
         enable_writes.assert_called_once_with(merged)
+        strategy_hash.assert_called_once_with(merged["strategies"][0])
+        invalidate_cards.assert_called_once_with(
+            {"strategy-one": "a" * 64},
+            config_enabled=True,
+        )
         wake_runner.assert_called_once_with("rule_saved")
 
 

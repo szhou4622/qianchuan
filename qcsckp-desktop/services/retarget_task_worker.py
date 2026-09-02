@@ -59,6 +59,23 @@ _WORKER_THREAD: Optional[threading.Thread] = None
 _WORKER_STOP = threading.Event()
 
 
+class RetargetTaskInvalidated(RuntimeError):
+    """The frozen card no longer matches the user's saved strategy."""
+
+
+def _strategy_invalidated_result(exc: BaseException) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "invalidated": True,
+        "message": (
+            "策略已更新，本卡失效，未向千川提交；"
+            "请使用最新策略生成的新提醒"
+        ),
+        "detail": str(exc or "追投策略已更新"),
+        "step": "strategy_invalidated",
+    }
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -233,7 +250,7 @@ def _save_local_task(
     }
     if status == "executing":
         data["claimed_at"] = _now()
-    if status in ("succeeded", "failed"):
+    if status in ("succeeded", "failed", "invalidated"):
         data["finished_at"] = _now()
     db.insert_or_update("cloud_retarget_task_local", data, unique_fields=["cloud_task_id"])
 
@@ -410,6 +427,8 @@ async def _execute_grouped_task(
             unique_material_ids,
             _task_candidate_material_ids(task),
         )
+    except RetargetTaskInvalidated as exc:
+        return _strategy_invalidated_result(exc)
     except Exception as exc:
         return {
             "success": False,
@@ -487,19 +506,19 @@ def _validate_task(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
     cfg = load_rule_retargeting_config()
     if not cfg.get("enabled"):
-        raise RuntimeError("规则化追投已关闭")
+        raise RetargetTaskInvalidated("规则化追投已关闭")
     strategy_id = str(task.get("strategy_id") or "")
     strategy = _find_strategy(cfg, strategy_id)
     if not strategy:
-        raise RuntimeError("追投策略已删除")
+        raise RetargetTaskInvalidated("追投策略已删除")
     if str(strategy.get("action_mode") or "card_confirm") != "card_confirm":
-        raise RuntimeError("追投策略的执行方式已经变更")
+        raise RetargetTaskInvalidated("追投策略的执行方式已经变更")
     expected_hash = str(task.get("strategy_hash") or "")
     task_snapshot = task.get("rule_snapshot") if isinstance(task.get("rule_snapshot"), dict) else {}
     if not task_snapshot or _snapshot_hash(task_snapshot) != expected_hash:
         raise RuntimeError("云端追投策略快照校验失败")
     if not _strategy_matches_task_snapshot(strategy, task_snapshot, expected_hash):
-        raise RuntimeError("追投策略参数已经变更，请等待新提醒")
+        raise RetargetTaskInvalidated("追投策略参数已经变更")
 
     aavid = str(task.get("aavid") or "")
     ad_id = str(task.get("ad_id") or "")
@@ -836,15 +855,15 @@ def _validate_budget_increase_task(
     """Re-read and validate a control task before adjusting its budget."""
     cfg = load_rule_retargeting_config()
     if not cfg.get("enabled"):
-        raise RuntimeError("规则化追投已关闭")
+        raise RetargetTaskInvalidated("规则化追投已关闭")
     strategy_id = str(task.get("strategy_id") or "")
     strategy = _find_strategy(cfg, strategy_id)
     if not strategy:
-        raise RuntimeError("追加预算策略已删除")
+        raise RetargetTaskInvalidated("追加预算策略已删除")
     if str(strategy.get("task_action") or "create_retarget") != "increase_budget":
-        raise RuntimeError("策略已不再执行追加预算")
+        raise RetargetTaskInvalidated("策略已不再执行追加预算")
     if str(strategy.get("action_mode") or "card_confirm") != "card_confirm":
-        raise RuntimeError("策略执行方式已经变更")
+        raise RetargetTaskInvalidated("策略执行方式已经变更")
     expected_hash = str(task.get("strategy_hash") or "")
     task_snapshot = (
         task.get("rule_snapshot")
@@ -854,7 +873,7 @@ def _validate_budget_increase_task(
     if not task_snapshot or _snapshot_hash(task_snapshot) != expected_hash:
         raise RuntimeError("追加预算策略快照校验失败")
     if _strategy_hash(strategy) != expected_hash:
-        raise RuntimeError("追加预算策略已经修改，请等待新的提醒")
+        raise RetargetTaskInvalidated("追加预算策略已经修改")
 
     target_uid = str(task.get("target_uid") or "")
     aavid = str(task.get("aavid") or "")
@@ -1135,6 +1154,8 @@ async def _execute_budget_increase_task(
                 "step": "platform_capability_unverified",
                 "calculation": calculation,
             }
+    except RetargetTaskInvalidated as exc:
+        return _strategy_invalidated_result(exc)
     except Exception as exc:
         return {
             "success": False,
@@ -1182,6 +1203,8 @@ async def _execute_task(
             cfg, strategy, rows = await asyncio.to_thread(_validate_task, task, db)
         else:
             cfg, strategy, rows = _prevalidated
+    except RetargetTaskInvalidated as exc:
+        return _strategy_invalidated_result(exc)
     except Exception as exc:
         failure = {"success": False, "message": str(exc), "detail": traceback.format_exc(), "step": "revalidate"}
         ended_at = _now()
@@ -1546,7 +1569,11 @@ async def run_worker_loop() -> None:
             task_uid = str(task.get("task_uid") or "")
             claim_token = str(task.get("claim_token") or "")
             cached = _local_task(db, task_uid)
-            if cached and str(cached.get("status")) in ("succeeded", "failed"):
+            if cached and str(cached.get("status")) in (
+                "succeeded",
+                "failed",
+                "invalidated",
+            ):
                 await asyncio.to_thread(_cached_report, task_uid, claim_token, cached)
                 continue
             if cached and str(cached.get("status")) == "executing":
@@ -1607,7 +1634,11 @@ async def run_worker_loop() -> None:
             final_status = (
                 "verifying"
                 if pending_verification
-                else ("succeeded" if result.get("success") else "failed")
+                else (
+                    "invalidated"
+                    if result.get("invalidated")
+                    else ("succeeded" if result.get("success") else "failed")
+                )
             )
             _save_local_task(db, task_uid, final_status, result, task)
             await asyncio.to_thread(

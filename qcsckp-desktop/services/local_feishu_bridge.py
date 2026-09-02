@@ -20,7 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -31,7 +31,14 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 PROFILE_FILE = os.path.join(DATA_DIR, "feishu_local_profiles.json")
-TERMINAL_STATUSES = {"succeeded", "failed", "rejected", "expired", "cancelled"}
+TERMINAL_STATUSES = {
+    "succeeded",
+    "failed",
+    "rejected",
+    "expired",
+    "cancelled",
+    "invalidated",
+}
 ACTIVE_STATUSES = {"pending", "approved_queued", "claimed", "executing"}
 VERIFYING_STATUSES = {"verifying"}
 MAX_RETARGET_GROUPS = 20
@@ -1107,6 +1114,7 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         "verifying": "已提交，正在核验",
         "succeeded": "追投成功",
         "failed": "追投失败",
+        "invalidated": "策略已更新，本卡失效",
         "rejected": "已暂不追投",
         "expired": "已过期",
         "cancelled": "已取消",
@@ -1117,6 +1125,7 @@ def build_task_card(task: Dict[str, Any], *, expanded: bool = False) -> Dict[str
         elif status == "cancelled" and task.get("selection_snapshot"):
             status_text = "测试完成"
     template = "green" if status == "succeeded" else (
+        "orange" if status == "invalidated" else
         "red" if status in {"failed", "expired", "rejected"} else "blue"
     )
     if preview_only and status == "cancelled" and task.get("selection_snapshot"):
@@ -1661,12 +1670,14 @@ def build_budget_increase_task_card(
         "executing": "正在复核并追加预算",
         "succeeded": "追加预算成功",
         "failed": "追加预算失败",
+        "invalidated": "策略已更新，本卡失效",
         "rejected": "已暂不追加",
         "expired": "已过期",
         "cancelled": "已取消",
     }.get(status, status)
     template = (
         "green" if status == "succeeded"
+        else "orange" if status == "invalidated"
         else "red" if status in {"failed", "expired", "rejected"}
         else "blue"
     )
@@ -2981,6 +2992,93 @@ def cancel_active_local_retarget_tasks(
     return len(task_uids)
 
 
+def invalidate_stale_local_retarget_tasks(
+    strategy_hashes: Mapping[str, str],
+    *,
+    config_enabled: bool,
+    account_username: str = "",
+) -> Dict[str, Any]:
+    """Invalidate unclaimed cards whose frozen strategy no longer matches.
+
+    Claimed/executing/verifying tasks are intentionally left to the worker's
+    execution-time revalidation because a platform write may already be in
+    flight.  Pending and approved-but-unclaimed tasks are safe to terminate
+    atomically and release their active dedupe key for a fresh reminder.
+    """
+    account = _account_key(account_username or _MANAGER.account)
+    if not account:
+        return {"success": True, "count": 0, "task_uids": []}
+    normalized_hashes = {
+        str(strategy_id or "").strip(): str(strategy_hash or "").strip()
+        for strategy_id, strategy_hash in dict(strategy_hashes or {}).items()
+        if str(strategy_id or "").strip()
+        and re.fullmatch(r"[a-f0-9]{64}", str(strategy_hash or "").strip())
+    }
+    now_text = _dt(_now())
+    changed: List[str] = []
+    conn = _db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT task_uid,status,payload_json FROM local_retarget_task "
+            "WHERE account_username=? AND action_type='retarget' "
+            "AND status IN ('pending','approved_queued')",
+            (account,),
+        ).fetchall()
+        for row in rows:
+            payload = _loads(row["payload_json"], {})
+            if not isinstance(payload, dict):
+                continue
+            strategy_id = str(payload.get("strategy_id") or "").strip()
+            frozen_hash = str(payload.get("strategy_hash") or "").strip()
+            current_hash = normalized_hashes.get(strategy_id, "")
+            if config_enabled and current_hash and current_hash == frozen_hash:
+                continue
+            if not config_enabled:
+                reason = "追投规则已关闭"
+            elif not current_hash:
+                reason = "追投策略已删除"
+            else:
+                reason = "追投策略已更新"
+            message = (
+                "策略已更新，本卡失效，未向千川提交；"
+                "请使用最新策略生成的新提醒"
+            )
+            result = {
+                "success": False,
+                "invalidated": True,
+                "step": "strategy_invalidated",
+                "message": message,
+                "reason": reason,
+            }
+            updated = conn.execute(
+                "UPDATE local_retarget_task SET status='invalidated',"
+                "active_dedupe_key=NULL,claim_token=NULL,claim_expires_at=NULL,"
+                "claimed_at=NULL,result_message=?,result_detail=?,result_json=?,"
+                "finished_at=?,updated_at=? WHERE task_uid=? "
+                "AND account_username=? AND status IN ('pending','approved_queued')",
+                (
+                    message,
+                    reason,
+                    _json(result),
+                    now_text,
+                    now_text,
+                    str(row["task_uid"]),
+                    account,
+                ),
+            )
+            if updated.rowcount == 1:
+                changed.append(str(row["task_uid"]))
+        conn.commit()
+    finally:
+        conn.close()
+    bridge = _MANAGER.bridge() if _MANAGER.account == account else None
+    if bridge is not None:
+        for task_uid in changed:
+            _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
+    return {"success": True, "count": len(changed), "task_uids": changed}
+
+
 def _create_local_retarget_task_for(
     account_username: str,
     bridge: LocalFeishuBridge,
@@ -3631,6 +3729,12 @@ def handle_local_card_action(
         }
     if action == "view":
         return {"success": True, "message": "已展开详情", "update": True, "expanded": True}
+    if str(row.get("status") or "") == "invalidated":
+        return {
+            "success": True,
+            "message": "策略已更新，本卡已失效，未向千川提交",
+            "update": True,
+        }
     if str(row.get("action_type") or "retarget") == "stop":
         return _handle_local_stop_card_action(
             account,
@@ -4063,7 +4167,13 @@ def report_local_retarget_task(
     regulate_task_id: str = "",
     result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    if status not in {"executing", "verifying", "succeeded", "failed"}:
+    if status not in {
+        "executing",
+        "verifying",
+        "succeeded",
+        "failed",
+        "invalidated",
+    }:
         return {"success": False, "message": "本地任务状态无效"}
     row = _task_row(task_uid)
     if not row:
