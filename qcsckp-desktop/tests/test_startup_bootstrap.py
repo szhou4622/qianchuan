@@ -97,6 +97,43 @@ class StartupBootstrapTests(unittest.TestCase):
                 self.assertNotIn("token-value", text)
                 self.assertIn("<redacted>", text)
 
+    def test_startup_redaction_removes_paths_urls_cookies_and_business_ids(self):
+        raw = (
+            r"C:\Users\RealName\AppData\Local\QCSCKP\logs\startup.log "
+            "https://example.test/path?token=private Cookie: sessionid=private-value\n"
+            "advertiser 1862251436023940"
+        )
+        safe = bootstrap._redact(raw)
+        for private in (
+            "RealName",
+            "example.test",
+            "private-value",
+            "1862251436023940",
+        ):
+            self.assertNotIn(private, safe)
+        self.assertIn("<local-path>", safe)
+        self.assertIn("<url>", safe)
+        self.assertIn("<business-id>", safe)
+
+    def test_startup_state_contains_release_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "release.json").write_text(
+                json.dumps(
+                    {
+                        "version": "0.1.66",
+                        "channel": "production",
+                        "build_revision": 16,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(bootstrap, "_app_root", return_value=root):
+                state = bootstrap._state_payload("ready")
+            self.assertEqual("0.1.66", state["version"])
+            self.assertEqual("production", state["channel"])
+            self.assertEqual(16, state["build_revision"])
+
     def test_windows_build_uses_bootstrap_and_signed_webview_installer(self):
         root = Path(__file__).resolve().parents[1]
         script = (root / "packaging/windows/build_windows.ps1").read_text(
@@ -106,6 +143,23 @@ class StartupBootstrapTests(unittest.TestCase):
         self.assertIn('LinkId=2124703', script)
         self.assertIn('Get-AuthenticodeSignature', script)
         self.assertIn('PACKAGE-MANIFEST.json', script)
+
+    def test_native_updater_requires_ready_handshake_and_rolls_back(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "packaging/windows/apply_channel_update.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("startup-state", script)
+        self.assertIn("phase -eq 'ready'", script)
+        self.assertIn("build_revision", script)
+        self.assertIn("New version did not reach ready state", script)
+        self.assertIn("Stop-Process -Id $newProcess.Id", script)
+
+    def test_gui_startup_exception_is_reraised_for_bootstrap(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "gui_app.py").read_text(encoding="utf-8")
+        self.assertIn('except Exception as e:', source)
+        self.assertIn('traceback.print_exc()\n        raise', source)
 
 
 if __name__ == "__main__":

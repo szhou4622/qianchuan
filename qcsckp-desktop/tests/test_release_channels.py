@@ -216,7 +216,9 @@ class Updates(Isolated):
         (payload/"bin").mkdir(parents=True)
         (payload/"QCSCKP.exe").write_bytes(b"new-exe")
         (payload/"bin/value").write_bytes(b"new-bin")
-        runtime.atomic_json(payload/"PACKAGE-MANIFEST.json",{})
+        runtime.atomic_json(payload/"PACKAGE-MANIFEST.json",{
+            "app_name":"QCSCKP","channel":"production","version":"0.1.66","build_revision":16
+        })
         context=stage/"context.json"
         runtime.atomic_json(context,{"root":str(root),"stage":str(stage),"payload":str(payload),"old_pid":0})
         helper=Path(__file__).resolve().parents[1]/"packaging/windows/apply_channel_update.ps1"

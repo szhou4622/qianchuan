@@ -816,6 +816,7 @@ class OfficialApiRegulationStopService:
         plan_system: str = "unknown",
         execution_uid: Optional[str] = None,
         reconciliation_task_uid: Optional[str] = None,
+        control_cycle_key: str = "",
         **_: Any,
     ) -> Any:
         from services.regulation_service import RegulationRunResult
@@ -884,6 +885,7 @@ class OfficialApiRegulationStopService:
                     "task_id": text_id(assist_task_id),
                     "expected_status": opt_type,
                     "execution_uid": intent_key,
+                    "control_cycle_key": str(control_cycle_key or ""),
                 },
             )
             if not intent_reserved:
@@ -896,7 +898,20 @@ class OfficialApiRegulationStopService:
                         else "该停投已有提交记录，已禁止重复提交，请等待核验或人工检查"
                     ),
                     existing_status,
-                    str(intent.get("last_error") or ""),
+                    json.dumps(
+                        {
+                            "reconciliation_uid": str(
+                                intent.get("reconciliation_uid") or ""
+                            ),
+                            "idempotency_key": str(
+                                intent.get("idempotency_key") or intent_key
+                            ),
+                            "status": existing_status,
+                            "control_cycle_key": str(control_cycle_key or ""),
+                            "error": str(intent.get("last_error") or ""),
+                        },
+                        ensure_ascii=False,
+                    ),
                     text_id(aavid),
                     text_id(ad_id),
                     text_id(assist_task_id),
@@ -955,6 +970,7 @@ class OfficialApiRegulationStopService:
                     "task_id": text_id(assist_task_id),
                     "expected_status": opt_type,
                     "execution_uid": intent_key,
+                    "control_cycle_key": str(control_cycle_key or ""),
                 },
             )
             start_official_api_reconciliation_background_thread()
@@ -1015,6 +1031,7 @@ class OfficialApiRegulationStopService:
                             "task_id": text_id(assist_task_id),
                             "expected_status": opt_type,
                             "execution_uid": intent_key,
+                            "control_cycle_key": str(control_cycle_key or ""),
                         },
                     )
                     start_official_api_reconciliation_background_thread()

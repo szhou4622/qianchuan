@@ -259,7 +259,7 @@
 
     <div class="notice">
         <span aria-hidden="true">ⓘ</span>
-        <p><strong>工具必须保持运行。</strong> 工具关闭期间点击卡片不会执行；重新打开并显示“已连接”后，在有效期内重新点击即可。</p>
+        <p><strong>工具必须保持运行。</strong> 工具关闭期间点击卡片不会执行；重新打开并显示“已连接”后，在有效期内重新点击即可。<br><span id="outboxState">消息队列：正在读取</span></p>
     </div>
 
     <div class="grid">
@@ -476,6 +476,15 @@
         ui('groupsState').textContent = groups.length ? ('已绑定 ' + groups.length + ' 个群') : '尚未绑定群';
         ui('groupCodeBtn').disabled = !owner;
         ui('testCard').disabled = !latest.connected || !owner;
+        const outbox = latest.outbox || {};
+        const queued = Number(outbox.queued || 0);
+        const sending = Number(outbox.sending || 0);
+        const failed = Number(outbox.failed || 0);
+        ui('outboxState').textContent = failed
+            ? ('消息队列：' + failed + '条永久失败，请导出失败报告')
+            : (queued || sending)
+                ? ('消息队列：待发' + queued + '条，发送中' + sending + '条')
+                : '消息队列：无积压';
         if (latest.last_card_action_at) {
             feedback(
                 'actionFeedback',

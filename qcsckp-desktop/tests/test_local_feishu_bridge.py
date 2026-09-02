@@ -435,6 +435,22 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertFalse(second.get("duplicate", False))
         self.assertNotEqual(first["data"]["task_uid"], second["data"]["task_uid"])
 
+    def test_two_strategies_share_one_stop_card_in_the_same_cycle(self):
+        first_payload = {**self._stop_payload(), "control_cycle_key": "cycle-1"}
+        second_payload = {
+            **first_payload,
+            "strategy_id": "stop-strategy-2",
+            "strategy_name": "第二条策略",
+            "strategy_hash": "c" * 64,
+            "rule_snapshot": {"id": "stop-strategy-2"},
+        }
+        first = bridge.create_local_stop_task(first_payload)
+        second = bridge.create_local_stop_task(second_payload)
+        self.assertTrue(first["success"])
+        self.assertTrue(second["success"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(first["data"]["task_uid"], second["data"]["task_uid"])
+
     def test_stop_success_card_shows_official_verification_evidence(self):
         task = {
             **self._stop_payload(),
@@ -483,6 +499,146 @@ class LocalFeishuTaskTests(unittest.TestCase):
             where={"reconciliation_uid": "stop-card-update-1"},
         )
         self.assertEqual("sent", reconciliation["card_update_state"])
+
+    def test_card_update_queue_and_permanent_failure_are_observable(self):
+        created = bridge.create_local_stop_task(self._stop_payload())
+        task_uid = created["data"]["task_uid"]
+        store = SQLiteStore(database=self.db_path)
+        store.insert(
+            "execution_reconciliation",
+            {
+                "reconciliation_uid": "stop-card-update-failed",
+                "account_username": "tool-user-a",
+                "task_uid": task_uid,
+                "action_type": "stop",
+                "idempotency_key": "stop-card-update-failed",
+                "status": "confirmed_succeeded",
+                "card_update_state": "pending",
+            },
+        )
+        actual_bridge = bridge.LocalFeishuBridge("tool-user-a")
+        with patch("utils.sqlite_store.DB_FILE", self.db_path), patch.object(
+            actual_bridge,
+            "_request",
+            side_effect=RuntimeError("network down"),
+        ):
+            actual_bridge.update_task_cards(task_uid)
+            reconciliation = store.select_one(
+                "execution_reconciliation",
+                where={"reconciliation_uid": "stop-card-update-failed"},
+            )
+            self.assertEqual("queued", reconciliation["card_update_state"])
+            store.execute(
+                "UPDATE feishu_outbox SET attempt_count=7,next_attempt_at='2000-01-01 00:00:00' "
+                "WHERE task_uid=?",
+                (task_uid,),
+            )
+            self.assertTrue(actual_bridge._deliver_outbox_once())
+        outbox = store.select_one("feishu_outbox", where={"task_uid": task_uid})
+        reconciliation = store.select_one(
+            "execution_reconciliation",
+            where={"reconciliation_uid": "stop-card-update-failed"},
+        )
+        self.assertEqual("failed", outbox["status"])
+        self.assertEqual("failed", reconciliation["card_update_state"])
+
+    def test_latest_card_delivery_supersedes_old_failure_for_same_target(self):
+        store = SQLiteStore(database=self.db_path)
+        store.insert(
+            "execution_reconciliation",
+            {
+                "reconciliation_uid": "delivery-latest",
+                "account_username": "tool-user-a",
+                "task_uid": "task-delivery",
+                "action_type": "stop",
+                "idempotency_key": "delivery-latest",
+                "status": "confirmed_succeeded",
+                "card_update_state": "pending",
+            },
+        )
+        for index, status in enumerate(("failed", "sent"), start=1):
+            store.insert(
+                "feishu_outbox",
+                {
+                    "outbox_uid": f"delivery-{index}",
+                    "account_username": "tool-user-a",
+                    "operation": "update_card",
+                    "receive_type": "open_id",
+                    "receive_id": "ou_owner",
+                    "message_id": "om_same",
+                    "task_uid": "task-delivery",
+                    "status": status,
+                },
+            )
+        bridge._refresh_reconciliation_card_update_state(
+            store,
+            "tool-user-a",
+            "task-delivery",
+        )
+        row = store.select_one(
+            "execution_reconciliation",
+            where={"reconciliation_uid": "delivery-latest"},
+        )
+        self.assertEqual("sent", row["card_update_state"])
+
+    def test_natural_expiry_is_a_distinct_local_terminal_state(self):
+        created = bridge.create_local_stop_task(self._stop_payload())
+        task_uid = created["data"]["task_uid"]
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='verifying' WHERE task_uid=?",
+                (task_uid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        result = bridge.finalize_reconciled_local_task(
+            task_uid,
+            succeeded=True,
+            message="调控任务已自然到期",
+            result={"platform_status": "OFFLINE_TIME", "step": "terminal_natural"},
+        )
+        self.assertTrue(result["success"])
+        row = bridge._task_row(task_uid, "tool-user-a")
+        self.assertEqual("naturally_expired", row["status"])
+        card = json.dumps(
+            bridge.build_stop_task_card(bridge._task_payload(row)),
+            ensure_ascii=False,
+        )
+        self.assertIn("任务已自然到期", card)
+        self.assertIn("OFFLINE_TIME", card)
+
+    def test_stop_cycle_reconciliation_finalizes_attached_confirmation_card(self):
+        created = bridge.create_local_stop_task(
+            {**self._stop_payload(), "control_cycle_key": "shared-cycle"}
+        )
+        task_uid = created["data"]["task_uid"]
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='verifying' WHERE task_uid=?",
+                (task_uid,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        count = bridge.finalize_reconciled_local_stop_cycle(
+            "tool-user-a",
+            "shared-cycle",
+            succeeded=True,
+            message="停投已核验成功",
+            regulate_task_id="assist-30003",
+            result={
+                "platform_status": "DISABLE",
+                "control_cycle_key": "shared-cycle",
+            },
+        )
+        self.assertEqual(1, count)
+        self.assertEqual(
+            "succeeded",
+            bridge._task_row(task_uid, "tool-user-a")["status"],
+        )
 
     def test_strategy_save_invalidates_old_card_and_releases_dedupe(self):
         payload = task_payload(2)

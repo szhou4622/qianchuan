@@ -745,6 +745,8 @@ class DashboardApi:
                 adlab_mode,
                 ad_delivery_type,
                 ad_delivery_name,
+                task_status_source,
+                task_status_observed_at,
                 ad_opt_type,
                 hint_type,
                 learning_phase,

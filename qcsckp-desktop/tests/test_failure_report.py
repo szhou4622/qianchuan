@@ -3,9 +3,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from services.failure_report import build_failure_report, failure_report_json, sanitize
+from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class FailureReportTests(unittest.TestCase):
@@ -98,12 +100,114 @@ class FailureReportTests(unittest.TestCase):
         for forbidden in ("urlopen", "requests.post", "diagnostics.example", "/api/qcsckp/diagnostics"):
             self.assertNotIn(forbidden, source)
 
+    def test_report_separates_stop_failures_and_reads_shared_reconciliation(self):
+        with tempfile.TemporaryDirectory(prefix="qcsckp-failure-shared-") as root:
+            root_path = Path(root)
+            db = root_path / "qianchuan.db"
+            shared_dir = root_path / "shared"
+            shared_dir.mkdir()
+            shared_db = shared_dir / "execution.sqlite3"
+            init_sqlite_schema(database=str(db))
+            store = SQLiteStore(database=str(db))
+            store.insert(
+                "pmc_regulation_run",
+                {
+                    "aavid": "1001",
+                    "ad_id": "2001",
+                    "assist_task_id": "3001",
+                    "started_at": "2026-09-02 10:00:00",
+                    "ended_at": "2026-09-02 10:00:01",
+                    "status": 1,
+                    "execution_state": "confirmed_succeeded",
+                },
+            )
+            store.insert(
+                "pmc_regulation_run",
+                {
+                    "aavid": "1001",
+                    "ad_id": "2001",
+                    "assist_task_id": "3002",
+                    "started_at": "2026-09-02 10:01:00",
+                    "ended_at": "2026-09-02 10:01:01",
+                    "status": -1,
+                    "execution_state": "confirmed_failed",
+                    "message": "failed",
+                },
+            )
+            store.insert(
+                "local_retarget_task",
+                {
+                    "task_uid": "stop-failed-card",
+                    "account_username": "owner",
+                    "action_type": "stop",
+                    "status": "failed",
+                    "action_nonce": "nonce",
+                    "payload_json": "{}",
+                    "expires_at": "2026-09-02 11:00:00",
+                    "result_message": "failed",
+                },
+            )
+            store.insert(
+                "feishu_outbox",
+                {
+                    "outbox_uid": "outbox-failed",
+                    "account_username": "owner",
+                    "operation": "update_card",
+                    "task_uid": "stop-failed-card",
+                    "status": "failed",
+                    "last_error": "network failed",
+                },
+            )
+            shared = sqlite3.connect(shared_db)
+            shared.execute(
+                "CREATE TABLE execution_reconciliation ("
+                "id INTEGER PRIMARY KEY,task_uid TEXT,action_type TEXT,status TEXT,"
+                "request_id TEXT,control_task_id TEXT,last_error TEXT,attempt_count INTEGER,"
+                "card_update_state TEXT,created_at TEXT,updated_at TEXT)"
+            )
+            shared.execute(
+                "INSERT INTO execution_reconciliation VALUES(1,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "shared-stop",
+                    "stop",
+                    "confirmed_succeeded",
+                    "request-1",
+                    "3001",
+                    "",
+                    1,
+                    "sent",
+                    "2026-09-02 10:00:00",
+                    "2026-09-02 10:00:02",
+                ),
+            )
+            shared.commit()
+            shared.close()
+            with patch("services.failure_report.DB_FILE", str(db)), patch(
+                "channel_runtime.layout",
+                return_value=SimpleNamespace(
+                    shared=shared_dir,
+                    profile=root_path / "profile",
+                ),
+            ):
+                report = build_failure_report(db_path=str(db))
+            self.assertEqual(1, len(report["regulation_failures"]))
+            self.assertEqual(-1, report["regulation_failures"][0]["status"])
+            self.assertEqual(1, len(report["stop_failures"]))
+            self.assertEqual([], report["retarget_failures"])
+            self.assertEqual("sent", report["reconciliation"][0]["card_update_state"])
+            self.assertEqual("failed", report["feishu_outbox"][0]["status"])
+
     def test_ui_exposes_local_export_without_version_diagnostics(self):
         root = Path(__file__).resolve().parents[1]
         page = (root / "static" / "index.html").read_text(encoding="utf-8")
         bridge = (root / "gui_app.py").read_text(encoding="utf-8")
         self.assertIn('id="sidebarFailureReportBtn"', page)
         self.assertIn("api.saveFailureReport", page)
+        feishu = (root / "static" / "feishu_binding.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('id="outboxState"', feishu)
+        self.assertIn("latest.outbox", feishu)
         self.assertIn("def saveFailureReport", bridge)
         self.assertNotIn("channel-settings", page)
         self.assertNotIn("版本与诊断", page)

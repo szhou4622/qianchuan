@@ -153,8 +153,10 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
         "database": {"available": False, "quick_check": "not_run"},
         "api_recent": [],
         "retarget_failures": [],
+        "stop_failures": [],
         "regulation_failures": [],
         "reconciliation": [],
+        "feishu_outbox": [],
         "target_errors": [],
         "diagnostic_events": [],
     }
@@ -181,28 +183,101 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
                 "response": _parse_json(row.get("response_summary_json")),
             }) for row in reversed(audits)]
         if _table_exists(conn, "local_retarget_task"):
-            rows = _rows(conn, "SELECT task_uid,action_type,status,result_message,result_detail,regulate_task_id,created_at,finished_at FROM local_retarget_task WHERE status IN ('failed','unknown_requires_review','expired','cancelled') ORDER BY id DESC LIMIT 50")
-            report["retarget_failures"] = [sanitize({
+            rows = _rows(conn, "SELECT task_uid,action_type,status,result_message,result_detail,regulate_task_id,created_at,finished_at FROM local_retarget_task WHERE status IN ('failed','unknown_requires_review','expired','cancelled') ORDER BY id DESC LIMIT 100")
+            normalized_tasks = [sanitize({
                 **{k: row.get(k) for k in ("task_uid", "action_type", "status", "result_message", "regulate_task_id", "created_at", "finished_at")},
                 "trace": _trace_evidence(row.get("result_detail")),
             }) for row in rows]
+            report["retarget_failures"] = [
+                item for item in normalized_tasks if item.get("action_type") == "retarget"
+            ][:50]
+            report["stop_failures"] = [
+                item for item in normalized_tasks if item.get("action_type") == "stop"
+            ][:50]
         if _table_exists(conn, "pmc_regulation_run"):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(pmc_regulation_run)")}
-            wanted = [name for name in ("run_uid", "status", "message", "result_message", "task_id", "control_task_id", "created_at", "finished_at", "updated_at") if name in columns]
+            wanted = [name for name in ("execution_uid", "execution_state", "step", "status", "message", "assist_task_id", "created_at", "ended_at", "updated_at") if name in columns]
             if wanted:
-                rows = _rows(conn, "SELECT " + ",".join(wanted) + " FROM pmc_regulation_run WHERE status NOT IN ('succeeded','confirmed_succeeded','success') ORDER BY rowid DESC LIMIT 50")
+                rows = _rows(
+                    conn,
+                    "SELECT " + ",".join(wanted)
+                    + " FROM pmc_regulation_run WHERE NOT (status IN (1,2) "
+                    "OR COALESCE(execution_state,'')='confirmed_succeeded' "
+                    "OR COALESCE(step,'') IN ('confirmed_succeeded','terminal_natural')) "
+                    "ORDER BY rowid DESC LIMIT 50",
+                )
                 report["regulation_failures"] = [sanitize(row) for row in rows]
         if _table_exists(conn, "execution_reconciliation"):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(execution_reconciliation)")}
-            wanted = [name for name in ("task_uid", "action_type", "status", "request_id", "control_task_id", "last_error", "attempt_count", "created_at", "updated_at") if name in columns]
+            wanted = [name for name in ("task_uid", "action_type", "status", "request_id", "control_task_id", "last_error", "attempt_count", "card_update_state", "created_at", "updated_at") if name in columns]
             if wanted:
                 rows = _rows(conn, "SELECT " + ",".join(wanted) + " FROM execution_reconciliation ORDER BY rowid DESC LIMIT 100")
                 report["reconciliation"] = [sanitize(row) for row in rows]
+        if _table_exists(conn, "feishu_outbox"):
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(feishu_outbox)")}
+            wanted = [name for name in ("task_uid", "operation", "receive_type", "message_id", "status", "attempt_count", "last_error", "created_at", "updated_at") if name in columns]
+            if wanted:
+                rows = _rows(
+                    conn,
+                    "SELECT " + ",".join(wanted)
+                    + " FROM feishu_outbox WHERE status IN ('queued','sending','failed') "
+                    "ORDER BY rowid DESC LIMIT 100",
+                )
+                report["feishu_outbox"] = [sanitize(row) for row in rows]
         if _table_exists(conn, "promotion_target"):
             rows = _rows(conn, "SELECT target_uid,aadvid,ad_id,promotion_scene,plan_system,platform_status,last_status,last_error,last_sync_at,updated_at FROM promotion_target WHERE enabled=1 AND (last_error<>'' OR last_status NOT IN ('ok','healthy','normal_monitoring')) ORDER BY updated_at DESC LIMIT 100")
             report["target_errors"] = [sanitize(row) for row in rows]
     finally:
         conn.close()
+    try:
+        from channel_runtime import layout
+
+        shared_path = layout().shared / "execution.sqlite3"
+        if (
+            Path(db_path).resolve() == Path(DB_FILE).resolve()
+            and shared_path.is_file()
+        ):
+            shared = sqlite3.connect(
+                shared_path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+            shared.row_factory = sqlite3.Row
+            try:
+                if _table_exists(shared, "execution_reconciliation"):
+                    columns = {
+                        row[1]
+                        for row in shared.execute(
+                            "PRAGMA table_info(execution_reconciliation)"
+                        )
+                    }
+                    wanted = [
+                        name
+                        for name in (
+                            "task_uid",
+                            "action_type",
+                            "status",
+                            "request_id",
+                            "control_task_id",
+                            "last_error",
+                            "attempt_count",
+                            "card_update_state",
+                            "created_at",
+                            "updated_at",
+                        )
+                        if name in columns
+                    ]
+                    if wanted:
+                        rows = _rows(
+                            shared,
+                            "SELECT " + ",".join(wanted)
+                            + " FROM execution_reconciliation ORDER BY rowid DESC LIMIT 100",
+                        )
+                        report["reconciliation"] = [sanitize(row) for row in rows]
+            finally:
+                shared.close()
+    except (OSError, sqlite3.Error):
+        report["reconciliation_read_error"] = True
     try:
         from channel_runtime import layout
 

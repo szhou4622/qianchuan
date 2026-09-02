@@ -1631,6 +1631,7 @@ def main():
         print(f"[ERR] 错误: {e}")
         import traceback
         traceback.print_exc()
+        raise
     finally:
         try:
             if js_api is not None:

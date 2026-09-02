@@ -956,6 +956,11 @@ class QianchuanOfficialApiService:
             query,
             advertiser_id=aid,
             page_size=100,
+            identity_getter=lambda row: text_id(
+                first(row, "task_id", "control_task_id", "assist_task_id", "id")
+            ),
+            verify_stability=True,
+            parallel_workers=1,
         )
         normalized = [normalize_control_task(row) for row in rows]
         for item in normalized:
@@ -1139,6 +1144,12 @@ class QianchuanOfficialApiService:
         if kind == "AD":
             query["object_id"] = require_digit_id(object_id, "object_id")
         rows, request_ids = self.client.get_all_pages(
-            self.OPERATION_LOGS, query, advertiser_id=aid, page_size=20
+            self.OPERATION_LOGS,
+            query,
+            advertiser_id=aid,
+            page_size=20,
+            identity_getter=lambda row: text_id(first(row, "log_id", "logId", "id")),
+            verify_stability=True,
+            parallel_workers=1,
         )
         return [normalize_operation_log(row) for row in rows], request_ids

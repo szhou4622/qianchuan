@@ -55,6 +55,10 @@ def _notify_reconciled_auto_stop(
     *,
     status: str,
     error: str = "",
+    verified: Optional[Mapping[str, Any]] = None,
+    submitted_at: str = "",
+    confirmed_at: str = "",
+    verification_duration_seconds: Optional[float] = None,
 ) -> None:
     """Send the terminal notification for an auto-stop reconciliation.
 
@@ -90,7 +94,10 @@ def _notify_reconciled_auto_stop(
         else None
     ) or {}
     succeeded = status == "confirmed_succeeded"
-    if succeeded:
+    platform_status = str((verified or {}).get("status") or "").strip().upper()
+    if succeeded and platform_status == "OFFLINE_TIME":
+        message = "调控任务已自然到期"
+    elif succeeded:
         message = "官方 API 停投已核验成功"
     elif status == "confirmed_failed":
         message = "官方 API 停投核验失败"
@@ -119,6 +126,12 @@ def _notify_reconciled_auto_stop(
         stop_action="pause" if expected == "PAUSE" else "delete",
         success=succeeded,
         message=message,
+        platform_status=platform_status,
+        request_id=str(row.get("request_id") or ""),
+        submitted_at=submitted_at,
+        confirmed_at=confirmed_at,
+        verification_duration_seconds=verification_duration_seconds,
+        delivery_task_uid=str(row.get("task_uid") or ""),
     )
 
 
@@ -253,6 +266,51 @@ def reserve_execution_intent(
     return row, True
 
 
+def resolve_stop_idempotency_key(
+    base_key: str,
+    *,
+    allow_confirmed_failed_retry: bool = False,
+    db: Optional[SQLiteStore] = None,
+) -> str:
+    """Return the shared cycle key or a user-authorized failed-attempt suffix."""
+    stable = str(base_key or "").strip()
+    if not stable:
+        raise RuntimeError("停投周期缺少幂等键")
+    store = db or SQLiteStore()
+    owner = str(current_session_owner() or "").strip().casefold()
+    if not owner:
+        return stable
+    rows = store.execute(
+        "SELECT idempotency_key,status FROM execution_reconciliation "
+        "WHERE account_username=? AND action_type='stop' "
+        "AND (idempotency_key=? OR idempotency_key LIKE ?) ORDER BY id",
+        (owner, stable, stable + ":attempt:%"),
+        fetch=True,
+    ) or []
+    if not rows:
+        return stable
+    blocking = {
+        "submitting",
+        "submitted",
+        "verifying",
+        "unknown_requires_review",
+        "confirmed_succeeded",
+    }
+    if any(str(row.get("status") or "") in blocking for row in rows):
+        return stable
+    if not allow_confirmed_failed_retry or any(
+        str(row.get("status") or "") != "confirmed_failed" for row in rows
+    ):
+        return stable
+    next_attempt = 2
+    for row in rows:
+        key = str(row.get("idempotency_key") or "")
+        matched = re.fullmatch(re.escape(stable) + r":attempt:(\d+)", key)
+        if matched:
+            next_attempt = max(next_attempt, int(matched.group(1)) + 1)
+    return f"{stable}:attempt:{next_attempt}"
+
+
 def finish_execution_intent(
     idempotency_key: str,
     *,
@@ -348,6 +406,10 @@ def _finish(
         )
     except (TypeError, ValueError):
         verification_duration_seconds = None
+    verified_status = str((verified or {}).get("status") or "").strip().upper()
+    naturally_expired = (
+        status == "confirmed_succeeded" and verified_status == "OFFLINE_TIME"
+    )
     changed = store.execute(
         "UPDATE execution_reconciliation SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
         "last_error=?,confirmed_at=?,card_update_state='pending',updated_at=? "
@@ -365,6 +427,7 @@ def _finish(
     if int(changed or 0) != 1:
         return False
     data = _payload(row.get("payload_json"))
+    is_stop = str(row.get("action_type") or "retarget") == "stop"
     request_uid = str(data.get("request_uid") or "")
     if request_uid:
         OfficialApiAuditStore(store).mark_reconciled(
@@ -377,38 +440,48 @@ def _finish(
     run_task_uid = str(data.get("execution_uid") or task_uid)
     if run_task_uid:
         succeeded = status == "confirmed_succeeded"
-        is_stop = str(row.get("action_type") or "retarget") == "stop"
         if is_stop:
+            stop_step = "terminal_natural" if naturally_expired else (
+                "confirmed_succeeded" if succeeded else status
+            )
+            stop_message = (
+                "调控任务已自然到期"
+                if naturally_expired
+                else "官方 API 停投已核验成功"
+                if succeeded
+                else "官方 API 停投核验失败，请人工检查"
+            )
             store.execute(
                 "UPDATE pmc_regulation_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
                 "WHERE execution_uid=? AND execution_state='submitted_verifying'",
                 (
-                    1 if succeeded else -1,
+                    2 if naturally_expired else 1 if succeeded else -1,
                     "confirmed_succeeded" if succeeded else status,
-                    "confirmed_succeeded" if succeeded else status,
-                    "官方 API 停投已核验成功" if succeeded else "官方 API 停投核验失败，请人工检查",
+                    stop_step,
+                    stop_message,
                     str(error or "")[:4000],
                     now,
                     run_task_uid,
                 ),
             )
             if succeeded:
-                actual_status = str(
-                    (verified or {}).get("status") or "DISABLE"
-                ).strip().upper()
+                actual_status = verified_status or "DISABLE"
                 if actual_status not in {
                     "DISABLE",
                     "DISABLED",
                     "FINISHED",
                     "ENDED",
+                    "OFFLINE_TIME",
                 }:
                     actual_status = "DISABLE"
                 store.execute(
                     "UPDATE pmc_roi2_assist_task SET ad_delivery_type=1,"
-                    "ad_delivery_name=?,reconciliation_status='confirmed',updated_at=? "
+                    "ad_delivery_name=?,task_status_source='api',"
+                    "task_status_observed_at=?,reconciliation_status='confirmed',updated_at=? "
                     "WHERE aadvid=? AND ad_id=? AND assist_task_id=?",
                     (
                         actual_status,
+                        now,
                         now,
                         str(row.get("aavid") or ""),
                         str(row.get("ad_id") or ""),
@@ -481,6 +554,51 @@ def _finish(
             return True
         succeeded = bool(sibling_statuses) and sibling_statuses == {"confirmed_succeeded"}
         aggregate_status = "confirmed_succeeded" if succeeded else "unknown_requires_review"
+        label = "停投" if is_stop else "追投"
+        terminal_message = (
+            "调控任务已自然到期"
+            if is_stop and naturally_expired
+            else f"官方 API {label}已核验成功"
+            if succeeded
+            else f"官方 API {label}核验失败，请人工检查"
+        )
+        final_result = {
+            "success": succeeded,
+            "step": (
+                "terminal_natural"
+                if is_stop and naturally_expired
+                else aggregate_status
+            ),
+            "regulate_task_id": str(row.get("control_task_id") or ""),
+            "request_id": str(row.get("request_id") or ""),
+            "submitted_at": submitted_at,
+            "confirmed_at": now,
+            "verification_duration_seconds": verification_duration_seconds,
+            "platform_status": verified_status,
+            "control_cycle_key": str(data.get("control_cycle_key") or ""),
+            "verification": dict(verified or {}),
+        }
+        stop_observer_count = 0
+        if is_stop and final_result["control_cycle_key"]:
+            try:
+                from services.local_feishu_bridge import (
+                    finalize_reconciled_local_stop_cycle,
+                )
+
+                stop_observer_count = finalize_reconciled_local_stop_cycle(
+                    str(row.get("account_username") or ""),
+                    final_result["control_cycle_key"],
+                    succeeded=succeeded,
+                    message=terminal_message,
+                    detail=str(error or ""),
+                    regulate_task_id=str(row.get("control_task_id") or ""),
+                    result=final_result,
+                )
+            except Exception:
+                logger.exception(
+                    "官方 API 对账完成后更新停投周期卡片失败 cycle=%s",
+                    final_result["control_cycle_key"],
+                )
         local_task = store.select_one(
             "local_retarget_task",
             fields="task_uid,action_type",
@@ -489,38 +607,21 @@ def _finish(
                 "account_username": str(row.get("account_username") or ""),
             },
         )
-        if local_task:
+        if local_task and not (is_stop and stop_observer_count):
             try:
                 from services.local_feishu_bridge import finalize_reconciled_local_task
 
-                label = "停投" if is_stop else "追投"
                 finalize_reconciled_local_task(
                     task_uid,
                     succeeded=succeeded,
-                    message=(
-                        f"官方 API {label}已核验成功"
-                        if succeeded
-                        else f"官方 API {label}核验失败，请人工检查"
-                    ),
+                    message=terminal_message,
                     detail=str(error or ""),
                     regulate_task_id=str(row.get("control_task_id") or ""),
-                    result={
-                        "success": succeeded,
-                        "step": aggregate_status,
-                        "regulate_task_id": str(row.get("control_task_id") or ""),
-                        "request_id": str(row.get("request_id") or ""),
-                        "submitted_at": submitted_at,
-                        "confirmed_at": now,
-                        "verification_duration_seconds": verification_duration_seconds,
-                        "platform_status": str(
-                            (verified or {}).get("status") or ""
-                        ).strip().upper(),
-                        "verification": dict(verified or {}),
-                    },
+                    result=final_result,
                 )
             except Exception:
                 logger.exception("官方 API 对账完成后更新飞书任务失败 task=%s", task_uid)
-        elif is_stop:
+        elif is_stop and not stop_observer_count:
             try:
                 _notify_reconciled_auto_stop(
                     store,
@@ -528,8 +629,48 @@ def _finish(
                     data,
                     status=status,
                     error=error,
+                    verified=verified,
+                    submitted_at=submitted_at,
+                    confirmed_at=now,
+                    verification_duration_seconds=verification_duration_seconds,
+                )
+                pending_delivery = store.execute(
+                    "SELECT id FROM feishu_outbox WHERE account_username=? "
+                    "AND task_uid=? AND status IN ('queued','sending') LIMIT 1",
+                    (
+                        str(row.get("account_username") or ""),
+                        str(row.get("task_uid") or ""),
+                    ),
+                    fetch=True,
+                ) or []
+                store.execute(
+                    "UPDATE execution_reconciliation SET card_update_state=?,updated_at=? "
+                    "WHERE reconciliation_uid=?",
+                    (
+                        "queued" if pending_delivery else "sent",
+                        now,
+                        str(row.get("reconciliation_uid") or ""),
+                    ),
                 )
             except Exception:
+                queued_rows = store.execute(
+                    "SELECT id FROM feishu_outbox WHERE account_username=? "
+                    "AND task_uid=? AND status IN ('queued','sending') LIMIT 1",
+                    (
+                        str(row.get("account_username") or ""),
+                        str(row.get("task_uid") or ""),
+                    ),
+                    fetch=True,
+                ) or []
+                store.execute(
+                    "UPDATE execution_reconciliation SET card_update_state=?,updated_at=? "
+                    "WHERE reconciliation_uid=?",
+                    (
+                        "queued" if queued_rows else "failed",
+                        now,
+                        str(row.get("reconciliation_uid") or ""),
+                    ),
+                )
                 logger.exception(
                     "官方 API 自动停投对账完成后发送通知失败 task=%s",
                     task_uid,

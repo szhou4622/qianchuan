@@ -642,6 +642,7 @@ class SQLiteStore:
                 'account_username': 'TEXT NOT NULL',
                 'qianchuan_account_uid': "TEXT NOT NULL DEFAULT ''",
                 'action_type': "TEXT NOT NULL DEFAULT 'retarget' CHECK (action_type IN ('retarget', 'stop'))",
+                'control_cycle_key': "TEXT NOT NULL DEFAULT ''",
                 'active_dedupe_key': 'TEXT',
                 'status': 'TEXT NOT NULL',
                 'action_nonce': 'TEXT NOT NULL',
@@ -665,6 +666,7 @@ class SQLiteStore:
             'indexes': [
                 ('idx_local_retarget_account_status', 'account_username, status'),
                 ('idx_local_retarget_action_status', 'account_username, action_type, status'),
+                ('idx_local_stop_cycle', 'account_username, action_type, control_cycle_key, status'),
                 ('idx_local_retarget_expires', 'expires_at'),
             ],
             'unique_indexes': [
@@ -799,6 +801,7 @@ class SQLiteStore:
                 'receive_type': "TEXT NOT NULL DEFAULT ''",
                 'receive_id': "TEXT NOT NULL DEFAULT ''",
                 'message_id': "TEXT NOT NULL DEFAULT ''",
+                'task_uid': "TEXT NOT NULL DEFAULT ''",
                 'payload_json': "TEXT NOT NULL DEFAULT '{}'",
                 'status': "TEXT NOT NULL DEFAULT 'queued'",
                 'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
@@ -814,6 +817,7 @@ class SQLiteStore:
             'indexes': [
                 ('idx_feishu_outbox_due', 'account_username, status, next_attempt_at'),
                 ('idx_feishu_outbox_lease', 'status, lease_expires_at'),
+                ('idx_feishu_outbox_task', 'account_username, task_uid, operation, message_id, id'),
             ],
             'unique_indexes': [
                 ('uk_feishu_outbox_uid', 'outbox_uid'),
@@ -998,6 +1002,8 @@ class SQLiteStore:
                 'adlab_mode': 'INTEGER',
                 'ad_delivery_type': 'INTEGER',
                 'ad_delivery_name': 'TEXT',
+                'task_status_source': "TEXT NOT NULL DEFAULT ''",
+                'task_status_observed_at': 'TEXT',
                 'ad_opt_type': 'INTEGER',
                 'hint_type': 'INTEGER',
                 'learning_phase': 'INTEGER',

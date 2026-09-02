@@ -40,6 +40,7 @@ TERMINAL_STATUSES = {
     "expired",
     "cancelled",
     "invalidated",
+    "naturally_expired",
 }
 ACTIVE_STATUSES = {"pending", "approved_queued", "claimed", "executing"}
 VERIFYING_STATUSES = {"verifying"}
@@ -396,16 +397,15 @@ def _refresh_reconciliation_card_update_state(
     if not uid:
         return
     rows = store.execute(
-        "SELECT status,payload_json FROM feishu_outbox WHERE account_username=? "
-        "AND operation='update_card' ORDER BY id",
-        (_account_key(account_username),),
+        "SELECT o.status,o.message_id FROM feishu_outbox o JOIN ("
+        "SELECT operation,receive_type,receive_id,message_id,MAX(id) AS latest_id "
+        "FROM feishu_outbox WHERE account_username=? AND task_uid=? "
+        "GROUP BY operation,receive_type,receive_id,message_id) latest "
+        "ON latest.latest_id=o.id ORDER BY o.id",
+        (_account_key(account_username), uid),
         fetch=True,
     ) or []
-    related = []
-    for row in rows:
-        payload = _loads(row.get("payload_json"), {})
-        if isinstance(payload, dict) and str(payload.get("task_uid") or "") == uid:
-            related.append(str(row.get("status") or ""))
+    related = [str(row.get("status") or "") for row in rows]
     state = (
         "failed"
         if "failed" in related
@@ -668,6 +668,11 @@ def _task_payload(row: Dict[str, Any]) -> Dict[str, Any]:
                 row.get("action_type")
                 or payload.get("action_type")
                 or "retarget"
+            ),
+            "control_cycle_key": str(
+                row.get("control_cycle_key")
+                or payload.get("control_cycle_key")
+                or ""
             ),
             "status": display_status,
             "action_nonce": str(row.get("action_nonce") or ""),
@@ -1835,6 +1840,7 @@ def build_stop_task_card(
         "executing": "正在停投",
         "verifying": "已提交，正在核验",
         "succeeded": "停投成功",
+        "naturally_expired": "任务已自然到期",
         "failed": "停投失败",
         "rejected": "已暂不停投",
         "expired": "已过期",
@@ -1845,6 +1851,8 @@ def build_stop_task_card(
         if status == "succeeded"
         else "red"
         if status in {"failed", "expired", "rejected"}
+        else "grey"
+        if status == "naturally_expired"
         else "orange"
     )
     scene_text = (
@@ -2330,6 +2338,7 @@ class LocalFeishuBridge:
                 "receive_type": receive_type,
                 "receive_id": receive_id,
                 "message_id": message_id,
+                "task_uid": str(payload.get("task_uid") or ""),
                 "payload_json": _json(payload),
                 "status": "queued",
                 "next_attempt_at": _dt(_now()),
@@ -2454,7 +2463,7 @@ class LocalFeishuBridge:
                     token,
                 ),
             )
-            if operation == "update_card":
+            if operation in {"send_card", "update_card"}:
                 _refresh_reconciliation_card_update_state(
                     store,
                     self.account_username,
@@ -2478,7 +2487,7 @@ class LocalFeishuBridge:
                     token,
                 ),
             )
-            if operation == "update_card":
+            if operation in {"send_card", "update_card"}:
                 _refresh_reconciliation_card_update_state(
                     store,
                     self.account_username,
@@ -3207,6 +3216,7 @@ def send_local_feishu_bound_card(
     *,
     targets: Optional[List[Tuple[str, str]]] = None,
     require_connected: bool = True,
+    task_uid: str = "",
 ) -> List[Dict[str, str]]:
     bridge = _MANAGER.bridge()
     if bridge is None:
@@ -3214,7 +3224,7 @@ def send_local_feishu_bound_card(
     status = bridge.status()
     if require_connected and not status.get("connected"):
         raise FeishuApiError("飞书长连接尚未连接")
-    return bridge.send_bound_card(card, targets=targets)
+    return bridge.send_bound_card(card, targets=targets, task_uid=task_uid)
 
 
 def save_local_feishu_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -3315,7 +3325,9 @@ def _expire_local_tasks(account_username: str) -> List[str]:
             conn.execute(
                 f"UPDATE local_retarget_task SET status='expired',active_dedupe_key=NULL,"
                 f"claim_token=NULL,claim_expires_at=NULL,finished_at=?,"
-                f"result_message='追投卡片已过期或本机执行中断',updated_at=? "
+                f"result_message=CASE WHEN action_type='stop' "
+                f"THEN '停投卡片已过期或本机执行中断' "
+                f"ELSE '追投卡片已过期或本机执行中断' END,updated_at=? "
                 f"WHERE task_uid IN ({placeholders})",
                 [now_text, now_text, *expired],
             )
@@ -3850,10 +3862,61 @@ def create_local_stop_task(payload: Dict[str, Any]) -> Dict[str, Any]:
     dedupe = hashlib.sha256(
         (
             f"{account}|stop|{required['aavid']}|{required['ad_id']}|"
-            f"{required['assist_task_id']}|{required['strategy_id']}|"
-            f"{str(snapshot.get('control_cycle_key') or 'legacy')}"
+            f"{required['assist_task_id']}|"
+            f"{str(snapshot.get('control_cycle_key') or 'legacy')}|"
+            f"{str(snapshot.get('regulation_stop_action') or 'pause')}"
         ).encode("utf-8")
     ).hexdigest()
+    # r15 and older stored the cycle only inside payload_json and used a
+    # strategy-scoped dedupe key. Reuse that active card instead of sending a
+    # second card during the local upgrade.
+    legacy_conn = _db()
+    try:
+        legacy_conn.execute("BEGIN IMMEDIATE")
+        legacy_rows = legacy_conn.execute(
+            "SELECT task_uid,status,payload_json FROM local_retarget_task "
+            "WHERE account_username=? AND action_type='stop' "
+            "AND status IN ('pending','approved_queued','claimed','executing','verifying')",
+            (account,),
+        ).fetchall()
+        for legacy_row in legacy_rows:
+            legacy_payload = _loads(legacy_row["payload_json"], {})
+            if not isinstance(legacy_payload, dict):
+                continue
+            if (
+                str(legacy_payload.get("aavid") or "") == required["aavid"]
+                and str(legacy_payload.get("ad_id") or "") == required["ad_id"]
+                and str(legacy_payload.get("assist_task_id") or "")
+                == required["assist_task_id"]
+                and str(legacy_payload.get("control_cycle_key") or "legacy")
+                == str(snapshot.get("control_cycle_key") or "legacy")
+                and str(
+                    legacy_payload.get("regulation_stop_action") or "pause"
+                )
+                == str(snapshot.get("regulation_stop_action") or "pause")
+            ):
+                legacy_conn.execute(
+                    "UPDATE local_retarget_task SET control_cycle_key=?,"
+                    "active_dedupe_key=?,updated_at=? WHERE task_uid=?",
+                    (
+                        str(snapshot.get("control_cycle_key") or ""),
+                        dedupe,
+                        _dt(_now()),
+                        str(legacy_row["task_uid"]),
+                    ),
+                )
+                legacy_conn.commit()
+                return {
+                    "success": True,
+                    "duplicate": True,
+                    "data": {
+                        "task_uid": str(legacy_row["task_uid"]),
+                        "status": str(legacy_row["status"]),
+                    },
+                }
+        legacy_conn.commit()
+    finally:
+        legacy_conn.close()
     task_uid = str(uuid.uuid4())
     nonce = secrets.token_hex(32)
     now_text = _dt(_now())
@@ -3864,13 +3927,14 @@ def create_local_stop_task(payload: Dict[str, Any]) -> Dict[str, Any]:
             conn.execute(
                 "INSERT INTO local_retarget_task("
                 "task_uid,account_username,qianchuan_account_uid,action_type,"
-                "active_dedupe_key,status,action_nonce,payload_json,"
+                "control_cycle_key,active_dedupe_key,status,action_nonce,payload_json,"
                 "expires_at,created_at,updated_at"
-                ") VALUES(?,?,?,'stop',?,'pending',?,?,?,?,?)",
+                ") VALUES(?,?,?,'stop',?,?,'pending',?,?,?,?,?)",
                 (
                     task_uid,
                     account,
                     qianchuan_account["account_uid"],
+                    str(snapshot.get("control_cycle_key") or ""),
                     dedupe,
                     nonce,
                     _json(snapshot),
@@ -4666,7 +4730,18 @@ def finalize_reconciled_local_task(
             grouped_result.get("regulate_task_id") or regulate_task_id or ""
         )
     else:
-        expected = "succeeded" if succeeded else "failed"
+        naturally_expired = (
+            str(row.get("action_type") or "") == "stop"
+            and str(final_result.get("platform_status") or "").upper()
+            == "OFFLINE_TIME"
+        )
+        expected = (
+            "naturally_expired"
+            if naturally_expired
+            else "succeeded"
+            if succeeded
+            else "failed"
+        )
     if str(row.get("status") or "") in TERMINAL_STATUSES:
         return {"success": str(row.get("status") or "") == expected}
     if str(row.get("status") or "") != "verifying":
@@ -4698,6 +4773,67 @@ def finalize_reconciled_local_task(
     if bridge:
         _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
     return {"success": True}
+
+
+def finalize_reconciled_local_stop_cycle(
+    account_username: str,
+    control_cycle_key: str,
+    *,
+    succeeded: bool,
+    message: str,
+    detail: str = "",
+    regulate_task_id: str = "",
+    result: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Finalize every confirmed stop card observing one shared cycle intent."""
+    account = _account_key(account_username)
+    cycle_key = str(control_cycle_key or "").strip()
+    if not account or not cycle_key:
+        return 0
+    conn = _db()
+    try:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM local_retarget_task WHERE account_username=? "
+                "AND action_type='stop' AND status='verifying' ORDER BY id",
+                (account,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    matched = 0
+    for row in rows:
+        payload = _loads(row.get("payload_json"), {})
+        row_cycle = str(
+            row.get("control_cycle_key")
+            or (payload.get("control_cycle_key") if isinstance(payload, dict) else "")
+            or ""
+        ).strip()
+        if row_cycle != cycle_key:
+            continue
+        task_uid = str(row.get("task_uid") or "")
+        bind = _db()
+        try:
+            bind.execute(
+                "UPDATE local_retarget_task SET control_cycle_key=? "
+                "WHERE task_uid=? AND control_cycle_key=''",
+                (cycle_key, task_uid),
+            )
+            bind.commit()
+        finally:
+            bind.close()
+        outcome = finalize_reconciled_local_task(
+            task_uid,
+            succeeded=succeeded,
+            message=message,
+            detail=detail,
+            regulate_task_id=regulate_task_id,
+            result=result,
+        )
+        if outcome.get("success"):
+            matched += 1
+    return matched
 
 
 def repair_reconciled_local_retarget_tasks(account_username: str = "") -> Dict[str, Any]:

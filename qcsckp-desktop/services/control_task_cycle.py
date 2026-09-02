@@ -8,6 +8,7 @@ from typing import Any, Mapping, Optional
 
 
 _RESUME_TRANSITIONS = ("已暂停 -> 调控中", "已暂停 → 调控中")
+_ACTIVE_STATUSES = {"PROCESSING", "ENABLE", "ENABLED", "ACTIVE", "RUNNING", "DELIVERING"}
 
 
 def _text(value: Any) -> str:
@@ -30,7 +31,36 @@ def _cycle_key(target_uid: str, task_id: str, marker: str) -> str:
     ).hexdigest()
 
 
-def _latest_successful_stop(db: Any, target_uid: str, task_id: str) -> dict[str, Any]:
+def stop_cycle_execution_key(
+    owner: Any,
+    aavid: Any,
+    ad_id: Any,
+    assist_task_id: Any,
+    cycle_key: Any,
+    action: Any,
+) -> str:
+    """Return one shared idempotency namespace for every actor in a cycle."""
+    return hashlib.sha256(
+        "|".join(
+            (
+                _text(owner).casefold(),
+                _text(aavid),
+                _text(ad_id),
+                _text(assist_task_id),
+                _text(cycle_key),
+                _text(action).lower(),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _latest_successful_stop(
+    db: Any,
+    target_uid: str,
+    task_id: str,
+    *,
+    connection: Any = None,
+) -> dict[str, Any]:
     rows = db.execute(
         "SELECT execution_uid,ended_at,created_at FROM pmc_regulation_run "
         "WHERE target_uid=? AND assist_task_id=? AND "
@@ -39,6 +69,7 @@ def _latest_successful_stop(db: Any, target_uid: str, task_id: str) -> dict[str,
         "ORDER BY COALESCE(NULLIF(ended_at,''),created_at) DESC,id DESC LIMIT 1",
         (target_uid, task_id),
         fetch=True,
+        connection=connection,
     ) or []
     run = dict(rows[0]) if rows else {}
 
@@ -51,6 +82,7 @@ def _latest_successful_stop(db: Any, target_uid: str, task_id: str) -> dict[str,
         "ORDER BY COALESCE(NULLIF(e.confirmed_at,''),e.created_at) DESC,e.id DESC LIMIT 1",
         (target_uid, task_id),
         fetch=True,
+        connection=connection,
     ) or []
     reconciliation = dict(reconciliations[0]) if reconciliations else {}
 
@@ -86,11 +118,14 @@ def _latest_resume_event(
     target_uid: str,
     task_id: str,
     stop_completed_at: str,
+    *,
+    connection: Any = None,
 ) -> dict[str, Any]:
     rows = db.execute(
         "SELECT event_uid,platform_event_id,occurred_at,summary,action_type "
         "FROM account_operation_event WHERE target_uid=? AND regulate_task_id=? "
-        "AND status='success' AND occurred_at>? AND (action_type='control_resume' "
+        "AND source IN ('qianchuan_open_api','platform_log') "
+        "AND status='success' AND occurred_at>=? AND (action_type='control_resume' "
         "OR summary LIKE ? OR summary LIKE ?) "
         "ORDER BY occurred_at DESC,id DESC LIMIT 1",
         (
@@ -101,6 +136,7 @@ def _latest_resume_event(
             f"%{_RESUME_TRANSITIONS[1]}%",
         ),
         fetch=True,
+        connection=connection,
     ) or []
     return dict(rows[0]) if rows else {}
 
@@ -112,6 +148,7 @@ def stop_cycle_state(
     *,
     assist_row: Optional[Mapping[str, Any]] = None,
     observed_at: Any = "",
+    connection: Any = None,
 ) -> dict[str, Any]:
     """Return the current stop cycle and whether another stop must be blocked.
 
@@ -134,7 +171,12 @@ def stop_cycle_state(
             "resume_event_uid": "",
         }
 
-    completed = _latest_successful_stop(db, target, task_id)
+    completed = _latest_successful_stop(
+        db,
+        target,
+        task_id,
+        connection=connection,
+    )
     stop_at = _text(completed.get("completed_at"))
     if not stop_at:
         return {
@@ -146,7 +188,13 @@ def stop_cycle_state(
             "resume_event_uid": "",
         }
 
-    resume = _latest_resume_event(db, target, task_id, stop_at)
+    resume = _latest_resume_event(
+        db,
+        target,
+        task_id,
+        stop_at,
+        connection=connection,
+    )
     if not resume:
         return {
             "cycle_key": _cycle_key(target, task_id, f"stopped:{completed.get('marker') or stop_at}"),
@@ -163,22 +211,41 @@ def stop_cycle_state(
     row = dict(assist_row or {})
     if not row or any(
         key not in row
-        for key in ("ad_delivery_type", "data_source", "updated_at")
+        for key in (
+            "ad_delivery_type",
+            "ad_delivery_name",
+            "task_status_source",
+            "task_status_observed_at",
+            "data_source",
+            "updated_at",
+        )
     ):
         persisted = db.select_one(
             "pmc_roi2_assist_task",
             where={"target_uid": target, "assist_task_id": task_id},
+            connection=connection,
         ) or {}
         row = {**persisted, **row}
-    row_observed_at = _text(observed_at or row.get("updated_at"))
+    row_observed_at = _text(
+        row.get("task_status_observed_at") or observed_at or row.get("updated_at")
+    )
     active = _text(row.get("ad_delivery_type") if row.get("ad_delivery_type") is not None else "0") in {"", "0"}
     official = _text(row.get("data_source")) == "qianchuan_open_api"
+    explicit_status = _text(row.get("task_status_source")) == "api"
+    platform_active = _text(row.get("ad_delivery_name")).upper() in _ACTIVE_STATUSES
     fresh_after_resume = bool(
         _time(row_observed_at)
         and _time(resume_at)
-        and _time(row_observed_at) >= _time(resume_at)
+        and _time(row_observed_at) > _time(resume_at)
     )
-    if not row or not active or not official or not fresh_after_resume:
+    if (
+        not row
+        or not active
+        or not official
+        or not explicit_status
+        or not platform_active
+        or not fresh_after_resume
+    ):
         return {
             "cycle_key": resumed_key,
             "blocked": True,

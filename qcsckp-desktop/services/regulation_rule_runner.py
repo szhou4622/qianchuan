@@ -37,7 +37,7 @@ from services.promotion_capability import (
     check_target_capability,
     parse_target_capability,
 )
-from services.control_task_cycle import stop_cycle_state
+from services.control_task_cycle import stop_cycle_execution_key, stop_cycle_state
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -656,8 +656,22 @@ async def _process_approved_stop_tasks(
                         continue
                     cfg = load_rule_regulation_config()
                     svc = QianChuanRegulationStopService.from_rule_file_dict(cfg)
-                    execution_uid = (
-                        f"stop-card:{task_uid}:cycle:{actual_cycle_key}"
+                    from services.official_api_reconciliation import (
+                        resolve_stop_idempotency_key,
+                    )
+
+                    base_execution_uid = stop_cycle_execution_key(
+                        expected_owner,
+                        aavid,
+                        ad_id,
+                        assist_task_id,
+                        actual_cycle_key,
+                        stop_action,
+                    )
+                    execution_uid = resolve_stop_idempotency_key(
+                        base_execution_uid,
+                        allow_confirmed_failed_retry=True,
+                        db=db,
                     )
                     result = await svc.run(
                         aavid=aavid_int,
@@ -676,14 +690,22 @@ async def _process_approved_stop_tasks(
                         close_session=False,
                         execution_uid=execution_uid,
                         reconciliation_task_uid=task_uid,
+                        control_cycle_key=actual_cycle_key,
                     )
                     ended_at = _beijing_now_str()
                     duration_ms = int((time.time() - started) * 1000)
+                    verifying_steps = {
+                        "submitting",
+                        "submitted",
+                        "verifying",
+                        "submitted_verifying",
+                    }
                     run_status = (
                         2
-                        if result.step == "done_already_paused"
+                        if result.step
+                        in {"done_already_paused", "done_naturally_expired"}
                         else -1
-                        if result.step == "submitted_verifying"
+                        if result.step in verifying_steps
                         else 1
                         if result.success
                         else -1
@@ -736,7 +758,9 @@ async def _process_approved_stop_tasks(
                         execution_uid=execution_uid,
                         execution_state=(
                             "submitted_verifying"
-                            if result.step == "submitted_verifying"
+                            if result.step in verifying_steps
+                            else "unknown_requires_review"
+                            if result.step == "unknown_requires_review"
                             else ("confirmed_succeeded" if run_status in {1, 2} else "confirmed_failed")
                         ),
                     )
@@ -745,7 +769,11 @@ async def _process_approved_stop_tasks(
                         claim_token,
                         (
                             "verifying"
-                            if result.step == "submitted_verifying"
+                            if result.step in verifying_steps
+                            else "naturally_expired"
+                            if result.step == "done_naturally_expired"
+                            else "unknown_requires_review"
+                            if result.step == "unknown_requires_review"
                             else ("succeeded" if run_status in {1, 2} else "failed")
                         ),
                         message=result.message,
@@ -754,6 +782,7 @@ async def _process_approved_stop_tasks(
                             "step": result.step,
                             "stop_action": stop_action,
                             "assist_task_id": assist_task_id,
+                            "control_cycle_key": actual_cycle_key,
                         },
                     )
         except Exception:
@@ -788,23 +817,34 @@ def _send_auto_stop_result_notification(
     stop_action: str,
     success: bool,
     message: str,
-) -> None:
+    platform_status: str = "",
+    request_id: str = "",
+    submitted_at: str = "",
+    confirmed_at: str = "",
+    verification_duration_seconds: Any = None,
+    delivery_task_uid: str = "",
+) -> List[Dict[str, str]]:
     from services.local_feishu_bridge import send_local_feishu_bound_card
     from services.qianchuan_accounts import resolve_account_feishu_targets
 
     scene = "推商品" if promotion_scene == "product" else "推直播"
     system = "乘方" if plan_system == "chengfang" else "全域"
     action = "结束调控" if stop_action == "delete" else "暂停调控"
+    naturally_expired = str(platform_status or "").upper() == "OFFLINE_TIME"
     card = {
         "config": {
             "wide_screen_mode": True,
             "enable_forward": False,
         },
         "header": {
-            "template": "green" if success else "red",
+            "template": "grey" if naturally_expired else "green" if success else "red",
             "title": {
                 "tag": "plain_text",
-                "content": f"千川自动停投{'成功' if success else '失败'} · {system} · {scene}",
+                "content": (
+                    f"千川调控任务已自然到期 · {system} · {scene}"
+                    if naturally_expired
+                    else f"千川自动停投{'成功' if success else '失败'} · {system} · {scene}"
+                ),
             },
         },
         "elements": [
@@ -822,6 +862,11 @@ def _send_auto_stop_result_notification(
                             f"调控任务ID：{assist_task_id}",
                             f"动作：{action}",
                             f"结果：{message}",
+                            f"千川最终状态：{platform_status or '未记录'}",
+                            f"request_id：{request_id or '未记录'}",
+                            f"提交时间：{submitted_at or '未记录'}",
+                            f"核验时间：{confirmed_at or '未记录'}",
+                            f"核验耗时：{verification_duration_seconds if verification_duration_seconds not in (None, '') else '未记录'}秒",
                         ]
                     ),
                 },
@@ -835,10 +880,11 @@ def _send_auto_stop_result_notification(
     )
     # 结果通知只依赖飞书 REST 发信能力，不依赖卡片回调长连接在线。
     # REST 临时失败时 LocalFeishuBridge 会把消息写入持久化 outbox 重试。
-    send_local_feishu_bound_card(
+    return send_local_feishu_bound_card(
         card,
         targets=targets or None,
         require_connected=False,
+        task_uid=delivery_task_uid,
     )
 
 
@@ -1547,13 +1593,14 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                         "evaluation": eval_snap,
                                     }
                                 )
-                                execution_uid = hashlib.sha256(
-                                    (
-                                        f"{cycle_owner}|{target_uid}|{assist_task_id}|"
-                                        f"{st.get('id') or st_label}|{stop_action}|"
-                                        f"{control_cycle_key}"
-                                    ).encode("utf-8")
-                                ).hexdigest()
+                                execution_uid = stop_cycle_execution_key(
+                                    cycle_owner,
+                                    aavid,
+                                    ad_id,
+                                    assist_task_id,
+                                    control_cycle_key,
+                                    stop_action,
+                                )
                                 result = await svc.run(
                                     aavid=aavid_int,
                                     ad_id=ad_id_int,
@@ -1568,7 +1615,21 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     close_session=False,
                                     execution_uid=execution_uid,
                                     reconciliation_task_uid=execution_uid,
+                                    control_cycle_key=control_cycle_key,
                                 )
+                                if result.step in {
+                                    "submitting",
+                                    "submitted",
+                                    "verifying",
+                                }:
+                                    logger.info(
+                                        "%s 同周期停投已在核验，本策略不重复提交 "
+                                        "target=%s assist_task_id=%s",
+                                        _tag,
+                                        target_uid,
+                                        assist_task_id,
+                                    )
+                                    continue
                         except Exception:
                             ended_at = _beijing_now_str()
                             dur = int((time.time() - t0) * 1000)
@@ -1603,15 +1664,27 @@ async def run_one_cycle(db: SQLiteStore) -> None:
 
                         ended_at = _beijing_now_str()
                         dur = int((time.time() - t0) * 1000)
-                        if result.step == "done_already_paused":
+                        verifying_steps = {
+                            "submitting",
+                            "submitted",
+                            "verifying",
+                            "submitted_verifying",
+                        }
+                        if result.step in {
+                            "done_already_paused",
+                            "done_naturally_expired",
+                        }:
                             st_ok = 2
-                        elif result.step == "submitted_verifying":
+                        elif result.step in verifying_steps:
                             st_ok = -1
                         elif result.success:
                             st_ok = 1
                         else:
                             st_ok = -1
-                        if result.step == "done_already_paused" or not result.success:
+                        if result.step in {
+                            "done_already_paused",
+                            "done_naturally_expired",
+                        } or not result.success:
                             detail = (result.detail or "")[:8000]
                         else:
                             detail = ""
@@ -1643,7 +1716,9 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             execution_uid=execution_uid,
                             execution_state=(
                                 "submitted_verifying"
-                                if result.step == "submitted_verifying"
+                                if result.step in verifying_steps
+                                else "unknown_requires_review"
+                                if result.step == "unknown_requires_review"
                                 else ("confirmed_succeeded" if st_ok in {1, 2} else "confirmed_failed")
                             ),
                         )

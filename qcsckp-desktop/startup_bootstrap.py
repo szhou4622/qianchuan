@@ -73,9 +73,27 @@ def _redact(text: Any) -> str:
     patterns = (
         r"(?i)(app[_ -]?secret|access[_ -]?token|refresh[_ -]?token|activation[_ -]?code|device[_ -]?credential|device[_ -]?session)\s*[:=]\s*[^\s,;]+",
         r"(?i)(authorization\s*:\s*bearer)\s+[^\s]+",
+        r"(?i)(cookie|set-cookie)\s*:\s*[^\r\n]+",
+        r"(?i)(sessionid|session_id|sid|ticket|code)\s*=\s*[^\s,;]+",
     )
     for pattern in patterns:
         value = re.sub(pattern, r"\1=<redacted>", value)
+    value = re.sub(
+        r"(?i)https?://[^\s?#]+(?:\?[^\s#]*)?(?:#[^\s]*)?",
+        "<url>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)[A-Z]:\\(?:[^\s\\/:*?\"<>|]+\\)*[^\s\\/:*?\"<>|]*",
+        "<local-path>",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b[A-Z]:\\Users\\[^\\\r\n]+",
+        "<local-user>",
+        value,
+    )
+    value = re.sub(r"(?<!\d)\d{12,}(?!\d)", "<business-id>", value)
     return value
 
 
@@ -134,7 +152,7 @@ def native_confirm(message: str, *, title: str = APP_TITLE) -> bool:
 
 
 def _state_payload(phase: str, detail: str = "") -> dict[str, Any]:
-    return {
+    payload = {
         "pid": os.getpid(),
         "executable": str(Path(sys.executable).resolve()),
         "phase": str(phase or "unknown"),
@@ -142,6 +160,23 @@ def _state_payload(phase: str, detail: str = "") -> dict[str, Any]:
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "updated_unix": time.time(),
     }
+    for identity_path in (
+        _app_root() / "bin" / "release.json",
+        _app_root() / "release.json",
+    ):
+        try:
+            identity = json.loads(identity_path.read_text(encoding="utf-8-sig"))
+            payload.update(
+                {
+                    "version": str(identity.get("version") or ""),
+                    "channel": str(identity.get("channel") or ""),
+                    "build_revision": int(identity.get("build_revision") or 0),
+                }
+            )
+            break
+        except (OSError, ValueError, TypeError):
+            continue
+    return payload
 
 
 def mark_startup_phase(phase: str, detail: str = "") -> None:

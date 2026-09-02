@@ -830,6 +830,7 @@ def _control_snapshot(
     *,
     target: Mapping[str, Any],
     request_id: str,
+    observed_at: str = "",
     units: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     raw = _mapping(task.get("raw"))
@@ -875,6 +876,8 @@ def _control_snapshot(
         "ecp_roi2_goal": first(raw, "roi2_goal", "ecp_roi2_goal", "roi2Goal"),
         "ad_delivery_type": 0 if active else 1,
         "ad_delivery_name": status,
+        "task_status_source": str(task.get("status_source") or "")[:64],
+        "task_status_observed_at": str(observed_at or _now())[:64],
         "daily_delivery_seconds": (
             int(Decimal(str(task.get("duration"))) * Decimal("3600"))
             if task.get("duration") not in (None, "")
@@ -928,20 +931,60 @@ def _guard_control_snapshot_after_confirmed_stop(
     snapshot: Mapping[str, Any],
     *,
     observed_at: str,
+    connection: Any = None,
+    cycle_state: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     guarded = dict(snapshot)
     if guarded.get("ad_delivery_type") != 0:
         return guarded
-    cycle_state = stop_cycle_state(
+    state = dict(cycle_state or {}) or stop_cycle_state(
         store,
         target_uid,
         guarded.get("assist_task_id"),
         assist_row=guarded,
         observed_at=observed_at,
+        connection=connection,
     )
-    if cycle_state.get("blocked"):
+    if state.get("blocked"):
+        persisted = store.select_one(
+            "pmc_roi2_assist_task",
+            where={
+                "target_uid": target_uid,
+                "assist_task_id": guarded.get("assist_task_id"),
+            },
+            connection=connection,
+        ) or {}
+        persisted_status = str(
+            persisted.get("ad_delivery_name") or ""
+        ).strip().upper()
+        terminal_status = (
+            persisted_status
+            if persisted_status
+            in {"DISABLE", "DISABLED", "FINISHED", "ENDED", "OFFLINE_TIME"}
+            else "DISABLE"
+        )
+        persisted_terminal = terminal_status == persisted_status
         guarded["ad_delivery_type"] = 1
-        guarded["ad_delivery_name"] = "DISABLE"
+        guarded["ad_delivery_name"] = terminal_status
+        guarded["task_status_source"] = (
+            str(persisted.get("task_status_source") or "api_reconciliation")
+            if persisted_terminal
+            else "api_reconciliation"
+        )
+        terminal_observed_at = (
+            (
+                persisted.get("task_status_observed_at")
+                or persisted.get("updated_at")
+            )
+            if persisted_terminal
+            else state.get("stop_completed_at")
+        )
+        guarded["task_status_observed_at"] = str(
+            terminal_observed_at
+            or state.get("stop_completed_at")
+            or guarded.get("task_status_observed_at")
+            or observed_at
+        )
         guarded["reconciliation_status"] = "confirmed"
     return guarded
 
@@ -1424,7 +1467,15 @@ def collect_target(
                     if text_id(item.get("task_id"))
                 }
                 for item in control_tasks:
-                    by_task[text_id(item.get("task_id"))] = item
+                    task_id = text_id(item.get("task_id"))
+                    existing = by_task.get(task_id) or {}
+                    if (
+                        str(item.get("status_source") or "")
+                        == "request_filter_inferred"
+                        and str(existing.get("status_source") or "") == "api"
+                    ):
+                        continue
+                    by_task[task_id] = item
                 control_tasks = list(by_task.values())
                 control_request_ids = [
                     *control_request_ids,
@@ -1462,32 +1513,78 @@ def collect_target(
         )
     control_request_id = control_request_ids[-1] if control_request_ids else ""
     control_observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    control_rows: list[dict[str, Any]] = []
-    for item in control_tasks:
-        task_id = text_id(item.get("task_id"))
-        if (
-            str(item.get("scene") or "").upper()
-            not in {"", "MATERIAL_ADD_BUDGET"}
-            or not task_id
-        ):
-            continue
-        snapshot = _control_snapshot(
-            item,
-            target=target,
-            request_id=control_request_id,
-            units=units,
-        )
-        # A completed stop is stronger than an active-only response.  The
-        # platform frequently omits task_status and the client then inherits
-        # PROCESSING from the request filter. Only a later official resume log
-        # may open a new active cycle.
-        control_rows.append(
-            _guard_control_snapshot_after_confirmed_stop(
+
+    def build_control_rows(
+        tasks: list[dict[str, Any]],
+        *,
+        request_id: str,
+        observed_at: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        built: list[dict[str, Any]] = []
+        needs_explicit_resume_status = False
+        for item in tasks:
+            task_id = text_id(item.get("task_id"))
+            if (
+                str(item.get("scene") or "").upper()
+                not in {"", "MATERIAL_ADD_BUDGET"}
+                or not task_id
+            ):
+                continue
+            snapshot = _control_snapshot(
+                item,
+                target=target,
+                request_id=request_id,
+                observed_at=observed_at,
+                units=units,
+            )
+            state = stop_cycle_state(
                 store,
                 target_uid,
-                snapshot,
-                observed_at=control_observed_at,
+                task_id,
+                assist_row=snapshot,
+                observed_at=observed_at,
             )
+            if (
+                state.get("blocked")
+                and state.get("resume_at")
+                and str(item.get("status_source") or "") != "api"
+            ):
+                needs_explicit_resume_status = True
+            built.append(
+                _guard_control_snapshot_after_confirmed_stop(
+                    store,
+                    target_uid,
+                    snapshot,
+                    observed_at=observed_at,
+                    cycle_state=state,
+                )
+            )
+        return built, needs_explicit_resume_status
+
+    control_rows, needs_explicit_resume_status = build_control_rows(
+        control_tasks,
+        request_id=control_request_id,
+        observed_at=control_observed_at,
+    )
+    if needs_explicit_resume_status and not refresh_control_history:
+        explicit_tasks, explicit_request_ids = fetch_controls(179, active_only=False)
+        explicit_by_task = {
+            text_id(item.get("task_id")): item
+            for item in explicit_tasks
+            if text_id(item.get("task_id"))
+            and str(item.get("status_source") or "") == "api"
+        }
+        control_tasks = [
+            explicit_by_task.get(text_id(item.get("task_id"))) or item
+            for item in control_tasks
+        ]
+        control_request_ids = [*control_request_ids, *explicit_request_ids]
+        control_request_id = control_request_ids[-1] if control_request_ids else ""
+        control_observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        control_rows, _ = build_control_rows(
+            control_tasks,
+            request_id=control_request_id,
+            observed_at=control_observed_at,
         )
 
     active_material_rows = store.execute(
@@ -1719,6 +1816,35 @@ def collect_target(
         effective_control["updated_at"] = cycle_observed_at
         control_upserts.append(effective_control)
     with store.transaction() as connection:
+        # Acquire the writer lock before the final status guard. If a stop
+        # reconciliation committed after the network response, it is visible
+        # here; if it commits later, it must wait and will become the final
+        # writer. In neither ordering can an older PROCESSING snapshot win.
+        connection.execute("BEGIN IMMEDIATE")
+        fenced_control_upserts: list[dict[str, Any]] = []
+        for row in control_upserts:
+            observed = str(
+                row.get("task_status_observed_at") or control_observed_at
+            )
+            state = stop_cycle_state(
+                store,
+                target_uid,
+                row.get("assist_task_id"),
+                assist_row=row,
+                observed_at=observed,
+                connection=connection,
+            )
+            fenced_control_upserts.append(
+                _guard_control_snapshot_after_confirmed_stop(
+                    store,
+                    target_uid,
+                    row,
+                    observed_at=observed,
+                    connection=connection,
+                    cycle_state=state,
+                )
+            )
+        control_upserts = fenced_control_upserts
         _bulk_upsert_rows(
             connection,
             "pmc_material_metric_snapshot",
