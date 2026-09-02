@@ -1948,6 +1948,67 @@ class OfficialApiBackendTests(unittest.TestCase):
                 notify.call_args.kwargs["status"],
             )
 
+    def test_reconciliation_repairs_legacy_group_uid_without_attempt_suffix(self):
+        with tempfile.TemporaryDirectory() as temp:
+            database = os.path.join(temp, "legacy-group-reconcile.db")
+            init_sqlite_schema(database=database)
+            store = SQLiteStore(database=database)
+            base_uid = "card-1:group:1"
+            attempt_uid = base_uid + ":attempt:1"
+            store.insert(
+                "pmc_retargeting_run",
+                {
+                    "aavid": "10001",
+                    "ad_id": "20002",
+                    "material_id": "30003",
+                    "started_at": "2026-09-02 14:54:42",
+                    "ended_at": "2026-09-02 14:54:47",
+                    "status": 1,
+                    "step": "submitted_verifying",
+                    "message": "核验中",
+                    "execution_uid": base_uid,
+                    "execution_state": "submitted_verifying",
+                },
+            )
+            store.insert(
+                "execution_reconciliation",
+                {
+                    "reconciliation_uid": "legacy-group-recon-1",
+                    "account_username": "owner",
+                    "task_uid": "",
+                    "action_type": "retarget",
+                    "aavid": "10001",
+                    "ad_id": "20002",
+                    "control_task_id": "40004",
+                    "idempotency_key": attempt_uid,
+                    "status": "verifying",
+                    "lease_owner": "lease-1",
+                    "fencing_token": 1,
+                    "payload_json": json.dumps(
+                        {"execution_uid": attempt_uid}
+                    ),
+                },
+            )
+            row = store.select_one(
+                "execution_reconciliation",
+                where={"reconciliation_uid": "legacy-group-recon-1"},
+            )
+
+            changed = _finish(
+                store,
+                row,
+                status="confirmed_succeeded",
+                verified={"task_id": "40004", "status": "PROCESSING"},
+            )
+
+            self.assertTrue(changed)
+            run = store.select_one(
+                "pmc_retargeting_run",
+                where={"execution_uid": base_uid},
+            )
+            self.assertEqual("confirmed_succeeded", run["execution_state"])
+            self.assertEqual("confirmed_succeeded", run["step"])
+
     def test_pause_verification_uses_disable_and_recognizes_natural_expiry(self):
         self.assertEqual(
             ("confirmed", "调控任务已暂停，平台状态为 DISABLE"),

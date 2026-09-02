@@ -1699,7 +1699,7 @@ class RetargetWorkerValidationTests(unittest.TestCase):
             return_value=service,
         ), patch(
             "services.retarget_task_worker._insert_run",
-        ), patch(
+        ) as insert_run, patch(
             "services.retarget_task_worker._interval_from_root_cfg",
             return_value=(3600, 5),
         ), patch(
@@ -1727,6 +1727,10 @@ class RetargetWorkerValidationTests(unittest.TestCase):
         )
         self.assertEqual([60, 120], [call.args[0] for call in sleeper.await_args_list])
         self.assertEqual(2, report.call_count)
+        self.assertEqual(
+            "task-retryable:attempt:3",
+            insert_run.call_args.kwargs["cloud_task_id"],
+        )
 
     def test_nonretryable_failure_is_submitted_only_once(self):
         task = {

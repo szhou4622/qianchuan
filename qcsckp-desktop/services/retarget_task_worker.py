@@ -1299,6 +1299,7 @@ async def _execute_task(
     attempt_history: List[Dict[str, Any]] = []
     submission_attempts = 0
     rate_recorded_under_lock = False
+    last_attempt_execution_uid = task_uid
     try:
         target = db.select_one("promotion_target", where={"target_uid": target_uid}) or {}
         for attempt in range(1, 4):
@@ -1315,6 +1316,7 @@ async def _execute_task(
                     db,
                 )
                 attempt_execution_uid = f"{task_uid}:attempt:{attempt}"
+                last_attempt_execution_uid = attempt_execution_uid
                 locked_result = await svc.run(
                     aavid=int(aavid),
                     ad_id=int(ad_id),
@@ -1496,7 +1498,7 @@ async def _execute_task(
         headless=bool(payload.get("headless", cfg.get("browser_headless", True))),
         browser_headless_rule=bool(cfg.get("browser_headless", True)),
         trigger_source=f"feishu_card:{task_uid}"[:64],
-        cloud_task_id=task_uid,
+        cloud_task_id=last_attempt_execution_uid,
         operator_id=str(task.get("clicker_open_id") or ""),
         materials=materials,
     )

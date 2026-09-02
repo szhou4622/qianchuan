@@ -7,6 +7,7 @@ submitted task into a false success or cause the POST to be repeated.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -377,7 +378,7 @@ def _finish(
                 ),
             )
         else:
-            store.execute(
+            run_update = store.execute(
                 "UPDATE pmc_retargeting_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
                 "WHERE execution_uid=? AND execution_state='submitted_verifying'",
                 (
@@ -390,6 +391,30 @@ def _finish(
                     run_task_uid,
                 ),
             )
+            if int(run_update or 0) != 1:
+                # r12 and older grouped runs persisted the parent group UID
+                # while reconciliation used its concrete attempt UID. Repair
+                # those rows without resubmitting the platform write.
+                legacy_run_uid = re.sub(r":attempt:\d+$", "", run_task_uid)
+                if legacy_run_uid and legacy_run_uid != run_task_uid:
+                    store.execute(
+                        "UPDATE pmc_retargeting_run SET status=?,execution_state=?,"
+                        "step=?,message=?,detail=?,ended_at=? WHERE execution_uid=? "
+                        "AND execution_state='submitted_verifying'",
+                        (
+                            1 if succeeded else -1,
+                            "confirmed_succeeded" if succeeded else status,
+                            "confirmed_succeeded" if succeeded else status,
+                            (
+                                "官方 API 追投已核验成功"
+                                if succeeded
+                                else "官方 API 追投核验失败，请人工检查"
+                            ),
+                            str(error or "")[:4000],
+                            now,
+                            legacy_run_uid,
+                        ),
+                    )
         store.execute(
             "UPDATE account_operation_event SET status=?,summary=?,detail=?,updated_at=? "
             "WHERE cloud_task_id=? AND status='pending'",

@@ -401,7 +401,30 @@ def _grouped_result_from_runs(
             continue
         group_index = int(matched.group(1))
         by_group[group_index] = dict(run)
-    if not by_group:
+    reconciled_by_group: Dict[int, Dict[str, Any]] = {}
+    try:
+        reconciliation_rows = SQLiteStore(database=DB_FILE).execute(
+            "SELECT status,control_task_id,last_error,payload_json "
+            "FROM execution_reconciliation WHERE task_uid=? "
+            "AND account_username=? ORDER BY id",
+            (
+                task_uid,
+                str(row.get("account_username") or "").strip().casefold(),
+            ),
+            fetch=True,
+        ) or []
+    except Exception:
+        reconciliation_rows = []
+    for reconciliation in reconciliation_rows:
+        data = _loads(reconciliation.get("payload_json"), {})
+        if not isinstance(data, dict):
+            continue
+        execution_uid = str(data.get("execution_uid") or "")
+        matched = re.search(r":group:(\d+)(?::|$)", execution_uid)
+        if not matched:
+            continue
+        reconciled_by_group[int(matched.group(1))] = dict(reconciliation)
+    if not by_group and not reconciled_by_group:
         return None
 
     parent_status = str(row.get("status") or "")
@@ -415,6 +438,7 @@ def _grouped_result_from_runs(
     for group_index, group in enumerate(groups, start=1):
         group = group if isinstance(group, dict) else {}
         run = by_group.get(group_index)
+        reconciliation = reconciled_by_group.get(group_index)
         material_ids = [
             str(value)
             for value in group.get("material_ids") or []
@@ -453,6 +477,43 @@ def _grouped_result_from_runs(
             else:
                 outcome = "unknown_requires_review"
             message = str(run.get("message") or message)
+        if reconciliation:
+            reconciliation_status = str(
+                reconciliation.get("status") or ""
+            ).strip()
+            reconciled_task_id = str(
+                reconciliation.get("control_task_id") or ""
+            ).strip()
+            if reconciled_task_id:
+                ids = [reconciled_task_id]
+            if reconciliation_status == "confirmed_succeeded":
+                outcome = "succeeded"
+                message = "官方 API 追投已核验成功"
+            elif reconciliation_status in {
+                "confirmed_failed",
+                "rejected",
+            }:
+                outcome = "failed"
+                message = str(
+                    reconciliation.get("last_error")
+                    or "官方 API 追投核验失败"
+                )
+            elif reconciliation_status in {
+                "unknown_requires_review",
+                "result_unknown",
+            }:
+                outcome = "unknown_requires_review"
+                message = str(
+                    reconciliation.get("last_error")
+                    or "官方 API 追投结果无法确认"
+                )
+            elif reconciliation_status in {
+                "submitting",
+                "submitted",
+                "verifying",
+            }:
+                outcome = "verifying"
+                message = "追投已提交，正在核验平台最终状态"
         if outcome == "succeeded":
             success_count += 1
             task_ids.extend(ids)
@@ -2941,6 +3002,10 @@ class LocalFeishuManager:
             with self._lock:
                 self._bridge = bridge
             bridge.start()
+            _EVENT_EXECUTOR.submit(
+                repair_reconciled_local_retarget_tasks,
+                key,
+            )
 
     def deactivate(self) -> None:
         with self._lock:
@@ -4533,6 +4598,74 @@ def finalize_reconciled_local_task(
     if bridge:
         _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
     return {"success": True}
+
+
+def repair_reconciled_local_retarget_tasks(account_username: str = "") -> Dict[str, Any]:
+    """Finish grouped cards whose shared reconciliation already reached terminal state."""
+    account = _account_key(account_username or _MANAGER.account)
+    if not account:
+        return {"success": True, "count": 0, "task_uids": []}
+    conn = _db()
+    try:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM local_retarget_task WHERE account_username=? "
+                "AND action_type='retarget' AND status='verifying' "
+                "ORDER BY id",
+                (account,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    changed: List[str] = []
+    for row in rows:
+        payload = _loads(row.get("payload_json"), {})
+        result = _loads(row.get("result_json"), {})
+        if not isinstance(payload, dict) or not isinstance(result, dict):
+            continue
+        grouped_result = _grouped_result_from_runs(row, payload, result)
+        if not grouped_result:
+            continue
+        status = str(grouped_result.get("status") or "verifying")
+        if status not in {
+            "succeeded",
+            "partial_succeeded",
+            "failed",
+            "unknown_requires_review",
+        }:
+            continue
+        task_uid = str(row.get("task_uid") or "")
+        now_text = _dt(_now())
+        update_conn = _db()
+        try:
+            updated = update_conn.execute(
+                "UPDATE local_retarget_task SET status=?,active_dedupe_key=NULL,"
+                "claim_expires_at=NULL,result_message=?,result_detail=?,"
+                "regulate_task_id=?,result_json=?,finished_at=?,updated_at=? "
+                "WHERE task_uid=? AND account_username=? AND status='verifying'",
+                (
+                    status,
+                    str(grouped_result.get("message") or "")[:1000],
+                    str(grouped_result.get("detail") or "")[:4000],
+                    str(grouped_result.get("regulate_task_id") or "")[:128],
+                    _json(grouped_result),
+                    now_text,
+                    now_text,
+                    task_uid,
+                    account,
+                ),
+            )
+            update_conn.commit()
+            if updated.rowcount == 1:
+                changed.append(task_uid)
+        finally:
+            update_conn.close()
+    bridge = _MANAGER.bridge() if _MANAGER.account == account else None
+    if bridge is not None:
+        for task_uid in changed:
+            _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
+    return {"success": True, "count": len(changed), "task_uids": changed}
 
 
 def report_local_stop_task(

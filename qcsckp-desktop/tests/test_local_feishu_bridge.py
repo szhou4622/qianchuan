@@ -764,6 +764,83 @@ class LocalFeishuTaskTests(unittest.TestCase):
         )
         self.assertEqual("verifying", run(succeeded, pending)["status"])
 
+    def test_startup_repair_finishes_r12_grouped_card_from_shared_ledger(self):
+        payload = task_payload(3)
+        created = bridge.create_local_retarget_task(payload)
+        self.assertTrue(created["success"])
+        task_uid = created["data"]["task_uid"]
+        row = bridge._task_row(task_uid, "tool-user-a")
+        saved_payload = json.loads(row["payload_json"])
+        saved_payload["retarget_groups"] = [
+            {
+                "group_uid": f"group-{index}",
+                "material_ids": [material["material_id"]],
+                "materials": [material],
+            }
+            for index, material in enumerate(saved_payload["materials"], start=1)
+        ]
+        task_ids = ["ledger-task-1", "ledger-task-2", "ledger-task-3"]
+        conn = bridge._db()
+        try:
+            conn.execute(
+                "UPDATE local_retarget_task SET status='verifying',payload_json=?,"
+                "result_json='{}' WHERE task_uid=?",
+                (json.dumps(saved_payload, ensure_ascii=False), task_uid),
+            )
+            for index, material in enumerate(saved_payload["materials"], start=1):
+                group_uid = f"{task_uid}:group:{index}"
+                attempt_uid = f"{group_uid}:attempt:1"
+                conn.execute(
+                    "INSERT INTO pmc_retargeting_run("
+                    "aavid,ad_id,material_id,materials_json,started_at,ended_at,"
+                    "status,step,message,regulate_task_id,trigger_source,"
+                    "execution_uid,execution_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "10001",
+                        "20002",
+                        material["material_id"],
+                        json.dumps([material], ensure_ascii=False),
+                        "2026-09-02 14:54:42",
+                        "2026-09-02 14:55:01",
+                        1,
+                        "submitted_verifying",
+                        "追投已提交，正在核验平台最终状态",
+                        task_ids[index - 1],
+                        f"feishu_card:{task_uid}:group:{index}",
+                        group_uid,
+                        "submitted_verifying",
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO execution_reconciliation("
+                    "reconciliation_uid,account_username,task_uid,action_type,"
+                    "control_task_id,idempotency_key,status,payload_json) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        f"reconcile-{index}",
+                        "tool-user-a",
+                        task_uid,
+                        "retarget",
+                        task_ids[index - 1],
+                        attempt_uid,
+                        "confirmed_succeeded",
+                        json.dumps({"execution_uid": attempt_uid}),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        repaired = bridge.repair_reconciled_local_retarget_tasks("tool-user-a")
+
+        self.assertEqual(1, repaired["count"])
+        final = bridge._task_row(task_uid, "tool-user-a")
+        result = json.loads(final["result_json"])
+        self.assertEqual("succeeded", final["status"])
+        self.assertEqual(task_ids, result["regulate_task_ids"])
+        self.assertEqual(3, result["successful_group_count"])
+        self.assertIn("3组追投全部核验成功", final["result_message"])
+
     def test_stop_card_shows_complete_strategy_and_task_metric_snapshot(self):
         payload = self._stop_payload()
         trigger = payload["trigger"]
