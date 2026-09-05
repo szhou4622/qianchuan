@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 from collections import Counter
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ from api.dashboard import DashboardApi
 from api.operation_events import prune_operation_events
 from api.rule_retargeting_config import evaluate_trigger, load_rule_retargeting_config
 from config import DATA_DIR
+from config import QIANCHUAN_BACKEND
 from services.cloud_retarget_client import pull_retarget_task, report_retarget_task
 from services.local_test_guard import (
     assert_test_task_scope,
@@ -57,6 +59,14 @@ MAX_REVALIDATION_AGE_SECONDS = 10 * 60
 _WORKER_LOCK = threading.Lock()
 _WORKER_THREAD: Optional[threading.Thread] = None
 _WORKER_STOP = threading.Event()
+_LEASE_CANCEL_EVENT = ContextVar("retarget_lease_cancel_event", default=None)
+
+
+def _assert_execution_not_cancelled() -> str:
+    event = _LEASE_CANCEL_EVENT.get()
+    if event is not None and (event.is_set() or _WORKER_STOP.is_set()):
+        raise RuntimeError("任务领取权已失效，本次未继续提交")
+    return ""
 
 
 class RetargetTaskInvalidated(RuntimeError):
@@ -255,7 +265,7 @@ def _save_local_task(
     db.insert_or_update("cloud_retarget_task_local", data, unique_fields=["cloud_task_id"])
 
 
-def _cached_report(task_uid: str, claim_token: str, local: Dict[str, Any]) -> None:
+def _cached_report(task_uid: str, claim_token: str, local: Dict[str, Any], fencing_token=None) -> None:
     raw = local.get("result_json") or "{}"
     try:
         result = json.loads(raw)
@@ -269,6 +279,7 @@ def _cached_report(task_uid: str, claim_token: str, local: Dict[str, Any]) -> No
         detail=str(result.get("detail") or ""),
         regulate_task_id=str(result.get("regulate_task_id") or ""),
         result=result,
+        fencing_token=fencing_token,
     )
 
 
@@ -956,7 +967,7 @@ def _validate_budget_increase_task(
         "0",
     }:
         raise RuntimeError("调控任务已不在执行中")
-    if not _timestamp_is_fresh(row.get("updated_at")):
+    if not _timestamp_is_fresh(row.get("metrics_observed_at")):
         raise RuntimeError("调控任务最新指标已超过10分钟，请等待重新同步")
     trigger = strategy.get("trigger") or {}
     if not evaluate_trigger(trigger, row):
@@ -988,181 +999,118 @@ def _validate_budget_increase_task(
 
 
 async def _execute_budget_increase_task(
-    task: Dict[str, Any],
-    db: SQLiteStore,
+    task: Dict[str, Any], db: SQLiteStore,
 ) -> Dict[str, Any]:
-    """Revalidate and adjust an existing control task through the selected backend."""
+    """An existing budget/duration plan shares one fenced, GET-recoverable intent."""
     target_uid = str(task.get("target_uid") or "")
     assist_task_id = str(task.get("assist_task_id") or "")
+    gate = None
+    calculation = {}
     try:
         async with exclusive_browser_operation(
-            f"飞书确认追加预算:{target_uid}:{assist_task_id}",
-            priority=10,
+            f"飞书确认追加预算:{target_uid}:{assist_task_id}", priority=10,
         ):
-            _, _, target, row, calculation = await asyncio.to_thread(
-                _validate_budget_increase_task,
-                task,
-                db,
-            )
+            _, _, target, row, calculation = await asyncio.to_thread(_validate_budget_increase_task, task, db)
             from config import QIANCHUAN_BACKEND
-
-            if QIANCHUAN_BACKEND == "official_api":
-                from datetime import datetime, timedelta
-                from decimal import Decimal
-                from services.qianchuan_open_api.audit import OfficialApiAuditStore
-                from services.qianchuan_open_api.errors import ApiWriteOutcomeUnknown
-                from services.qianchuan_open_api.normalizers import text_id
-                from services.qianchuan_open_api.runtime import get_official_api_service
-
-                service = get_official_api_service()
-                aavid = str(target.get("aadvid") or "")
-                ad_id = str(target.get("ad_id") or "")
-                scene = str(target.get("promotion_scene") or "product")
-                goal = "LIVE_PROM_GOODS" if scene == "live" else "VIDEO_PROM_GOODS"
-                now = datetime.now()
-                tasks, _ = await asyncio.to_thread(
-                    service.list_control_tasks,
-                    aavid,
-                    ad_id=ad_id,
-                    marketing_goal=goal,
-                    start_time=(now - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00"),
-                    end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
-                )
-                exact = next(
-                    (
-                        item
-                        for item in tasks
-                        if text_id(item.get("task_id")) == text_id(assist_task_id)
-                    ),
-                    None,
-                )
-                if not exact or str(exact.get("scene") or "").upper() != "MATERIAL_ADD_BUDGET":
-                    raise RuntimeError("官方 API 未找到待调整的素材追投调控任务")
-                status = str(exact.get("status") or "").upper()
-                if status in {"PAUSE", "PAUSED", "DISABLE", "DISABLED", "FINISHED", "ENDED"}:
-                    raise RuntimeError("调控任务已不在可调整状态")
-                audit = OfficialApiAuditStore(db)
-
-                async def reconcile_unknown(
-                    exc: ApiWriteOutcomeUnknown,
-                    *,
-                    field: str,
-                    expected: Any,
-                ) -> str:
-                    fresh_tasks, request_ids = await asyncio.to_thread(
-                        service.list_control_tasks,
-                        aavid,
-                        ad_id=ad_id,
-                        marketing_goal=goal,
-                        start_time=(now - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00"),
-                        end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
-                    )
-                    fresh = next(
-                        (
-                            item
-                            for item in fresh_tasks
-                            if text_id(item.get("task_id")) == text_id(assist_task_id)
-                        ),
-                        None,
-                    )
-                    confirmed = False
-                    if fresh is not None:
-                        try:
-                            confirmed = Decimal(str(fresh.get(field))) == Decimal(str(expected))
-                        except Exception:
-                            confirmed = False
-                    audit.mark_reconciled(
-                        exc.request_uid,
-                        status="confirmed" if confirmed else "unresolved",
-                        task_id=assist_task_id,
-                        response={
-                            "field": field,
-                            "expected": expected,
-                            "actual": fresh.get(field) if fresh else None,
-                            "list_request_ids": request_ids,
-                        },
-                    )
-                    if not confirmed:
-                        raise RuntimeError(
-                            f"官方 API {field}修改结果未知且对账未确认，禁止自动重试；请人工核对"
-                        ) from exc
-                    return str(exc.request_id or "reconciled")
-
-                budget_request_id = ""
-                try:
-                    budget_response = await asyncio.to_thread(
-                        service.update_control_budget,
-                        aavid,
-                        assist_task_id,
-                        calculation["new_budget_yuan"],
-                    )
-                    budget_request_id = budget_response.request_id
-                except ApiWriteOutcomeUnknown as exc:
-                    budget_request_id = await reconcile_unknown(
-                        exc,
-                        field="budget",
-                        expected=calculation["new_budget_yuan"],
-                    )
-                duration_request_id = ""
-                extend_hours = calculation.get("extend_hours")
-                if extend_hours:
-                    current_duration = exact.get("duration")
-                    if current_duration is None:
-                        raise RuntimeError(
-                            "预算已更新，但官方 API 未返回当前时长，未继续修改时长；请人工核对"
-                        )
-                    new_duration = float(current_duration) + float(extend_hours)
-                    try:
-                        duration_response = await asyncio.to_thread(
-                            service.update_control_duration,
-                            aavid,
-                            assist_task_id,
-                            new_duration,
-                        )
-                        duration_request_id = duration_response.request_id
-                    except ApiWriteOutcomeUnknown as exc:
-                        duration_request_id = await reconcile_unknown(
-                            exc,
-                            field="duration",
-                            expected=new_duration,
-                        )
+            if QIANCHUAN_BACKEND != "official_api":
                 return {
-                    "success": True,
-                    "message": "官方 API 调控任务预算/时长调整成功",
-                    "detail": _json(
-                        {
-                            "source": "qianchuan_open_api",
-                            "assist_task_id": assist_task_id,
-                            "budget_request_id": budget_request_id,
-                            "duration_request_id": duration_request_id,
-                            "latest_calculation": calculation,
-                        }
-                    ),
-                    "step": "done",
+                    "success": False, "step": "platform_capability_unverified",
+                    "message": "追加预算提交能力尚未完成真实页面接口取证，本次未向千川提交",
                     "calculation": calculation,
                 }
+            from datetime import datetime, timedelta
+            from functools import partial
+            from services.official_api_execution import prepare_submission_gate, _ExistingExecutionIntent
+            from services.qianchuan_open_api.normalizers import text_id
+            from services.qianchuan_open_api.runtime import get_official_api_service
+            service = get_official_api_service()
+            aavid, ad_id = str(target.get("aadvid") or ""), str(target.get("ad_id") or "")
+            scene = str(target.get("promotion_scene") or "product")
+            now = datetime.now()
+            tasks, _ = await asyncio.to_thread(
+                service.list_control_tasks, aavid, ad_id=ad_id,
+                marketing_goal="LIVE_PROM_GOODS" if scene == "live" else "VIDEO_PROM_GOODS",
+                start_time=(now - timedelta(days=179)).strftime("%Y-%m-%d 00:00:00"),
+                end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
+            )
+            exact = next((item for item in tasks if text_id(item.get("task_id")) == text_id(assist_task_id)), None)
+            if not exact or str(exact.get("scene") or "").upper() != "MATERIAL_ADD_BUDGET":
+                raise RuntimeError("官方 API 未找到待调整的素材追投调控任务")
+            if str(exact.get("status") or "").upper() in {
+                "PAUSE", "PAUSED", "DISABLE", "DISABLED", "FINISHED", "ENDED", "OFFLINE_TIME",
+            }:
+                raise RuntimeError("调控任务已不在可调整状态")
+            extend_hours = calculation.get("extend_hours")
+            new_duration = None
+            if extend_hours:
+                if exact.get("duration") is None:
+                    raise RuntimeError("官方 API 未返回当前时长，本次预算/时长均未提交")
+                new_duration = float(exact["duration"]) + float(extend_hours)
+            task_uid = str(task.get("task_uid") or "")
+            execution_uid = str(task.get("execution_uid") or task_uid) + ":budget-plan"
+            required_steps = ["budget"] + (["duration"] if extend_hours else [])
+
+            def final_check():
+                _assert_execution_not_cancelled()
+                _validate_budget_increase_task(task, db)
+                return ""
+
+            gate = prepare_submission_gate(
+                task_uid=task_uid, action_type="budget", aavid=aavid, ad_id=ad_id,
+                intent_key=execution_uid, control_task_id=assist_task_id,
+                submission_claim=task.get("submission_claim"), pre_submit_check=final_check,
+                verify_payload={
+                    "aavid": aavid, "ad_id": ad_id, "promotion_scene": scene,
+                    "task_id": assist_task_id, "execution_uid": execution_uid,
+                    "budget": calculation["new_budget_yuan"], "duration": new_duration,
+                    "required_steps": required_steps, "attempted_steps": ["budget"],
+                    "completed_steps": [],
+                },
+            )
+            try:
+                response = await asyncio.to_thread(
+                    service.update_control_budget, aavid, assist_task_id,
+                    calculation["new_budget_yuan"], before_send=gate.before_send,
+                )
+            except _ExistingExecutionIntent as exc:
+                status = str(exc.row.get("status") or "unknown_requires_review")
+                return {"success": status == "confirmed_succeeded", "step": status,
+                        "message": "该预算调整已有提交记录，只允许继续核验，不会重复修改",
+                        "calculation": calculation}
+            if response is None:
+                raise RuntimeError("预算修改未返回确定结果")
+            gate.verify_payload["completed_steps"] = ["budget"]
+            gate.accept(response)
+            if extend_hours:
+                response = await asyncio.to_thread(
+                    service.update_control_duration, aavid, assist_task_id, new_duration,
+                    before_send=partial(gate.before_followup, "duration"),
+                )
+                if response is None:
+                    raise RuntimeError("时长修改未返回确定结果")
+                gate.verify_payload["completed_steps"] = ["budget", "duration"]
+                gate.accept(response)
             return {
-                "success": False,
-                "message": "追加预算提交能力尚未完成真实页面接口取证，本次未向千川提交",
-                "detail": _json(
-                    {
-                        "step": "platform_capability_unverified",
-                        "assist_task_id": assist_task_id,
-                        "latest_calculation": calculation,
-                    }
-                ),
-                "step": "platform_capability_unverified",
+                "success": True, "step": "submitted_verifying",
+                "message": "预算/时长修改已提交，正在整体只读核验",
+                "detail": _json({"submission_phase": gate.phase, "required_steps": required_steps,
+                                 "completed_steps": gate.verify_payload["completed_steps"]}),
                 "calculation": calculation,
             }
-    except RetargetTaskInvalidated as exc:
-        return _strategy_invalidated_result(exc)
     except Exception as exc:
-        return {
-            "success": False,
-            "message": str(exc),
-            "detail": traceback.format_exc(),
-            "step": "revalidate",
-        }
+        if gate is not None and gate.handle_error(exc):
+            return {
+                "success": True, "step": "submitted_verifying",
+                "message": "预算/时长修改部分已接受或结果未知，已禁止重复提交，等待整体核验",
+                "detail": _json({"submission_phase": gate.phase, "error": str(exc),
+                                 "completed_steps": gate.verify_payload.get("completed_steps") or []}),
+                "calculation": calculation,
+            }
+        if isinstance(exc, RetargetTaskInvalidated):
+            return _strategy_invalidated_result(exc)
+        return {"success": False, "message": str(exc),
+                "detail": _json({"submission_phase": gate.phase if gate else "not_sent",
+                                 "trace": traceback.format_exc()}), "step": "revalidate"}
 
 
 async def _execute_task(
@@ -1175,6 +1123,7 @@ async def _execute_task(
     _skip_live_guard: bool = False,
     _allow_groups: bool = True,
 ) -> Dict[str, Any]:
+    _assert_execution_not_cancelled()
     if str(task.get("task_operation") or "") == "increase_budget":
         return await _execute_budget_increase_task(task, db)
     groups = _task_retarget_groups(task)
@@ -1317,6 +1266,10 @@ async def _execute_task(
                 )
                 attempt_execution_uid = f"{task_uid}:attempt:{attempt}"
                 last_attempt_execution_uid = attempt_execution_uid
+                def final_preflight():
+                    _assert_execution_not_cancelled()
+                    _validate_task(task, db)
+                    return ""
                 locked_result = await svc.run(
                     aavid=int(aavid),
                     ad_id=int(ad_id),
@@ -1334,6 +1287,9 @@ async def _execute_task(
                     source_url=target.get("sanitized_page_url") or None,
                     reuse_session=False,
                     close_session=False,
+                    **({"submission_claim": task.get("submission_claim"),
+                        "pre_submit_check": final_preflight}
+                       if QIANCHUAN_BACKEND == "official_api" else {}),
                 )
                 results = [locked_result]
                 attempt_history.append(
@@ -1385,11 +1341,12 @@ async def _execute_task(
                 default_delay,
                 int(getattr(locked_result, "retry_after_seconds", 0) or 0),
             )
-            await asyncio.to_thread(
+            retry_report = await asyncio.to_thread(
                 report_retarget_task,
                 str(task.get("parent_task_uid") or task_uid),
                 str(task.get("claim_token") or ""),
                 "executing",
+                fencing_token=task.get("fencing_token"),
                 message=(
                     f"第{attempt}次追投已明确失败，未创建任务；"
                     f"将在{retry_delay}秒后进行第{attempt + 1}次尝试"
@@ -1403,6 +1360,11 @@ async def _execute_task(
                     "retry_after_seconds": retry_delay,
                 },
             )
+            if not retry_report.get("success"):
+                event = _LEASE_CANCEL_EVENT.get()
+                if event is not None:
+                    event.set()
+                raise RuntimeError("重试前领取权已失效，禁止继续提交")
             await asyncio.sleep(retry_delay)
     except Exception as exc:
         results = []
@@ -1531,19 +1493,32 @@ async def _execute_task(
     return payload
 
 
-async def _heartbeat_lease(task_uid: str, claim_token: str) -> None:
+async def _heartbeat_lease(task_uid: str, claim_token: str, *, fencing_token=None, cancelled=None) -> None:
     while not _WORKER_STOP.is_set():
-        stopped = await asyncio.to_thread(_WORKER_STOP.wait, 240)
-        if stopped:
+        # Cancellation must not leave a four-minute blocking executor job
+        # behind for every completed card.
+        await asyncio.sleep(240)
+        if _WORKER_STOP.is_set():
+            if cancelled is not None:
+                cancelled.set()
             return
-        response = await asyncio.to_thread(
-            report_retarget_task,
-            task_uid,
-            claim_token,
-            "executing",
-            message="桌面工具正在执行追投",
-        )
+        try:
+            response = await asyncio.to_thread(
+                report_retarget_task,
+                task_uid,
+                claim_token,
+                "executing",
+                fencing_token=fencing_token,
+                message="桌面工具正在执行追投",
+            )
+        except Exception:
+            if cancelled is not None:
+                cancelled.set()
+            logger.exception("[飞书确认追投] 任务租约续期异常 task=%s", task_uid)
+            return
         if not response.get("success"):
+            if cancelled is not None:
+                cancelled.set()
             logger.warning("[飞书确认追投] 任务租约续期失败 %s: %s", task_uid, response.get("message"))
             return
 
@@ -1570,13 +1545,20 @@ async def run_worker_loop() -> None:
                 continue
             task_uid = str(task.get("task_uid") or "")
             claim_token = str(task.get("claim_token") or "")
+            fence = task.get("fencing_token")
+            if fence is not None:
+                task["submission_claim"] = {
+                    "task_uid": task_uid, "account_username": str(task.get("account_username") or ""),
+                    "claim_token": claim_token, "fencing_token": int(fence),
+                }
             cached = _local_task(db, task_uid)
             if cached and str(cached.get("status")) in (
                 "succeeded",
                 "failed",
                 "invalidated",
+                "unknown_requires_review",
             ):
-                await asyncio.to_thread(_cached_report, task_uid, claim_token, cached)
+                await asyncio.to_thread(_cached_report, task_uid, claim_token, cached, fence)
                 continue
             if cached and str(cached.get("status")) == "executing":
                 unknown = {
@@ -1591,6 +1573,7 @@ async def run_worker_loop() -> None:
                     task_uid,
                     claim_token,
                     "failed",
+                    fencing_token=fence,
                     message=unknown["message"],
                     detail=unknown["detail"],
                     result=unknown,
@@ -1609,6 +1592,7 @@ async def run_worker_loop() -> None:
                 task_uid,
                 claim_token,
                 "executing",
+                fencing_token=fence,
                 message="桌面工具正在复核并执行追投",
             )
             if not executing_report.get("success"):
@@ -1621,7 +1605,9 @@ async def run_worker_loop() -> None:
                 _save_local_task(db, task_uid, "failed", refused, task)
                 logger.warning("[飞书确认追投] 任务队列拒绝执行租约 %s: %s", task_uid, refused["detail"])
                 continue
-            heartbeat = asyncio.create_task(_heartbeat_lease(task_uid, claim_token))
+            cancelled = threading.Event()
+            context_token = _LEASE_CANCEL_EVENT.set(cancelled)
+            heartbeat = asyncio.create_task(_heartbeat_lease(task_uid, claim_token, fencing_token=fence, cancelled=cancelled))
             try:
                 result = await _execute_task(task, db)
             finally:
@@ -1630,12 +1616,15 @@ async def run_worker_loop() -> None:
                     await heartbeat
                 except asyncio.CancelledError:
                     pass
+                _LEASE_CANCEL_EVENT.reset(context_token)
             pending_verification = bool(result.get("pending_verification")) or str(
                 result.get("step") or ""
             ) == "submitted_verifying"
             final_status = (
                 "verifying"
                 if pending_verification
+                else "unknown_requires_review"
+                if str(result.get("step") or "") in {"unknown_requires_review", "result_unknown"}
                 else (
                     "invalidated"
                     if result.get("invalidated")
@@ -1643,11 +1632,12 @@ async def run_worker_loop() -> None:
                 )
             )
             _save_local_task(db, task_uid, final_status, result, task)
-            await asyncio.to_thread(
+            final_report = await asyncio.to_thread(
                 report_retarget_task,
                 task_uid,
                 claim_token,
                 final_status,
+                fencing_token=fence,
                 message=str(
                     result.get("message")
                     or (
@@ -1660,6 +1650,8 @@ async def run_worker_loop() -> None:
                 regulate_task_id=str(result.get("regulate_task_id") or ""),
                 result=result,
             )
+            if not final_report.get("success"):
+                logger.warning("[飞书确认追投] 最终状态回报未落地，保留执行意图待对账 task=%s", task_uid)
         except Exception:
             logger.exception("[飞书确认追投] 任务轮询异常")
             await asyncio.sleep(15)

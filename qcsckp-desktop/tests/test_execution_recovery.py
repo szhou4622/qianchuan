@@ -34,6 +34,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
             "task_uid": uid, "account_username": self.owner,
             "action_type": action, "status": status, "action_nonce": "nonce",
             "claim_token": "claim", "active_dedupe_key": uid,
+            "claim_expires_at": "2099-01-01 00:00:00",
             "expires_at": "2099-01-01 00:00:00", "payload_json": json.dumps(payload or {}),
             "card_messages_json": json.dumps([{"message_id": "message-" + uid}]),
         })
@@ -165,6 +166,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
         saved = self.store.select_one("execution_reconciliation", where={"task_uid": "auto-stop"})
         self.assertEqual("queued", saved["card_update_state"])
         with patch.object(actual, "_send_card", return_value="remote-message") as send:
+            self.store.execute("UPDATE feishu_outbox SET next_attempt_at='2000-01-01 00:00:00'")
             self.assertTrue(actual._deliver_outbox_once())
             send.assert_called_once()
         with patch.object(reconciliation, "_notify_reconciled_auto_stop") as notify_again:
@@ -230,11 +232,12 @@ class ExecutionRecoveryTests(unittest.TestCase):
         with patch.object(actual, "_send_card", return_value="terminal-message") as send:
             actual.send_bound_card({"phase": "terminal"}, targets=[("open_id", "recipient")],
                                    task_uid="auto-stop", delivery_stage="terminal")
+            self.store.execute("UPDATE feishu_outbox SET next_attempt_at='2000-01-01 00:00:00'")
             self.assertTrue(actual._deliver_outbox_once())
             actual.send_bound_card({"phase": "submitted"}, targets=[("open_id", "recipient")],
                                    task_uid="auto-stop", delivery_stage="submitted")
             send.assert_called_once()
-            self.assertEqual({"phase": "terminal"}, send.call_args.args[2])
+            self.assertEqual({"phase": "terminal"}, json.loads(send.call_args.kwargs["frozen_content"]))
         self.assertEqual("superseded", self.store.select_one("feishu_outbox", where={"task_uid": "auto-stop"})["status"])
 
     def test_old_queue_cannot_overwrite_successful_direct_patch(self):

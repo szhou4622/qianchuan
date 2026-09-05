@@ -62,6 +62,7 @@ from services.retargeting_service import (
 )
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+from services.rule_wakeup import TargetWakeBatch
 
 
 DEFAULT_INTERVAL_SEC = 300
@@ -79,6 +80,7 @@ _material_retouch_locks_guard = asyncio.Lock()
 # 规则保存、监控计划首次采集完成后，不应让用户再等待完整的 5 分钟周期。
 # Queue 用于合并连续唤醒，同时避免 Event 在 wait/clear 交界处丢失通知。
 _RUNNER_WAKE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=1)
+_TARGET_WAKE = TargetWakeBatch()
 _RUNNER_THREAD_LOCK = threading.Lock()
 _RUNNER_THREAD: Optional[threading.Thread] = None
 _RUNNER_STOP = threading.Event()
@@ -206,8 +208,10 @@ def target_has_usable_collection_snapshot(target: Dict[str, Any]) -> bool:
     return False
 
 
-def request_retargeting_rule_evaluation(reason: str = "") -> bool:
+def request_retargeting_rule_evaluation(reason: str = "", *, target_uids=None) -> bool:
     """请求规则线程立即执行一轮；连续请求合并为一次。"""
+    if not _TARGET_WAKE.request(target_uids):
+        return False
     try:
         _RUNNER_WAKE_QUEUE.put_nowait(str(reason or "manual"))
         return True
@@ -1334,7 +1338,7 @@ def _insert_run(
             logger.exception("追投流水已保存，补齐已完成核验结果失败 run_id=%s", run_id)
 
 
-async def run_one_cycle(db: SQLiteStore) -> None:
+async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
     _log_sched = retarget_log_tag(scheduler=True)
     cfg = load_rule_retargeting_config()
     if not cfg.get("enabled"):
@@ -1352,6 +1356,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         strategies = [
             {"id": "", "title": "策略 1", "trigger": trig, "retargeting": ret},
         ]
+
+    if target_uids is not None:
+        scope = {str(uid) for uid in target_uids}
+        strategies = [st for st in strategies if isinstance(st, dict) and str(st.get("target_uid") or "") in scope]
+        if not strategies:
+            return
 
     rule_full_json = _json_dumps(cfg)
     ws, mc = _interval_from_root_cfg(cfg)
@@ -1427,6 +1437,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
             ad_delivery_type=0,
             regulation_full_scan=True,
             assist_updated_within_minutes=10,
+            **({"target_uids": sorted({str(st.get("target_uid") or "") for st in strategies})}
+               if target_uids is not None else {}),
         )
         if not assist_resp.get("success"):
             logger.warning(
@@ -1597,6 +1609,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                         or str(assist_row.get("ad_id") or "")
                         != str(target.get("ad_id") or "")
                     ):
+                        continue
+                    if not _timestamp_is_fresh(assist_row.get("metrics_observed_at")):
                         continue
                     delivery_type = assist_row.get("ad_delivery_type")
                     if str(
@@ -2060,11 +2074,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                 )
                 if card_result.get("success"):
                     logger.info(
-                        "%s 已创建单张批量飞书确认卡片 materials=%s task_uid=%s duplicate=%s",
+                        "%s 已登记批量飞书确认卡片 materials=%s task_uid=%s duplicate=%s delivery_state=%s",
                         _tag,
                         len(batch_materials),
                         (card_result.get("data") or {}).get("task_uid"),
                         bool(card_result.get("duplicate")),
+                        (card_result.get("data") or {}).get("delivery_state", "unrecorded"),
                     )
                 else:
                     logger.warning(
@@ -2624,20 +2639,28 @@ async def main_loop(interval_sec: int = DEFAULT_INTERVAL_SEC) -> None:
         interval_sec,
         CURRENT_VERSION,
     )
+    scope = None
+    next_full_scan = time.monotonic()
     while not _RUNNER_STOP.is_set():
+        if time.monotonic() >= next_full_scan:
+            _TARGET_WAKE.take(full_scan=True)
+            scope = None
+            next_full_scan = time.monotonic() + max(1, int(interval_sec))
         try:
-            await run_one_cycle(db)
+            await run_one_cycle(db, target_uids=scope)
         except Exception:
             logger.exception("%s 本轮未捕获异常", retarget_log_tag(scheduler=True))
-        woke = await asyncio.to_thread(
-            _wait_for_next_rule_cycle,
-            max(1, int(interval_sec)),
-        )
-        if woke:
-            logger.info(
-                "%s 收到即时复核请求，开始新一轮",
-                retarget_log_tag(scheduler=True),
+        while not _RUNNER_STOP.is_set() and time.monotonic() < next_full_scan:
+            woke = await asyncio.to_thread(
+                _wait_for_next_rule_cycle, max(0.01, next_full_scan - time.monotonic()),
             )
+            if woke:
+                await asyncio.to_thread(_RUNNER_STOP.wait, _TARGET_WAKE.remaining())
+                ready, scope = _TARGET_WAKE.take()
+                if ready:
+                    logger.info("%s 收到即时复核请求 scope=%s", retarget_log_tag(scheduler=True),
+                                "all" if scope is None else len(scope))
+                    break
 
 
 def _gui_background_target() -> None:

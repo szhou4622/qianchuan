@@ -3,7 +3,7 @@ import asyncio
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from api.views import Api
 from services.official_api_execution import OfficialApiRegulationStopService
@@ -16,6 +16,17 @@ from services.regulation_rule_runner import (
 
 class StopSubmitSafetyTests(unittest.TestCase):
     def run_stop(self, service, guard):
+        effect = service.update_control_status.side_effect
+        response = service.update_control_status.return_value
+        service.transport = Mock()
+        def send(*args, before_send=None, **kwargs):
+            if before_send:
+                before_send()
+            service.transport(*args, **kwargs)
+            if isinstance(effect, BaseException):
+                raise effect
+            return response
+        service.update_control_status.side_effect = send
         with ExitStack() as stack:
             stack.enter_context(patch("services.official_api_execution.get_official_api_service", return_value=service))
             stack.enter_context(patch("services.official_api_execution._check_plan", return_value={}))
@@ -23,7 +34,7 @@ class StopSubmitSafetyTests(unittest.TestCase):
                 "task_id": "30003", "scene": "MATERIAL_ADD_BUDGET", "status": "PROCESSING",
             }))
             stack.enter_context(patch("services.official_api_reconciliation.reserve_execution_intent", return_value=({}, True)))
-            finish = stack.enter_context(patch("services.official_api_reconciliation.finish_execution_intent"))
+            finish = stack.enter_context(patch("services.official_api_reconciliation.record_execution_submission_phase"))
             enqueue = stack.enter_context(patch("services.official_api_reconciliation.enqueue_execution_reconciliation"))
             stack.enter_context(patch("services.official_api_reconciliation.start_official_api_reconciliation_background_thread"))
             result = asyncio.run(OfficialApiRegulationStopService().run(
@@ -38,11 +49,11 @@ class StopSubmitSafetyTests(unittest.TestCase):
                 service, guard = Mock(), Mock(return_value=reason)
                 result, finish, enqueue = self.run_stop(service, guard)
                 guard.assert_called_once()
-                service.update_control_status.assert_not_called()
+                service.transport.assert_not_called()
                 enqueue.assert_not_called()
                 self.assertEqual("stop_preflight_blocked", result.step)
                 self.assertIn("未向千川提交", result.message)
-                finish.assert_called_once_with("test-stop", status="confirmed_failed", error=reason)
+                finish.assert_not_called()  # authorization failed before intent/send
 
     def test_valid_final_guard_sends_exactly_once(self):
         service, guard = Mock(), Mock(return_value="")
@@ -50,7 +61,8 @@ class StopSubmitSafetyTests(unittest.TestCase):
         result, _finish, enqueue = self.run_stop(service, guard)
         self.assertEqual("submitted_verifying", result.step)
         guard.assert_called_once()
-        service.update_control_status.assert_called_once_with(10001, ["30003"], action="PAUSE")
+        service.update_control_status.assert_called_once_with(10001, ["30003"], action="PAUSE", before_send=ANY)
+        service.transport.assert_called_once_with(10001, ["30003"], action="PAUSE")
         enqueue.assert_called_once()
 
     def test_rate_limit_has_no_sleep_or_automatic_second_post(self):

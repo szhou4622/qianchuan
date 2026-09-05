@@ -353,7 +353,7 @@ class OfficialOperationLogWindowTests(unittest.TestCase):
     def test_incomplete_pages_fail_after_three_attempts_until_manual_retry(self):
         self._add_target()
         account = get_qianchuan_account("1001", db=self.db)
-        start, end = _parse_manual_range("2026-08-20", "2026-08-20")
+        start, end = datetime(2026, 8, 20, 10), datetime(2026, 8, 20, 10, 10)
         _enqueue_range(account, start, end, request_kind="history", db=self.db)
         self.db.update("operation_log_sync_window", {"attempt_count": 2})
         task = _claim_window(self.db, "worker-three")
@@ -499,13 +499,15 @@ class OfficialOperationLogWindowTests(unittest.TestCase):
                                                      "completed_at": "2026-09-05 10:00:00"})
         result = _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 23, 59, 59),
                                 request_kind="manual", db=self.db)
-        self.db.update("operation_log_sync_window", {"status": "empty", "completed_at": "2026-09-05 09:55:00"},
+        self.db.update("operation_log_sync_window", {"status": "empty", "completed_at": "2026-09-05 09:55:00",
+                                                     "last_success_at": "2026-09-05 09:55:00"},
                        where={"status": "queued"})
         refresh_task = {**result, "account_uid": account["account_uid"],
                         "aavid": "1001", "request_kind": "manual"}
         _refresh_batch_state(self.db, refresh_task)
         self.assertEqual(2, self.db.count("operation_log_sync_window", where={"status": "failed"}))
-        self.db.update("operation_log_sync_window", {"completed_at": "2026-09-05 10:05:00"},
+        self.db.update("operation_log_sync_window", {"completed_at": "2026-09-05 10:05:00",
+                                                     "last_success_at": "2026-09-05 10:05:00"},
                        where={"status": "empty"})
         _refresh_batch_state(self.db, {**result, "account_uid": account["account_uid"],
                                       "aavid": "1001", "request_kind": "manual"})

@@ -314,6 +314,7 @@ class QianchuanOpenApiClient:
         query: Optional[Mapping[str, Any]] = None,
         body: Optional[Mapping[str, Any]] = None,
         advertiser_id: Any = "",
+        before_send: Optional[Callable[[], None]] = None,
     ) -> ApiResponse:
         verb = str(method or "GET").upper()
         if verb not in {"GET", "POST"}:
@@ -323,6 +324,7 @@ class QianchuanOpenApiClient:
         local_request_uid = f"oe_{uuid.uuid4().hex}"
         last_error: Optional[BaseException] = None
         for attempt in range(1, attempts + 1):
+            write_started = False
             wait_for_request = getattr(
                 self.rate_limiter, "wait_for_request", None
             )
@@ -346,6 +348,12 @@ class QianchuanOpenApiClient:
                     headers=headers,
                     method=verb,
                 )
+                # Authorization may have changed during limiter/token waits.
+                # The callback commits its short local transaction before any
+                # socket operation; a failed callback must never send a POST.
+                if before_send is not None:
+                    before_send()
+                write_started = verb == "POST"
                 with urlopen(request, timeout=self.timeout) as response:
                     decoded = self._decode(response.read())
                     status = int(getattr(response, "status", 200) or 200)
@@ -514,7 +522,7 @@ class QianchuanOpenApiClient:
                     continue
                 raise
             except (URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
-                if verb == "POST":
+                if verb == "POST" and write_started:
                     error = ApiWriteOutcomeUnknown(
                         "千川官方 API 写请求结果未知，禁止直接重试，正在等待对账",
                         endpoint=endpoint,
@@ -545,8 +553,10 @@ class QianchuanOpenApiClient:
     def get(self, endpoint: str, query: Optional[Mapping[str, Any]] = None, *, advertiser_id: Any = "") -> ApiResponse:
         return self.request("GET", endpoint, query=query, advertiser_id=advertiser_id)
 
-    def post(self, endpoint: str, body: Mapping[str, Any], *, advertiser_id: Any = "") -> ApiResponse:
-        return self.request("POST", endpoint, body=body, advertiser_id=advertiser_id)
+    def post(self, endpoint: str, body: Mapping[str, Any], *, advertiser_id: Any = "",
+             before_send: Optional[Callable[[], None]] = None) -> ApiResponse:
+        return self.request("POST", endpoint, body=body, advertiser_id=advertiser_id,
+                            **({"before_send": before_send} if before_send is not None else {}))
 
     @staticmethod
     def extract_items(data: Any) -> list[dict[str, Any]]:

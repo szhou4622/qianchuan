@@ -41,6 +41,7 @@ from services.promotion_capability import (
 from services.control_task_cycle import stop_cycle_execution_key, stop_cycle_state
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
+from services.rule_wakeup import TargetWakeBatch
 
 DEFAULT_INTERVAL_SEC = 300
 MAX_STRATEGY_PARALLEL = 3
@@ -50,7 +51,8 @@ _DEFAULT_ASSIST_UPDATED_WITHIN_MIN = 30
 _RUNNER_LOCK = threading.Lock()
 _RUNNER_THREAD: Optional[threading.Thread] = None
 _RUNNER_STOP = threading.Event()
-_RUNNER_WAKE = threading.Event()
+_TARGET_WAKE = TargetWakeBatch()
+_RUNNER_WAKE = _TARGET_WAKE.event
 
 
 def _shadow_mode_enabled() -> bool:
@@ -123,6 +125,12 @@ def _find_stop_strategy(
 
 
 def _stop_strategy_was_invalidated(error: str) -> bool:
+    try:
+        parsed = json.loads(error)
+        if isinstance(parsed, dict):
+            error = str(parsed.get("detail") or parsed.get("error") or error)
+    except (TypeError, ValueError):
+        pass
     return error in {
         "规则化停投已关闭", "停投策略已删除", "停投策略参数已经变更",
         "调控任务已加入停投白名单",
@@ -254,7 +262,7 @@ def _revalidate_stop_candidate(
     if not assist_ready:
         return None, None, target_system, assist_error
     try:
-        metric_age = datetime.now() - datetime.fromisoformat(str(row.get("updated_at") or ""))
+        metric_age = datetime.now() - datetime.fromisoformat(str(row.get("metrics_observed_at") or ""))
     except (TypeError, ValueError):
         return None, None, target_system, "调控任务指标采集时间无效"
     if metric_age < timedelta(minutes=-5) or metric_age > timedelta(minutes=max_age_minutes):
@@ -538,7 +546,7 @@ async def _process_approved_stop_tasks(
     """Claim approved stop cards and execute only after a full locked revalidation."""
     from services.local_feishu_bridge import (
         pull_local_stop_task,
-        report_local_stop_task,
+        report_local_stop_task as _report_local_stop_task,
     )
     from services.qianchuan_session import current_session_owner
 
@@ -552,6 +560,8 @@ async def _process_approved_stop_tasks(
             return
         task_uid = str(task.get("task_uid") or "")
         claim_token = str(task.get("claim_token") or "")
+        fence = int(task.get("fencing_token") or 0)
+        report_local_stop_task = partial(_report_local_stop_task, fencing_token=fence)
         original_strategy = (
             dict(task.get("rule_snapshot") or {})
             if isinstance(task.get("rule_snapshot"), dict)
@@ -606,12 +616,15 @@ async def _process_approved_stop_tasks(
                 message="停投任务快照不完整",
             )
             continue
-        report_local_stop_task(
+        executing_report = report_local_stop_task(
             task_uid,
             claim_token,
             "executing",
             message="已领取，正在重新核验账户、计划、策略和实时指标",
         )
+        if not executing_report.get("success"):
+            logger.warning("停投领取权已失效，未提交 task=%s: %s", task_uid, executing_report.get("message"))
+            continue
         lock = await _lock_for_assist_task(assist_task_id, target_uid)
         started_at = _beijing_now_str()
         started = time.time()
@@ -730,7 +743,10 @@ async def _process_approved_stop_tasks(
                         execution_uid=execution_uid,
                         reconciliation_task_uid=task_uid,
                         control_cycle_key=actual_cycle_key,
-                        **({"pre_submit_check": partial(
+                        **({"submission_claim": {
+                            "account_username": expected_owner, "task_uid": task_uid,
+                            "claim_token": claim_token, "fencing_token": fence,
+                        }, "pre_submit_check": partial(
                             _pre_submit_stop_check, db,
                             expected_cycle_key=actual_cycle_key,
                             original_strategy=original_strategy,
@@ -1019,7 +1035,7 @@ def _send_auto_stop_submitted_notification(
     )
 
 
-async def run_one_cycle(db: SQLiteStore) -> None:
+async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
     _log_sched = regulation_log_tag(scheduler=True)
     await _process_approved_stop_tasks(db)
     cfg = load_rule_regulation_config()
@@ -1051,6 +1067,12 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         logger.warning("%s strategies 为空", _log_sched)
         return
 
+    if target_uids is not None:
+        scope = {str(uid) for uid in target_uids}
+        strategies = [st for st in strategies if isinstance(st, dict) and str(st.get("target_uid") or "") in scope]
+        if not strategies:
+            return
+
     rule_full_json = _json_dumps(cfg)
 
     assist_uw_min = _assist_updated_within_minutes_from_env()
@@ -1063,6 +1085,8 @@ async def run_one_cycle(db: SQLiteStore) -> None:
         ad_delivery_type=0,
         regulation_full_scan=True,
         assist_updated_within_minutes=assist_uw_min,
+        **({"target_uids": sorted({str(st.get("target_uid") or "") for st in strategies})}
+           if target_uids is not None else {}),
     )
     if not resp.get("success"):
         logger.warning("%s get_roi2_assist_table_data 失败: %s", _log_sched, resp.get("message"))
@@ -1559,9 +1583,9 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                             )
                             if card_result.get("success"):
                                 logger.info(
-                                    "%s 停投确认卡片%s target=%s assist_task_id=%s",
+                                    "%s 停投确认卡片%s target=%s assist_task_id=%s delivery_state=%s",
                                     _tag,
-                                    "已去重" if card_result.get("duplicate") else "已发送",
+                                    "已去重" if card_result.get("duplicate") else "已入队",
                                     target_uid,
                                     assist_task_id,
                                 )
@@ -1615,6 +1639,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     db,
                                     target_uid,
                                     assist_task_id,
+                                    (card_result.get("data") or {}).get("delivery_state", "unrecorded"),
                                     assist_row=latest_row,
                                 )
                                 if latest_cycle_state.get("blocked"):
@@ -1892,9 +1917,10 @@ def _interval_sec() -> int:
     return DEFAULT_INTERVAL_SEC
 
 
-def request_regulation_rule_evaluation(reason: str = "") -> bool:
+def request_regulation_rule_evaluation(reason: str = "", *, target_uids=None) -> bool:
     """Request one immediate rule pass; repeated requests collapse safely."""
-    _RUNNER_WAKE.set()
+    if not _TARGET_WAKE.request(target_uids):
+        return False
     logger.debug(
         "%s 收到即时复核请求 reason=%s",
         regulation_log_tag(scheduler=True),
@@ -1916,10 +1942,13 @@ async def main_loop(interval_sec: Optional[int] = None) -> None:
     next_rule_cycle_at = 0.0
     while not _RUNNER_STOP.is_set():
         try:
-            if _RUNNER_WAKE.is_set() or time.monotonic() >= next_rule_cycle_at:
-                _RUNNER_WAKE.clear()
-                await run_one_cycle(db)
-                next_rule_cycle_at = time.monotonic() + max(60, int(sec))
+            full_scan = time.monotonic() >= next_rule_cycle_at
+            if full_scan or (_RUNNER_WAKE.is_set() and _TARGET_WAKE.remaining() <= 0):
+                ready, scope = _TARGET_WAKE.take(full_scan=full_scan)
+                if full_scan:
+                    next_rule_cycle_at = time.monotonic() + max(60, int(sec))
+                if ready:
+                    await run_one_cycle(db, target_uids=scope)
             else:
                 # 卡片点击只负责本地入队；独立短轮询让确认停投不必等待
                 # 下一次十分钟规则扫描。

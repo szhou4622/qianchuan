@@ -108,13 +108,38 @@ class CollectionFreshnessTests(unittest.TestCase):
             self.assertIsNone(row[field], field)
         self.assertEqual(0, row["ad_delivery_type"])
 
-    def test_failed_backfill_is_retried_after_today_success_and_reconstructed_target(self):
+    def test_read_times_are_not_rejuvenated_by_later_slow_phases(self):
+        timestamps = [f"{self.today} 10:00:00", f"{self.today} 10:05:00", f"{self.today} 10:10:00"]
+        clock = [timestamps[0]]
+        material_result = self.service.list_plan_materials.return_value
+        control_result = self.service.list_control_tasks.return_value
+        def materials(*args, **kwargs):
+            clock[0] = timestamps[1]
+            return material_result
+        def controls(*args, **kwargs):
+            clock[0] = timestamps[2]
+            return control_result
+        self.service.list_plan_materials.side_effect = materials
+        self.service.list_control_tasks.side_effect = controls
+        with patch("services.official_api_collection._now", side_effect=lambda: clock[0]):
+            collect_target(self.target, db=self.store)
+        latest = self._rows("pmc_promotion_material_latest")[0]
+        control = self._rows("pmc_roi2_assist_task")[0]
+        cap = self.mocks["_patch_target_sync_in_transaction"].call_args.kwargs["capability_updates"]
+        self.assertEqual(timestamps[0], latest["collected_at"])
+        self.assertEqual(timestamps[2], latest["updated_at"])
+        self.assertEqual(timestamps[1], control["metrics_observed_at"])
+        self.assertEqual(timestamps[1], cap["assist_synced_at"])
+        self.assertEqual(timestamps[2], cap["collection_committed_at"])
+
+    def test_hot_collection_does_not_execute_or_overwrite_background_backfill(self):
         self.target["last_sync_at"] = f"{self.yesterday} 23:00:00"
         current = self.service.list_plan_materials.return_value
         self.service.list_plan_materials.side_effect = [current, ApiRequestError("分页不完整")]
         self.assertTrue(collect_target(self.target, db=self.store)["success"])
         state = self.mocks["_patch_target_sync_in_transaction"].call_args.kwargs["capability_updates"]
-        self.assertEqual([self.yesterday], state["recovery_backfill_pending_dates"])
+        self.assertNotIn("material_backfill_state", state)
+        self.assertNotIn("recovery_backfill_pending_dates", state)
         resumed_target = copy.deepcopy(self.target)
         resumed_target["last_sync_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         resumed_target["capability"].update(state)
@@ -123,21 +148,20 @@ class CollectionFreshnessTests(unittest.TestCase):
         self.mocks["_bulk_upsert_rows"].reset_mock()
         self.assertTrue(collect_target(resumed_target, db=self.store)["success"])
         calls = self.service.list_plan_materials.call_args_list
-        self.assertEqual(2, len(calls))
-        self.assertEqual(self.yesterday, calls[1].kwargs["start_date"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(self.today, calls[0].kwargs["start_date"])
         state = self.mocks["_patch_target_sync_in_transaction"].call_args.kwargs["capability_updates"]
-        self.assertEqual([], state["recovery_backfill_pending_dates"])
-        self.assertEqual(self.yesterday, state["recovery_backfill_date"])
+        self.assertNotIn("material_backfill_state", state)
         self.assertEqual(self.today, self._rows("pmc_promotion_material_latest")[0]["stat_date"])
 
-    def test_pending_older_date_is_not_lost_at_next_day_boundary(self):
+    def test_hot_collection_leaves_older_pending_state_to_background_owner(self):
         older = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
         self.target["last_sync_at"] = f"{self.yesterday} 23:00:00"
         self.target["capability"]["recovery_backfill_pending_dates"] = [older]
         collect_target(self.target, db=self.store)
-        self.assertEqual(older, self.service.list_plan_materials.call_args.kwargs["start_date"])
+        self.assertEqual(self.today, self.service.list_plan_materials.call_args.kwargs["start_date"])
         state = self.mocks["_patch_target_sync_in_transaction"].call_args.kwargs["capability_updates"]
-        self.assertEqual([self.yesterday], state["recovery_backfill_pending_dates"])
+        self.assertNotIn("recovery_backfill_pending_dates", state)
 
     def test_collection_that_crosses_midnight_does_not_stamp_old_day_as_fresh(self):
         with patch("services.official_api_collection._date_window", return_value=(self.yesterday, self.yesterday)):

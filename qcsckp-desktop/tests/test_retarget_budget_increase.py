@@ -228,6 +228,7 @@ class RetargetBudgetIncreaseCalculationTests(unittest.TestCase):
             ),
         }
         assist_row = {
+            "metrics_observed_at": datetime.now().isoformat(timespec="seconds"),
             "target_uid": "target-1",
             "aadvid": "1001",
             "ad_id": "2001",

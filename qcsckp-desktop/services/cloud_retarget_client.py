@@ -216,6 +216,7 @@ def report_retarget_task(
     detail: str = "",
     regulate_task_id: str = "",
     result: Optional[Dict[str, Any]] = None,
+    fencing_token: Optional[int] = None,
 ) -> Dict[str, Any]:
     from services.local_feishu_bridge import report_local_retarget_task, selected_task_backend
 
@@ -228,6 +229,7 @@ def report_retarget_task(
             detail=detail,
             regulate_task_id=regulate_task_id,
             result=result,
+            fencing_token=fencing_token,
         )
     token = _token()
     if not token:

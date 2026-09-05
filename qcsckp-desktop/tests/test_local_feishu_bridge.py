@@ -107,7 +107,14 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.db_path = os.path.join(self.temp.name, "tasks.db")
         self.profile_path = os.path.join(self.temp.name, "profiles.json")
         self.manager = FakeManager("tool-user-a")
+        original_report = bridge.report_local_retarget_task
+        def report_with_fence(task_uid, claim_token, status, **kwargs):
+            if kwargs.get("fencing_token") is None:
+                kwargs["fencing_token"] = (bridge._task_row(task_uid) or {}).get("fencing_token", 0)
+            return original_report(task_uid, claim_token, status, **kwargs)
         self.patches = [
+            patch.object(bridge, "_wake_delivery", side_effect=self._drain_initial_deliveries),
+            patch.object(bridge, "report_local_retarget_task", side_effect=report_with_fence),
             patch.object(bridge, "DB_FILE", self.db_path),
             patch.object(bridge, "PROFILE_FILE", self.profile_path),
             patch.object(bridge, "_MANAGER", self.manager),
@@ -136,6 +143,15 @@ class LocalFeishuTaskTests(unittest.TestCase):
             seen=True,
             db=SQLiteStore(database=self.db_path),
         )
+
+    def _drain_initial_deliveries(self, _bridge):
+        # Old scenarios assume delivery succeeded; model that through the r19
+        # journal, not by bypassing task/outbox atomic creation.
+        actual = bridge.LocalFeishuBridge(self.manager.account)
+        with patch.object(actual, "status", return_value={"connected": True}), patch.object(actual, "_request", return_value={"data": {"message_id": "om_test"}}):
+            for _ in range(10):
+                if not actual._deliver_outbox_once():
+                    break
 
     def _stop_payload(self) -> dict:
         db = SQLiteStore(database=self.db_path)
@@ -534,7 +550,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
                 (task_uid,),
             )
             self.assertTrue(actual_bridge._deliver_outbox_once())
-        outbox = store.select_one("feishu_outbox", where={"task_uid": task_uid})
+        outbox = store.select_one("feishu_outbox", where={"task_uid": task_uid, "operation": "update_card"})
         reconciliation = store.select_one(
             "execution_reconciliation",
             where={"reconciliation_uid": "stop-card-update-failed"},

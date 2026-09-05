@@ -900,7 +900,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             "products:catalog timeout",
             state_kwargs["capability_updates"]["maintenance_error"],
         )
-        regulation_wake.assert_called_once_with("collection_completed")
+        regulation_wake.assert_called_once_with("collection_completed", target_uids={"target-product"})
 
     def test_missing_material_is_soft_removed_and_paused_history_is_retained(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1077,7 +1077,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             self.assertEqual("delivering", saved["delivery_state"])
             self.assertEqual(9.0, saved["stat_cost"])
 
-    def test_cross_day_restart_backfills_yesterday_without_replacing_latest(self):
+    def test_cross_day_hot_cycle_leaves_history_to_independent_backfill(self):
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         report_filter_context = {
@@ -1164,25 +1164,17 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         ):
             result = collect_target(target, db=store)
         self.assertTrue(result["success"])
-        self.assertEqual(2, service.list_plan_materials.call_count)
-        self.assertEqual(2, service.list_material_report.call_count)
+        self.assertEqual(1, service.list_plan_materials.call_count)
+        self.assertEqual(1, service.list_material_report.call_count)
         for call in service.list_material_report.call_args_list:
             self.assertEqual(
                 report_filter_context,
                 call.kwargs["filter_context"],
             )
-        self.assertEqual(
-            yesterday,
-            service.list_material_report.call_args_list[1].kwargs["start_date"],
-        )
-        self.assertEqual(
-            yesterday,
-            service.list_material_report.call_args_list[1].kwargs["end_date"],
-        )
         state = patch_state.call_args.kwargs["capability_updates"]
         self.assertTrue(state["material_sync_complete"])
-        self.assertEqual(yesterday, state["recovery_backfill_date"])
-        self.assertEqual(1, state["recovery_backfill_count"])
+        self.assertNotIn("material_backfill_state", state)
+        self.assertNotIn("recovery_backfill_date", state)
         self.assertEqual("ok", patch_state.call_args.kwargs["status"])
         self.assertEqual("", patch_state.call_args.kwargs["error"])
         removed = set(patch_atomic_state.call_args.kwargs["capability_remove_keys"])
@@ -1206,8 +1198,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             for row in call.args[2]
             if row.get("stat_date") == yesterday
         ]
-        self.assertEqual(1, len(recovery_rows))
-        self.assertEqual(yesterday, recovery_rows[0]["stat_date"])
+        self.assertEqual([], recovery_rows)
 
     def test_official_delivery_ok_material_is_writable(self):
         self.assertTrue(
@@ -2459,16 +2450,10 @@ class OfficialApiBackendTests(unittest.TestCase):
 
     def test_stop_rate_limit_does_not_retry_without_new_confirmation(self):
         service = Mock()
-        service.update_control_status.side_effect = [
-            ApiRateLimitError("rate limited", retry_after=1),
-            ApiRateLimitError("rate limited", retry_after=1),
-            ApiResponse(
-                data={},
-                raw={"code": 0},
-                request_id="req-stop",
-                request_uid="write-stop",
-            ),
-        ]
+        def reject_once(*args, before_send, **kwargs):
+            before_send()
+            raise ApiRateLimitError("rate limited", retry_after=1)
+        service.update_control_status.side_effect = reject_once
         runner = OfficialApiRegulationStopService()
 
         async def no_sleep(_seconds):
@@ -2498,7 +2483,7 @@ class OfficialApiBackendTests(unittest.TestCase):
             "services.official_api_execution.asyncio.sleep",
             side_effect=no_sleep,
         ) as sleep, patch(
-            "services.official_api_reconciliation.finish_execution_intent"
+            "services.official_api_reconciliation.record_execution_submission_phase"
         ) as finish:
             result = asyncio.run(
                 runner.run(
@@ -2522,6 +2507,12 @@ class OfficialApiBackendTests(unittest.TestCase):
         service.update_control_status.return_value = ApiResponse(
             data={}, raw={"code": 0}, request_id="req-stop", request_uid="write-stop"
         )
+        posts = []
+        def submit(*args, before_send, **kwargs):
+            before_send()
+            posts.append(args)
+            return service.update_control_status.return_value
+        service.update_control_status.side_effect = submit
         runner = OfficialApiRegulationStopService()
         with patch(
             "services.official_api_execution.get_official_api_service",
@@ -2565,7 +2556,7 @@ class OfficialApiBackendTests(unittest.TestCase):
             )
         self.assertEqual("submitted_verifying", first.step)
         self.assertEqual("verifying", second.step)
-        service.update_control_status.assert_called_once()
+        self.assertEqual(1, len(posts))
 
     def test_confirmed_failure_retry_requires_new_user_confirmed_attempt(self):
         with tempfile.TemporaryDirectory(prefix="qcsckp-stop-retry-") as root:
@@ -3010,7 +3001,10 @@ class OfficialApiBackendTests(unittest.TestCase):
             request_id="req-create",
             request_uid="write-uid",
         )
-        service.create_material_control_task.return_value = response
+        def create(*args, before_send, **kwargs):
+            before_send()
+            return response
+        service.create_material_control_task.side_effect = create
         reconcile = Mock()
         runner = OfficialApiRetargetingService()
         with patch(
@@ -3020,7 +3014,7 @@ class OfficialApiBackendTests(unittest.TestCase):
             "services.official_api_execution._check_plan",
             return_value={},
         ), patch(
-            "services.official_api_execution._start_control_task_reconciliation",
+            "services.official_api_reconciliation.enqueue_execution_reconciliation",
             reconcile,
         ), patch(
             "services.official_api_execution._existing_reconciliation",
@@ -3028,7 +3022,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         ), patch(
             "services.official_api_reconciliation.reserve_execution_intent",
             return_value=({}, True),
-        ):
+        ), patch("services.official_api_reconciliation.start_official_api_reconciliation_background_thread"):
             result = asyncio.run(
                 runner.run(
                     aavid=1795110974060618,
@@ -3061,27 +3055,16 @@ class OfficialApiBackendTests(unittest.TestCase):
         )
         self.assertEqual([], material_call.kwargs["fields"])
         self.assertIs(True, material_call.kwargs["delivery_only"])
-        reconcile.assert_called_once_with(
-            service,
-            request_uid="write-uid",
-            request_id="req-create",
-            task_id="1873333931211978",
-            task_uid="abdcf523-b1d0-45e5-992e-f023ffdc13e9",
-            idempotency_key="abdcf523-b1d0-45e5-992e-f023ffdc13e9",
-            verify_kwargs={
-                "aavid": 1795110974060618,
-                "ad_id": 1859333122962634,
-                "promotion_scene": "product",
-                "task_id": "1873333931211978",
-                "material_ids": ["7643772216392564762"],
-                "task_name": _unique_control_task_name(
-                    "策略 1", "abdcf523-b1d0-45e5-992e-f023ffdc13e9"
-                ),
-                "budget": Decimal("100"),
-                "duration": Decimal("24"),
-                "execution_uid": "abdcf523-b1d0-45e5-992e-f023ffdc13e9",
-            },
-        )
+        reconcile.assert_called_once()
+        call = reconcile.call_args.kwargs
+        self.assertEqual("write-uid", call["request_uid"])
+        self.assertEqual("req-create", call["request_id"])
+        self.assertEqual("1873333931211978", call["control_task_id"])
+        self.assertEqual("accepted", call["submission_phase"])
+        self.assertEqual("abdcf523-b1d0-45e5-992e-f023ffdc13e9", call["idempotency_key"])
+        self.assertEqual(["7643772216392564762"], call["verify_payload"]["material_ids"])
+        self.assertEqual("100", call["verify_payload"]["budget"])
+        self.assertEqual("24", call["verify_payload"]["duration"])
 
     def test_create_reconciliation_retries_incomplete_material_list_without_resubmitting(self):
         expected = {
@@ -4544,7 +4527,7 @@ class OfficialApiBackendTests(unittest.TestCase):
             "services.official_api_execution._check_plan",
             return_value={},
         ), patch(
-            "services.official_api_execution._start_control_task_reconciliation",
+            "services.official_api_reconciliation.enqueue_execution_reconciliation",
             reconcile,
         ), patch(
             "services.official_api_execution._existing_reconciliation",
@@ -4552,7 +4535,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         ), patch(
             "services.official_api_reconciliation.reserve_execution_intent",
             return_value=({}, True),
-        ):
+        ), patch("services.official_api_reconciliation.start_official_api_reconciliation_background_thread"):
             result = asyncio.run(
                 runner.run(
                     aavid=1843497131079815,
@@ -4576,11 +4559,11 @@ class OfficialApiBackendTests(unittest.TestCase):
             )
         self.assertTrue(result.success)
         self.assertEqual("submitted_verifying", result.step)
-        self.assertIn("正在查询", result.message)
+        self.assertIn("只读核验", result.message)
         call = reconcile.call_args.kwargs
-        self.assertEqual("", call["task_id"])
+        self.assertEqual("", call["control_task_id"])
         self.assertEqual("req-timeout", call["request_id"])
-        self.assertTrue(call["verify_kwargs"]["task_name"])
+        self.assertTrue(call["verify_payload"]["task_name"])
 
     def test_reconciliation_can_discover_timeout_write_by_immutable_name(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(

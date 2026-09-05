@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
 from services.plan_system import normalize_plan_system
-from services.qianchuan_open_api.errors import ApiRateLimitError, ApiWriteOutcomeUnknown
+from services.qianchuan_open_api.errors import ApiRateLimitError, ApiRequestError, ApiWriteOutcomeUnknown
 from services.qianchuan_open_api.audit import OfficialApiAuditStore
 from services.qianchuan_open_api.normalizers import (
     first,
@@ -28,6 +28,136 @@ from services.qianchuan_open_api.runtime import get_official_api_service
 
 
 CONTROL_TASK_NAME_MAX_LENGTH = 50
+
+
+class _ExistingExecutionIntent(RuntimeError):
+    def __init__(self, row: Mapping[str, Any]):
+        self.row = dict(row)
+        super().__init__("该执行已有持久化提交记录，禁止重复提交")
+
+
+class _SubmissionAttempt:
+    """Own the send boundary; local bookkeeping cannot negate platform acceptance."""
+    def __init__(self, *, task_uid, action_type, aavid, ad_id, intent_key,
+                 verify_payload, control_task_id="", submission_claim=None,
+                 pre_submit_check=None):
+        from services.qianchuan_session import current_session_owner
+        self.owner = str(current_session_owner() or "").strip().casefold()
+        self.task_uid, self.action_type = str(task_uid), str(action_type)
+        self.aavid, self.ad_id, self.intent_key = aavid, ad_id, str(intent_key)
+        self.verify_payload = dict(verify_payload)
+        self.control_task_id = str(control_task_id or "")
+        self.claim = dict(submission_claim or {})
+        self.pre_submit_check = pre_submit_check
+        self.phase = "not_sent"
+        self.reserved = False
+
+    def before_send(self):
+        from services.official_api_reconciliation import reserve_execution_intent
+        from services.qianchuan_session import current_session_owner
+        if str(current_session_owner() or "").strip().casefold() != self.owner:
+            raise _StopSubmissionBlocked("提交账户已变化")
+        if self.pre_submit_check is not None:
+            reason = self.pre_submit_check()
+            if reason:
+                raise _StopSubmissionBlocked(str(reason))
+        row, reserved = reserve_execution_intent(
+            task_uid=self.task_uid, action_type=self.action_type,
+            aavid=self.aavid, ad_id=self.ad_id, control_task_id=self.control_task_id,
+            idempotency_key=self.intent_key, verify_payload=self.verify_payload,
+            submission_claim=self.claim or None, submission_phase="sending",
+            account_username=self.owner,
+        )
+        if not reserved:
+            raise _ExistingExecutionIntent(row)
+        self.reserved = True
+        self.reservation_uid = str(row.get("reconciliation_uid") or "")
+        self.phase = "sending"
+
+    def before_followup(self, step):
+        from services.official_api_reconciliation import authorize_execution_followup
+        from services.qianchuan_session import current_session_owner
+        if str(current_session_owner() or "").strip().casefold() != self.owner:
+            raise _StopSubmissionBlocked("提交账户已变化")
+        if self.pre_submit_check is not None:
+            reason = self.pre_submit_check()
+            if reason:
+                raise _StopSubmissionBlocked(str(reason))
+        authorize_execution_followup(
+            self.intent_key, str(getattr(self, "reservation_uid", "")), str(step),
+            account_username=self.owner, submission_claim=self.claim or None,
+        )
+        self.verify_payload["attempted_steps"] = list(dict.fromkeys(
+            list(self.verify_payload.get("attempted_steps") or []) + [str(step)]
+        ))
+
+    def reconcile(self, *, response=None, error=""):
+        from services.official_api_reconciliation import (
+            enqueue_execution_reconciliation, record_execution_submission_phase,
+            start_official_api_reconciliation_background_thread,
+        )
+        from utils.log import logger
+        request_uid = str(getattr(response, "request_uid", "") or "")
+        request_id = str(getattr(response, "request_id", "") or "")
+        try:
+            enqueue_execution_reconciliation(
+                task_uid=self.task_uid, action_type=self.action_type,
+                aavid=self.aavid, ad_id=self.ad_id, control_task_id=self.control_task_id,
+                request_id=request_id, request_uid=request_uid,
+                idempotency_key=self.intent_key, verify_payload=self.verify_payload,
+                account_username=self.owner, submission_phase=self.phase,
+            )
+        except Exception:
+            # The committed sending intent still forbids POST on restart.
+            # Preserve the stronger phase if the smaller fallback write works.
+            try:
+                record_execution_submission_phase(
+                    self.intent_key, self.phase, account_username=self.owner, error=error,
+                )
+            except Exception:
+                logger.exception("提交结果需恢复只读核验，发送意图已保留")
+        if request_uid:
+            try:
+                OfficialApiAuditStore().mark_reconciled(
+                    request_uid, status="pending", task_id=self.control_task_id,
+                    response={"message": "提交结果待只读核验", "submission_phase": self.phase},
+                )
+            except Exception:
+                logger.exception("平台提交结果已保留，附属审计更新失败")
+        try:
+            start_official_api_reconciliation_background_thread()
+        except Exception:
+            logger.exception("提交结果已保留，将在核验工作器恢复后只读核验")
+
+    def handle_error(self, exc):
+        """Return True when a POST may exist and only GET recovery is allowed."""
+        if self.phase == "accepted" or isinstance(exc, ApiWriteOutcomeUnknown) or (
+            self.phase == "sending" and not isinstance(exc, ApiRequestError)
+        ):
+            if self.phase != "accepted":
+                self.phase = "unknown"
+            self.reconcile(response=exc, error=str(exc))
+            return True
+        if self.reserved:
+            from services.official_api_reconciliation import record_execution_submission_phase
+            try:
+                record_execution_submission_phase(
+                    self.intent_key, "rejected", account_username=self.owner, error=str(exc),
+                )
+            except Exception:
+                from utils.log import logger
+                logger.exception("明确拒绝结果暂未落盘，保留发送意图禁止自动重发")
+        self.phase = "rejected" if self.reserved else "not_sent"
+        return False
+
+    def accept(self, response=None):
+        self.phase = "accepted"
+        self.reconcile(response=response)
+
+
+def prepare_submission_gate(**kwargs):
+    """Shared card/automatic send gate, also used by confirmed budget updates."""
+    return _SubmissionAttempt(**kwargs)
 
 
 class _MaterialRetargetEvidenceCheckError(RuntimeError):
@@ -500,6 +630,8 @@ class OfficialApiRetargetingService:
         plan_system: str = "unknown",
         execution_uid: Optional[str] = None,
         reconciliation_task_uid: Optional[str] = None,
+        submission_claim: Optional[Mapping[str, Any]] = None,
+        pre_submit_check: Optional[Callable[[], str]] = None,
         **_: Any,
     ) -> Any:
         from services.retargeting_service import RetargetingRunResult
@@ -507,7 +639,7 @@ class OfficialApiRetargetingService:
         service = get_official_api_service()
         mids = [text_id(value) for value in (material_ids or [material_id]) if text_id(value)]
         rdict = dict(retargeting or {})
-        intent_reserved = False
+        attempt: Optional[_SubmissionAttempt] = None
         intent_key = str(execution_uid or "").strip()
         control_task_name = _unique_control_task_name(
             _configured_control_task_base_name(rdict, strategy_title),
@@ -597,41 +729,18 @@ class OfficialApiRetargetingService:
                 if not _material_is_writable(current.get(mid) or {}):
                     raise RuntimeError(f"素材 {mid} 的投放或审核状态未明确可用，已禁止追投")
 
-            if intent_key:
-                from services.official_api_reconciliation import reserve_execution_intent
-
-                intent, intent_reserved = reserve_execution_intent(
-                    task_uid=str(reconciliation_task_uid or execution_uid or ""),
-                    action_type="retarget",
-                    aavid=aavid,
-                    ad_id=ad_id,
-                    idempotency_key=intent_key,
-                    verify_payload={
-                        "aavid": aavid,
-                        "ad_id": ad_id,
-                        "promotion_scene": promotion_scene,
-                        "material_ids": mids,
-                        "task_name": control_task_name,
-                        "budget": str(budget),
-                        "duration": str(duration) if duration is not None else "",
-                        "execution_uid": intent_key,
-                    },
-                )
-                if not intent_reserved:
-                    return RetargetingRunResult(
-                        False,
-                        "该追投已有提交记录，已禁止重复提交，请等待核验或人工检查",
-                        str(intent.get("status") or "unknown_requires_review"),
-                        str(intent.get("last_error") or ""),
-                        text_id(aavid),
-                        text_id(ad_id),
-                        text_id(material_id),
-                        text_id(intent.get("control_task_id")),
-                        str(rdict.get("method") or "volume"),
-                        json.dumps(rdict, ensure_ascii=False, separators=(",", ":")),
-                        _now(),
-                        True,
-                    )
+            intent_key = intent_key or control_task_name
+            attempt = prepare_submission_gate(
+                task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
+                action_type="retarget", aavid=aavid, ad_id=ad_id, intent_key=intent_key,
+                submission_claim=submission_claim, pre_submit_check=pre_submit_check,
+                verify_payload={
+                    "aavid": aavid, "ad_id": ad_id, "promotion_scene": promotion_scene,
+                    "material_ids": mids, "task_name": control_task_name,
+                    "budget": str(budget), "duration": str(duration) if duration is not None else "",
+                    "execution_uid": intent_key,
+                },
+            )
             response = await asyncio.to_thread(
                 service.create_material_control_task,
                 aavid,
@@ -642,47 +751,17 @@ class OfficialApiRetargetingService:
                 duration=duration,
                 material_ids=mids,
                 extra=extra,
+                before_send=attempt.before_send,
             )
+            attempt.phase = "accepted"
             task_id = _task_id(response)
             if task_id:
                 require_digit_id(task_id, "control_task_id")
-            if not task_id:
-                duplicate = await asyncio.to_thread(
-                    service.find_duplicate_control_task,
-                    aavid,
-                    ad_id=ad_id,
-                    marketing_goal=_goal(promotion_scene),
-                    task_name=control_task_name,
-                    budget=budget,
-                    duration=duration,
-                    material_ids=mids,
-                )
-                task_id = text_id((duplicate or {}).get("task_id"))
-            if not task_id:
-                raise RuntimeError("官方 API 已返回成功但未返回可核验的调控任务 ID")
-            # A code=0 create response with a concrete task ID is the write
-            # result.  The list endpoint is eventually consistent, so its
-            # read-only verification runs in the background and must not hold
-            # the card in "executing" for another 20+ seconds.
-            _start_control_task_reconciliation(
-                service,
-                request_uid=str(response.request_uid or ""),
-                request_id=str(response.request_id or ""),
-                task_id=task_id,
-                task_uid=str(reconciliation_task_uid or execution_uid or ""),
-                idempotency_key=str(execution_uid or control_task_name),
-                verify_kwargs={
-                    "aavid": aavid,
-                    "ad_id": ad_id,
-                    "promotion_scene": promotion_scene,
-                    "task_id": task_id,
-                    "material_ids": mids,
-                    "task_name": control_task_name,
-                    "budget": budget,
-                    "duration": duration,
-                    "execution_uid": str(execution_uid or ""),
-                },
-            )
+            # A success response without an ID is still an accepted write.
+            # The durable immutable name/material manifest supports GET-only
+            # duplicate lookup on restart; never turn it into a retryable reject.
+            attempt.control_task_id = task_id
+            attempt.accept(response)
             return RetargetingRunResult(
                 success=True,
                 message="官方 API 已提交追投，正在核验平台最终状态",
@@ -692,6 +771,7 @@ class OfficialApiRetargetingService:
                         "source": "qianchuan_open_api",
                         "request_id": response.request_id,
                         "reconciliation_status": "pending",
+                        "submission_phase": attempt.phase,
                     },
                     ensure_ascii=False,
                 ),
@@ -704,101 +784,33 @@ class OfficialApiRetargetingService:
                 finished_at=_now(),
                 headless=True,
             )
-        except ApiWriteOutcomeUnknown as exc:
-            try:
-                budget, duration, _ = _retarget_params(rdict, promotion_scene)
-                duplicate = await asyncio.to_thread(
-                    service.find_duplicate_control_task,
-                    aavid,
-                    ad_id=ad_id,
-                    marketing_goal=_goal(promotion_scene),
-                    task_name=control_task_name,
-                    budget=budget,
-                    duration=duration,
-                    material_ids=mids,
-                )
-            except Exception:
-                duplicate = None
-            task_id = text_id((duplicate or {}).get("task_id"))
-            if exc.request_uid:
-                OfficialApiAuditStore().mark_reconciled(
-                    exc.request_uid,
-                    status="confirmed" if task_id else "unresolved",
-                    task_id=task_id,
-                    response=duplicate or {},
-                )
-            if intent_reserved and intent_key:
-                _start_control_task_reconciliation(
-                    service,
-                    request_uid=str(exc.request_uid or ""),
-                    request_id=str(exc.request_id or ""),
-                    task_id=task_id,
-                    task_uid=str(reconciliation_task_uid or execution_uid or ""),
-                    idempotency_key=intent_key,
-                    verify_kwargs={
-                        "aavid": aavid,
-                        "ad_id": ad_id,
-                        "promotion_scene": promotion_scene,
-                        "task_id": task_id,
-                        "material_ids": mids,
-                        "task_name": control_task_name,
-                        "budget": budget,
-                        "duration": duration,
-                        "execution_uid": intent_key,
-                    },
-                )
-            pending_verification = bool(task_id or (intent_reserved and intent_key))
+        except _ExistingExecutionIntent as exc:
             return RetargetingRunResult(
-                success=pending_verification,
-                message=(
-                    "官方 API 已找到对应调控任务，正在继续核验"
-                    if task_id
-                    else "千川内部处理超时，已禁止重复提交，正在查询是否已创建"
-                ),
-                step=(
-                    "submitted_verifying"
-                    if pending_verification
-                    else "unknown_requires_review"
-                ),
-                detail=_public_api_error(exc),
-                aavid=text_id(aavid),
-                ad_id=text_id(ad_id),
-                material_id=text_id(material_id),
-                regulate_task_id=task_id,
+                success=False, message=str(exc),
+                step=str(exc.row.get("status") or "unknown_requires_review"),
+                detail=json.dumps({"idempotency_key": intent_key}, ensure_ascii=False),
+                aavid=text_id(aavid), ad_id=text_id(ad_id), material_id=text_id(material_id),
                 retargeting_method=str(rdict.get("method") or "volume"),
                 retargeting_json=json.dumps(rdict, ensure_ascii=False, separators=(",", ":")),
-                finished_at=_now(),
-                headless=True,
+                finished_at=_now(), headless=True,
             )
         except Exception as exc:
-            retryable = isinstance(exc, ApiRateLimitError)
-            retry_after_seconds = (
-                max(60, int(getattr(exc, "retry_after", 0) or 0))
-                if retryable
-                else 0
-            )
-            if intent_reserved and intent_key:
-                from services.official_api_reconciliation import finish_execution_intent
-
-                finish_execution_intent(
-                    intent_key,
-                    status="confirmed_failed",
-                    error=_public_api_error(exc),
-                )
+            pending = attempt is not None and attempt.handle_error(exc)
+            retryable = not pending and isinstance(exc, ApiRateLimitError)
             return RetargetingRunResult(
-                success=False,
-                message=_public_api_error(exc),
-                step="official_api",
-                detail=traceback.format_exc()[:8000],
-                aavid=text_id(aavid),
-                ad_id=text_id(ad_id),
-                material_id=text_id(material_id),
+                success=bool(pending),
+                message=("追投提交结果待核验，已禁止重复提交，正在只读核验"
+                         if pending else _public_api_error(exc)),
+                step="submitted_verifying" if pending else "official_api",
+                detail=json.dumps({"submission_phase": attempt.phase if attempt else "not_sent",
+                                   "error": _public_api_error(exc),
+                                   "trace": "" if pending else traceback.format_exc()[:8000]}, ensure_ascii=False),
+                aavid=text_id(aavid), ad_id=text_id(ad_id), material_id=text_id(material_id),
+                regulate_task_id=attempt.control_task_id if attempt else "",
                 retargeting_method=str(rdict.get("method") or "volume"),
                 retargeting_json=json.dumps(rdict, ensure_ascii=False, separators=(",", ":")),
-                finished_at=_now(),
-                headless=True,
-                retryable=retryable,
-                retry_after_seconds=retry_after_seconds,
+                finished_at=_now(), headless=True, retryable=retryable,
+                retry_after_seconds=max(60, int(getattr(exc, "retry_after", 0) or 0)) if retryable else 0,
             )
 
 
@@ -810,275 +822,91 @@ class OfficialApiRegulationStopService:
         return None
 
     async def run(
-        self,
-        *,
-        aavid: int,
-        ad_id: int,
-        assist_task_id: str,
-        stop_action: str,
-        promotion_scene: str = "live",
-        plan_system: str = "unknown",
-        execution_uid: Optional[str] = None,
-        reconciliation_task_uid: Optional[str] = None,
-        control_cycle_key: str = "",
-        pre_submit_check: Optional[Callable[[], str]] = None,
-        **_: Any,
+        self, *, aavid: int, ad_id: int, assist_task_id: str, stop_action: str,
+        promotion_scene: str = "live", plan_system: str = "unknown",
+        execution_uid: Optional[str] = None, reconciliation_task_uid: Optional[str] = None,
+        control_cycle_key: str = "", pre_submit_check: Optional[Callable[[], str]] = None,
+        submission_claim: Optional[Mapping[str, Any]] = None, **_: Any,
     ) -> Any:
         from services.regulation_service import RegulationRunResult
-
         service = get_official_api_service()
         action = str(stop_action or "").lower()
         opt_type = "PAUSE" if action == "pause" else "DISABLE"
         intent_key = str(execution_uid or "").strip() or hashlib.sha256(
             f"stop|{text_id(aavid)}|{text_id(ad_id)}|{text_id(assist_task_id)}|{opt_type}".encode("utf-8")
         ).hexdigest()
-        intent_reserved = False
+        attempt = prepare_submission_gate(
+            task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
+            action_type="stop", aavid=aavid, ad_id=ad_id, intent_key=intent_key,
+            control_task_id=assist_task_id, submission_claim=submission_claim,
+            pre_submit_check=pre_submit_check,
+            verify_payload={
+                "aavid": aavid, "ad_id": ad_id, "promotion_scene": promotion_scene,
+                "task_id": text_id(assist_task_id), "expected_status": opt_type,
+                "execution_uid": intent_key, "control_cycle_key": str(control_cycle_key or ""),
+            },
+        )
+
+        def result(success, message, step, detail=""):
+            return RegulationRunResult(
+                success, message, step,
+                json.dumps({"submission_phase": attempt.phase, "detail": detail}, ensure_ascii=False),
+                text_id(aavid), text_id(ad_id),
+                text_id(assist_task_id), action, _now(), True,
+            )
+
         try:
             await asyncio.to_thread(
-                _check_plan,
-                service,
-                aavid=aavid,
-                ad_id=ad_id,
-                promotion_scene=promotion_scene,
-                plan_system=plan_system,
+                _check_plan, service, aavid=aavid, ad_id=ad_id,
+                promotion_scene=promotion_scene, plan_system=plan_system,
             )
             exact = await asyncio.to_thread(
-                _find_control_task,
-                service,
-                aavid=aavid,
-                ad_id=ad_id,
-                promotion_scene=promotion_scene,
-                task_id=assist_task_id,
+                _find_control_task, service, aavid=aavid, ad_id=ad_id,
+                promotion_scene=promotion_scene, task_id=assist_task_id,
             )
             if not exact:
                 raise RuntimeError("官方 API 未找到待停投的素材追投调控任务")
-            exact_scene = str(exact.get("scene") or "").upper()
-            if exact_scene and exact_scene != "MATERIAL_ADD_BUDGET":
+            scene = str(exact.get("scene") or "").upper()
+            if scene and scene != "MATERIAL_ADD_BUDGET":
                 raise RuntimeError("目标不是素材追投调控任务，已禁止操作")
-            if not exact_scene:
+            if not scene:
                 try:
-                    has_fresh_material_evidence = _cached_material_retarget_evidence(
-                        aavid=aavid,
-                        ad_id=ad_id,
-                        task_id=assist_task_id,
+                    evidence = _cached_material_retarget_evidence(
+                        aavid=aavid, ad_id=ad_id, task_id=assist_task_id,
                     )
                 except _MaterialRetargetEvidenceCheckError as exc:
-                    raise RuntimeError(
-                        "调控任务场景证据校验异常，未向千川提交停投"
-                    ) from exc
-                if not has_fresh_material_evidence:
+                    raise RuntimeError("调控任务场景证据校验异常，未向千川提交停投") from exc
+                if not evidence:
                     raise RuntimeError("调控任务缺少场景证据，且本地没有10分钟内的素材追投记录，已禁止操作")
-            current_status = str(exact.get("status") or "").upper()
-            if current_status in {"DISABLE", "DISABLED", "FINISHED", "ENDED"}:
-                message = "调控任务已经暂停" if opt_type == "PAUSE" else "调控任务已经结束"
-                return RegulationRunResult(True, message, "done_already_paused", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
-            if current_status == "OFFLINE_TIME":
-                return RegulationRunResult(True, "调控任务已自然到期", "done_naturally_expired", "", text_id(aavid), text_id(ad_id), text_id(assist_task_id), action, _now(), True)
-            from services.official_api_reconciliation import reserve_execution_intent
-
-            intent, intent_reserved = reserve_execution_intent(
-                task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
-                action_type="stop",
-                aavid=aavid,
-                ad_id=ad_id,
-                control_task_id=assist_task_id,
-                idempotency_key=intent_key,
-                verify_payload={
-                    "aavid": aavid,
-                    "ad_id": ad_id,
-                    "promotion_scene": promotion_scene,
-                    "task_id": text_id(assist_task_id),
-                    "expected_status": opt_type,
-                    "execution_uid": intent_key,
-                    "control_cycle_key": str(control_cycle_key or ""),
-                },
+            status = str(exact.get("status") or "").upper()
+            if status in {"DISABLE", "DISABLED", "FINISHED", "ENDED"}:
+                return result(True, "调控任务已经暂停" if opt_type == "PAUSE" else "调控任务已经结束",
+                              "done_already_paused")
+            if status == "OFFLINE_TIME":
+                return result(True, "调控任务已自然到期", "done_naturally_expired")
+            response = await asyncio.to_thread(
+                service.update_control_status, aavid, [assist_task_id], action=opt_type,
+                before_send=attempt.before_send,
             )
-            if not intent_reserved:
-                existing_status = str(intent.get("status") or "unknown_requires_review")
-                return RegulationRunResult(
-                    existing_status == "confirmed_succeeded",
-                    (
-                        "该停投已由平台核验成功"
-                        if existing_status == "confirmed_succeeded"
-                        else "该停投已有提交记录，已禁止重复提交，请等待核验或人工检查"
-                    ),
-                    existing_status,
-                    json.dumps(
-                        {
-                            "reconciliation_uid": str(
-                                intent.get("reconciliation_uid") or ""
-                            ),
-                            "idempotency_key": str(
-                                intent.get("idempotency_key") or intent_key
-                            ),
-                            "status": existing_status,
-                            "control_cycle_key": str(control_cycle_key or ""),
-                            "error": str(intent.get("last_error") or ""),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    text_id(aavid),
-                    text_id(ad_id),
-                    text_id(assist_task_id),
-                    action,
-                    _now(),
-                    True,
-                )
-            # One confirmation authorizes one attempt, not a delayed retry
-            # loop. Recheck after the potentially slow read-only API preflight,
-            # immediately before sending, so closing/changing a rule takes
-            # effect while those reads are in flight as well.
-            def submit_once():
-                if pre_submit_check is not None:
-                    reason = pre_submit_check()
-                    if reason:
-                        raise _StopSubmissionBlocked(str(reason))
-                return service.update_control_status(
-                    aavid, [assist_task_id], action=opt_type
-                )
-
-            response = await asyncio.to_thread(submit_once)
             if response is None:
                 raise RuntimeError("官方 API 停投提交未返回结果")
-            if response.request_uid:
-                OfficialApiAuditStore().mark_reconciled(
-                    response.request_uid,
-                    status="pending",
-                    task_id=assist_task_id,
-                    response={"message": "停投已提交，等待平台状态核验"},
-                )
-            from services.official_api_reconciliation import (
-                enqueue_execution_reconciliation,
-                start_official_api_reconciliation_background_thread,
-            )
-
-            enqueue_execution_reconciliation(
-                task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
-                action_type="stop",
-                aavid=aavid,
-                ad_id=ad_id,
-                control_task_id=assist_task_id,
-                request_id=str(response.request_id or ""),
-                request_uid=str(response.request_uid or ""),
-                idempotency_key=intent_key,
-                verify_payload={
-                    "aavid": aavid,
-                    "ad_id": ad_id,
-                    "promotion_scene": promotion_scene,
-                    "task_id": text_id(assist_task_id),
-                    "expected_status": opt_type,
-                    "execution_uid": intent_key,
-                    "control_cycle_key": str(control_cycle_key or ""),
-                },
-            )
-            start_official_api_reconciliation_background_thread()
-            return RegulationRunResult(
-                True,
-                "官方 API 停投已提交，正在核验平台最终状态",
-                "submitted_verifying",
-                json.dumps({"source": "qianchuan_open_api", "request_id": response.request_id, "opt_type": opt_type}, ensure_ascii=False),
-                text_id(aavid),
-                text_id(ad_id),
-                text_id(assist_task_id),
-                action,
-                _now(),
-                True,
-            )
+            attempt.accept(response)
+            return result(True, "官方 API 停投已提交，正在核验平台最终状态", "submitted_verifying",
+                          json.dumps({"source": "qianchuan_open_api",
+                                      "request_id": str(response.request_id or ""),
+                                      "opt_type": opt_type, "submission_phase": attempt.phase}, ensure_ascii=False))
+        except _ExistingExecutionIntent as exc:
+            status = str(exc.row.get("status") or "unknown_requires_review")
+            return result(status == "confirmed_succeeded",
+                          "该停投已有提交记录，已禁止重复提交，请等待核验或人工检查", status,
+                          json.dumps({"status": status, "idempotency_key": intent_key}, ensure_ascii=False))
         except _StopSubmissionBlocked as exc:
-            if intent_reserved:
-                from services.official_api_reconciliation import finish_execution_intent
-
-                finish_execution_intent(
-                    intent_key, status="confirmed_failed", error=str(exc)
-                )
-            return RegulationRunResult(
-                False, f"提交前复核未通过，未向千川提交：{exc}",
-                "stop_preflight_blocked", str(exc), text_id(aavid),
-                text_id(ad_id), text_id(assist_task_id), action, _now(), True,
-            )
-        except ApiWriteOutcomeUnknown as exc:
-            try:
-                exact = await asyncio.to_thread(
-                    _find_control_task,
-                    service,
-                    aavid=aavid,
-                    ad_id=ad_id,
-                    promotion_scene=promotion_scene,
-                    task_id=assist_task_id,
-                )
-            except Exception:
-                exact = None
-            status = str((exact or {}).get("status") or "").upper()
-            stop_outcome, stop_message = classify_stop_status(opt_type, status)
-            reconciled = stop_outcome in {"confirmed", "terminal_natural"}
-            if exc.request_uid:
-                OfficialApiAuditStore().mark_reconciled(
-                    exc.request_uid,
-                    status="confirmed" if reconciled else "unresolved",
-                    task_id=assist_task_id,
-                    response=exact or {},
-                )
-            if intent_reserved:
-                if reconciled:
-                    from services.official_api_reconciliation import (
-                        enqueue_execution_reconciliation,
-                        start_official_api_reconciliation_background_thread,
-                    )
-
-                    enqueue_execution_reconciliation(
-                        task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
-                        action_type="stop",
-                        aavid=aavid,
-                        ad_id=ad_id,
-                        control_task_id=assist_task_id,
-                        request_id="",
-                        request_uid=str(exc.request_uid or ""),
-                        idempotency_key=intent_key,
-                        verify_payload={
-                            "aavid": aavid,
-                            "ad_id": ad_id,
-                            "promotion_scene": promotion_scene,
-                            "task_id": text_id(assist_task_id),
-                            "expected_status": opt_type,
-                            "execution_uid": intent_key,
-                            "control_cycle_key": str(control_cycle_key or ""),
-                        },
-                    )
-                    start_official_api_reconciliation_background_thread()
-                else:
-                    from services.official_api_reconciliation import finish_execution_intent
-
-                    finish_execution_intent(intent_key, status="unknown_requires_review", error=str(exc))
-            return RegulationRunResult(
-                reconciled,
-                stop_message if reconciled else "官方 API 停投结果未知，已禁止自动重试",
-                "submitted_verifying" if reconciled else "unknown_requires_review",
-                str(exc),
-                text_id(aavid),
-                text_id(ad_id),
-                text_id(assist_task_id),
-                action,
-                _now(),
-                True,
-            )
+            return result(False, f"提交前复核未通过，未向千川提交：{exc}",
+                          "stop_preflight_blocked", str(exc))
         except Exception as exc:
-            if intent_reserved:
-                from services.official_api_reconciliation import finish_execution_intent
-
-                finish_execution_intent(
-                    intent_key,
-                    status="confirmed_failed",
-                    error=_public_api_error(exc),
-                )
-            return RegulationRunResult(
-                False,
-                _public_api_error(exc),
-                "official_api",
-                traceback.format_exc()[:8000],
-                text_id(aavid),
-                text_id(ad_id),
-                text_id(assist_task_id),
-                action,
-                _now(),
-                True,
-            )
+            if attempt.handle_error(exc):
+                return result(True, "停投提交结果待核验，已禁止重复提交，正在只读核验",
+                              "submitted_verifying",
+                              json.dumps({"submission_phase": attempt.phase, "error": _public_api_error(exc)},
+                                         ensure_ascii=False))
+            return result(False, _public_api_error(exc), "official_api", traceback.format_exc()[:8000])

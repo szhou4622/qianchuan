@@ -138,134 +138,191 @@ def _notify_reconciled_auto_stop(
 
 
 def enqueue_execution_reconciliation(
-    *,
-    task_uid: str,
-    action_type: str,
-    aavid: Any,
-    ad_id: Any,
-    control_task_id: Any,
-    request_id: str,
-    request_uid: str,
-    idempotency_key: str,
-    verify_payload: Mapping[str, Any],
-    db: Optional[SQLiteStore] = None,
+    *, task_uid: str, action_type: str, aavid: Any, ad_id: Any,
+    control_task_id: Any, request_id: str, request_uid: str,
+    idempotency_key: str, verify_payload: Mapping[str, Any],
+    db: Optional[SQLiteStore] = None, account_username: str = "",
+    submission_phase: str = "accepted",
 ) -> dict[str, Any]:
+    """Save known acceptance/uncertainty before any optional local auditing."""
+    if submission_phase not in {"accepted", "unknown"}:
+        raise ValueError("无效的待核验提交阶段")
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
-    owner = str(current_session_owner() or "").strip().casefold()
+    owner = str(account_username or current_session_owner() or "").strip().casefold()
     if not owner:
-        raise RuntimeError("工具账号已经退出，不能登记官方 API 对账任务")
+        raise RuntimeError("缺少原提交账户，不能登记官方 API 对账任务")
     stable_key = str(idempotency_key or task_uid or request_uid or control_task_id).strip()
-    existing = store.select_one(
-        "execution_reconciliation",
-        where={"account_username": owner, "idempotency_key": stable_key},
-    )
-    if isinstance(existing, dict):
-        if str(existing.get("status") or "") == "submitting":
-            store.execute(
-                "UPDATE execution_reconciliation SET task_uid=?,action_type=?,aavid=?,ad_id=?,"
-                "control_task_id=?,request_id=?,status='submitted',next_attempt_at=?,"
-                "payload_json=?,last_error='',updated_at=? WHERE account_username=? "
-                "AND idempotency_key=? AND status='submitting'",
-                (
-                    str(task_uid or ""),
-                    str(action_type or "retarget"),
-                    str(aavid or ""),
-                    str(ad_id or ""),
-                    str(control_task_id or ""),
-                    str(request_id or ""),
-                    (datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),
-                    _json({**dict(verify_payload), "request_uid": str(request_uid or "")}),
-                    _now(),
-                    owner,
-                    stable_key,
-                ),
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        found = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND idempotency_key=?",
+            (owner, stable_key),
+        ).fetchone()
+        existing = dict(found) if found is not None else {}
+        data = {**_payload(existing.get("payload_json")), **dict(verify_payload)}
+        phase = "accepted" if data.get("submission_phase") == "accepted" else submission_phase
+        phases = list(data.get("submission_phases") or [])
+        if not phases or phases[-1] != phase:
+            phases.append(phase)
+        data.update(request_uid=str(request_uid or ""), submission_phase=phase,
+                    submission_phases=phases[-8:])
+        row = {
+            "reconciliation_uid": existing.get("reconciliation_uid") or uuid.uuid4().hex,
+            "account_username": owner, "task_uid": str(task_uid or ""),
+            "action_type": str(action_type or "retarget"), "aavid": str(aavid or ""),
+            "ad_id": str(ad_id or ""), "control_task_id": str(control_task_id or ""),
+            "request_id": str(request_id or ""), "idempotency_key": stable_key,
+            "status": "submitted",
+            "next_attempt_at": (datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),
+            "payload_json": _json(data),
+        }
+        if existing:
+            if str(existing.get("status") or "") in {"submitting", "submitted"}:
+                connection.execute(
+                    "UPDATE execution_reconciliation SET task_uid=?,control_task_id=?,request_id=?,"
+                    "status='submitted',next_attempt_at=?,payload_json=?,last_error='',updated_at=? "
+                    "WHERE account_username=? AND idempotency_key=? AND status IN ('submitting','submitted')",
+                    (row["task_uid"], row["control_task_id"], row["request_id"],
+                     row["next_attempt_at"], row["payload_json"], _now(), owner, stable_key),
+                )
+            elif str(existing.get("status") or "") == "verifying":
+                connection.execute(
+                    "UPDATE execution_reconciliation SET payload_json=?,control_task_id=?,request_id=?,updated_at=? "
+                    "WHERE account_username=? AND idempotency_key=? AND status='verifying'",
+                    (row["payload_json"], row["control_task_id"], row["request_id"], _now(), owner, stable_key),
+                )
+                row["status"] = "verifying"
+            else:
+                row = existing
+        else:
+            connection.execute(
+                f"INSERT INTO execution_reconciliation ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
+                tuple(row.values()),
             )
-            existing = store.select_one(
-                "execution_reconciliation",
-                where={"account_username": owner, "idempotency_key": stable_key},
-            ) or existing
-        _WAKE.set()
-        return existing
-    row = {
-        "reconciliation_uid": uuid.uuid4().hex,
-        "account_username": owner,
-        "task_uid": str(task_uid or ""),
-        "action_type": str(action_type or "retarget"),
-        "aavid": str(aavid or ""),
-        "ad_id": str(ad_id or ""),
-        "control_task_id": str(control_task_id or ""),
-        "request_id": str(request_id or ""),
-        "idempotency_key": stable_key,
-        "status": "submitted",
-        "next_attempt_at": (datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),
-        "payload_json": _json(
-            {
-                **dict(verify_payload),
-                "request_uid": str(request_uid or ""),
-            }
-        ),
-    }
-    store.insert("execution_reconciliation", row)
     _WAKE.set()
     return row
 
 
 def reserve_execution_intent(
-    *,
-    task_uid: str,
-    action_type: str,
-    aavid: Any,
-    ad_id: Any,
-    idempotency_key: str,
-    verify_payload: Mapping[str, Any],
-    control_task_id: Any = "",
-    db: Optional[SQLiteStore] = None,
+    *, task_uid: str, action_type: str, aavid: Any, ad_id: Any,
+    idempotency_key: str, verify_payload: Mapping[str, Any],
+    control_task_id: Any = "", db: Optional[SQLiteStore] = None,
+    submission_claim: Optional[Mapping[str, Any]] = None,
+    submission_phase: str = "not_sent", account_username: str = "",
 ) -> tuple[dict[str, Any], bool]:
-    """Persist an immutable write intent immediately before the POST.
-
-    A crash after this reservation is intentionally fail-closed: on restart
-    the same idempotency key is not submitted again until an operator or the
-    reconciliation flow has resolved the previous attempt.
-    """
+    """Validate a current claim and reserve the shared intent in one transaction."""
     store = db or SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
-    owner = str(current_session_owner() or "").strip().casefold()
+    owner = str(account_username or current_session_owner() or "").strip().casefold()
     if not owner:
         raise RuntimeError("工具账号已经退出，不能登记官方 API 写入意图")
     stable_key = str(idempotency_key or task_uid).strip()
     if not stable_key:
         raise RuntimeError("写入任务缺少不可变幂等键")
-    existing = store.select_one(
-        "execution_reconciliation",
-        where={"account_username": owner, "idempotency_key": stable_key},
-    )
-    if isinstance(existing, dict):
-        return existing, False
+    if submission_phase not in {"not_sent", "sending"}:
+        raise ValueError("写入意图初始阶段无效")
+    claim = dict(submission_claim or {})
+    if claim and str(claim.get("account_username") or "").strip().casefold() != owner:
+        raise RuntimeError("领取账户与写入账户不一致，未提交")
+    if claim:
+        from services.local_feishu_bridge import assert_valid_local_claim
     row = {
-        "reconciliation_uid": uuid.uuid4().hex,
-        "account_username": owner,
-        "task_uid": str(task_uid or ""),
-        "action_type": str(action_type or "retarget"),
-        "aavid": str(aavid or ""),
-        "ad_id": str(ad_id or ""),
-        "control_task_id": str(control_task_id or ""),
-        "idempotency_key": stable_key,
-        "status": "submitting",
-        "next_attempt_at": _now(),
-        "payload_json": _json(dict(verify_payload)),
+        "reconciliation_uid": uuid.uuid4().hex, "account_username": owner,
+        "task_uid": str(task_uid or ""), "action_type": str(action_type or "retarget"),
+        "aavid": str(aavid or ""), "ad_id": str(ad_id or ""),
+        "control_task_id": str(control_task_id or ""), "idempotency_key": stable_key,
+        "status": "submitting", "next_attempt_at": _now(),
+        "payload_json": _json({
+            **dict(verify_payload), "submission_phase": submission_phase,
+            "submission_claim": claim,
+            "submission_phases": (["not_sent", "sending"] if submission_phase == "sending" else ["not_sent"]),
+        }),
     }
-    try:
-        store.insert("execution_reconciliation", row)
-    except Exception:
-        existing = store.select_one(
-            "execution_reconciliation",
-            where={"account_username": owner, "idempotency_key": stable_key},
+    # The attached connection routes the intent into channel_guard and keeps
+    # the claim in main. Never open another connection while holding this lock.
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if claim:
+            assert_valid_local_claim(connection, claim, now=_now())
+        existing = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND idempotency_key=?",
+            (owner, stable_key),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing), False
+        connection.execute(
+            f"INSERT INTO execution_reconciliation ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
+            tuple(row.values()),
         )
-        if isinstance(existing, dict):
-            return existing, False
-        raise
     return row, True
+
+
+def authorize_execution_followup(
+    idempotency_key: str, reservation_uid: str, step: str, *, account_username: str,
+    submission_claim: Optional[Mapping[str, Any]] = None, db: Optional[SQLiteStore] = None,
+) -> None:
+    """Only the same live attempt can advance a predeclared multi-write plan."""
+    store = db or SQLiteStore()
+    claim = dict(submission_claim or {})
+    if claim:
+        from services.local_feishu_bridge import assert_valid_local_claim
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if claim:
+            assert_valid_local_claim(connection, claim, now=_now())
+        row = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND idempotency_key=?",
+            (account_username, idempotency_key),
+        ).fetchone()
+        if (row is None or not reservation_uid or row["reconciliation_uid"] != reservation_uid
+                or row["status"] not in {"submitting", "submitted", "verifying"}):
+            raise RuntimeError("提交意图已变化，禁止继续下一步写入")
+        data = _payload(row["payload_json"])
+        attempted = list(data.get("attempted_steps") or [])
+        if step not in (data.get("required_steps") or []) or step in attempted:
+            raise RuntimeError("后续步骤未预登记或已经发送，禁止重复提交")
+        data["attempted_steps"] = attempted + [step]
+        connection.execute(
+            "UPDATE execution_reconciliation SET payload_json=?,updated_at=? WHERE reconciliation_uid=?",
+            (_json(data), _now(), reservation_uid),
+        )
+
+
+def record_execution_submission_phase(
+    idempotency_key: str, phase: str, *, account_username: str = "",
+    error: str = "", db: Optional[SQLiteStore] = None,
+) -> None:
+    """Monotonic evidence: accepted/unknown must never become rejected."""
+    if phase not in {"not_sent", "sending", "accepted", "unknown", "rejected"}:
+        raise ValueError("无效的提交阶段")
+    store = db or SQLiteStore()
+    owner = str(account_username or current_session_owner() or "").strip().casefold()
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND idempotency_key=?",
+            (owner, str(idempotency_key)),
+        ).fetchone()
+        if row is None:
+            return
+        data = _payload(row["payload_json"])
+        previous = str(data.get("submission_phase") or "sending")
+        if ((previous == "accepted" and phase != "accepted")
+                or (previous == "unknown" and phase == "rejected")):
+            return
+        phases = list(data.get("submission_phases") or [])
+        if not phases or phases[-1] != phase:
+            phases.append(phase)
+        data.update(submission_phase=phase, submission_phases=phases[-8:])
+        status = str(row["status"])
+        if phase == "rejected" and status == "submitting":
+            status = "confirmed_failed"
+        connection.execute(
+            "UPDATE execution_reconciliation SET payload_json=?,status=?,last_error=?,updated_at=? "
+            "WHERE account_username=? AND idempotency_key=?",
+            (_json(data), status, str(error or "")[:1000], _now(), owner, str(idempotency_key)),
+        )
 
 
 def resolve_stop_idempotency_key(
@@ -314,28 +371,70 @@ def resolve_stop_idempotency_key(
 
 
 def finish_execution_intent(
-    idempotency_key: str,
-    *,
-    status: str,
-    error: str = "",
-    db: Optional[SQLiteStore] = None,
+    idempotency_key: str, *, status: str, error: str = "",
+    db: Optional[SQLiteStore] = None, account_username: str = "",
 ) -> None:
     store = db or SQLiteStore()
-    owner = str(current_session_owner() or "").strip().casefold()
+    owner = str(account_username or current_session_owner() or "").strip().casefold()
     if not owner or not str(idempotency_key or "").strip():
         return
-    store.execute(
-        "UPDATE execution_reconciliation SET status=?,last_error=?,confirmed_at=?,updated_at=? "
-        "WHERE account_username=? AND idempotency_key=? AND status='submitting'",
-        (
-            str(status or "unknown_requires_review"),
-            str(error or "")[:1000],
-            _now() if str(status or "").startswith("confirmed_") else None,
-            _now(),
-            owner,
-            str(idempotency_key),
-        ),
-    )
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND idempotency_key=?",
+            (owner, str(idempotency_key)),
+        ).fetchone()
+        if row is None or str(row["status"]) != "submitting":
+            return
+        data = _payload(row["payload_json"])
+        phase = str(data.get("submission_phase") or "sending")
+        result_status = str(status or "unknown_requires_review")
+        if result_status == "confirmed_failed":
+            if phase in {"not_sent", "rejected"}:
+                data["submission_phase"] = "rejected"
+            else:
+                # Legacy/local exceptions are not proof of platform rejection.
+                result_status = "submitted"
+                if phase != "accepted":
+                    data["submission_phase"] = "unknown"
+        connection.execute(
+            "UPDATE execution_reconciliation SET status=?,payload_json=?,last_error=?,"
+            "confirmed_at=?,updated_at=? WHERE account_username=? AND idempotency_key=? AND status='submitting'",
+            (result_status, _json(data), str(error or "")[:1000],
+             _now() if result_status.startswith("confirmed_") else None, _now(), owner, str(idempotency_key)),
+        )
+
+
+def recover_interrupted_submissions(
+    account_username: str, *, db: Optional[SQLiteStore] = None,
+) -> int:
+    """A stale sending/submitting intent is only eligible for GET verification."""
+    store = db or SQLiteStore()
+    owner = str(account_username or "").strip().casefold()
+    if not owner:
+        return 0
+    cutoff = (datetime.now() - timedelta(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
+    recovered = 0
+    with store.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? "
+            "AND status='submitting' AND updated_at<=?", (owner, cutoff),
+        ).fetchall()
+        for row in rows:
+            data = _payload(row["payload_json"])
+            if data.get("submission_phase") == "rejected":
+                continue
+            if data.get("submission_phase") != "accepted":
+                data["submission_phase"] = "unknown"
+            data["recovered_without_resubmit"] = True
+            changed = connection.execute(
+                "UPDATE execution_reconciliation SET status='submitted',next_attempt_at=?,"
+                "payload_json=?,updated_at=? WHERE reconciliation_uid=? AND status='submitting'",
+                (_now(), _json(data), _now(), row["reconciliation_uid"]),
+            )
+            recovered += changed.rowcount
+    return recovered
 
 
 def _claim_one(store: SQLiteStore, owner: str) -> Optional[dict[str, Any]]:
@@ -593,13 +692,20 @@ def _finish_locked(
                 (_now(), str(row.get("reconciliation_uid") or "")),
             )
             return True
+        if data.get("submission_claim"):
+            from services.local_feishu_bridge import promote_reconciled_local_claim
+            # Only the persisted original fence may project an expired claim.
+            # This transaction never grants a new lease or a right to POST.
+            with store.transaction() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                promote_reconciled_local_claim(connection, row)
         succeeded = bool(sibling_statuses) and sibling_statuses == {"confirmed_succeeded"}
         aggregate_status = (
             "confirmed_succeeded" if succeeded else "confirmed_failed"
             if sibling_statuses <= {"confirmed_succeeded", "confirmed_failed"}
             else "unknown_requires_review"
         )
-        label = "停投" if is_stop else "追投"
+        label = "停投" if is_stop else ("预算/时长调整" if row.get("action_type") == "budget" else "追投")
         terminal_message = (
             "调控任务已自然到期"
             if is_stop and naturally_expired
@@ -741,7 +847,8 @@ def _terminal_projection_ready(
         f"SELECT execution_state FROM {table} WHERE execution_uid IN (?,?)",
         (uid, legacy_uid), fetch=True,
     ) or []
-    if not runs or any(item.get("execution_state") == "submitted_verifying" for item in runs):
+    if ((not runs and row.get("action_type") != "budget")
+            or any(item.get("execution_state") == "submitted_verifying" for item in runs)):
         return False
     local = store.select_one("local_retarget_task", where={
         "task_uid": str(row.get("task_uid") or ""),
@@ -753,7 +860,7 @@ def _terminal_projection_ready(
         current = store.select_one("execution_reconciliation", where={
             "reconciliation_uid": str(row.get("reconciliation_uid") or ""),
         }) or {}
-        if current.get("card_update_state") not in {"sent", "queued", "failed"}:
+        if current.get("card_update_state") not in {"sent", "queued", "failed", "unknown"}:
             return False
     cycle = str(data.get("control_cycle_key") or "")
     if row.get("action_type") == "stop" and cycle:
@@ -834,7 +941,11 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
     data = _payload(row.get("payload_json"))
     try:
         action_type = str(row.get("action_type") or "retarget")
-        if action_type == "retarget":
+        if action_type in {"retarget", "budget"}:
+            if action_type == "budget" and not set(data.get("required_steps") or []).issubset(
+                set(data.get("attempted_steps") or [])
+            ):
+                raise RuntimeError("预算/时长计划尚有未发送步骤，不能把部分接受报告为整体成功")
             from services.official_api_execution import _verify_control_task
 
             service = get_official_api_service()
@@ -927,22 +1038,29 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
 
 
 def _loop() -> None:
-    init_sqlite_schema()
-    store = SQLiteStore()
+    store = None
     last_replay = 0.0
     while not _STOP.is_set():
-        owner = str(current_session_owner() or "").strip().casefold()
-        if not owner:
-            _WAKE.wait(2)
-            _WAKE.clear()
-            continue
-        if time.monotonic() - last_replay >= 5:
-            replay_terminal_reconciliations(owner, db=store)
-            last_replay = time.monotonic()
-        row = _claim_one(store, owner)
-        if row:
-            _verify_one(store, row)
-            continue
+        try:
+            if store is None:
+                candidate = SQLiteStore()
+                init_sqlite_schema(database=candidate.config.get("database"))
+                store = candidate
+            owner = str(current_session_owner() or "").strip().casefold()
+            if not owner:
+                _WAKE.wait(2)
+                _WAKE.clear()
+                continue
+            if time.monotonic() - last_replay >= 5:
+                recover_interrupted_submissions(owner, db=store)
+                replay_terminal_reconciliations(owner, db=store)
+                last_replay = time.monotonic()
+            row = _claim_one(store, owner)
+            if row:
+                _verify_one(store, row)
+                continue
+        except Exception:
+            logger.exception("官方 API 核验工作器暂时失败，保留持久化意图等待恢复")
         _WAKE.wait(2)
         _WAKE.clear()
 

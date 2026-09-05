@@ -886,6 +886,7 @@ class SQLiteStore:
                 'request_ids_json': "TEXT NOT NULL DEFAULT '[]'",
                 'last_error': 'TEXT',
                 'completed_at': 'TEXT',
+                'last_success_at': 'TEXT',
                 'created_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'updated_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
             },
@@ -1004,6 +1005,7 @@ class SQLiteStore:
                 'ad_delivery_name': 'TEXT',
                 'task_status_source': "TEXT NOT NULL DEFAULT ''",
                 'task_status_observed_at': 'TEXT',
+                'metrics_observed_at': 'TEXT',
                 'ad_opt_type': 'INTEGER',
                 'hint_type': 'INTEGER',
                 'learning_phase': 'INTEGER',
@@ -2188,6 +2190,11 @@ class SQLiteStore:
                 continue
             alter_sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}"
             cursor.execute(alter_sql)
+            if table_name == 'operation_log_sync_window' and col_name == 'last_success_at':
+                cursor.execute(
+                    "UPDATE operation_log_sync_window SET last_success_at=completed_at "
+                    "WHERE status IN ('succeeded','empty') AND completed_at IS NOT NULL"
+                )
             logger.info(f"表 {table_name} 已新增列 {col_name}")
 
         self.clear_table_cache(table_name)

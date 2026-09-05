@@ -882,6 +882,7 @@ def _control_snapshot(
         "ad_delivery_name": status,
         "task_status_source": str(task.get("status_source") or "")[:64],
         "task_status_observed_at": str(observed_at or _now())[:64],
+        "metrics_observed_at": str(task.get("_metrics_observed_at") or observed_at or _now())[:64],
         "daily_delivery_seconds": (
             int(Decimal(str(task.get("duration"))) * Decimal("3600"))
             if task.get("duration") not in (None, "")
@@ -1266,6 +1267,7 @@ def collect_target(
         capability_updates={"collection_stage": "scanning_active_materials"},
         db=store,
     )
+    material_observed_at = _now()
     materials, material_request_ids = service.list_plan_materials(
         aavid,
         ad_id,
@@ -1320,104 +1322,8 @@ def collect_target(
         db=store,
     )
 
-    # If the computer was closed across a date boundary, recover yesterday's
-    # final cumulative metrics once into history. They never replace today's
-    # latest state and never participate in today's rule evaluation.
-    recovery_snapshots: list[dict[str, Any]] = []
-    recovery_completed = False
-    today = datetime.now().date()
-    yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    last_sync = _parse_local_time(target.get("last_sync_at"))
-    pending_dates = capability.get("recovery_backfill_pending_dates")
-    pending_dates = list(pending_dates) if isinstance(pending_dates, list) else []
-    pending_dates = sorted({
-        value for value in pending_dates
-        if isinstance(value, str)
-        and _parse_local_time(f"{value} 00:00:00") is not None
-        and value < today.strftime("%Y-%m-%d")
-    })
-    if (
-        last_sync
-        and last_sync.date() < today
-        and str(capability.get("recovery_backfill_date") or "") != yesterday
-    ):
-        pending_dates = sorted(set(pending_dates + [yesterday]))
-    recovery_needed = bool(pending_dates)
-    recovery_date = pending_dates[0] if recovery_needed else yesterday
-    if recovery_needed:
-        # Keep recovery independent from the hot collector's last_sync_at. A
-        # successful today read must not erase yesterday's failed retry intent.
-        patch_target_sync_state(
-            target_uid,
-            status="collecting",
-            synced=False,
-            capability_updates={"recovery_backfill_pending_dates": pending_dates},
-            db=store,
-        )
-        try:
-            recovery_materials, recovery_request_ids = service.list_plan_materials(
-                aavid,
-                ad_id,
-                start_date=recovery_date,
-                end_date=recovery_date,
-                fields=supported_material_metrics,
-                delivery_only=True,
-                parallel_workers=3,
-            )
-            recovery_report_result = service.list_material_report(
-                aavid,
-                plan_system=expected_system,
-                promotion_scene=expected_scene,
-                start_date=recovery_date,
-                end_date=recovery_date,
-                metrics=supported_material_metrics,
-                filter_context=report_filter_context,
-            )
-            if (
-                isinstance(recovery_report_result, tuple)
-                and len(recovery_report_result) == 2
-            ):
-                recovery_report_rows, recovery_report_request_ids = (
-                    recovery_report_result
-                )
-            else:
-                recovery_report_rows, recovery_report_request_ids = [], []
-            recovery_materials = _merge_material_report(
-                recovery_materials, recovery_report_rows
-            )
-            recovery_request_id = (
-                recovery_report_request_ids[-1]
-                if recovery_report_request_ids
-                else recovery_request_ids[-1]
-                if recovery_request_ids
-                else ""
-            )
-            recovery_snapshots = [
-                {
-                    **_material_snapshot(
-                        item,
-                        target=target,
-                        units=units,
-                        request_id=recovery_request_id,
-                    ),
-                    "stat_date": recovery_date,
-                }
-                for item in recovery_materials
-                if text_id(item.get("material_id"))
-            ]
-            recovery_completed = True
-        except (ApiTokenError, ApiPermissionError):
-            raise
-        except (
-            ApiRateLimitError,
-            ApiRequestError,
-            RuntimeError,
-            TimeoutError,
-            ConnectionError,
-            OSError,
-        ) as exc:
-            maintenance_errors.append(f"recovery_backfill:{exc}")
-
+    # Historical reads have their own low-priority persistent job. They must
+    # neither delay today's hot reads nor overwrite its freshness timestamps.
     products_refreshed = bool(phase_plan["refresh_products"]) and (
         not rotate_maintenance or maintenance_phase == "products"
     )
@@ -1452,6 +1358,7 @@ def collect_target(
             )
 
     now = datetime.now()
+    control_read_times: list[str] = []
     refresh_control_history = bool(phase_plan["refresh_control_history"]) and (
         not rotate_maintenance or maintenance_phase == "control_history"
     )
@@ -1459,7 +1366,8 @@ def collect_target(
     def fetch_controls(
         days: int, *, active_only: bool = False
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        return service.list_control_tasks(
+        read_started_at = _now()
+        tasks, request_ids = service.list_control_tasks(
             aavid,
             ad_id=ad_id,
             marketing_goal=goal,
@@ -1467,6 +1375,9 @@ def collect_target(
             end_time=(now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59"),
             active_only=active_only,
         )
+        control_read_times.append(read_started_at)
+        return [dict(item, _metrics_observed_at=read_started_at,
+                     _status_observed_at=read_started_at) for item in tasks], request_ids
 
     # Active retarget task metrics (spend/orders/GMV/ROI/status/budget/duration)
     # are part of every five-minute hot cycle.  Hourly 179-day history is an
@@ -1540,7 +1451,7 @@ def collect_target(
             1 for item in raw_control_tasks if _control_is_active(item)
         )
     control_request_id = control_request_ids[-1] if control_request_ids else ""
-    control_observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    control_observed_at = min(control_read_times, default=_now())
 
     def build_control_rows(
         tasks: list[dict[str, Any]],
@@ -1551,6 +1462,7 @@ def collect_target(
         built: list[dict[str, Any]] = []
         needs_explicit_resume_status = False
         for item in tasks:
+            item_observed_at = str(item.get("_status_observed_at") or observed_at)
             task_id = text_id(item.get("task_id"))
             if (
                 str(item.get("scene") or "").upper()
@@ -1562,7 +1474,7 @@ def collect_target(
                 item,
                 target=target,
                 request_id=request_id,
-                observed_at=observed_at,
+                observed_at=item_observed_at,
                 units=units,
             )
             state = stop_cycle_state(
@@ -1570,7 +1482,7 @@ def collect_target(
                 target_uid,
                 task_id,
                 assist_row=snapshot,
-                observed_at=observed_at,
+                observed_at=item_observed_at,
             )
             if (
                 state.get("blocked")
@@ -1583,7 +1495,7 @@ def collect_target(
                     store,
                     target_uid,
                     snapshot,
-                    observed_at=observed_at,
+                    observed_at=item_observed_at,
                     cycle_state=state,
                 )
             )
@@ -1608,7 +1520,7 @@ def collect_target(
         ]
         control_request_ids = [*control_request_ids, *explicit_request_ids]
         control_request_id = control_request_ids[-1] if control_request_ids else ""
-        control_observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        control_observed_at = min(control_read_times, default=_now())
         control_rows, _ = build_control_rows(
             control_tasks,
             request_id=control_request_id,
@@ -1694,20 +1606,20 @@ def collect_target(
         "assist_sync_enabled": True,
         "assist_sync_in_progress": False,
         "assist_sync_ok": not control_suspicious,
-        "assist_synced_at": cycle_observed_at,
+        "assist_synced_at": control_observed_at,
         "material_request_ids": material_request_ids,
         "material_report_request_ids": material_report_request_ids,
         "material_report_count": len(material_report_rows),
         "control_request_ids": control_request_ids,
-        "collected_at": cycle_observed_at,
+        "collected_at": material_observed_at,
+        "material_observed_at": material_observed_at,
+        "control_observed_at": control_observed_at,
+        "collection_committed_at": cycle_observed_at,
+        "snapshot_version": uuid.uuid4().hex,
         "collection_window_start": start_date,
         "collection_window_end": end_date,
         "collection_scope": "active_video_materials_and_running_scene2_tasks",
         "collection_stage": "healthy",
-        "recovery_backfill_pending_dates": (
-            [value for value in pending_dates if value != recovery_date]
-            if recovery_completed else pending_dates
-        ),
         "account_collection_concurrency": account_concurrency,
         "application_worker_limit": _adaptive_worker_limit(
             COLLECTION_MAX_WORKERS
@@ -1721,13 +1633,6 @@ def collect_target(
             {
                 "maintenance_last_phase": maintenance_phase,
                 "maintenance_last_attempted_at": _now(),
-            }
-        )
-    if recovery_completed:
-        core_capability_updates.update(
-            {
-                "recovery_backfill_date": recovery_date,
-                "recovery_backfill_count": len(recovery_snapshots),
             }
         )
     if maintenance_errors:
@@ -1781,14 +1686,6 @@ def collect_target(
         for item in previous_latest_rows
         if str(item.get("material_id") or "")
     }
-    recovery_metric_upserts = [
-        _metric_snapshot_row(
-            recovery_row,
-            target=target,
-            observed_at=f"{recovery_date} 23:59:59",
-        )
-        for recovery_row in recovery_snapshots
-    ]
     latest_upserts: list[dict[str, Any]] = []
     metric_upserts: list[dict[str, Any]] = []
     for row in snapshots:
@@ -1801,8 +1698,8 @@ def collect_target(
         latest_row = dict(effective_row)
         latest_row.update(
             {
-                "collected_at": cycle_observed_at,
-                "last_seen_at": cycle_observed_at,
+                "collected_at": material_observed_at,
+                "last_seen_at": material_observed_at,
                 "delivery_state": "delivering",
                 "updated_at": cycle_observed_at,
             }
@@ -1813,7 +1710,7 @@ def collect_target(
                 _metric_snapshot_row(
                     effective_row,
                     target=target,
-                    observed_at=cycle_observed_at,
+                    observed_at=material_observed_at,
                 )
             )
     control_upserts: list[dict[str, Any]] = []
@@ -1853,17 +1750,6 @@ def collect_target(
                 )
             )
         control_upserts = fenced_control_upserts
-        _bulk_upsert_rows(
-            connection,
-            "pmc_material_metric_snapshot",
-            recovery_metric_upserts,
-            unique_fields=(
-                "account_username",
-                "target_uid",
-                "material_id",
-                "bucket_key",
-            ),
-        )
         _bulk_upsert_rows(
             connection,
             "pmc_promotion_material_latest",
@@ -2061,7 +1947,7 @@ def collect_target(
         )
 
         if not any_suspicious_empty:
-            request_retargeting_rule_evaluation("collection_completed")
+            request_retargeting_rule_evaluation("collection_completed", target_uids={target_uid})
     except Exception:
         logger.exception("官方 API 采集完成后唤醒追投规则失败 target=%s", target_uid)
     try:
@@ -2070,7 +1956,7 @@ def collect_target(
         )
 
         if not any_suspicious_empty:
-            request_regulation_rule_evaluation("collection_completed")
+            request_regulation_rule_evaluation("collection_completed", target_uids={target_uid})
     except Exception:
         logger.exception("官方 API 采集完成后唤醒停投规则失败 target=%s", target_uid)
     try:
@@ -2469,7 +2355,7 @@ def _enqueue_collection_jobs(
         requested_due = _parse_local_time(due_text) or datetime.now()
         effective_due = (
             min(existing_due, requested_due)
-            if existing_due is not None
+            if existing_due is not None and kind != "material_backfill"
             else requested_due
         )
         payload = {
@@ -2504,7 +2390,7 @@ def _enqueue_collection_jobs(
 
 
 def _claim_collection_jobs(
-    *, db: SQLiteStore, limit: int
+    *, db: SQLiteStore, limit: int, kind: str = "hot_collection"
 ) -> list[dict[str, Any]]:
     _ensure_collection_schema(db)
     owner = _owner_key()
@@ -2524,17 +2410,18 @@ def _claim_collection_jobs(
             "SELECT j.* FROM collection_job j "
             "INNER JOIN promotion_target pt ON pt.target_uid=j.target_uid "
             "INNER JOIN qianchuan_account qa ON qa.account_uid=pt.account_uid "
-            "WHERE j.owner_username=? AND j.status='queued' "
+            "WHERE j.owner_username=? AND j.status='queued' AND j.job_kind=? "
             "AND j.due_at <= datetime('now', '+8 hours') "
             "AND qa.enabled=1 AND pt.enabled=1 AND pt.capacity_state='active' "
             "ORDER BY j.priority DESC,j.due_at ASC,j.id ASC LIMIT 2000",
-            (owner,),
+            (owner, kind),
             fetch=True,
             connection=connection,
         ) or []
         # Preserve strict priority between bands while retaining account
         # round-robin fairness inside each band.
         fair_rows: list[dict[str, Any]] = []
+        selected_targets: set[str] = set()
         account_claims: dict[str, int] = {}
         claim_limit = max(1, int(limit))
         priorities = sorted(
@@ -2546,10 +2433,13 @@ def _claim_collection_jobs(
                 if int(raw.get("priority") or 0) == priority
             ]
             for candidate in _fair_order_targets(band):
+                if str(candidate.get("target_uid") or "") in selected_targets:
+                    continue
                 account_key = _target_account_key(candidate)
                 if account_claims.get(account_key, 0) >= ACCOUNT_MAX_CONCURRENT_PLANS:
                     continue
                 fair_rows.append(dict(candidate))
+                selected_targets.add(str(candidate.get("target_uid") or ""))
                 account_claims[account_key] = account_claims.get(account_key, 0) + 1
                 if len(fair_rows) >= claim_limit:
                     break
@@ -2586,6 +2476,20 @@ def _claim_collection_jobs(
 def _finish_collection_job(
     job: Mapping[str, Any], result: Mapping[str, Any], *, db: SQLiteStore
 ) -> None:
+    if str(job.get("job_kind") or "") == "material_backfill":
+        next_due = str(result.get("next_due_at") or "")
+        if not next_due and not result.get("job_idle"):
+            next_due = (datetime.now() + timedelta(seconds=max(5, int(result.get("retry_seconds") or 60)))).strftime("%Y-%m-%d %H:%M:%S")
+        db.execute(
+            "UPDATE collection_job SET status=?,priority=0,due_at=?,lease_owner=NULL,"
+            "lease_expires_at=NULL,last_error=?,last_finished_at=datetime('now','+8 hours'),"
+            "updated_at=datetime('now','+8 hours') WHERE id=? AND status='leased' "
+            "AND lease_owner=? AND fencing_token=?",
+            ("queued" if next_due else "idle", next_due or _now(),
+             str(result.get("message") or "")[:1000], job.get("id"),
+             job.get("lease_owner"), job.get("fencing_token")),
+        )
+        return
     success = bool(result.get("success"))
     if success:
         next_due = _fixed_cadence_due(
@@ -2730,21 +2634,36 @@ def get_collection_queue_health(*, db: Optional[SQLiteStore] = None) -> dict[str
 def _loop(interval_seconds: int) -> None:
     interval = max(30, int(interval_seconds))
     tick = min(COLLECTION_SCHEDULER_TICK_SECONDS, interval)
+    from services.material_backfill import run_material_backfill_job, schedule_material_backfills
+    backfill_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="material-backfill")
+    backfill_future = None
+    backfill_job = None
+    next_backfill_schedule = 0.0
     while not _STOP.is_set():
         claimed: list[dict[str, Any]] = []
         try:
             store = SQLiteStore()
             _ensure_collection_schema(store)
+            if backfill_future is not None and backfill_future.done():
+                try:
+                    backfill_result = backfill_future.result()
+                except Exception as exc:
+                    logger.exception("历史素材回补失败")
+                    backfill_result = {"success": False, "message": str(exc), "retry_seconds": 60}
+                _finish_collection_job(backfill_job, backfill_result, db=store)
+                backfill_future = backfill_job = None
             pending = _take_pending_targets()
             if pending:
                 _enqueue_collection_jobs(
                     pending, db=store, priority=100, due_at=datetime.now()
                 )
+            targets = schedulable_promotion_targets(db=store, refresh_capacity=False)
+            if time.monotonic() >= next_backfill_schedule:
+                schedule_material_backfills(targets, db=store)
+                next_backfill_schedule = time.monotonic() + 60
             due_targets = [
                 str(target.get("target_uid") or "")
-                for target in schedulable_promotion_targets(
-                    db=store, refresh_capacity=False
-                )
+                for target in targets
                 if _target_is_due(target, interval_seconds=interval)
             ]
             if due_targets:
@@ -2780,6 +2699,12 @@ def _loop(interval_seconds: int) -> None:
                         ),
                     }
                     _finish_collection_job(job, item, db=store)
+            if not claimed and backfill_future is None:
+                background_jobs = _claim_collection_jobs(db=store, limit=1, kind="material_backfill")
+                if background_jobs:
+                    backfill_job = background_jobs[0]
+                    backfill_future = backfill_executor.submit(run_material_backfill_job, backfill_job, db=store)
+                    backfill_future.add_done_callback(lambda future: _WAKE.set())
         except Exception:
             logger.exception("官方 API 采集轮次异常")
         if claimed and not _STOP.is_set():
@@ -2791,6 +2716,7 @@ def _loop(interval_seconds: int) -> None:
             continue
         _WAKE.wait(tick)
         _WAKE.clear()
+    backfill_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def start_official_api_collection_background_thread(

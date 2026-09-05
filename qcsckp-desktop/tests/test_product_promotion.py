@@ -132,6 +132,7 @@ class ProductPromotionTests(unittest.TestCase):
             "pmc_roi2_assist_task",
             {
                 "assist_task_id": "assist-dashboard",
+                "metrics_observed_at": datetime.now().isoformat(timespec="seconds"),
                 "aadvid": "10001",
                 "ad_id": "20001",
                 "target_uid": "target-dashboard",

@@ -584,6 +584,7 @@ class DashboardApi:
             "task_name",
             "create_time",
             "updated_at",
+            "metrics_observed_at",
             "budget",
             "bid",
             "ecp_roi2_goal",
@@ -628,6 +629,7 @@ class DashboardApi:
         assist_updated_within_minutes: Optional[int] = None,
         search: Optional[str] = None,
         target_uid: Optional[str] = None,
+        target_uids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         全域调控任务（pmc_roi2_assist_task）列表，分页排序。
@@ -662,20 +664,23 @@ class DashboardApi:
                         _mins = min(_m, 24 * 60)
                 except (TypeError, ValueError):
                     _mins = None
+            freshness_column = "metrics_observed_at" if regulation_full_scan else "updated_at"
             if _mins is not None:
                 _updated_ge = (
-                    "datetime(REPLACE(SUBSTR(TRIM(updated_at), 1, 19), 'T', ' ')) >= "
+                    f"datetime(REPLACE(SUBSTR(TRIM({freshness_column}), 1, 19), 'T', ' ')) >= "
                     f"datetime('now', '+8 hours', '-{_mins} minutes')"
                 )
             else:
                 _updated_ge = (
-                    "datetime(REPLACE(SUBSTR(TRIM(updated_at), 1, 19), 'T', ' ')) >= "
+                    f"datetime(REPLACE(SUBSTR(TRIM({freshness_column}), 1, 19), 'T', ' ')) >= "
                     "datetime('now', '+8 hours', '-1 hours')"
                 )
             where_clauses = [
-                "updated_at IS NOT NULL",
-                "TRIM(updated_at) != ''",
+                f"{freshness_column} IS NOT NULL",
+                f"TRIM({freshness_column}) != ''",
                 _updated_ge,
+                f"datetime(REPLACE(SUBSTR(TRIM({freshness_column}), 1, 19), 'T', ' ')) "
+                "<= datetime('now', '+8 hours', '+5 minutes')",
             ]
             params: List[Any] = []
             aadvid_s = (aadvid or "").strip()
@@ -686,6 +691,10 @@ class DashboardApi:
             if target_uid_s:
                 where_clauses.insert(0, "target_uid = ?")
                 params.insert(0, target_uid_s)
+            if target_uids is not None:
+                scoped = sorted({str(value).strip() for value in target_uids if str(value).strip()})
+                where_clauses.append("target_uid IN (" + ",".join("?" for _ in scoped) + ")" if scoped else "0=1")
+                params.extend(scoped)
             if ad_delivery_type is not None:
                 where_clauses.append("ad_delivery_type = ?")
                 params.append(int(ad_delivery_type))
@@ -747,6 +756,7 @@ class DashboardApi:
                 ad_delivery_name,
                 task_status_source,
                 task_status_observed_at,
+                metrics_observed_at,
                 ad_opt_type,
                 hint_type,
                 learning_phase,

@@ -1047,6 +1047,7 @@ class QianchuanOfficialApiService:
         duration: Any,
         material_ids: Iterable[Any],
         extra: Optional[Mapping[str, Any]] = None,
+        before_send: Optional[Callable[[], None]] = None,
     ) -> ApiResponse:
         self._require_writes()
         aid = require_digit_id(advertiser_id, "advertiser_id")
@@ -1089,9 +1090,11 @@ class QianchuanOfficialApiService:
                 request_id="",
                 message="同一执行任务已存在，已完成幂等对账",
             )
-        return self.client.post(self.CONTROL_CREATE, body, advertiser_id=aid)
+        return self.client.post(self.CONTROL_CREATE, body, advertiser_id=aid,
+                                **({"before_send": before_send} if before_send is not None else {}))
 
-    def update_control_status(self, advertiser_id: Any, task_ids: Iterable[Any], *, action: str) -> ApiResponse:
+    def update_control_status(self, advertiser_id: Any, task_ids: Iterable[Any], *, action: str,
+                              before_send: Optional[Callable[[], None]] = None) -> ApiResponse:
         self._require_writes()
         aid = require_digit_id(advertiser_id, "advertiser_id")
         ids = tuple(dict.fromkeys(require_digit_id(value, "task_id") for value in task_ids))
@@ -1108,24 +1111,29 @@ class QianchuanOfficialApiService:
                 "opt_type": opt_type,
             },
             advertiser_id=aid,
+            **({"before_send": before_send} if before_send is not None else {}),
         )
 
-    def update_control_budget(self, advertiser_id: Any, task_id: Any, budget: Any) -> ApiResponse:
+    def update_control_budget(self, advertiser_id: Any, task_id: Any, budget: Any, *,
+                              before_send: Optional[Callable[[], None]] = None) -> ApiResponse:
         self._require_writes()
         aid = require_digit_id(advertiser_id, "advertiser_id")
         return self.client.post(
             self.CONTROL_BUDGET,
             {"advertiser_id": id_number(aid, "advertiser_id"), "task_id": id_number(task_id, "task_id"), "budget": float(Decimal(str(budget)))},
             advertiser_id=aid,
+            **({"before_send": before_send} if before_send is not None else {}),
         )
 
-    def update_control_duration(self, advertiser_id: Any, task_id: Any, duration: Any) -> ApiResponse:
+    def update_control_duration(self, advertiser_id: Any, task_id: Any, duration: Any, *,
+                                before_send: Optional[Callable[[], None]] = None) -> ApiResponse:
         self._require_writes()
         aid = require_digit_id(advertiser_id, "advertiser_id")
         return self.client.post(
             self.CONTROL_DURATION,
             {"advertiser_id": id_number(aid, "advertiser_id"), "task_id": id_number(task_id, "task_id"), "duration": float(Decimal(str(duration)))},
             advertiser_id=aid,
+            **({"before_send": before_send} if before_send is not None else {}),
         )
 
     def list_operation_logs(
