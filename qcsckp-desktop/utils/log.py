@@ -8,14 +8,15 @@
 
 import os
 import logging
+import re
+import threading
 from logging.handlers import TimedRotatingFileHandler
 from config import LOGS_DIR
+from utils.log_redaction import redact_text
 
 
-# 创建 logs 目录（如果不存在）
+# Directory creation belongs to configure_logging so handler setup is atomic.
 log_dir = LOGS_DIR
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
 
 # 日志文件名（不包含后缀，后缀由处理器自动添加）
 log_file_base = os.path.join(log_dir, 'app')
@@ -28,32 +29,54 @@ date_format = '%Y-%m-%d %H:%M:%S'
 logger = logging.getLogger('QianChuanPMCServices')
 logger.setLevel(logging.INFO)
 
-# 避免重复添加处理器
-if not logger.handlers:
-    # 使用 TimedRotatingFileHandler 实现按时间分割日志
-    # when='H' 表示按小时，interval=4 表示每4小时分割一次
-    # midnight 表示每天午夜分割
-    # backupCount=30 表示保留30天的日志文件
-    file_handler = TimedRotatingFileHandler(
-        filename=log_file_base,
-        when='H',           # 按小时分割
-        interval=4,         # 每4小时分割一次
-        backupCount=30,     # 保留30个备份文件
-        encoding='utf-8',
-        atTime=None         # 配合 when='H' 使用，每4小时自动分割
-    )
-    # 日志文件后缀格式（用于区分不同时间的日志文件）
-    file_handler.suffix = '%Y%m%d-%H'  # 如：20260227-08 表示8点到12点的日志
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(log_format, date_format))
+_CONFIG_LOCK = threading.RLock()
 
-    # 控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter(log_format, date_format))
 
-    # 添加处理器到日志记录器
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        # Redact rendered arguments and traceback text without changing the
+        # LogRecord shared with unrelated handlers.
+        return redact_text(super().format(record))
 
-logger.info(f'日志服务已启动，每4小时分割日志，保留30天')
+
+def configure_logging(logs_dir: str, target: logging.Logger) -> logging.Logger:
+    """Ensure a disk sink even if another library already added a handler."""
+    with _CONFIG_LOCK:
+        os.makedirs(logs_dir, exist_ok=True)
+        filename = os.path.normcase(os.path.abspath(os.path.join(logs_dir, 'app')))
+        target.setLevel(logging.INFO)
+        target.disabled = False
+        matching = [
+            handler for handler in target.handlers
+            if isinstance(handler, TimedRotatingFileHandler)
+            and getattr(handler, '_qcsckp_disk_sink', False)
+            and os.path.normcase(handler.baseFilename) == filename
+        ]
+        if not matching:
+            handler = TimedRotatingFileHandler(
+                filename=filename, when='H', interval=4, backupCount=30,
+                encoding='utf-8',
+            )
+            handler.suffix = '%Y%m%d-%H'
+            handler._qcsckp_disk_sink = True
+            target.addHandler(handler)
+            matching.append(handler)
+        formatter = RedactingFormatter(log_format, date_format)
+        for handler in matching:
+            # Rotation discovery must match our historical compact filenames;
+            # changing suffix alone leaves the default YYYY-MM-DD_HH matcher.
+            handler.extMatch = re.compile(r'\d{8}-\d{2}', re.ASCII)
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(formatter)
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+                   for h in target.handlers):
+            console = logging.StreamHandler()
+            console.setLevel(logging.INFO)
+            console.setFormatter(formatter)
+            target.addHandler(console)
+        return target
+
+
+configure_logging(log_dir, logger)
+
+logger.info('日志服务已启动，每4小时分割日志，保留30个轮转文件')

@@ -28,6 +28,7 @@ _THREAD: Optional[threading.Thread] = None
 _LEASE_OWNER = f"reconcile-{uuid.uuid4().hex}"
 _LEASE_SECONDS = 90
 _MAX_ATTEMPTS = 8
+_FINALIZATION_LOCKS = tuple(threading.RLock() for _ in range(64))
 
 
 def _now() -> str:
@@ -132,6 +133,7 @@ def _notify_reconciled_auto_stop(
         confirmed_at=confirmed_at,
         verification_duration_seconds=verification_duration_seconds,
         delivery_task_uid=str(row.get("task_uid") or ""),
+        result_unknown=status == "unknown_requires_review",
     )
 
 
@@ -383,14 +385,29 @@ def _claim_one(store: SQLiteStore, owner: str) -> Optional[dict[str, Any]]:
 
 
 def _finish(
+    store: SQLiteStore, row: Mapping[str, Any], *, status: str, error: str = "",
+    verified: Optional[Mapping[str, Any]] = None, _replay: bool = False,
+) -> bool:
+    uid = str(row.get("reconciliation_uid") or "")
+    with _FINALIZATION_LOCKS[hash(uid) % len(_FINALIZATION_LOCKS)]:
+        if _replay:
+            row = store.select_one("execution_reconciliation", where={"reconciliation_uid": uid}) or row
+        return _finish_locked(store, row, status=status, error=error,
+                              verified=verified, _replay=_replay)
+
+
+def _finish_locked(
     store: SQLiteStore,
     row: Mapping[str, Any],
     *,
     status: str,
     error: str = "",
     verified: Optional[Mapping[str, Any]] = None,
+    _replay: bool = False,
 ) -> bool:
-    now = _now()
+    data = _payload(row.get("payload_json"))
+    terminal = _payload(data.get("terminal_result"))
+    now = str(terminal.get("finished_at") or _now()) if _replay else _now()
     submitted_at = str(row.get("created_at") or "")
     verification_duration_seconds: Optional[float] = None
     try:
@@ -410,15 +427,21 @@ def _finish(
     naturally_expired = (
         status == "confirmed_succeeded" and verified_status == "OFFLINE_TIME"
     )
-    changed = store.execute(
+    data["terminal_result"] = {
+        "status": status, "error": str(error or ""),
+        "verified": dict(verified or {}), "finished_at": now,
+    }
+    data["finalization_pending"] = True
+    changed = 1 if _replay else store.execute(
         "UPDATE execution_reconciliation SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
-        "last_error=?,confirmed_at=?,card_update_state='pending',updated_at=? "
+        "last_error=?,confirmed_at=?,card_update_state='pending',updated_at=?,payload_json=? "
         "WHERE reconciliation_uid=? AND status='verifying' AND lease_owner=? AND fencing_token=?",
         (
             status,
             str(error or "")[:1000],
             now if status.startswith("confirmed_") else None,
             now,
+            _json(data),
             str(row.get("reconciliation_uid") or ""),
             str(row.get("lease_owner") or ""),
             int(row.get("fencing_token") or 0),
@@ -426,7 +449,6 @@ def _finish(
     )
     if int(changed or 0) != 1:
         return False
-    data = _payload(row.get("payload_json"))
     is_stop = str(row.get("action_type") or "retarget") == "stop"
     request_uid = str(data.get("request_uid") or "")
     if request_uid:
@@ -449,6 +471,8 @@ def _finish(
                 if naturally_expired
                 else "官方 API 停投已核验成功"
                 if succeeded
+                else "官方 API 停投结果无法确认，请人工检查"
+                if status == "unknown_requires_review"
                 else "官方 API 停投核验失败，请人工检查"
             )
             store.execute(
@@ -477,15 +501,20 @@ def _finish(
                 store.execute(
                     "UPDATE pmc_roi2_assist_task SET ad_delivery_type=1,"
                     "ad_delivery_name=?,task_status_source='api',"
-                    "task_status_observed_at=?,reconciliation_status='confirmed',updated_at=? "
-                    "WHERE aadvid=? AND ad_id=? AND assist_task_id=?",
+                    "task_status_observed_at=?,reconciliation_status='confirmed' "
+                    "WHERE aadvid=? AND ad_id=? AND assist_task_id=? AND ("
+                    "COALESCE(NULLIF(task_status_observed_at,''),updated_at,'')<? OR ("
+                    "COALESCE(NULLIF(task_status_observed_at,''),updated_at,'')=? "
+                    "AND (ad_delivery_type=1 OR (?=1 AND task_status_source<>'api'))))",
                     (
                         actual_status,
-                        now,
                         now,
                         str(row.get("aavid") or ""),
                         str(row.get("ad_id") or ""),
                         str(row.get("control_task_id") or ""),
+                        now,
+                        now,
+                        0 if _replay else 1,
                     ),
                 )
         else:
@@ -536,6 +565,8 @@ def _finish(
                     if is_stop and succeeded
                     else "官方 API 追投已核验成功"
                     if succeeded
+                    else "官方 API 写入结果无法确认，请人工检查"
+                    if status == "unknown_requires_review"
                     else "官方 API 写入核验失败，请人工检查"
                 ),
                 str(error or "")[:4000],
@@ -545,21 +576,37 @@ def _finish(
         )
     if task_uid:
         siblings = store.execute(
-            "SELECT status FROM execution_reconciliation WHERE account_username=? AND task_uid=?",
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND task_uid=? ORDER BY id",
             (str(row.get("account_username") or ""), task_uid),
             fetch=True,
         ) or []
-        sibling_statuses = {str(item.get("status") or "") for item in siblings}
-        if sibling_statuses.intersection({"submitted", "verifying"}):
+        latest_attempts: dict[str, Mapping[str, Any]] = {}
+        for item in siblings:
+            item_data = _payload(item.get("payload_json"))
+            attempt_uid = str(item_data.get("execution_uid") or item.get("idempotency_key") or task_uid)
+            logical_uid = re.sub(r":attempt:\d+$", "", attempt_uid)
+            latest_attempts[logical_uid] = item
+        sibling_statuses = {str(item.get("status") or "") for item in latest_attempts.values()}
+        if sibling_statuses.intersection({"submitting", "submitted", "verifying"}):
+            store.execute(
+                "UPDATE execution_reconciliation SET updated_at=? WHERE reconciliation_uid=?",
+                (_now(), str(row.get("reconciliation_uid") or "")),
+            )
             return True
         succeeded = bool(sibling_statuses) and sibling_statuses == {"confirmed_succeeded"}
-        aggregate_status = "confirmed_succeeded" if succeeded else "unknown_requires_review"
+        aggregate_status = (
+            "confirmed_succeeded" if succeeded else "confirmed_failed"
+            if sibling_statuses <= {"confirmed_succeeded", "confirmed_failed"}
+            else "unknown_requires_review"
+        )
         label = "停投" if is_stop else "追投"
         terminal_message = (
             "调控任务已自然到期"
             if is_stop and naturally_expired
             else f"官方 API {label}已核验成功"
             if succeeded
+            else f"官方 API {label}结果无法确认，请人工检查"
+            if aggregate_status == "unknown_requires_review"
             else f"官方 API {label}核验失败，请人工检查"
         )
         final_result = {
@@ -621,7 +668,7 @@ def _finish(
                 )
             except Exception:
                 logger.exception("官方 API 对账完成后更新飞书任务失败 task=%s", task_uid)
-        elif is_stop and not stop_observer_count:
+        elif is_stop and not stop_observer_count and str(row.get("card_update_state") or "") not in {"sent", "queued"}:
             try:
                 _notify_reconciled_auto_stop(
                     store,
@@ -675,7 +722,89 @@ def _finish(
                     "官方 API 自动停投对账完成后发送通知失败 task=%s",
                     task_uid,
                 )
+    data["finalization_pending"] = not _terminal_projection_ready(store, row, data)
+    store.execute(
+        "UPDATE execution_reconciliation SET payload_json=?,updated_at=? WHERE reconciliation_uid=?",
+        (_json(data), _now(), str(row.get("reconciliation_uid") or "")),
+    )
     return True
+
+
+def _terminal_projection_ready(
+    store: SQLiteStore, row: Mapping[str, Any], data: Mapping[str, Any],
+) -> bool:
+    """Do not consume a result before its foreground run/card has been persisted."""
+    uid = str(data.get("execution_uid") or row.get("task_uid") or "")
+    table = "pmc_regulation_run" if row.get("action_type") == "stop" else "pmc_retargeting_run"
+    legacy_uid = re.sub(r":attempt:\d+$", "", uid)
+    runs = store.execute(
+        f"SELECT execution_state FROM {table} WHERE execution_uid IN (?,?)",
+        (uid, legacy_uid), fetch=True,
+    ) or []
+    if not runs or any(item.get("execution_state") == "submitted_verifying" for item in runs):
+        return False
+    local = store.select_one("local_retarget_task", where={
+        "task_uid": str(row.get("task_uid") or ""),
+        "account_username": str(row.get("account_username") or ""),
+    })
+    if local and local.get("status") in {"claimed", "executing", "verifying"}:
+        return False
+    if local:
+        current = store.select_one("execution_reconciliation", where={
+            "reconciliation_uid": str(row.get("reconciliation_uid") or ""),
+        }) or {}
+        if current.get("card_update_state") not in {"sent", "queued", "failed"}:
+            return False
+    cycle = str(data.get("control_cycle_key") or "")
+    if row.get("action_type") == "stop" and cycle:
+        observers = store.execute(
+            "SELECT task_uid FROM local_retarget_task WHERE account_username=? "
+            "AND action_type='stop' AND control_cycle_key=? "
+            "AND status IN ('claimed','executing','verifying') LIMIT 1",
+            (str(row.get("account_username") or ""), cycle), fetch=True,
+        ) or []
+        if observers:
+            return False
+    return True
+
+
+def replay_terminal_reconciliations(
+    account_username: str, *, db: Optional[SQLiteStore] = None,
+    task_uid: str = "", execution_uid: str = "",
+) -> int:
+    """Read-only platform recovery: replay durable local projections, never POST."""
+    owner = str(account_username or "").strip().casefold()
+    if not owner:
+        return 0
+    store = db or SQLiteStore()
+    sql = ("SELECT * FROM execution_reconciliation WHERE account_username=? "
+           "AND status IN ('confirmed_succeeded','confirmed_failed','unknown_requires_review')")
+    params: list[Any] = [owner]
+    if task_uid:
+        sql += " AND task_uid=?"
+        params.append(task_uid)
+    if execution_uid:
+        sql += " AND idempotency_key=?"
+        params.append(execution_uid)
+    # Pending projections remain durable across restarts. Also repair a caller's
+    # exact row after a late run insert or a late foreground status report.
+    if not task_uid and not execution_uid:
+        sql += ' AND payload_json LIKE \'%"finalization_pending":true%\''
+    rows = store.execute(sql + " ORDER BY updated_at,id LIMIT 100", tuple(params), fetch=True) or []
+    count = 0
+    for row in rows:
+        data = _payload(row.get("payload_json"))
+        terminal = _payload(data.get("terminal_result"))
+        if not terminal:
+            continue
+        try:
+            _finish(store, row, status=str(terminal.get("status") or row["status"]),
+                    error=str(terminal.get("error") or ""),
+                    verified=_payload(terminal.get("verified")), _replay=True)
+            count += 1
+        except Exception:
+            logger.exception("重放官方 API 本地核验结果失败 uid=%s", row.get("reconciliation_uid"))
+    return count
 
 
 def _retry(store: SQLiteStore, row: Mapping[str, Any], error: str) -> None:
@@ -786,24 +915,30 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
     except Exception as exc:
         _retry(store, row, str(exc))
         return
-    _finish(
-        store,
-        row,
-        status="confirmed_succeeded",
-        error=str(data.get("verification_note") or ""),
-        verified=verified,
-    )
+    try:
+        _finish(
+            store, row, status="confirmed_succeeded",
+            error=str(data.get("verification_note") or ""), verified=verified,
+        )
+    except Exception:
+        # The durable terminal result is already committed. Projection replay
+        # will retry local persistence without repeating the platform request.
+        logger.exception("官方 API 已核验，落地结果暂失败 uid=%s", row.get("reconciliation_uid"))
 
 
 def _loop() -> None:
     init_sqlite_schema()
     store = SQLiteStore()
+    last_replay = 0.0
     while not _STOP.is_set():
         owner = str(current_session_owner() or "").strip().casefold()
         if not owner:
             _WAKE.wait(2)
             _WAKE.clear()
             continue
+        if time.monotonic() - last_replay >= 5:
+            replay_terminal_reconciliations(owner, db=store)
+            last_replay = time.monotonic()
         row = _claim_one(store, owner)
         if row:
             _verify_one(store, row)

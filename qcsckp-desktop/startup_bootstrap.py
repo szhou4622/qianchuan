@@ -22,6 +22,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from utils.log_redaction import redact_text
 
 
 APP_NAME = "QCSCKP"
@@ -69,7 +70,7 @@ def _app_root() -> Path:
 
 
 def _redact(text: Any) -> str:
-    value = str(text or "")
+    value = redact_text(text)
     patterns = (
         r"(?i)(app[_ -]?secret|access[_ -]?token|refresh[_ -]?token|activation[_ -]?code|device[_ -]?credential|device[_ -]?session)\s*[:=]\s*[^\s,;]+",
         r"(?i)(authorization\s*:\s*bearer)\s+[^\s]+",
@@ -202,8 +203,17 @@ def mark_startup_phase(phase: str, detail: str = "") -> None:
         pass
     startup_log(f"phase={phase}" + (f" detail={detail}" if detail else ""))
     if phase == "failed":
+        _record_diagnostic_event("failed", "startup_failure")
+
+
+def _record_diagnostic_event(phase: str, event: str, **kwargs: Any) -> None:
+    # Diagnostics is optional during import/DLL failures. It must never prevent
+    # the standard-library startup log and native error dialog from running.
+    try:
         from services.diagnostics import record_event
-        record_event("failed", "startup_failure")
+        record_event(phase, event, **kwargs)
+    except Exception as exc:
+        startup_log(f"diagnostic_event_failed type={type(exc).__name__}")
 
 
 def mark_window_ready() -> None:
@@ -254,16 +264,14 @@ def install_exception_hooks() -> None:
         _FAULT_HANDLE = None
 
     def main_hook(exc_type: Any, exc: BaseException, tb: Any) -> None:
-        from services.diagnostics import record_event
-        record_event("runtime", "runtime_failure", exception=exc)
+        _record_diagnostic_event("runtime", "runtime_failure", exception=exc)
         detail = _exception_text(exc_type, exc, tb)
         startup_log("unhandled_exception\n" + detail)
         mark_startup_phase("failed", str(exc))
         _show_fatal_error("软件启动失败。", str(exc))
 
     def thread_hook(args: Any) -> None:
-        from services.diagnostics import record_event
-        record_event("runtime", "runtime_failure", exception=args.exc_value)
+        _record_diagnostic_event("runtime", "runtime_failure", exception=args.exc_value)
         detail = _exception_text(args.exc_type, args.exc_value, args.exc_traceback)
         startup_log(f"thread_exception name={getattr(args.thread, 'name', '')}\n{detail}")
 
@@ -630,8 +638,7 @@ def _main_impl() -> int:
         _show_fatal_error("软件无法启动。", str(exc))
         return 2
     except Exception as exc:
-        from services.diagnostics import record_event
-        record_event("bootstrap", "startup_failure", exception=exc)
+        _record_diagnostic_event("bootstrap", "startup_failure", exception=exc)
         detail = traceback.format_exc()
         startup_log("startup_failed\n" + detail)
         mark_startup_phase("failed", str(exc))
@@ -658,8 +665,7 @@ def main() -> int:
         startup_log(DISPLAY_VERSION)
         return _main_impl()
     except Exception as exc:
-        from services.diagnostics import record_event
-        record_event("switch", "switch_failure", exception=exc)
+        _record_diagnostic_event("switch", "switch_failure", exception=exc)
         native_message("安全切版未完成，原数据已保留。\n" + str(exc))
         return 2
     finally:

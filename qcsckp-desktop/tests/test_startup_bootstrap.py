@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import sys
+import threading
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +14,36 @@ import startup_bootstrap as bootstrap
 
 
 class StartupBootstrapTests(unittest.TestCase):
+    def test_diagnostic_failure_cannot_hide_unhandled_exception(self):
+        def fail_diagnostics(*args, **kwargs):
+            raise RuntimeError('diagnostics broken')
+
+        with tempfile.TemporaryDirectory(prefix='qcsckp-bootstrap-hooks-') as temp:
+            with (
+                patch.object(bootstrap, '_runtime_root', return_value=Path(temp)),
+                patch.object(bootstrap, '_STATE_FILE', None),
+                patch.object(bootstrap, '_HOOKS_INSTALLED', False),
+                patch.object(bootstrap, '_FAULT_HANDLE', None),
+                patch.object(bootstrap.faulthandler, 'enable'),
+                patch.object(sys, 'excepthook'),
+                patch.object(threading, 'excepthook'),
+                patch.dict(sys.modules, {'services.diagnostics': SimpleNamespace(record_event=fail_diagnostics)}),
+                patch.object(bootstrap, '_show_fatal_error') as show,
+            ):
+                try:
+                    bootstrap.install_exception_hooks()
+                    error = ValueError('app_secret=never-export-this')
+                    sys.excepthook(ValueError, error, None)
+                    text = bootstrap.startup_log_path().read_text(encoding='utf-8')
+                    self.assertIn('unhandled_exception', text)
+                    self.assertIn('ValueError', text)
+                    self.assertIn('diagnostic_event_failed', text)
+                    self.assertNotIn('never-export-this', text)
+                    show.assert_called_once()
+                finally:
+                    if bootstrap._FAULT_HANDLE:
+                        bootstrap._FAULT_HANDLE.close()
+
     def _release_fixture(self, root: Path) -> Path:
         files = {
             "QCSCKP.exe": b"exe",

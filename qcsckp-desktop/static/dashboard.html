@@ -1329,6 +1329,12 @@
             localStorage.setItem(ASSIST_COLUMN_STORAGE_KEY, JSON.stringify(cfg));
         }
 
+        function optionalMetricNumber(value) {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? parsed : null;
+        }
+
         function formatAssistMetricCell(val, format) {
             if (val === null || val === undefined || val === '') return '—';
             const n = Number(val);
@@ -2037,13 +2043,7 @@
                     window.totalDataCount = result.total || 0;
                     totalPages = result.totalPages || 1;
 
-                    function optionalMetricNumber(value) {
-                        if (value === null || value === undefined || value === '') return null;
-                        const parsed = Number(value);
-                        return Number.isFinite(parsed) ? parsed : null;
-                    }
-
-                    // 将后端字段转换为前端需要的格式。六项规则指标的
+                    // 将后端字段转换为前端需要的格式。全部单素材指标的
                     // NULL 必须保留，不能把“官方接口未提供”伪装成真实 0。
                     return result.data.map(mat => {
                         const id = mat.id ?? mat.material_id;
@@ -2064,7 +2064,7 @@
                         const videoType = videoTypeNum !== null ? (videoTypeMap[videoTypeNum] ?? '其他') : (mat.videoTypeText ?? '其他');
 
                         const createTime = mat.createTime ?? mat.video_create_time ?? '';
-                        const costDiff = Number(mat.costDiff ?? mat.stat_cost_diff ?? 0) || 0;
+                        const costDiff = optionalMetricNumber(mat.costDiff ?? mat.stat_cost_diff);
 
                         const maxCostTimeRaw = mat.periodEndTime ?? mat.period_end_time ?? null;
                         const minCostTimeRaw = mat.periodStartTime ?? mat.period_start_time ?? null;
@@ -2089,16 +2089,16 @@
                             currentCost,
                             netRoi: optionalMetricNumber(mat.netRoi),
                             netAmount: optionalMetricNumber(mat.netAmount),
-                            hourRefundRate: Number(mat.hourRefundRate ?? 0) || 0,
+                            hourRefundRate: optionalMetricNumber(mat.hourRefundRate),
                             overallPayRoi: optionalMetricNumber(mat.overallPayRoi),
                             overallAmount: optionalMetricNumber(mat.overallAmount),
-                            netSettleRate: Number(mat.netSettleRate ?? 0) || 0,
+                            netSettleRate: optionalMetricNumber(mat.netSettleRate),
                             netOrderCount: optionalMetricNumber(mat.netOrderCount),
-                            overallOrderCount: Number(mat.overallOrderCount ?? mat.overall_order_count ?? 0) || 0,
-                            overallShowCount: Number(mat.overallShowCount ?? mat.overall_show_count ?? 0) || 0,
-                            overallClickCount: Number(mat.overallClickCount ?? mat.overall_click_count ?? 0) || 0,
-                            overallCtr: Number(mat.overallCtr ?? mat.overall_ctr ?? 0) || 0,
-                            overallConversionRate: Number(mat.overallConversionRate ?? mat.overall_conversion_rate ?? 0) || 0,
+                            overallOrderCount: optionalMetricNumber(mat.overallOrderCount ?? mat.overall_order_count),
+                            overallShowCount: optionalMetricNumber(mat.overallShowCount ?? mat.overall_show_count),
+                            overallClickCount: optionalMetricNumber(mat.overallClickCount ?? mat.overall_click_count),
+                            overallCtr: optionalMetricNumber(mat.overallCtr ?? mat.overall_ctr),
+                            overallConversionRate: optionalMetricNumber(mat.overallConversionRate ?? mat.overall_conversion_rate),
                             deliveryState: String(mat.deliveryState ?? mat.delivery_state ?? 'delivering'),
                             estimatedEcpm: (mat.estimatedEcpm !== undefined && mat.estimatedEcpm !== null)
                                 ? Number(mat.estimatedEcpm)
@@ -2134,7 +2134,7 @@
                     return result.data.map(mat => ({
                         id: mat.id ?? mat.material_id,
                         title: mat.title ?? mat.video_name ?? '未命名',
-                        currentCost: Number(mat.currentCost ?? mat.stat_cost ?? 0) || 0
+                        currentCost: optionalMetricNumber(mat.currentCost ?? mat.stat_cost)
                     }));
                 }
                 return [];
@@ -2402,7 +2402,7 @@
                     <td class="p-2 border-b border-slate-800/50" data-col="velocity">
                         <div class="flex flex-col">
                             <span class="font-mono font-bold text-sm ${velocityColorClass}">
-                                ¥${item.velocity.toFixed(2)}
+                                ${item.velocity == null ? '--' : '¥' + item.velocity.toFixed(2)}
                             </span>
                         </div>
                     </td>
@@ -2428,28 +2428,28 @@
                         <span class="text-slate-300 font-mono text-xs">${item.overallAmount == null ? '--' : '¥' + item.overallAmount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="hourRefundRate">
-                        <span class="font-mono ${refundRateClass} text-xs">${item.hourRefundRate}%</span>
+                        <span class="font-mono ${refundRateClass} text-xs">${item.hourRefundRate == null ? '--' : item.hourRefundRate + '%'}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="netSettleRate">
-                        <span class="text-slate-300 font-mono text-xs">${item.netSettleRate}%</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.netSettleRate == null ? '--' : item.netSettleRate + '%'}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="netOrderCount">
                         <span class="text-slate-300 font-mono text-xs">${item.netOrderCount == null ? '--' : item.netOrderCount}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallOrderCount">
-                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallOrderCount || 0).toLocaleString()}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallOrderCount == null ? '--' : item.overallOrderCount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallShowCount">
-                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallShowCount || 0).toLocaleString()}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallShowCount == null ? '--' : item.overallShowCount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallClickCount">
-                        <span class="text-slate-300 font-mono text-xs">${Number(item.overallClickCount || 0).toLocaleString()}</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallClickCount == null ? '--' : item.overallClickCount.toLocaleString()}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallCtr">
-                        <span class="text-slate-300 font-mono text-xs">${item.overallCtr}%</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallCtr == null ? '--' : item.overallCtr + '%'}</span>
                     </td>
                     <td class="p-2 border-b border-slate-800/50" data-col="overallConversionRate">
-                        <span class="text-slate-300 font-mono text-xs">${item.overallConversionRate}%</span>
+                        <span class="text-slate-300 font-mono text-xs">${item.overallConversionRate == null ? '--' : item.overallConversionRate + '%'}</span>
                     </td>
                 `;
                 tbody.appendChild(row);
@@ -2693,8 +2693,9 @@
                     textStyle: { color: '#e2e8f0' },
                     formatter: function(params) {
                         const data = params[0];
+                        if (!data) return '';
                         return `<div class="text-sm">时间: ${data.name}</div>
-                                <div class="font-bold text-white mt-1">消耗: ¥${data.value.toLocaleString()}</div>`;
+                                <div class="font-bold text-white mt-1">消耗: ${data.value == null ? '--' : '¥' + Number(data.value).toLocaleString()}</div>`;
                     }
                 },
                 grid: {
@@ -2761,7 +2762,7 @@
             }
 
             const timePoints = historyData.map(d => d.time);
-            const roiData = historyData.map(d => Number(d.value ?? d.roi ?? 0) || 0);
+            const roiData = historyData.map(d => optionalMetricNumber(d.value ?? d.roi));
 
             const option = {
                 backgroundColor: 'transparent',
@@ -2772,8 +2773,9 @@
                     textStyle: { color: '#e2e8f0' },
                     formatter: function(params) {
                         const data = params[0];
+                        if (!data) return '';
                         return `<div class="text-sm">时间: ${data.name}</div>
-                                <div class="font-bold text-white mt-1">整体支付ROI: ${Number(data.value).toLocaleString()}</div>`;
+                                <div class="font-bold text-white mt-1">整体支付ROI: ${data.value == null ? '--' : Number(data.value).toLocaleString()}</div>`;
                     }
                 },
                 grid: {
@@ -2834,7 +2836,7 @@
             }
 
             const timePoints = historyData.map(d => d.time);
-            const amountData = historyData.map(d => Number(d.value ?? d.amount ?? 0) || 0);
+            const amountData = historyData.map(d => optionalMetricNumber(d.value ?? d.amount));
 
             const option = {
                 backgroundColor: 'transparent',
@@ -2845,8 +2847,9 @@
                     textStyle: { color: '#e2e8f0' },
                     formatter: function(params) {
                         const data = params[0];
+                        if (!data) return '';
                         return `<div class="text-sm">时间: ${data.name}</div>
-                                <div class="font-bold text-white mt-1">整体成交金额: ¥${Number(data.value).toLocaleString()}</div>`;
+                                <div class="font-bold text-white mt-1">整体成交金额: ${data.value == null ? '--' : '¥' + Number(data.value).toLocaleString()}</div>`;
                     }
                 },
                 grid: {
@@ -2918,11 +2921,11 @@
         let pieChartData = []; // 缓存饼图数据
 
         function buildPieDataFromTopList(topData) {
-            return topData.map(item => {
+            return topData.filter(item => optionalMetricNumber(item.currentCost) !== null).map(item => {
                 const label = getMaterialDisplayTitle({ title: item.title ?? '未命名' });
                 const short = label.length > 8 ? label.substring(0, 8) + '...' : label;
                 return {
-                    value: parseFloat((item.currentCost || 0).toFixed(2)),
+                    value: parseFloat(Number(item.currentCost).toFixed(2)),
                     name: short,
                     fullName: label
                 };

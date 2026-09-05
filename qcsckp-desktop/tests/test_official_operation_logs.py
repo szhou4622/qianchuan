@@ -1,18 +1,26 @@
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from services.official_api_operation_logs import (
     _claim_window,
+    _daily_windows,
+    _enqueue_incremental_range,
     _enqueue_range,
+    _ensure_workers,
     _parse_manual_range,
     _process_window,
+    _prune_completed_windows,
+    _refresh_batch_state,
+    _worker_loop,
     sync_official_operation_logs,
 )
-from services.qianchuan_open_api.errors import ApiRateLimitError
+from services.qianchuan_open_api.errors import ApiRateLimitError, ApiRequestError
 from services.qianchuan_accounts import (
     ensure_qianchuan_account,
     get_qianchuan_account,
@@ -313,6 +321,217 @@ class OfficialOperationLogWindowTests(unittest.TestCase):
         self.assertIn("syncOperationLogsNow(f.aavid,f.date_from,f.date_to)", html)
         self.assertIn("backfilling:'正在补录历史日志'", html)
         self.assertIn("进度：", html)
+
+    def test_daily_windows_preserve_incremental_start_and_split_midnight(self):
+        windows = _daily_windows(
+            datetime(2026, 9, 4, 23, 55), datetime(2026, 9, 5, 0, 5)
+        )
+        self.assertEqual([
+            ("2026-09-05 00:00:00", "2026-09-05 00:05:00"),
+            ("2026-09-04 23:55:00", "2026-09-04 23:59:59"),
+        ], windows)
+
+    def test_scheduler_preserves_existing_backoff_and_visible_error(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        start, end = _parse_manual_range("2026-08-20", "2026-08-20")
+        _enqueue_range(account, start, end, request_kind="history", db=self.db)
+        task = _claim_window(self.db, "worker-one")
+        service = MagicMock()
+        service.list_operation_logs.side_effect = ApiRateLimitError("请求过于频繁")
+        with patch("services.official_api_operation_logs.get_official_api_service", return_value=service):
+            _process_window(self.db, task)
+            before = self.db.select_one("operation_log_sync_window", where={"id": task["id"]})
+            _enqueue_range(account, start, end, request_kind="history", db=self.db)
+        after = self.db.select_one("operation_log_sync_window", where={"id": task["id"]})
+        for field in ("status", "attempt_count", "next_attempt_at", "last_error"):
+            self.assertEqual(before[field], after[field], field)
+        state = self.db.select_one("platform_log_sync_state", where={"aavid": "1001"})
+        self.assertIn("请求过于频繁", state["last_error"])
+        self.assertEqual(before["next_attempt_at"], state["next_retry_at"])
+
+    def test_incomplete_pages_fail_after_three_attempts_until_manual_retry(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        start, end = _parse_manual_range("2026-08-20", "2026-08-20")
+        _enqueue_range(account, start, end, request_kind="history", db=self.db)
+        self.db.update("operation_log_sync_window", {"attempt_count": 2})
+        task = _claim_window(self.db, "worker-three")
+        service = MagicMock()
+        service.list_operation_logs.side_effect = ApiRequestError("分页记录数与总数不一致，结果不完整")
+        with patch("services.official_api_operation_logs.get_official_api_service", return_value=service), patch(
+            "services.official_api_operation_logs._ingest_rows"
+        ) as ingest:
+            _process_window(self.db, task)
+            _enqueue_range(account, start, end, request_kind="history", db=self.db)
+            row = self.db.select_one("operation_log_sync_window", where={"id": task["id"]})
+            self.assertEqual("failed", row["status"])
+            self.assertEqual(3, row["attempt_count"])
+            self.assertIn("不完整", row["last_error"])
+            ingest.assert_not_called()
+            _enqueue_range(account, start, end, request_kind="manual", db=self.db)
+        row = self.db.select_one("operation_log_sync_window", where={"id": task["id"]})
+        self.assertEqual("queued", row["status"])
+        self.assertEqual(0, row["attempt_count"])
+
+    def test_worker_survives_sqlite_lock_during_claim_progress_and_completion(self):
+        for stage in ("_claim_window", "_refresh_batch_state", "_process_window"):
+            with self.subTest(stage=stage):
+                stop = MagicMock()
+                stop.is_set.side_effect = [False, False, True]
+                with patch("services.official_api_operation_logs._STOP", stop), patch(
+                    "services.official_api_operation_logs.SQLiteStore", return_value=self.db
+                ), patch("services.official_api_operation_logs.init_sqlite_schema"), patch(
+                    "services.official_api_operation_logs._claim_window", return_value={"id": 1}
+                ) as claim, patch(
+                    "services.official_api_operation_logs._refresh_batch_state"
+                ) as progress, patch(
+                    "services.official_api_operation_logs._process_window"
+                ) as process:
+                    selected = {"_claim_window": claim, "_refresh_batch_state": progress,
+                                "_process_window": process}[stage]
+                    selected.side_effect = [sqlite3.OperationalError("database is locked"),
+                                            {"id": 2} if stage == "_claim_window" else None]
+                    _worker_loop("mock-lock-worker")
+                self.assertEqual(2, claim.call_count)
+                stop.wait.assert_any_call(5.0)
+
+    def test_concurrent_worker_recovery_starts_only_one_writer(self):
+        thread_class = threading.Thread
+        barrier = threading.Barrier(2)
+        worker = MagicMock()
+        worker.is_alive.return_value = True
+        stop = MagicMock()
+        stop.is_set.return_value = False
+        with patch("services.official_api_operation_logs._WORKERS", []), patch(
+            "services.official_api_operation_logs._STOP", stop
+        ), patch("services.official_api_operation_logs.SQLiteStore", return_value=self.db), patch(
+            "services.official_api_operation_logs.init_sqlite_schema"
+        ), patch("services.official_api_operation_logs._migrate_legacy_coverage", side_effect=lambda db: barrier.wait(2)), patch(
+            "services.official_api_operation_logs.threading.Thread", return_value=worker
+        ) as factory:
+            callers = [thread_class(target=_ensure_workers) for _ in range(2)]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(3)
+                self.assertFalse(caller.is_alive())
+            factory.assert_called_once()
+            worker.start.assert_called_once()
+
+    def test_incremental_is_single_inflight_and_uses_watermark_overlap(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        first_end = datetime(2026, 9, 5, 10)
+        first = _enqueue_incremental_range(account, first_end, db=self.db)
+        self.assertEqual("2026-09-05 00:00:00", first["requested_from"])
+        self.assertIsNone(_enqueue_incremental_range(account, first_end + timedelta(minutes=5), db=self.db))
+        self.assertEqual(2, self.db.count("operation_log_sync_window"))
+        self.db.update("operation_log_sync_window", {"status": "empty"})
+        second = _enqueue_incremental_range(account, first_end + timedelta(minutes=5), db=self.db)
+        self.assertEqual("2026-09-05 09:50:00", second["requested_from"])
+        self.assertEqual("2026-09-05 10:05:00", second["requested_to"])
+        self.assertEqual(4, self.db.count("operation_log_sync_window"))
+
+    def test_new_monitored_object_does_not_inherit_another_objects_watermark(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        _enqueue_incremental_range(account, datetime(2026, 9, 5, 10), db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"})
+        self._add_target(ad_id="2002")
+        result = _enqueue_incremental_range(account, datetime(2026, 9, 5, 10, 5), db=self.db)
+        self.assertEqual("2026-09-05 00:00:00", result["requested_from"])
+        self.assertEqual(3, result["object_count"])
+
+    def test_disabled_objects_pending_increment_does_not_block_enabled_objects(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        _enqueue_incremental_range(account, datetime(2026, 9, 5, 10), db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"}, where={"object_type": "ACCOUNT"})
+        self.db.update("promotion_target", {"enabled": 0}, where={"ad_id": "2001"})
+        self._add_target(ad_id="2002")
+        result = _enqueue_incremental_range(account, datetime(2026, 9, 5, 10, 5), db=self.db)
+        self.assertIsNotNone(result)
+        self.assertEqual(2, result["object_count"])
+
+    def test_completed_daily_coverage_prunes_only_successful_incremental_metadata(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        for minute in (0, 5):
+            _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 10, minute),
+                           request_kind="incremental", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"})
+        _enqueue_range(account, datetime(2026, 9, 4, 10, 5), datetime(2026, 9, 4, 10, 10),
+                       request_kind="incremental", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "failed", "last_error": "不完整"},
+                       where={"status": "queued"})
+        _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 23, 59, 59),
+                       request_kind="history", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"}, where={"status": "queued"})
+        _prune_completed_windows(account, db=self.db, now=datetime(2026, 9, 5, 12))
+        self.assertEqual(4, self.db.count("operation_log_sync_window"))
+        self.assertEqual(2, self.db.count("operation_log_sync_window", where={"status": "failed"}))
+        self.assertEqual(2, self.db.count("operation_log_sync_window", where={"request_kind": "history"}))
+
+    def test_new_success_does_not_hide_unresolved_window_error(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 23, 59, 59),
+                       request_kind="history", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "failed", "last_error": "分页不完整",
+                                                     "attempt_count": 3})
+        result = _enqueue_range(account, datetime(2026, 9, 5), datetime(2026, 9, 5, 10),
+                                request_kind="incremental", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"}, where={"status": "queued"})
+        _refresh_batch_state(self.db, {**result, "account_uid": account["account_uid"],
+                                      "aavid": "1001", "request_kind": "incremental"})
+        state = self.db.select_one("platform_log_sync_state", where={"aavid": "1001"})
+        self.assertEqual("partial", state["last_status"])
+        self.assertIn("分页不完整", state["last_error"])
+        self.assertIn("3 次", state["last_error"])
+
+    def test_later_complete_cover_resolves_failure_without_erasing_its_evidence(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        _enqueue_range(account, datetime(2026, 9, 4, 10), datetime(2026, 9, 4, 10, 10),
+                       request_kind="incremental", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "failed", "last_error": "分页不完整",
+                                                     "completed_at": "2026-09-05 10:00:00"})
+        result = _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 23, 59, 59),
+                                request_kind="manual", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty", "completed_at": "2026-09-05 09:55:00"},
+                       where={"status": "queued"})
+        refresh_task = {**result, "account_uid": account["account_uid"],
+                        "aavid": "1001", "request_kind": "manual"}
+        _refresh_batch_state(self.db, refresh_task)
+        self.assertEqual(2, self.db.count("operation_log_sync_window", where={"status": "failed"}))
+        self.db.update("operation_log_sync_window", {"completed_at": "2026-09-05 10:05:00"},
+                       where={"status": "empty"})
+        _refresh_batch_state(self.db, {**result, "account_uid": account["account_uid"],
+                                      "aavid": "1001", "request_kind": "manual"})
+        self.assertEqual(0, self.db.count("operation_log_sync_window", where={"status": "failed"}))
+        self.assertEqual(2, self.db.count("operation_log_sync_window", where={"status": "superseded"}))
+        resolved = self.db.select_one("operation_log_sync_window", where={"status": "superseded"})
+        self.assertIn("分页不完整", resolved["last_error"])
+        self.assertIn("已由完整窗口覆盖", resolved["last_error"])
+        state = self.db.select_one("platform_log_sync_state", where={"aavid": "1001"})
+        self.assertEqual("empty", state["last_status"])
+
+    def test_other_batch_backoff_cannot_look_healthy_after_current_batch_completes(self):
+        self._add_target()
+        account = get_qianchuan_account("1001", db=self.db)
+        _enqueue_range(account, datetime(2026, 9, 4), datetime(2026, 9, 4, 23, 59, 59),
+                       request_kind="history", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "backoff", "last_error": "请求过于频繁",
+                                                     "next_attempt_at": "2026-09-05 15:00:00"})
+        result = _enqueue_range(account, datetime(2026, 9, 5), datetime(2026, 9, 5, 10),
+                                request_kind="manual", db=self.db)
+        self.db.update("operation_log_sync_window", {"status": "empty"}, where={"status": "queued"})
+        _refresh_batch_state(self.db, {**result, "account_uid": account["account_uid"],
+                                      "aavid": "1001", "request_kind": "manual"})
+        state = self.db.select_one("platform_log_sync_state", where={"aavid": "1001"})
+        self.assertEqual("backfilling", state["last_status"])
+        self.assertIn("请求过于频繁", state["last_error"])
 
 
 if __name__ == "__main__":

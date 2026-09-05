@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 from api.dashboard import DashboardApi
@@ -25,7 +26,7 @@ from api.rule_regulation_config import (
     evaluate_trigger_roi2_assist,
     load_rule_regulation_config,
 )
-from config import CURRENT_VERSION
+from config import CURRENT_VERSION, QIANCHUAN_BACKEND
 from services.regulation_service import (
     QianChuanRegulationStopService,
     regulation_log_tag,
@@ -119,6 +120,13 @@ def _find_stop_strategy(
         ):
             return strategy
     return None
+
+
+def _stop_strategy_was_invalidated(error: str) -> bool:
+    return error in {
+        "规则化停投已关闭", "停投策略已删除", "停投策略参数已经变更",
+        "调控任务已加入停投白名单",
+    }
 
 
 def _revalidate_stop_candidate(
@@ -245,6 +253,12 @@ def _revalidate_stop_candidate(
     )
     if not assist_ready:
         return None, None, target_system, assist_error
+    try:
+        metric_age = datetime.now() - datetime.fromisoformat(str(row.get("updated_at") or ""))
+    except (TypeError, ValueError):
+        return None, None, target_system, "调控任务指标采集时间无效"
+    if metric_age < timedelta(minutes=-5) or metric_age > timedelta(minutes=max_age_minutes):
+        return None, None, target_system, "调控任务指标已过期"
     capability_ok, capability_error = check_target_capability(
         target,
         action="regulation",
@@ -262,6 +276,21 @@ def _revalidate_stop_candidate(
     if not evaluate_trigger_roi2_assist(trigger, row):
         return None, None, target_system, "最新调控指标已不满足停投策略"
     return target, row, target_system, ""
+
+
+def _pre_submit_stop_check(
+    db: SQLiteStore, *, expected_cycle_key: str, **candidate: Any,
+) -> str:
+    """Recheck mutable local evidence after the official read-only preflight."""
+    _target, row, _system, error = _revalidate_stop_candidate(db, **candidate)
+    if error:
+        return error
+    cycle = stop_cycle_state(
+        db, candidate["target_uid"], candidate["assist_task_id"], assist_row=row,
+    )
+    if cycle.get("blocked") or str(cycle.get("cycle_key") or "") != expected_cycle_key:
+        return "调控任务恢复周期已变化或已有停投结果，本卡未提交停投"
+    return ""
 
 
 def _assist_updated_within_minutes_from_env() -> Optional[int]:
@@ -489,6 +518,16 @@ def _insert_regulation_run(
         )
     except Exception:
         logger.exception("%s 统一操作流水写入失败 run_id=%s", regulation_log_tag(scheduler=True), run_id)
+    if execution_uid and execution_state == "submitted_verifying":
+        try:
+            from services.official_api_reconciliation import replay_terminal_reconciliations
+            account = db.select_one("qianchuan_account", where={"account_uid": account_uid}) or {}
+            replay_terminal_reconciliations(
+                str(account.get("owner_username") or ""), db=db, execution_uid=execution_uid,
+            )
+        except Exception:
+            # The durable pending projection is retried by reconciliation.
+            logger.exception("停投流水已保存，补齐已完成核验结果失败 run_id=%s", run_id)
 
 
 async def _process_approved_stop_tasks(
@@ -608,8 +647,8 @@ async def _process_approved_stop_tasks(
                         report_local_stop_task(
                             task_uid,
                             claim_token,
-                            "failed",
-                            message=f"执行前复核未通过：{error}",
+                            "invalidated" if _stop_strategy_was_invalidated(error) else "failed",
+                            message=f"执行前复核未通过，未向千川提交：{error}",
                         )
                         continue
                     cycle_state = stop_cycle_state(
@@ -691,7 +730,27 @@ async def _process_approved_stop_tasks(
                         execution_uid=execution_uid,
                         reconciliation_task_uid=task_uid,
                         control_cycle_key=actual_cycle_key,
+                        **({"pre_submit_check": partial(
+                            _pre_submit_stop_check, db,
+                            expected_cycle_key=actual_cycle_key,
+                            original_strategy=original_strategy,
+                            expected_owner=expected_owner,
+                            expected_session_epoch=expected_epoch,
+                            target_uid=target_uid, assist_task_id=assist_task_id,
+                            aavid=aavid, ad_id=ad_id, promotion_scene=promotion_scene,
+                            trigger=trigger,
+                            max_age_minutes=(_assist_updated_within_minutes_from_env()
+                                             or _DEFAULT_ASSIST_UPDATED_WITHIN_MIN),
+                        )} if QIANCHUAN_BACKEND == "official_api" else {}),
                     )
+                    if (result.step == "stop_preflight_blocked"
+                            and _stop_strategy_was_invalidated(result.detail)):
+                        report_local_stop_task(
+                            task_uid, claim_token, "invalidated",
+                            message=result.message,
+                            result={"reason": "strategy_invalidated", "submitted": False},
+                        )
+                        continue
                     ended_at = _beijing_now_str()
                     duration_ms = int((time.time() - started) * 1000)
                     verifying_steps = {
@@ -823,6 +882,7 @@ def _send_auto_stop_result_notification(
     confirmed_at: str = "",
     verification_duration_seconds: Any = None,
     delivery_task_uid: str = "",
+    result_unknown: bool = False,
 ) -> List[Dict[str, str]]:
     from services.local_feishu_bridge import send_local_feishu_bound_card
     from services.qianchuan_accounts import resolve_account_feishu_targets
@@ -837,12 +897,14 @@ def _send_auto_stop_result_notification(
             "enable_forward": False,
         },
         "header": {
-            "template": "grey" if naturally_expired else "green" if success else "red",
+            "template": "grey" if naturally_expired else "orange" if result_unknown else "green" if success else "red",
             "title": {
                 "tag": "plain_text",
                 "content": (
                     f"千川调控任务已自然到期 · {system} · {scene}"
                     if naturally_expired
+                    else f"千川自动停投结果无法确认 · {system} · {scene}"
+                    if result_unknown
                     else f"千川自动停投{'成功' if success else '失败'} · {system} · {scene}"
                 ),
             },
@@ -885,6 +947,7 @@ def _send_auto_stop_result_notification(
         targets=targets or None,
         require_connected=False,
         task_uid=delivery_task_uid,
+        delivery_stage="terminal",
     )
 
 
@@ -902,6 +965,7 @@ def _send_auto_stop_submitted_notification(
     assist_task_id: str,
     stop_action: str,
     message: str,
+    delivery_task_uid: str = "",
 ) -> None:
     """Notify immediately after an automatic stop POST is accepted."""
 
@@ -950,6 +1014,8 @@ def _send_auto_stop_submitted_notification(
         card,
         targets=targets or None,
         require_connected=False,
+        task_uid=delivery_task_uid,
+        delivery_stage="submitted",
     )
 
 
@@ -1616,6 +1682,17 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     execution_uid=execution_uid,
                                     reconciliation_task_uid=execution_uid,
                                     control_cycle_key=control_cycle_key,
+                                    **({"pre_submit_check": partial(
+                                        _pre_submit_stop_check, db,
+                                        expected_cycle_key=control_cycle_key,
+                                        original_strategy=st,
+                                        expected_owner=cycle_owner,
+                                        expected_session_epoch=cycle_session_epoch,
+                                        target_uid=target_uid, assist_task_id=assist_task_id,
+                                        aavid=aavid, ad_id=ad_id,
+                                        promotion_scene=promotion_scene, trigger=trigger,
+                                        max_age_minutes=(assist_uw_min or _DEFAULT_ASSIST_UPDATED_WITHIN_MIN),
+                                    )} if QIANCHUAN_BACKEND == "official_api" else {}),
                                 )
                                 if result.step in {
                                     "submitting",
@@ -1755,6 +1832,7 @@ async def run_one_cycle(db: SQLiteStore) -> None:
                                     assist_task_id=assist_task_id,
                                     stop_action=stop_action,
                                     message=result.message,
+                                    delivery_task_uid=execution_uid,
                                 )
                             except Exception as notify_error:
                                 logger.warning(

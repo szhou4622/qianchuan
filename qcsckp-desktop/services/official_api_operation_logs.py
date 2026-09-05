@@ -44,13 +44,16 @@ MAX_MANUAL_RANGE_DAYS = 30
 OPERATION_LOG_WORKERS = 1
 LEASE_SECONDS = 60
 POLL_SECONDS = 1.0
+MAX_REQUEST_ERROR_ATTEMPTS = 3
+MAX_TRANSIENT_ERROR_ATTEMPTS = 8
+COMPLETED_WINDOW_RETENTION_DAYS = 45
 _KIND_PRIORITY = {
     "manual": 100,
     "report": 80,
     "incremental": 60,
     "history": 20,
 }
-_DONE_STATUSES = {"succeeded", "empty"}
+_DONE_STATUSES = {"succeeded", "empty", "superseded"}
 _ACTIVE_STATUSES = {"queued", "running", "backoff"}
 
 
@@ -206,7 +209,7 @@ def _parse_manual_range(date_from: Any, date_to: Any) -> tuple[datetime, datetim
 
 def _daily_windows(start: datetime, end: datetime) -> list[tuple[str, str]]:
     windows: list[tuple[str, str]] = []
-    cursor = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    cursor = start.replace(microsecond=0)
     while cursor <= end:
         window_end = min(
             end,
@@ -218,7 +221,7 @@ def _daily_windows(start: datetime, end: datetime) -> list[tuple[str, str]]:
                 window_end.strftime("%Y-%m-%d %H:%M:%S"),
             )
         )
-        cursor = cursor + timedelta(days=1)
+        cursor = (cursor + timedelta(days=1)).replace(hour=0, minute=0, second=0)
     # 手动查询和日报都先给出最新日期的可见结果。
     return list(reversed(windows))
 
@@ -320,12 +323,15 @@ def _enqueue_range(
                         "priority": max(priority, existing_priority),
                         "updated_at": now_text,
                     }
-                    if status not in _DONE_STATUSES and status != "running":
+                    # Scheduled discovery is not a retry request. In particular,
+                    # never undo a worker's backoff or revive a terminal failure.
+                    if kind == "manual" and status in {"failed", "cancelled"}:
                         values.update(
                             {
                                 "status": "queued",
                                 "next_attempt_at": now_text,
                                 "last_error": "",
+                                "attempt_count": 0,
                             }
                         )
                     db.update(
@@ -370,11 +376,11 @@ def _enqueue_range(
     active_batch = str(current_state.get("active_batch_uid") or "")
     active_manual = bool(
         kind != "manual"
-        and str(current_state.get("last_status") or "") == "syncing"
         and active_batch
         and db.select_one(
             "operation_log_sync_window",
-            where={"batch_uid": active_batch, "request_kind": "manual"},
+            where="batch_uid=? AND request_kind='manual' AND status IN ('queued','running','backoff')",
+            params=(active_batch,),
         )
     )
     if not active_manual:
@@ -419,6 +425,96 @@ def _enqueue_range(
         "requested_from": start.strftime("%Y-%m-%d %H:%M:%S"),
         "requested_to": end.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _enqueue_incremental_range(
+    account: dict[str, Any], end: datetime, *, db: SQLiteStore
+) -> Optional[dict[str, Any]]:
+    """One in-flight incremental batch per account, with a per-object watermark.
+
+    Failed terminal windows remain visible gaps, while later increments can
+    continue. A newly monitored object has no watermark and gets today's full
+    range once. History jobs independently cover completed calendar days.
+    """
+    account_uid = str(account.get("account_uid") or "")
+    aavid = str(account.get("aavid") or "")
+    if db.select_one(
+        "operation_log_sync_window",
+        where="account_uid=? AND aavid=? AND request_kind='incremental' "
+        "AND status IN ('queued','running','backoff') "
+        "AND (object_type<>'AD' OR EXISTS (SELECT 1 FROM promotion_target pt "
+        "WHERE pt.account_uid=operation_log_sync_window.account_uid "
+        "AND pt.ad_id=operation_log_sync_window.object_id AND pt.enabled=1))",
+        params=(account_uid, aavid),
+    ):
+        return None
+    today_start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    starts = []
+    for item in _sync_objects(account, db=db):
+        rows = db.execute(
+            "SELECT MAX(window_end) AS watermark FROM operation_log_sync_window "
+            "WHERE account_uid=? AND aavid=? AND object_type=? AND object_id=? "
+        "AND request_kind='incremental' AND status IN ('succeeded','empty','superseded','failed') "
+            "AND window_end>=? AND window_end<=?",
+            (account_uid, aavid, item["object_type"], item["object_id"],
+             today_start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+            fetch=True,
+        ) or []
+        watermark = str((rows[0] if rows else {}).get("watermark") or "")
+        try:
+            previous_end = datetime.strptime(watermark, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            previous_end = today_start
+        starts.append(max(today_start, previous_end - timedelta(minutes=INCREMENTAL_OVERLAP_MINUTES)))
+    if not starts:
+        return None
+    return _enqueue_range(account, min(starts), end, request_kind="incremental", db=db)
+
+
+def _resolve_covered_failures(db: SQLiteStore, account_uid: str, aavid: str) -> None:
+    """A later complete containing read resolves, but does not erase, a gap."""
+    cover = (
+        "d.owner_username=w.owner_username AND d.account_uid=w.account_uid "
+        "AND d.aavid=w.aavid AND d.object_type=w.object_type AND d.object_id=w.object_id "
+        "AND d.status IN ('succeeded','empty') AND d.window_start<=w.window_start "
+        "AND d.window_end>=w.window_end "
+        "AND d.completed_at>=COALESCE(w.completed_at,w.updated_at)"
+    )
+    db.execute(
+        "UPDATE operation_log_sync_window AS w SET status='superseded', "
+        "last_error=COALESCE(w.last_error,'') || '；已由完整窗口覆盖：' || "
+        f"(SELECT d.window_uid FROM operation_log_sync_window d WHERE {cover} "
+        "ORDER BY d.completed_at DESC LIMIT 1), updated_at=? "
+        "WHERE w.account_uid=? AND w.aavid=? AND w.status='failed' "
+        f"AND EXISTS (SELECT 1 FROM operation_log_sync_window d WHERE {cover})",
+        (_now(), account_uid, aavid),
+    )
+
+
+def _prune_completed_windows(
+    account: dict[str, Any], *, db: SQLiteStore, now: Optional[datetime] = None
+) -> None:
+    """Prune scheduler metadata only; never delete ingested operation events.
+
+    Yesterday's completed daily window supersedes its overlapping successful
+    increments. Keep incomplete/failed evidence, plus 45 days of daily coverage
+    (longer than the supported 30-day history request).
+    """
+    current = now or datetime.now()
+    db.execute(
+        "DELETE FROM operation_log_sync_window AS w "
+        "WHERE w.account_uid=? AND w.aavid=? AND w.status IN ('succeeded','empty','superseded') "
+        "AND (w.window_end<? OR (w.status IN ('succeeded','empty') "
+        "AND w.request_kind='incremental' AND w.window_end<? "
+        "AND EXISTS (SELECT 1 FROM operation_log_sync_window d "
+        "WHERE d.owner_username=w.owner_username AND d.account_uid=w.account_uid "
+        "AND d.aavid=w.aavid AND d.object_type=w.object_type AND d.object_id=w.object_id "
+        "AND d.request_kind<>'incremental' AND d.status IN ('succeeded','empty') "
+        "AND d.window_start<=w.window_start AND d.window_end>=w.window_end)))",
+        (str(account.get("account_uid") or ""), str(account.get("aavid") or ""),
+         (current - timedelta(days=COMPLETED_WINDOW_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S"),
+         current.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")),
+    )
 
 
 def _event_count(account_uid: str, aavid: str, db: SQLiteStore) -> int:
@@ -600,7 +696,7 @@ def _finish_task(
         "lease_expires_at": None,
         "updated_at": _now(),
     }
-    if status in _DONE_STATUSES:
+    if status in _DONE_STATUSES or status == "failed":
         values["completed_at"] = _now()
     if next_attempt_at:
         values["next_attempt_at"] = next_attempt_at
@@ -624,10 +720,10 @@ def _completed_coverage(
 ) -> tuple[str, str, bool]:
     rows = db.execute(
         "SELECT window_start,window_end,COUNT(*) AS total,"
-        "SUM(CASE WHEN status IN ('succeeded','empty') THEN 1 ELSE 0 END) AS done "
-        "FROM operation_log_sync_window WHERE account_uid=? AND aavid=? "
+        "SUM(CASE WHEN status IN ('succeeded','empty','superseded') THEN 1 ELSE 0 END) AS done "
+        "FROM operation_log_sync_window WHERE account_uid=? AND aavid=? AND window_end>=? "
         "GROUP BY window_start,window_end HAVING total=done ORDER BY window_start ASC",
-        (account_uid, aavid),
+        (account_uid, aavid, (datetime.now() - timedelta(days=31)).strftime("%Y-%m-%d %H:%M:%S")),
         fetch=True,
     ) or []
     segments: list[tuple[datetime, datetime]] = []
@@ -663,6 +759,9 @@ def _refresh_batch_state(db: SQLiteStore, task: dict[str, Any]) -> None:
     account = get_qianchuan_account(str(task.get("aavid") or ""), db=db)
     if not account:
         return
+    _resolve_covered_failures(
+        db, str(task.get("account_uid") or ""), str(task.get("aavid") or "")
+    )
     current_state = db.select_one(
         "platform_log_sync_state",
         where={
@@ -674,9 +773,10 @@ def _refresh_batch_state(db: SQLiteStore, task: dict[str, Any]) -> None:
     if visible_batch and visible_batch != batch_uid:
         visible_manual = db.select_one(
             "operation_log_sync_window",
-            where={"batch_uid": visible_batch, "request_kind": "manual"},
+            where="batch_uid=? AND request_kind='manual' AND status IN ('queued','running','backoff')",
+            params=(visible_batch,),
         )
-        if visible_manual and str(current_state.get("last_status") or "") == "syncing":
+        if visible_manual:
             return
     rows = db.execute(
         "SELECT status,rows_seen,rows_inserted,window_start,window_end,"
@@ -699,7 +799,16 @@ def _refresh_batch_state(db: SQLiteStore, task: dict[str, Any]) -> None:
         for statuses in window_states.values()
         if statuses and all(status in _DONE_STATUSES for status in statuses)
     )
-    failed = [row for row in rows if str(row.get("status") or "") == "failed"]
+    # A newer successful batch must not hide an unresolved failure elsewhere
+    # in the requested history. Backoff is also an error, not healthy progress.
+    unresolved = db.execute(
+        "SELECT status,last_error,next_attempt_at,attempt_count FROM operation_log_sync_window "
+        "WHERE account_uid=? AND aavid=? AND status IN ('failed','backoff') "
+        "ORDER BY CASE WHEN status='failed' THEN 0 ELSE 1 END,updated_at DESC",
+        (task.get("account_uid"), task.get("aavid")), fetch=True,
+    ) or []
+    failed = [row for row in unresolved if str(row.get("status") or "") == "failed"]
+    backing_off = [row for row in unresolved if str(row.get("status") or "") == "backoff"]
     active = [row for row in rows if str(row.get("status") or "") in _ACTIVE_STATUSES]
     seen = sum(int(row.get("rows_seen") or 0) for row in rows)
     inserted = sum(int(row.get("rows_inserted") or 0) for row in rows)
@@ -711,7 +820,7 @@ def _refresh_batch_state(db: SQLiteStore, task: dict[str, Any]) -> None:
             if str(running.get("object_type") or "") == "ACCOUNT"
             else f"计划 {running.get('object_id') or ''}"
         )
-    elif active:
+    elif active or backing_off:
         current_object = "等待同步队列"
     coverage_from, coverage_to, history_complete = _completed_coverage(
         str(task.get("account_uid") or ""),
@@ -722,16 +831,23 @@ def _refresh_batch_state(db: SQLiteStore, task: dict[str, Any]) -> None:
     if failed:
         status = "partial" if completed else "error"
         error = str(failed[0].get("last_error") or "部分日志窗口同步失败")
-    elif active:
-        status = "syncing" if kind == "manual" else "backfilling"
+    elif active or backing_off:
+        status = "syncing" if kind == "manual" and active else "backfilling"
         error = ""
     else:
         status = "empty" if seen == 0 else "ok"
         error = "" if history_complete else "当前查询范围已完整；30天历史仍在后台补录"
+    if unresolved:
+        latest_error = unresolved[0]
+        error = (
+            f"{latest_error.get('last_error') or '日志窗口同步失败'}"
+            f"（已尝试 {int(latest_error.get('attempt_count') or 0)} 次"
+            + ("，需手动重新同步）" if failed else "，等待退避重试）")
+        )
     next_retry = min(
         (
             str(row.get("next_attempt_at") or "")
-            for row in active
+            for row in backing_off
             if str(row.get("status") or "") == "backoff"
             and str(row.get("next_attempt_at") or "")
         ),
@@ -764,9 +880,9 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
     aid = str(task.get("aavid") or "")
     object_type = str(task.get("object_type") or "ACCOUNT")
     object_id = str(task.get("object_id") or "")
-    service = get_official_api_service()
-    target = _target_for_task(task, db)
     try:
+        service = get_official_api_service()
+        target = _target_for_task(task, db)
         lock_priority = (
             PRIORITY_BACKFILL
             if str(task.get("request_kind") or "") == "history"
@@ -841,6 +957,13 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
                 next_attempt_at=retry_at,
             )
         elif isinstance(exc, (ApiRequestError, TimeoutError, ConnectionError, socket.timeout, OSError)):
+            max_attempts = (
+                MAX_REQUEST_ERROR_ATTEMPTS if isinstance(exc, ApiRequestError)
+                else MAX_TRANSIENT_ERROR_ATTEMPTS
+            )
+            if attempt >= max_attempts:
+                _finish_task(db, task, status="failed", error=str(exc))
+                return
             delay = min(10 * 60, 60 * (2 ** min(3, attempt - 1)))
             retry_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
             _finish_task(
@@ -857,33 +980,48 @@ def _process_window(db: SQLiteStore, task: dict[str, Any]) -> None:
 
 
 def _worker_loop(worker_uid: str) -> None:
-    store = SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
+    store = None
     while not _STOP.is_set():
-        task = _claim_window(store, worker_uid)
-        if not task:
-            _STOP.wait(POLL_SECONDS)
-            continue
-        _refresh_batch_state(store, task)
-        _process_window(store, task)
+        try:
+            if store is None:
+                candidate = SQLiteStore()
+                init_sqlite_schema(database=candidate.config.get("database"))
+                store = candidate
+            task = _claim_window(store, worker_uid)
+            if not task:
+                _STOP.wait(POLL_SECONDS)
+                continue
+            _refresh_batch_state(store, task)
+            _process_window(store, task)
+        except Exception:
+            # SQLite contention can occur in claim, progress, or completion.
+            # Keep this worker alive; an unfinished claim becomes retryable
+            # after its fenced lease expires, without dropping the window.
+            from utils.log import logger
+
+            logger.exception("官方操作日志工作器暂时失败，将恢复 worker=%s", worker_uid)
+            _STOP.wait(5.0)
 
 
 def _ensure_workers() -> None:
     store = SQLiteStore()
     init_sqlite_schema(database=store.config.get("database"))
     _migrate_legacy_coverage(store)
-    alive = [worker for worker in _WORKERS if worker.is_alive()]
-    _WORKERS[:] = alive
-    while len(_WORKERS) < OPERATION_LOG_WORKERS and not _STOP.is_set():
-        worker_uid = f"operation-log-worker-{uuid.uuid4().hex[:8]}"
-        thread = threading.Thread(
-            target=_worker_loop,
-            args=(worker_uid,),
-            name=worker_uid,
-            daemon=True,
-        )
-        thread.start()
-        _WORKERS.append(thread)
+    # Manual sync and the scheduler can both request recovery. Protect the
+    # check/start pair so they cannot accidentally create two log writers.
+    with _LOCK:
+        alive = [worker for worker in _WORKERS if worker.is_alive()]
+        _WORKERS[:] = alive
+        while len(_WORKERS) < OPERATION_LOG_WORKERS and not _STOP.is_set():
+            worker_uid = f"operation-log-worker-{uuid.uuid4().hex[:8]}"
+            thread = threading.Thread(
+                target=_worker_loop,
+                args=(worker_uid,),
+                name=worker_uid,
+                daemon=True,
+            )
+            thread.start()
+            _WORKERS.append(thread)
 
 
 def sync_official_operation_logs(
@@ -1067,7 +1205,6 @@ def start_official_operation_log_sync_background_thread() -> threading.Thread:
                 history_start = (now - timedelta(days=30)).replace(
                     hour=0, minute=0, second=0, microsecond=0
                 )
-                today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                 for account in list_qianchuan_accounts(db=store):
                     if not (
                         account.get("enabled")
@@ -1083,20 +1220,15 @@ def start_official_operation_log_sync_background_thread() -> threading.Thread:
                             request_kind="report",
                             db=store,
                         )
-                    _enqueue_range(
-                        account,
-                        today_start,
-                        now,
-                        request_kind="incremental",
-                        db=store,
-                    )
+                    _enqueue_incremental_range(account, now, db=store)
                     _enqueue_range(
                         account,
                         history_start,
-                        now,
+                        yesterday_end,
                         request_kind="history",
                         db=store,
                     )
+                    _prune_completed_windows(account, db=store, now=now)
                 _ensure_workers()
             except Exception:
                 from utils.log import logger

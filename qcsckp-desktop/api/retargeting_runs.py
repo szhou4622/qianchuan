@@ -140,7 +140,7 @@ def _pmc_record_to_dashboard_material_row(
 ) -> Dict[str, Any]:
     """
     将本地库单条素材记录映射为与 dashboard get_table_data 输出一致的字段名，供「素材信息」弹窗渲染。
-    即刻追投仅取该素材 created_at 最新一条；单点无周期首尾差，时段流速相关为 0。
+    即刻追投仅取该素材最新一条；单点无周期基线，时段流速为未知。
     """
     mid = str(r.get("material_id") or "").strip()
     title_raw = r.get("video_name")
@@ -149,27 +149,25 @@ def _pmc_record_to_dashboard_material_row(
     else:
         title = str(title_raw).strip()[:512]
 
-    def _f(v: Any, default: float = 0.0) -> float:
+    def _f(v: Any) -> Optional[float]:
         try:
             if v is None or str(v).strip() == "":
-                return default
+                return None
             return float(v)
         except (TypeError, ValueError):
-            return default
+            return None
 
-    def _i(v: Any) -> int:
+    def _i(v: Any) -> Optional[int]:
         try:
-            return int(v or 0)
+            if v is None or str(v).strip() == "":
+                return None
+            return int(v)
         except (TypeError, ValueError):
-            return 0
+            return None
 
-    sc = r.get("stat_cost")
-    try:
-        cost = float(sc) if sc is not None and str(sc).strip() != "" else 0.0
-    except (TypeError, ValueError):
-        cost = 0.0
+    cost = _f(r.get("stat_cost"))
     ct = r.get("video_create_time") or r.get("upload_time")
-    ca = r.get("created_at")
+    ca = r.get("collected_at") or r.get("created_at")
     return {
         "id": mid,
         "aadvid": r.get("aadvid"),
@@ -180,23 +178,23 @@ def _pmc_record_to_dashboard_material_row(
         "title": title,
         "createTime": ct,
         "currentCost": cost,
-        "costDiff": 0.0,
-        "velocity": 0.0,
+        "costDiff": None,
+        "velocity": None,
         "estimatedEcpm": None,
         "maxCostTime": ca,
         "minCostTime": ca,
-        "netRoi": _f(r.get("prepay_pay_settle_1h"), 0.0),
-        "netAmount": _f(r.get("order_settle_amount_1h"), 0.0),
-        "hourRefundRate": _f(r.get("refund_rate_1h"), 0.0),
-        "netSettleRate": _f(r.get("order_settle_rate_1h"), 0.0),
+        "netRoi": _f(r.get("prepay_pay_settle_1h")),
+        "netAmount": _f(r.get("order_settle_amount_1h")),
+        "hourRefundRate": _f(r.get("refund_rate_1h")),
+        "netSettleRate": _f(r.get("order_settle_rate_1h")),
         "netOrderCount": _i(r.get("order_settle_count_1h")),
-        "overallPayRoi": _f(r.get("prepay_pay_order_count"), 0.0),
-        "overallAmount": _f(r.get("pay_gmv_include_coupon"), 0.0),
+        "overallPayRoi": _f(r.get("prepay_pay_order_count")),
+        "overallAmount": _f(r.get("pay_gmv_include_coupon")),
         "overallOrderCount": _i(r.get("overall_order_count")),
         "overallShowCount": _i(r.get("overall_show_count")),
         "overallClickCount": _i(r.get("overall_click_count")),
-        "overallCtr": _f(r.get("overall_ctr"), 0.0),
-        "overallConversionRate": _f(r.get("overall_conversion_rate"), 0.0),
+        "overallCtr": _f(r.get("overall_ctr")),
+        "overallConversionRate": _f(r.get("overall_conversion_rate")),
         "periodStartTime": r.get("stat_date"),
         "periodEndTime": ca,
     }

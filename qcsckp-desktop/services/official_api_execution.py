@@ -11,7 +11,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from services.plan_system import normalize_plan_system
 from services.qianchuan_open_api.errors import ApiRateLimitError, ApiWriteOutcomeUnknown
@@ -32,6 +32,10 @@ CONTROL_TASK_NAME_MAX_LENGTH = 50
 
 class _MaterialRetargetEvidenceCheckError(RuntimeError):
     """The local fail-closed scene evidence could not be evaluated safely."""
+
+
+class _StopSubmissionBlocked(RuntimeError):
+    """The latest local authorization/evidence no longer permits this POST."""
 
 
 def _existing_reconciliation(execution_uid: Optional[str]) -> Optional[dict[str, Any]]:
@@ -817,6 +821,7 @@ class OfficialApiRegulationStopService:
         execution_uid: Optional[str] = None,
         reconciliation_task_uid: Optional[str] = None,
         control_cycle_key: str = "",
+        pre_submit_check: Optional[Callable[[], str]] = None,
         **_: Any,
     ) -> Any:
         from services.regulation_service import RegulationRunResult
@@ -919,27 +924,20 @@ class OfficialApiRegulationStopService:
                     _now(),
                     True,
                 )
-            # A rate-limit response is an explicit rejection before the write
-            # is accepted, so retrying is safe. Other parameter, permission or
-            # state errors are deterministic and must never be retried.
-            response = None
-            for attempt in range(1, 4):
-                try:
-                    response = await asyncio.to_thread(
-                        service.update_control_status,
-                        aavid,
-                        [assist_task_id],
-                        action=opt_type,
-                    )
-                    break
-                except ApiRateLimitError as exc:
-                    if attempt >= 3:
-                        raise
-                    retry_after = max(
-                        1.0,
-                        float(getattr(exc, "retry_after", 0) or 60),
-                    )
-                    await asyncio.sleep(retry_after)
+            # One confirmation authorizes one attempt, not a delayed retry
+            # loop. Recheck after the potentially slow read-only API preflight,
+            # immediately before sending, so closing/changing a rule takes
+            # effect while those reads are in flight as well.
+            def submit_once():
+                if pre_submit_check is not None:
+                    reason = pre_submit_check()
+                    if reason:
+                        raise _StopSubmissionBlocked(str(reason))
+                return service.update_control_status(
+                    aavid, [assist_task_id], action=opt_type
+                )
+
+            response = await asyncio.to_thread(submit_once)
             if response is None:
                 raise RuntimeError("官方 API 停投提交未返回结果")
             if response.request_uid:
@@ -985,6 +983,18 @@ class OfficialApiRegulationStopService:
                 action,
                 _now(),
                 True,
+            )
+        except _StopSubmissionBlocked as exc:
+            if intent_reserved:
+                from services.official_api_reconciliation import finish_execution_intent
+
+                finish_execution_intent(
+                    intent_key, status="confirmed_failed", error=str(exc)
+                )
+            return RegulationRunResult(
+                False, f"提交前复核未通过，未向千川提交：{exc}",
+                "stop_preflight_blocked", str(exc), text_id(aavid),
+                text_id(ad_id), text_id(assist_task_id), action, _now(), True,
             )
         except ApiWriteOutcomeUnknown as exc:
             try:

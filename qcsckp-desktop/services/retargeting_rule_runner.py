@@ -1323,6 +1323,15 @@ def _insert_run(
         )
     except Exception:
         logger.exception("%s 统一操作流水写入失败 run_id=%s", retarget_log_tag(scheduler=True), run_id)
+    if cloud_task_id and step == "submitted_verifying":
+        try:
+            from services.official_api_reconciliation import replay_terminal_reconciliations
+            account = db.select_one("qianchuan_account", where={"account_uid": account_uid}) or {}
+            replay_terminal_reconciliations(
+                str(account.get("owner_username") or ""), db=db, execution_uid=cloud_task_id,
+            )
+        except Exception:
+            logger.exception("追投流水已保存，补齐已完成核验结果失败 run_id=%s", run_id)
 
 
 async def run_one_cycle(db: SQLiteStore) -> None:

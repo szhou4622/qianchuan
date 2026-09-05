@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from api.dashboard_optimized import OptimizedDashboardQueries
 from api.dashboard_optimized import DASHBOARD_CONTRACT_VERSION
+from api.retargeting_runs import _manual_query_snapshot_json
 from config import CURRENT_VERSION
 from utils.dashboard_storage_maintenance import (
     backfill_latest_from_legacy,
@@ -22,6 +24,22 @@ from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 class DashboardOptimizationTests(unittest.TestCase):
+    SINGLE_METRIC_FIELDS = {
+        "stat_cost": "currentCost",
+        "prepay_pay_settle_1h": "netRoi",
+        "order_settle_amount_1h": "netAmount",
+        "refund_rate_1h": "hourRefundRate",
+        "prepay_pay_order_count": "overallPayRoi",
+        "pay_gmv_include_coupon": "overallAmount",
+        "order_settle_rate_1h": "netSettleRate",
+        "order_settle_count_1h": "netOrderCount",
+        "overall_order_count": "overallOrderCount",
+        "overall_show_count": "overallShowCount",
+        "overall_click_count": "overallClickCount",
+        "overall_ctr": "overallCtr",
+        "overall_conversion_rate": "overallConversionRate",
+    }
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.database = str(Path(self.temp.name) / "dashboard.db")
@@ -200,6 +218,90 @@ class DashboardOptimizationTests(unittest.TestCase):
         self.assertEqual(2, result["total"])
         self.assertEqual(80.0, result["data"][0]["cost"])
         self.assertEqual(100.0, result["data"][-1]["cost"])
+
+    def test_all_single_material_fields_and_top20_preserve_null(self):
+        self.db.update("pmc_promotion_material_latest",
+                       {field: None for field in self.SINGLE_METRIC_FIELDS},
+                       where={"target_uid": "target-1"})
+        row = self.queries.get_table_data(target_uid="target-1")["data"][0]
+        for field in self.SINGLE_METRIC_FIELDS.values():
+            self.assertIsNone(row[field], field)
+        self.assertIsNone(row["costDiff"])
+        self.assertIsNone(row["estimatedEcpm"])
+        self.assertIsNone(self.queries.get_top20_by_cost(target_uid="target-1")["data"][0]["currentCost"])
+        # Aggregated totals deliberately keep the existing available-value sum.
+        self.assertEqual(200.0, self.queries.get_latest_cost_sum()["totalCost"])
+
+    def test_real_zero_single_material_fields_remain_zero(self):
+        self.db.update("pmc_promotion_material_latest",
+                       {field: 0 for field in self.SINGLE_METRIC_FIELDS},
+                       where={"target_uid": "target-1"})
+        self.db.update("pmc_material_metric_snapshot", {"stat_cost": 0},
+                       where={"target_uid": "target-1"})
+        row = self.queries.get_table_data(target_uid="target-1")["data"][0]
+        for field in self.SINGLE_METRIC_FIELDS.values():
+            self.assertEqual(0, row[field], field)
+        self.assertEqual(0, row["costDiff"])
+        self.assertEqual(0, self.queries.get_top20_by_cost(target_uid="target-1")["data"][0]["currentCost"])
+
+    def test_cost_difference_is_unknown_when_baseline_is_missing_or_null(self):
+        self.db.update("pmc_material_metric_snapshot", {"stat_cost": None},
+                       where={"target_uid": "target-1"})
+        self.assertIsNone(self.queries.get_table_data(target_uid="target-1")["data"][0]["costDiff"])
+        self.db.execute("DELETE FROM pmc_material_metric_snapshot WHERE target_uid=?", ("target-1",))
+        self.assertIsNone(self.queries.get_table_data(target_uid="target-1")["data"][0]["costDiff"])
+
+    def test_cost_difference_requires_same_stat_date_and_keeps_valid_amount(self):
+        self.db.update("pmc_material_metric_snapshot",
+                       {"stat_date": (self.now - timedelta(days=1)).strftime("%Y-%m-%d")},
+                       where={"target_uid": "target-1"})
+        self.assertIsNone(self.queries.get_table_data(target_uid="target-1")["data"][0]["costDiff"])
+        self.db.update("pmc_material_metric_snapshot", {"stat_date": self.now.strftime("%Y-%m-%d")},
+                       where={"target_uid": "target-1"})
+        self.assertEqual(20.0, self.queries.get_table_data(target_uid="target-1")["data"][0]["costDiff"])
+
+    def test_single_material_history_preserves_null_points_and_valid_zero_endpoints(self):
+        fields = ("stat_cost", "prepay_pay_order_count", "pay_gmv_include_coupon")
+        for snapshot_value, latest_value in ((None, 0), (0, None)):
+            with self.subTest(snapshot=snapshot_value, latest=latest_value):
+                self.db.update("pmc_material_metric_snapshot", {field: snapshot_value for field in fields},
+                               where={"target_uid": "target-1"})
+                self.db.update("pmc_promotion_material_latest", {field: latest_value for field in fields},
+                               where={"target_uid": "target-1"})
+                history = self.queries.get_material_history("3001", target_uid="target-1")
+                self.assertEqual(2, history["total"])
+                for field in ("cost", "roi", "amount"):
+                    self.assertEqual(snapshot_value, history["data"][0][field])
+                    self.assertEqual(latest_value, history["data"][-1][field])
+
+    def test_estimated_ecpm_requires_current_rate_values_but_accepts_real_zero(self):
+        self.db.insert("pmc_ad_detail_basic", {"aadvid": "1001", "ad_id": "2001", "ecp_roi2_goal": 2})
+        for field in ("overall_ctr", "overall_conversion_rate"):
+            with self.subTest(field=field):
+                self.db.update("pmc_promotion_material_latest", {"overall_ctr": 3, "overall_conversion_rate": 4,
+                                                                 field: None}, where={"target_uid": "target-1"})
+                self.assertIsNone(self.queries.get_table_data(target_uid="target-1")["data"][0]["estimatedEcpm"])
+                self.db.update("pmc_promotion_material_latest", {field: 0}, where={"target_uid": "target-1"})
+                self.assertEqual(0, self.queries.get_table_data(target_uid="target-1")["data"][0]["estimatedEcpm"])
+
+    def test_manual_snapshot_serializes_unknown_values_as_json_null_not_zero(self):
+        self.db.update("pmc_promotion_material_latest",
+                       {**{field: None for field in self.SINGLE_METRIC_FIELDS}, "created_at": "2026-01-01 00:00:00"},
+                       where={"target_uid": "target-1"})
+        raw = _manual_query_snapshot_json(self.db, "3001", "fallback", "target-1")
+        row = json.loads(raw)["material_row"]
+        for field in (*self.SINGLE_METRIC_FIELDS.values(), "costDiff", "velocity"):
+            self.assertIsNone(row[field], field)
+        self.assertEqual(self.now.strftime("%Y-%m-%d %H:%M:%S"), row["periodEndTime"])
+
+    def test_manual_snapshot_keeps_real_zero_but_no_baseline_is_unknown(self):
+        self.db.update("pmc_promotion_material_latest", {field: 0 for field in self.SINGLE_METRIC_FIELDS},
+                       where={"target_uid": "target-1"})
+        row = json.loads(_manual_query_snapshot_json(self.db, "3001", "fallback", "target-1"))["material_row"]
+        for field in self.SINGLE_METRIC_FIELDS.values():
+            self.assertEqual(0, row[field], field)
+        self.assertIsNone(row["costDiff"])
+        self.assertIsNone(row["velocity"])
 
     def test_scope_history_aggregates_enabled_accounts_and_respects_filters(self):
         all_accounts = self.queries.get_scope_history()

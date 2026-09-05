@@ -50,6 +50,9 @@ PROFILE_LOCK = threading.RLock()
 TASK_LOCK = threading.RLock()
 _EVENT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="feishu-event")
 _OUTBOX_LEASE_OWNER = f"feishu-outbox-{uuid.uuid4().hex}"
+# Direct PATCHes and durable retries share the same per-message ordering lane.
+# Stripes keep memory bounded while also serializing bridge instances for an owner.
+_CARD_UPDATE_LOCKS = tuple(threading.RLock() for _ in range(64))
 
 
 def _inbox_begin(
@@ -1845,6 +1848,8 @@ def build_stop_task_card(
         "rejected": "已暂不停投",
         "expired": "已过期",
         "cancelled": "已取消",
+        "invalidated": "策略已更新，本卡失效",
+        "unknown_requires_review": "结果无法确认，需人工检查",
     }.get(status, status)
     template = (
         "green"
@@ -2316,7 +2321,7 @@ class LocalFeishuBridge:
         receive_id: str = "",
         message_id: str = "",
     ) -> None:
-        init_sqlite_schema()
+        init_sqlite_schema(database=DB_FILE)
         stable = _json(
             {
                 "operation": operation,
@@ -2329,7 +2334,7 @@ class LocalFeishuBridge:
         uid = hashlib.sha256(
             (self.account_username + "|" + stable).encode("utf-8")
         ).hexdigest()
-        SQLiteStore().insert_or_update(
+        SQLiteStore(database=DB_FILE).insert_or_update(
             "feishu_outbox",
             {
                 "outbox_uid": uid,
@@ -2387,8 +2392,56 @@ class LocalFeishuBridge:
         finally:
             conn.close()
 
+    def _patch_latest_task_card(
+        self, task_uid: str, message_id: str, *, expanded: bool = False,
+        queued_row: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        lane = int(hashlib.sha256(
+            (self.account_username + "|" + message_id).encode("utf-8")
+        ).hexdigest()[:8], 16) % len(_CARD_UPDATE_LOCKS)
+        with _CARD_UPDATE_LOCKS[lane]:
+            store = SQLiteStore(database=DB_FILE)
+            if queued_row:
+                current = store.select_one(
+                    "feishu_outbox", where={"outbox_uid": queued_row["outbox_uid"]},
+                ) or {}
+                if (current.get("status") != "sending"
+                    or int(current.get("fencing_token") or 0)
+                    != int(queued_row.get("fencing_token") or 0)):
+                    return False
+            row = _task_row(task_uid, self.account_username)
+            if not row:
+                # Never resurrect a deleted/unowned task using an old frozen card.
+                return False
+            content = json.dumps(
+                build_local_task_card(_task_payload(row), expanded=expanded),
+                ensure_ascii=False,
+            )
+            try:
+                self._request(
+                    "PATCH", "/im/v1/messages/" + quote(message_id, safe=""),
+                    payload={"content": content},
+                )
+            except Exception:
+                if queued_row is None:
+                    self._queue_outbox(
+                        operation="update_card", message_id=message_id,
+                        payload={"content": content, "task_uid": task_uid,
+                                 "expanded": expanded},
+                    )
+                raise
+            store.execute(
+                "UPDATE feishu_outbox SET status='superseded',lease_owner=NULL,"
+                "lease_expires_at=NULL,updated_at=? WHERE account_username=? "
+                "AND operation='update_card' AND message_id=? AND outbox_uid<>? "
+                "AND status IN ('queued','sending','failed')",
+                (_dt(_now()), self.account_username, message_id,
+                 str((queued_row or {}).get("outbox_uid") or "")),
+            )
+            return True
+
     def _deliver_outbox_once(self) -> bool:
-        store = SQLiteStore()
+        store = SQLiteStore(database=DB_FILE)
         now_text = _dt(_now())
         lease_until = _dt(_now() + timedelta(seconds=60))
         with store.transaction() as connection:
@@ -2430,11 +2483,28 @@ class LocalFeishuBridge:
             payload = _loads(row.get("payload_json"), {})
             operation = str(row.get("operation") or "")
             if operation == "send_card":
-                message_id = self._send_card(
+                task_row = _task_row(
+                    str(payload.get("task_uid") or ""), self.account_username,
+                )
+                card = (build_local_task_card(_task_payload(task_row)) if task_row
+                        else payload.get("card"))
+                message_id = self._send_versioned_card(
                     str(row.get("receive_type") or ""),
                     str(row.get("receive_id") or ""),
-                    payload.get("card") if isinstance(payload.get("card"), dict) else {},
+                    card if isinstance(card, dict) else {},
+                    task_uid=str(payload.get("task_uid") or ""),
+                    delivery_stage=str(payload.get("delivery_stage") or ""),
                 )
+                if message_id is None:
+                    store.execute(
+                        "UPDATE feishu_outbox SET status='superseded',lease_owner=NULL,"
+                        "lease_expires_at=NULL WHERE outbox_uid=? AND fencing_token=?",
+                        (str(row.get("outbox_uid") or ""), token),
+                    )
+                    _refresh_reconciliation_card_update_state(
+                        store, self.account_username, str(payload.get("task_uid") or ""),
+                    )
+                    return True
                 if not message_id:
                     raise FeishuApiError("飞书未返回消息ID")
                 self._append_task_message(
@@ -2443,11 +2513,18 @@ class LocalFeishuBridge:
                     receive_id=str(row.get("receive_id") or ""),
                     message_id=message_id,
                 )
+                if task_row:
+                    try:
+                        self._patch_latest_task_card(str(payload.get("task_uid") or ""), message_id)
+                    except Exception:
+                        # The send succeeded. The latest PATCH has its own outbox
+                        # record; retrying the send would duplicate the message.
+                        logger.warning("补发卡片已送达，最新状态更新已进入重试 task=%s", payload.get("task_uid"))
             elif operation == "update_card":
-                self._request(
-                    "PATCH",
-                    "/im/v1/messages/" + quote(str(row.get("message_id") or ""), safe=""),
-                    payload={"content": str(payload.get("content") or "")},
+                self._patch_latest_task_card(
+                    str(payload.get("task_uid") or ""),
+                    str(row.get("message_id") or ""),
+                    expanded=bool(payload.get("expanded")), queued_row=row,
                 )
             else:
                 raise FeishuApiError("未知飞书发件箱操作")
@@ -2526,21 +2603,46 @@ class LocalFeishuBridge:
                     targets.append(("chat_id", str(group["chat_id"]).strip()))
         return targets
 
+    def _send_versioned_card(
+        self, receive_type: str, receive_id: str, card: Dict[str, Any], *,
+        task_uid: str = "", delivery_stage: str = "",
+    ) -> Optional[str]:
+        lane = int(hashlib.sha256(
+            f"{self.account_username}|{task_uid}|{receive_type}|{receive_id}".encode("utf-8")
+        ).hexdigest()[:8], 16) % len(_CARD_UPDATE_LOCKS)
+        with _CARD_UPDATE_LOCKS[lane]:
+            if task_uid and delivery_stage == "submitted":
+                terminal = SQLiteStore(database=DB_FILE).execute(
+                    "SELECT id FROM execution_reconciliation WHERE account_username=? "
+                    "AND task_uid=? AND status IN ('confirmed_succeeded','confirmed_failed',"
+                    "'unknown_requires_review') LIMIT 1", (self.account_username, task_uid), fetch=True,
+                ) or []
+                if terminal:
+                    return None
+            return self._send_card(receive_type, receive_id, card)
+
     def send_bound_card(
         self,
         card: Dict[str, Any],
         *,
         targets: Optional[List[Tuple[str, str]]] = None,
         task_uid: str = "",
+        delivery_stage: str = "",
     ) -> List[Dict[str, str]]:
         targets = list(targets) if targets is not None else self.bound_targets()
         if not targets:
             raise FeishuApiError("尚未绑定个人或接收群，请先完成机器人绑定")
         sent: List[Dict[str, str]] = []
         errors: List[str] = []
+        suppressed = False
         for receive_type, receive_id in targets:
             try:
-                message_id = self._send_card(receive_type, receive_id, card)
+                message_id = self._send_versioned_card(
+                    receive_type, receive_id, card, task_uid=task_uid,
+                    delivery_stage=delivery_stage,
+                )
+                if message_id is None:
+                    suppressed = True
                 if message_id:
                     sent.append(
                         {
@@ -2555,9 +2657,9 @@ class LocalFeishuBridge:
                     operation="send_card",
                     receive_type=receive_type,
                     receive_id=receive_id,
-                    payload={"card": card, "task_uid": task_uid},
+                    payload={"card": card, "task_uid": task_uid, "delivery_stage": delivery_stage},
                 )
-        if not sent:
+        if not sent and not suppressed:
             raise FeishuApiError("飞书卡片发送失败：" + ("；".join(errors) or "未返回消息ID"))
         return sent
 
@@ -2577,9 +2679,6 @@ class LocalFeishuBridge:
         row = _task_row(task_uid, self.account_username)
         if not row:
             return
-        task = _task_payload(row)
-        card = build_local_task_card(task, expanded=expanded)
-        content = json.dumps(card, ensure_ascii=False)
         messages = _loads(row.get("card_messages_json"), [])
         attempted = 0
         queued = False
@@ -2589,18 +2688,9 @@ class LocalFeishuBridge:
                 continue
             attempted += 1
             try:
-                self._request(
-                    "PATCH",
-                    "/im/v1/messages/" + quote(message_id, safe=""),
-                    payload={"content": content},
-                )
+                self._patch_latest_task_card(task_uid, message_id, expanded=expanded)
             except Exception as exc:
                 logger.warning("[飞书长连接] 更新卡片失败 task=%s: %s", task_uid, exc)
-                self._queue_outbox(
-                    operation="update_card",
-                    message_id=message_id,
-                    payload={"content": content, "task_uid": task_uid},
-                )
                 queued = True
         _set_reconciliation_card_update_state(
             task_uid,
@@ -3217,6 +3307,7 @@ def send_local_feishu_bound_card(
     targets: Optional[List[Tuple[str, str]]] = None,
     require_connected: bool = True,
     task_uid: str = "",
+    delivery_stage: str = "",
 ) -> List[Dict[str, str]]:
     bridge = _MANAGER.bridge()
     if bridge is None:
@@ -3224,7 +3315,8 @@ def send_local_feishu_bound_card(
     status = bridge.status()
     if require_connected and not status.get("connected"):
         raise FeishuApiError("飞书长连接尚未连接")
-    return bridge.send_bound_card(card, targets=targets, task_uid=task_uid)
+    return bridge.send_bound_card(card, targets=targets, task_uid=task_uid,
+                                  delivery_stage=delivery_stage)
 
 
 def save_local_feishu_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -3406,6 +3498,37 @@ def invalidate_stale_local_retarget_tasks(
     config_enabled: bool,
     account_username: str = "",
 ) -> Dict[str, Any]:
+    return _invalidate_stale_local_tasks(
+        strategy_hashes, config_enabled=config_enabled,
+        account_username=account_username, action_type="retarget",
+    )
+
+
+def invalidate_obsolete_local_stop_tasks(
+    current_owner: str, current_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Invalidate only unclaimed stop cards, never the shared execution intent."""
+    from services.regulation_rule_runner import _stop_strategy_snapshot
+
+    hashes = {
+        str(strategy.get("id") or ""): hashlib.sha256(
+            _json(_stop_strategy_snapshot(strategy)).encode("utf-8")
+        ).hexdigest()
+        for strategy in current_config.get("strategies") or []
+        if isinstance(strategy, dict)
+        and not strategy.get("validation_error")
+        and str(strategy.get("action_mode") or "auto_execute") == "card_confirm"
+    }
+    return _invalidate_stale_local_tasks(
+        hashes, config_enabled=bool(current_config.get("enabled")),
+        account_username=current_owner, action_type="stop",
+    )
+
+
+def _invalidate_stale_local_tasks(
+    strategy_hashes: Mapping[str, str], *, config_enabled: bool,
+    account_username: str, action_type: str,
+) -> Dict[str, Any]:
     """Invalidate unclaimed cards whose frozen strategy no longer matches.
 
     Claimed/executing/verifying tasks are intentionally left to the worker's
@@ -3429,9 +3552,9 @@ def invalidate_stale_local_retarget_tasks(
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT task_uid,status,payload_json FROM local_retarget_task "
-            "WHERE account_username=? AND action_type='retarget' "
+            "WHERE account_username=? AND action_type=? "
             "AND status IN ('pending','approved_queued')",
-            (account,),
+            (account, action_type),
         ).fetchall()
         for row in rows:
             payload = _loads(row["payload_json"], {})
@@ -3443,11 +3566,11 @@ def invalidate_stale_local_retarget_tasks(
             if config_enabled and current_hash and current_hash == frozen_hash:
                 continue
             if not config_enabled:
-                reason = "追投规则已关闭"
+                reason = "规则已关闭"
             elif not current_hash:
-                reason = "追投策略已删除"
+                reason = "策略已删除或不再需要确认"
             else:
-                reason = "追投策略已更新"
+                reason = "策略已更新"
             message = (
                 "策略已更新，本卡失效，未向千川提交；"
                 "请使用最新策略生成的新提醒"
@@ -4634,6 +4757,8 @@ def report_local_retarget_task(
         "succeeded",
         "failed",
         "invalidated",
+        "naturally_expired",
+        "unknown_requires_review",
     }:
         return {"success": False, "message": "本地任务状态无效"}
     row = _task_row(task_uid)
@@ -4698,6 +4823,14 @@ def report_local_retarget_task(
             return {"success": False, "message": "本地任务状态已经变化"}
     finally:
         conn.close()
+    if status == "verifying":
+        # A fast verifier may already have completed before this foreground
+        # report. Replay its durable result instead of leaving a stranded card.
+        from services.official_api_reconciliation import replay_terminal_reconciliations
+        replay_terminal_reconciliations(
+            str(row.get("account_username") or ""),
+            db=SQLiteStore(database=DB_FILE), task_uid=task_uid,
+        )
     bridge = _MANAGER.bridge()
     if bridge:
         _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
@@ -4740,10 +4873,17 @@ def finalize_reconciled_local_task(
             if naturally_expired
             else "succeeded"
             if succeeded
+            else "unknown_requires_review"
+            if str(final_result.get("step") or "") in {"unknown_requires_review", "result_unknown"}
             else "failed"
         )
     if str(row.get("status") or "") in TERMINAL_STATUSES:
-        return {"success": str(row.get("status") or "") == expected}
+        matches = str(row.get("status") or "") == expected
+        if matches and _MANAGER.account == _account_key(row.get("account_username")):
+            bridge = _MANAGER.bridge()
+            if bridge:
+                _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
+        return {"success": matches}
     if str(row.get("status") or "") != "verifying":
         return {"success": False, "message": "任务不在核验状态"}
     now_text = _dt(_now())

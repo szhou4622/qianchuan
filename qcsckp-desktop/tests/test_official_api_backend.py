@@ -433,9 +433,9 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         self.assertEqual(0.03, row["overall_ctr"])
         self.assertEqual(0.12, row["overall_conversion_rate"])
 
-    def test_missing_metric_is_none_and_does_not_overwrite_previous_value(self):
+    def test_missing_metric_is_none_and_records_loss_of_current_evidence(self):
         self.assertIsNone(_metric({}, {"stat_cost_for_roi2": "3"}, "stat_cost_for_roi2"))
-        self.assertFalse(
+        self.assertTrue(
             _metric_values_changed(
                 {"stat_cost": 88.5},
                 {"stat_cost": None},
@@ -2457,7 +2457,7 @@ class OfficialApiBackendTests(unittest.TestCase):
         self.assertIn("不是素材追投调控任务", result.message)
         service.update_control_status.assert_not_called()
 
-    def test_stop_rate_limit_retries_at_most_three_attempts(self):
+    def test_stop_rate_limit_does_not_retry_without_new_confirmation(self):
         service = Mock()
         service.update_control_status.side_effect = [
             ApiRateLimitError("rate limited", retry_after=1),
@@ -2497,7 +2497,9 @@ class OfficialApiBackendTests(unittest.TestCase):
         ), patch(
             "services.official_api_execution.asyncio.sleep",
             side_effect=no_sleep,
-        ):
+        ) as sleep, patch(
+            "services.official_api_reconciliation.finish_execution_intent"
+        ) as finish:
             result = asyncio.run(
                 runner.run(
                     aavid=10001,
@@ -2509,9 +2511,11 @@ class OfficialApiBackendTests(unittest.TestCase):
                     execution_uid="stop-retry-1",
                 )
             )
-        self.assertTrue(result.success)
-        self.assertEqual("submitted_verifying", result.step)
-        self.assertEqual(3, service.update_control_status.call_count)
+        self.assertFalse(result.success)
+        self.assertEqual("official_api", result.step)
+        self.assertEqual(1, service.update_control_status.call_count)
+        sleep.assert_not_called()
+        finish.assert_called_once()
 
     def test_same_stop_cycle_reservation_allows_only_one_post(self):
         service = Mock()

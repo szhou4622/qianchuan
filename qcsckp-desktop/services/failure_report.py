@@ -12,13 +12,14 @@ from typing import Any, Mapping
 
 from config import DB_FILE
 from release_identity import IDENTITY
+from utils.log_redaction import redact_text
 
 
 _SECRET_KEYS = {
     "access_token", "refresh_token", "authorization", "access-token",
     "app_secret", "secret", "device_session", "device_credential",
     "activation_code", "cookie", "cookies", "encrypt_key",
-    "verification_token", "poll_secret",
+    "verification_token", "poll_secret", "api_key", "sessionid", "session_id",
 }
 _ID_KEYS = {
     "advertiser_id", "aavid", "aadvid", "ad_id", "material_id",
@@ -46,7 +47,7 @@ def _digest(value: Any) -> str:
 
 
 def _safe_text(value: Any) -> str:
-    text = str(value or "")[:4000]
+    text = redact_text(value)[:4000]
     text = _URL.sub("<url>", text)
     text = _WINDOWS_PATH.sub("<local-path>", text)
     return _LONG_ID.sub(lambda match: "<id:" + _digest(match.group())[7:] + ">", text)
@@ -54,14 +55,19 @@ def _safe_text(value: Any) -> str:
 
 def _diagnostic_text(value: Any) -> dict[str, Any]:
     text = str(value or "")
+    # Arbitrary short alphanumeric strings can be secrets or English names.
+    allowed = {
+        "RuntimeError", "ValueError", "TypeError", "KeyError", "OSError",
+        "PermissionError", "FileNotFoundError", "TimeoutError", "ConnectionError",
+        "ApiRequestError", "ApiRateLimitError", "ApiWriteOutcomeUnknown",
+        "FeishuApiError", "OperationalError", "IntegrityError", "JSONDecodeError",
+        "HTTPError", "URLError", "Traceback", "GET", "POST", "PATCH", "PUT",
+        "DELETE", "failed", "verifying", "submitted", "confirmed_succeeded",
+        "confirmed_failed", "unknown_requires_review",
+    }
     tokens: list[str] = []
-    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,80}", text):
-        lowered = token.lower()
-        if "/" in token or "." in token or lowered.startswith("http"):
-            continue
-        if any(secret in lowered for secret in ("secret", "password", "token", "cookie", "credential", "authorization")):
-            continue
-        if len(token) > 40 and re.fullmatch(r"[A-Za-z0-9_-]+", token):
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,80}", redact_text(text)):
+        if token not in allowed:
             continue
         if token not in tokens:
             tokens.append(token)

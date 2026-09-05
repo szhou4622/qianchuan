@@ -177,10 +177,14 @@ def _metric_values_changed(
     """
     if not previous:
         return True
+    if previous.get("stat_date") != current.get("stat_date"):
+        return True
     for field in _METRIC_SNAPSHOT_FIELDS:
         old = previous.get(field)
         new = current.get(field)
-        if new is None:
+        if old is None or new is None:
+            if old is not new:
+                return True
             continue
         try:
             if old is None or round(float(old), 8) != round(float(new), 8):
@@ -1293,7 +1297,10 @@ def collect_target(
         else detail_request_id
     )
     snapshots = [
-        _material_snapshot(item, target=target, units=units, request_id=material_request_id)
+        {
+            **_material_snapshot(item, target=target, units=units, request_id=material_request_id),
+            "stat_date": start_date,
+        }
         for item in materials
         if text_id(item.get("material_id"))
     ]
@@ -1318,14 +1325,35 @@ def collect_target(
     # latest state and never participate in today's rule evaluation.
     recovery_snapshots: list[dict[str, Any]] = []
     recovery_completed = False
-    recovery_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = datetime.now().date()
+    yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
     last_sync = _parse_local_time(target.get("last_sync_at"))
-    recovery_needed = bool(
+    pending_dates = capability.get("recovery_backfill_pending_dates")
+    pending_dates = list(pending_dates) if isinstance(pending_dates, list) else []
+    pending_dates = sorted({
+        value for value in pending_dates
+        if isinstance(value, str)
+        and _parse_local_time(f"{value} 00:00:00") is not None
+        and value < today.strftime("%Y-%m-%d")
+    })
+    if (
         last_sync
-        and last_sync.date() < datetime.now().date()
-        and str(capability.get("recovery_backfill_date") or "") != recovery_date
-    )
+        and last_sync.date() < today
+        and str(capability.get("recovery_backfill_date") or "") != yesterday
+    ):
+        pending_dates = sorted(set(pending_dates + [yesterday]))
+    recovery_needed = bool(pending_dates)
+    recovery_date = pending_dates[0] if recovery_needed else yesterday
     if recovery_needed:
+        # Keep recovery independent from the hot collector's last_sync_at. A
+        # successful today read must not erase yesterday's failed retry intent.
+        patch_target_sync_state(
+            target_uid,
+            status="collecting",
+            synced=False,
+            capability_updates={"recovery_backfill_pending_dates": pending_dates},
+            db=store,
+        )
         try:
             recovery_materials, recovery_request_ids = service.list_plan_materials(
                 aavid,
@@ -1625,6 +1653,8 @@ def collect_target(
         streak_key="product_empty_streak",
     ) if products_refreshed else (False, int(capability.get("product_empty_streak") or 0))
 
+    if datetime.now().strftime("%Y-%m-%d") != start_date:
+        raise RuntimeError("采集期间统计日期已切换，本轮不刷新指标，等待新日期重采")
     cycle_observed_at = _now()
     any_suspicious_empty = bool(material_suspicious or control_suspicious)
     with _ACTIVE_LOCK:
@@ -1674,6 +1704,10 @@ def collect_target(
         "collection_window_end": end_date,
         "collection_scope": "active_video_materials_and_running_scene2_tasks",
         "collection_stage": "healthy",
+        "recovery_backfill_pending_dates": (
+            [value for value in pending_dates if value != recovery_date]
+            if recovery_completed else pending_dates
+        ),
         "account_collection_concurrency": account_concurrency,
         "application_worker_limit": _adaptive_worker_limit(
             COLLECTION_MAX_WORKERS
@@ -1747,14 +1781,6 @@ def collect_target(
         for item in previous_latest_rows
         if str(item.get("material_id") or "")
     }
-    previous_control_rows = store.select(
-        "pmc_roi2_assist_task", where={"target_uid": target_uid}
-    ) or []
-    previous_control_by_task = {
-        str(item.get("assist_task_id") or ""): item
-        for item in previous_control_rows
-        if str(item.get("assist_task_id") or "")
-    }
     recovery_metric_upserts = [
         _metric_snapshot_row(
             recovery_row,
@@ -1769,12 +1795,8 @@ def collect_target(
         material_id = str(row.get("material_id") or "")
         previous_latest = previous_latest_by_material.get(material_id) or {}
         effective_row = dict(row)
-        for field in _METRIC_SNAPSHOT_FIELDS:
-            if (
-                effective_row.get(field) is None
-                and previous_latest.get(field) is not None
-            ):
-                effective_row[field] = previous_latest.get(field)
+        # Missing metrics describe this response, not the previous response.
+        # Preserve NULL for unknown values instead of manufacturing freshness.
         metrics_changed = _metric_values_changed(previous_latest, effective_row)
         latest_row = dict(effective_row)
         latest_row.update(
@@ -1796,23 +1818,9 @@ def collect_target(
             )
     control_upserts: list[dict[str, Any]] = []
     for row in control_rows:
-        task_id = str(row.get("assist_task_id") or "")
         effective_control = dict(row)
-        previous_control = previous_control_by_task.get(task_id) or {}
-        for field in (
-            "stat_cost_for_roi2_assist",
-            "total_pay_order_count_for_roi2_assist",
-            "total_pay_order_gmv_include_coupon_for_roi2_assist",
-            "total_prepay_and_pay_order_roi2_assist",
-            "total_order_settle_amount_for_roi2_1h_assist",
-            "total_prepay_and_pay_settle_roi2_1h_assist",
-            "total_order_settle_count_for_roi2_1h_assist",
-        ):
-            if (
-                effective_control.get(field) is None
-                and previous_control.get(field) is not None
-            ):
-                effective_control[field] = previous_control.get(field)
+        # A fresh task-status observation does not make an omitted metric
+        # fresh. In particular, stop conditions must still see NULL as unknown.
         effective_control["updated_at"] = cycle_observed_at
         control_upserts.append(effective_control)
     with store.transaction() as connection:

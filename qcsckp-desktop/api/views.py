@@ -1658,14 +1658,32 @@ class Api:
         saved = merge_and_save(merged)
         runtime = None
         if QIANCHUAN_BACKEND == "official_api":
+            from services.local_feishu_bridge import invalidate_obsolete_local_stop_tasks
+            from services.qianchuan_session import current_session_owner
+            from services.regulation_rule_runner import request_regulation_rule_evaluation
             from services.qianchuan_open_api.runtime_settings import (
                 enable_execution_for_saved_rules,
             )
+            from utils.log import logger
 
             runtime = enable_execution_for_saved_rules(saved)
+            try:
+                invalidation = invalidate_obsolete_local_stop_tasks(
+                    str(current_session_owner() or ""), saved,
+                )
+                invalidated_cards = int(invalidation.get("count") or 0)
+                invalidation_warning = ""
+            except Exception:
+                invalidated_cards = 0
+                invalidation_warning = "策略已保存，但旧卡状态刷新失败；提交前仍会安全复核"
+                logger.exception("停投策略保存后刷新旧卡状态失败")
+            request_regulation_rule_evaluation("rule_saved")
         out = dict(saved)
         out["success"] = True
         if runtime is not None:
+            out["invalidatedCardCount"] = invalidated_cards
+            if invalidation_warning:
+                out["cardInvalidationWarning"] = invalidation_warning
             out["officialApiWritesEnabled"] = bool(
                 runtime.get("allow_live_api_writes")
             )

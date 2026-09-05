@@ -297,15 +297,16 @@ class OptimizedDashboardQueries:
             ), Enriched AS (
                 SELECT sc.*,base.collected_at AS period_start_time,
                        sc.collected_at AS period_end_time,
-                       ROUND(COALESCE(sc.stat_cost,0)-COALESCE(base.stat_cost,sc.stat_cost,0),2)
+                       CASE WHEN sc.stat_date=base.stat_date
+                            THEN ROUND(sc.stat_cost-base.stat_cost,2) ELSE NULL END
                            AS stat_cost_diff,
                        CASE WHEN totals.total_orders>0 AND goals.roi_goal>0 THEN
-                           (CASE WHEN COALESCE(sc.overall_conversion_rate,0)>1
+                           (CASE WHEN sc.overall_conversion_rate>1
                                  THEN sc.overall_conversion_rate/100.0
-                                 ELSE COALESCE(sc.overall_conversion_rate,0) END)
-                           * (CASE WHEN COALESCE(sc.overall_ctr,0)>1
+                                 ELSE sc.overall_conversion_rate END)
+                           * (CASE WHEN sc.overall_ctr>1
                                    THEN sc.overall_ctr/100.0
-                                   ELSE COALESCE(sc.overall_ctr,0) END)
+                                   ELSE sc.overall_ctr END)
                            * ((totals.total_gmv/totals.total_orders)/goals.roi_goal) * 1000.0
                        ELSE NULL END AS estimated_ecpm
                 FROM Scope sc
@@ -362,19 +363,19 @@ class OptimizedDashboardQueries:
                     "duration": row.get("video_duration"),
                     "createTime": str(row.get("video_create_time") or ""),
                     "currentCost": _optional_float(row.get("stat_cost")),
-                    "costDiff": float(row.get("stat_cost_diff") or 0),
+                    "costDiff": _optional_float(row.get("stat_cost_diff")),
                     "netRoi": _optional_float(row.get("prepay_pay_settle_1h")),
                     "netAmount": _optional_float(row.get("order_settle_amount_1h")),
-                    "hourRefundRate": float(row.get("refund_rate_1h") or 0),
+                    "hourRefundRate": _optional_float(row.get("refund_rate_1h")),
                     "overallPayRoi": _optional_float(row.get("prepay_pay_order_count")),
                     "overallAmount": _optional_float(row.get("pay_gmv_include_coupon")),
-                    "netSettleRate": float(row.get("order_settle_rate_1h") or 0),
+                    "netSettleRate": _optional_float(row.get("order_settle_rate_1h")),
                     "netOrderCount": _optional_int(row.get("order_settle_count_1h")),
-                    "overallOrderCount": int(row.get("overall_order_count") or 0),
-                    "overallShowCount": int(row.get("overall_show_count") or 0),
-                    "overallClickCount": int(row.get("overall_click_count") or 0),
-                    "overallCtr": float(row.get("overall_ctr") or 0),
-                    "overallConversionRate": float(row.get("overall_conversion_rate") or 0),
+                    "overallOrderCount": _optional_int(row.get("overall_order_count")),
+                    "overallShowCount": _optional_int(row.get("overall_show_count")),
+                    "overallClickCount": _optional_int(row.get("overall_click_count")),
+                    "overallCtr": _optional_float(row.get("overall_ctr")),
+                    "overallConversionRate": _optional_float(row.get("overall_conversion_rate")),
                     "estimatedEcpm": (
                         round(float(row.get("estimated_ecpm")), 4)
                         if row.get("estimated_ecpm") is not None
@@ -410,7 +411,7 @@ class OptimizedDashboardQueries:
             "FROM pmc_promotion_material_latest l "
             "INNER JOIN promotion_target t ON t.target_uid=l.target_uid "
             "INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid "
-            f"WHERE {scope_where} ORDER BY COALESCE(l.stat_cost,0) DESC LIMIT 20",
+            f"WHERE {scope_where} ORDER BY l.stat_cost DESC LIMIT 20",
             (owner, *scope_params),
             fetch=True,
         ) or []
@@ -424,7 +425,7 @@ class OptimizedDashboardQueries:
                     "title": str(row.get("video_name") or "未命名"),
                     "accountName": str(row.get("account_name") or ""),
                     "planName": str(row.get("plan_name") or ""),
-                    "currentCost": float(row.get("stat_cost") or 0),
+                    "currentCost": _optional_float(row.get("stat_cost")),
                     "createdAt": str(row.get("collected_at") or ""),
                 }
                 for row in rows
@@ -497,9 +498,9 @@ class OptimizedDashboardQueries:
                     ).timestamp()
                     * 1000
                 ),
-                "cost": float(row.get("stat_cost") or 0),
-                "roi": float(row.get("prepay_pay_order_count") or 0),
-                "amount": float(row.get("pay_gmv_include_coupon") or 0),
+                "cost": _optional_float(row.get("stat_cost")),
+                "roi": _optional_float(row.get("prepay_pay_order_count")),
+                "amount": _optional_float(row.get("pay_gmv_include_coupon")),
             }
             for row in rows
             if row.get("collected_at")
@@ -533,9 +534,9 @@ class OptimizedDashboardQueries:
                     {
                         "time": latest_dt.strftime("%m-%d %H:%M"),
                         "timestamp": int(latest_dt.timestamp() * 1000),
-                        "cost": float(latest.get("stat_cost") or 0),
-                        "roi": float(latest.get("prepay_pay_order_count") or 0),
-                        "amount": float(latest.get("pay_gmv_include_coupon") or 0),
+                        "cost": _optional_float(latest.get("stat_cost")),
+                        "roi": _optional_float(latest.get("prepay_pay_order_count")),
+                        "amount": _optional_float(latest.get("pay_gmv_include_coupon")),
                     }
                 )
         return {"success": True, "data": result, "total": len(result)}
