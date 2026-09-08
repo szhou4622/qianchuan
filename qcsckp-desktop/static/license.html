@@ -100,6 +100,10 @@
                 </div>
                 <p class="hint">软件只需激活码，不需要账号密码。原激活码仅提交给授权服务器，并使用 Windows DPAPI 或 macOS Keychain 加密保存在本机；不会写入浏览器、明文配置或普通日志。</p>
             </form>
+            <div id="runtimeEntryPanel" hidden>
+                <p class="hint">本机授权已通过。当前是主程序启动异常，不需要重新激活、解绑或更换激活码。</p>
+                <button class="contact-link" id="retryEntryButton" type="button">重试进入软件</button>
+            </div>
             <div class="machine-info"><strong>本机机器码：</strong><span id="machineCode">正在读取…</span></div>
             <div class="license-summary" id="licenseSummary"></div>
             <button class="contact-link" id="repairConnectionButton" type="button">诊断并修复连接</button>
@@ -118,6 +122,8 @@
         const input = document.getElementById('activationCode');
         const activateButton = document.getElementById('activateButton');
         const retryButton = document.getElementById('retryButton');
+        const runtimeEntryPanel = document.getElementById('runtimeEntryPanel');
+        const retryEntryButton = document.getElementById('retryEntryButton');
         const repairConnectionButton = document.getElementById('repairConnectionButton');
         const connectionReport = document.getElementById('connectionReport');
         const machineCode = document.getElementById('machineCode');
@@ -153,6 +159,7 @@
             busy = !!value;
             activateButton.disabled = busy;
             retryButton.disabled = busy;
+            retryEntryButton.disabled = busy;
             repairConnectionButton.disabled = busy;
             input.disabled = busy;
             activateButton.textContent = busy ? (label || '处理中…') : '立即激活';
@@ -173,18 +180,40 @@
 
         async function enterApplication(state) {
             showLicenseInfo(state && state.license);
+            form.hidden = true;
+            runtimeEntryPanel.hidden = true;
             setStatus((state && state.message ? state.message : '授权有效') + '，正在进入软件…', 'ok');
-            const entered = await api.enterLicensedApplication();
+            let entered;
+            try {
+                entered = await api.enterLicensedApplication();
+            } catch (cause) {
+                const error = new Error(cause && cause.message ? cause.message : '本地主程序启动失败');
+                error.authorized = !!(state && state.authorized);
+                throw error;
+            }
             if (!entered || !entered.success) {
-                throw new Error((entered && entered.message) || '主程序启动失败');
+                const error = new Error((entered && entered.message) || '主程序启动失败');
+                error.authorized = !!(state && state.authorized) && (!entered || entered.authorized !== false);
+                throw error;
             }
             window.location.replace('index.html');
+        }
+
+        function showEntryError(error, fallback) {
+            const detail = error && error.message ? error.message : fallback;
+            const authorized = !!(error && error.authorized);
+            runtimeEntryPanel.hidden = !authorized;
+            repairConnectionButton.hidden = authorized;
+            form.hidden = authorized;
+            setStatus(authorized ? '授权已通过，但主程序启动失败。无需重新输入激活码。' + detail : detail, 'error');
         }
 
         async function checkAuthorization() {
             if (busy) return;
             setBusy(true, '正在验证…');
             form.hidden = true;
+            runtimeEntryPanel.hidden = true;
+            repairConnectionButton.hidden = false;
             setStatus('正在连接授权服务器验证本机设备…');
             try {
                 api = api || await waitForApi();
@@ -201,8 +230,7 @@
                 form.hidden = false;
                 if (!state.network_error) input.focus();
             } catch (error) {
-                setStatus(error && error.message ? error.message : '授权验证失败，请重试', 'error');
-                form.hidden = false;
+                showEntryError(error, '授权验证失败，请重试');
             } finally {
                 setBusy(false);
             }
@@ -225,12 +253,13 @@
                 }
                 await enterApplication(state);
             } catch (error) {
-                setStatus(error && error.message ? error.message : '激活失败，请重试', 'error');
+                showEntryError(error, '激活失败，请重试');
             } finally {
                 setBusy(false);
             }
         });
         retryButton.addEventListener('click', checkAuthorization);
+        retryEntryButton.addEventListener('click', checkAuthorization);
         repairConnectionButton.addEventListener('click', async () => {
             if (busy) return;
             setBusy(true, '正在检测…');

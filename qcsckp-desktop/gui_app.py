@@ -55,6 +55,25 @@ from services.license_manager import LicenseManager
 from services.runtime_supervisor import RUNTIME_SUPERVISOR
 
 
+def handle_window_loaded(window, generation):
+    """Record local page identity only, never a path, query or license value."""
+    mark_window_ready(generation)
+    state = startup_state()
+    if state["generation"] != generation or state["terminal"] or not state["ready"]:
+        return
+    try:
+        from urllib.parse import unquote, urlsplit
+        from pathlib import PurePosixPath
+        location = urlsplit(str(window.get_current_url() or ""))
+        if location.scheme.lower() != "file" or location.netloc.lower() not in {"", "localhost"}:
+            return
+        name = PurePosixPath(unquote(location.path)).name.casefold()
+        if name in {"license.html", "index.html"}:
+            startup_log("page_loaded=" + name)
+    except Exception as exc:
+        startup_log("page_loaded_read_failed_type=" + type(exc).__name__)
+
+
 def dispatch_window_action(window, action):
     """Defer WinForms calls out of synchronous input/COM event callbacks."""
     def perform():
@@ -778,7 +797,14 @@ class JSApi:
             }
         with self._licensed_runtime_lock:
             if not self._licensed_runtime_started:
-                RUNTIME_SUPERVISOR.start(self)
+                try:
+                    RUNTIME_SUPERVISOR.start(self)
+                except Exception:
+                    import traceback
+                    startup_log("licensed_runtime_start_failed\n" + traceback.format_exc())
+                    self._licensed_runtime_started = False
+                    return {"success": False, "authorized": True, "error": "runtime_start_failed",
+                            "message": "授权通过但后台启动失败，请使用修复版本重试或导出失败报告。"}
                 self._licensed_runtime_started = True
         self._start_license_watchdog()
         return {"success": True, "authorized": True}
@@ -1581,7 +1607,7 @@ def main():
         js_api._window = window
         try:
             generation = startup_state()["generation"]
-            window.events.loaded += lambda: mark_window_ready(generation)
+            window.events.loaded += lambda: handle_window_loaded(window, generation)
         except AttributeError:
             # Old pywebview builds should still be diagnosable.  The watchdog
             # will surface the missing readiness event instead of leaving a

@@ -96,8 +96,10 @@ $usageFile = Join-Path $scriptDir "README-Windows.txt"
 $diagnosticLauncher = Join-Path $scriptDir "QCSCKP-Startup-Diagnostics.cmd"
 $licenseRepairLauncher = Join-Path $scriptDir "QCSCKP-License-Repair.cmd"
 $privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
+$runtimeArchiveVerifier = Join-Path $scriptDir "verify_runtime_archive.py"
+$runtimeManifestSource = Join-Path $projectRoot "services\runtime_supervisor.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $licenseRepairLauncher, $privacyVerifier)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $licenseRepairLauncher, $privacyVerifier, $runtimeArchiveVerifier, $runtimeManifestSource)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
@@ -208,6 +210,13 @@ foreach ($movingPath in @($builtDir, $releaseDir)) {
     }
 }
 Move-Item -LiteralPath $builtDir -Destination $releaseDir
+# Validate the FINAL EXE's embedded PYZ, not the source tree or build TOC.
+# This reads every registry module without importing config or starting workers.
+# Run before runtime downloads and before either SkipArchive success or ZIP.
+& $python -B $runtimeArchiveVerifier (Join-Path $releaseDir "$appName.exe") --manifest $runtimeManifestSource
+if ($LASTEXITCODE -ne 0) {
+    throw "Runtime archive verification failed; this build cannot be released."
+}
 Copy-Item -LiteralPath $usageFile -Destination (Join-Path $releaseDir "README-Windows.txt") -Force
 Copy-Item -LiteralPath $diagnosticLauncher -Destination (Join-Path $releaseDir "QCSCKP-Startup-Diagnostics.cmd") -Force
 Copy-Item -LiteralPath $licenseRepairLauncher -Destination (Join-Path $releaseDir "QCSCKP-License-Repair.cmd") -Force

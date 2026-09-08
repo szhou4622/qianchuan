@@ -2,13 +2,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib
 import threading
 import time
 from typing import Any, Callable, Optional
 
 from config import QIANCHUAN_BACKEND
 from utils.log import logger
+
+# Archive validation reads this literal through AST without importing runtime
+# code. A regression test compares it with the resolved registry below.
+RUNTIME_MODULE_MANIFEST = (
+    "utils.sqlite_prune_scheduler",
+    "services.webhook_push_runtime",
+    "services.local_feishu_bridge",
+    "services.retargeting_rule_runner",
+    "services.retarget_task_worker",
+    "services.operation_log_monitor",
+    "services.operation_daily_report",
+    "services.regulation_rule_runner",
+    "services.official_api_reconciliation",
+    "services.official_api_catalog",
+    "services.official_api_collection",
+)
 
 
 @dataclass(frozen=True)
@@ -18,6 +33,68 @@ class ServiceSpec:
     stop: Callable[[], Any]
     watched: bool = True
     observe: Optional[Callable[[], Any]] = None
+
+
+def _resolve_service_specs(js_api: Any = None, *, backend: Optional[str] = None) -> list[ServiceSpec]:
+    """Resolve lazily without starting anything; static imports are packager-visible."""
+    from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread, stop_sqlite_prune_background_thread
+    from services.webhook_push_runtime import start_webhook_push_background_threads, stop_webhook_push_background_threads
+    from services.local_feishu_bridge import restore_local_feishu_account_from_device_session, deactivate_local_feishu_account
+    from services.retargeting_rule_runner import start_retargeting_rule_runner_background_thread, stop_retargeting_rule_runner_background_thread
+    from services.retarget_task_worker import start_retarget_task_worker_background_thread, stop_retarget_task_worker_background_thread
+    from services.operation_log_monitor import start_platform_log_sync_background_thread, stop_platform_log_sync_background_thread
+    from services import operation_daily_report
+    from services.operation_daily_report import start_operation_daily_report_background_thread, stop_operation_daily_report_background_thread
+    from services.regulation_rule_runner import start_regulation_rule_runner_background_thread, stop_regulation_rule_runner_background_thread
+    from services.official_api_reconciliation import start_official_api_reconciliation_background_thread, stop_official_api_reconciliation_background_thread
+
+    specs = [
+        ServiceSpec("prune", start_sqlite_prune_background_thread, stop_sqlite_prune_background_thread, False),
+        ServiceSpec("webhook", start_webhook_push_background_threads, stop_webhook_push_background_threads, False),
+        ServiceSpec("feishu", restore_local_feishu_account_from_device_session, deactivate_local_feishu_account, False),
+        ServiceSpec("retarget_rules", start_retargeting_rule_runner_background_thread, stop_retargeting_rule_runner_background_thread),
+        ServiceSpec("retarget_tasks", start_retarget_task_worker_background_thread, stop_retarget_task_worker_background_thread),
+        ServiceSpec("operation_logs", start_platform_log_sync_background_thread, stop_platform_log_sync_background_thread),
+        ServiceSpec("daily_report", start_operation_daily_report_background_thread, stop_operation_daily_report_background_thread,
+                    observe=lambda: operation_daily_report.SCHEDULER_THREAD),
+        ServiceSpec("stop_rules", start_regulation_rule_runner_background_thread, stop_regulation_rule_runner_background_thread),
+        ServiceSpec("reconciliation", start_official_api_reconciliation_background_thread, stop_official_api_reconciliation_background_thread),
+    ]
+    if (QIANCHUAN_BACKEND if backend is None else backend) == "official_api":
+        from services.official_api_catalog import start_official_api_catalog_scheduler, stop_official_api_catalog_scheduler
+        from services.official_api_collection import start_official_api_collection_background_thread, stop_official_api_collection_background_thread
+        specs.extend([
+            ServiceSpec("catalog", start_official_api_catalog_scheduler, stop_official_api_catalog_scheduler),
+            ServiceSpec("collection", start_official_api_collection_background_thread, stop_official_api_collection_background_thread),
+        ])
+    else:
+        service = js_api.api.service
+        specs.append(ServiceSpec("catalog", service.start_catalog_scheduler, service.stop_catalog_scheduler))
+    return specs
+
+
+def runtime_component_manifest() -> dict[str, Any]:
+    """Read-only activation dependency check using the exact runtime registry."""
+    specs = _resolve_service_specs(backend="official_api")
+    def describe(callback: Callable, role: str) -> dict[str, Any]:
+        if not callable(callback):
+            raise TypeError(f"后台服务注册回调不可调用：{role}")
+        return {"module": callback.__module__, "function": callback.__name__, "callable": True}
+    services = [{"name": spec.name, "watched": spec.watched,
+                 "start": describe(spec.start, spec.name + ".start"),
+                 "stop": describe(spec.stop, spec.name + ".stop"),
+                 "observe": describe(spec.observe, spec.name + ".observe") if spec.observe is not None else None}
+                for spec in specs]
+    return {
+        "success": True,
+        "backend": "official_api",
+        "expected_modules": list(RUNTIME_MODULE_MANIFEST),
+        "modules": list(dict.fromkeys(item[role]["module"] for item in services for role in ("start", "stop"))),
+        "services": services,
+    }
+
+
+runtime_registry_manifest = runtime_component_manifest
 
 
 class BackgroundRuntimeSupervisor:
@@ -50,32 +127,7 @@ class BackgroundRuntimeSupervisor:
         return bool(method()) if callable(method) else None
 
     def _build_service_specs(self, js_api: Any) -> list[ServiceSpec]:
-        definitions = [
-            ("prune", "utils.sqlite_prune_scheduler", "start_sqlite_prune_background_thread", "stop_sqlite_prune_background_thread", False),
-            ("webhook", "services.webhook_push_runtime", "start_webhook_push_background_threads", "stop_webhook_push_background_threads", False),
-            ("feishu", "services.local_feishu_bridge", "restore_local_feishu_account_from_device_session", "deactivate_local_feishu_account", False),
-            ("retarget_rules", "services.retargeting_rule_runner", "start_retargeting_rule_runner_background_thread", "stop_retargeting_rule_runner_background_thread", True),
-            ("retarget_tasks", "services.retarget_task_worker", "start_retarget_task_worker_background_thread", "stop_retarget_task_worker_background_thread", True),
-            ("operation_logs", "services.operation_log_monitor", "start_platform_log_sync_background_thread", "stop_platform_log_sync_background_thread", True),
-            ("daily_report", "services.operation_daily_report", "start_operation_daily_report_background_thread", "stop_operation_daily_report_background_thread", True),
-            ("stop_rules", "services.regulation_rule_runner", "start_regulation_rule_runner_background_thread", "stop_regulation_rule_runner_background_thread", True),
-            ("reconciliation", "services.official_api_reconciliation", "start_official_api_reconciliation_background_thread", "stop_official_api_reconciliation_background_thread", True),
-        ]
-        if QIANCHUAN_BACKEND == "official_api":
-            definitions.extend([
-                ("catalog", "services.official_api_catalog", "start_official_api_catalog_scheduler", "stop_official_api_catalog_scheduler", True),
-                ("collection", "services.official_api_collection", "start_official_api_collection_background_thread", "stop_official_api_collection_background_thread", True),
-            ])
-        specs = []
-        # Resolve every counterpart before any service can start.
-        for name, module_name, starter, stopper, watched in definitions:
-            module = importlib.import_module(module_name)
-            observe = (lambda module=module: module.SCHEDULER_THREAD) if name == "daily_report" else None
-            specs.append(ServiceSpec(name, getattr(module, starter), getattr(module, stopper), watched, observe))
-        if QIANCHUAN_BACKEND != "official_api":
-            service = js_api.api.service
-            specs.append(ServiceSpec("catalog", service.start_catalog_scheduler, service.stop_catalog_scheduler))
-        return specs
+        return _resolve_service_specs(js_api)
 
     def _stop_children(self) -> list[str]:
         errors = []
