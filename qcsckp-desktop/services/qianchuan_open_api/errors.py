@@ -16,6 +16,8 @@ class OfficialApiError(RuntimeError):
         http_status: Optional[int] = None,
         request_uid: Any = "",
         retry_after: Any = 0,
+        help_message: Any = None,
+        pagination: Any = None,
     ) -> None:
         super().__init__(str(message or "千川官方 API 请求失败"))
         self.code = str(code or "")
@@ -23,6 +25,8 @@ class OfficialApiError(RuntimeError):
         self.endpoint = str(endpoint or "")
         self.http_status = http_status
         self.request_uid = str(request_uid or "")
+        self.help_message = help_message if isinstance(help_message, dict) else {}
+        self.pagination = pagination if isinstance(pagination, dict) else {}
         try:
             self.retry_after = max(0.0, float(retry_after or 0))
         except (TypeError, ValueError):
@@ -38,6 +42,8 @@ class OfficialApiError(RuntimeError):
             "http_status": self.http_status,
             "request_uid": self.request_uid,
             "retry_after": self.retry_after,
+            "help_message": self.help_message,
+            "pagination": self.pagination,
         }
 
 
@@ -67,3 +73,27 @@ class ApiRateLimitError(ApiRequestError):
 
 class ApiWriteOutcomeUnknown(ApiRequestError):
     """POST 已发送但未得到确定响应，调用方只能查询对账，禁止直接重试。"""
+
+
+class CollectionCancelledError(ApiRequestError):
+    pass
+
+
+class CollectionDeadlineExceeded(ApiRequestError):
+    pass
+
+
+class PageAttemptBudgetExceeded(ApiRequestError):
+    pass
+
+
+class PaginationIntegrityError(ApiRequestError):
+    pass
+
+
+class PaginationDriftError(PaginationIntegrityError):
+    pass
+
+
+class ManagedWorkerUnavailable(ApiRequestError):
+    pass

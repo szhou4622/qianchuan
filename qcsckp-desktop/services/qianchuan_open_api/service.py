@@ -294,6 +294,8 @@ class QianchuanOfficialApiService:
         else:
             self.allow_writes = bool(allow_writes)
         self._business_account_cache_lock = threading.Lock()
+        self._business_account_cache_identity: Optional[tuple[str, str, str]] = None
+        self._business_account_cache_epoch = 0
         self._business_account_cache: Optional[
             tuple[float, list[dict[str, Any]], dict[str, Any]]
         ] = None
@@ -370,6 +372,21 @@ class QianchuanOfficialApiService:
     def clear_business_account_cache(self) -> None:
         with self._business_account_cache_lock:
             self._business_account_cache = None
+            self._business_account_cache_identity = None
+            self._business_account_cache_epoch += 1
+
+    def _business_account_identity(self) -> tuple[str, str, str]:
+        provider = getattr(self.client, "token_provider", None)
+        identity_reader = getattr(provider, "get_identity", None)
+        if callable(identity_reader):
+            identity = identity_reader()
+            if isinstance(identity, Mapping):
+                return tuple(str(identity.get(field) or "") for field in (
+                    "owner_username", "app_id", "auth_generation",
+                ))
+        # Narrow injected clients have no persisted credential context.
+        from .token_provider import _current_owner
+        return (_current_owner(), "", "client-" + str(id(self.client)))
 
     def list_business_accounts(
         self,
@@ -383,11 +400,14 @@ class QianchuanOfficialApiService:
         ``shop/advertiser/list`` before any plan or write API is called.
         """
         ttl = max(0.0, float(cache_ttl_seconds or 0))
+        identity = self._business_account_identity()
         with self._business_account_cache_lock:
+            cache_epoch = self._business_account_cache_epoch
             cached = self._business_account_cache
             if (
                 not force_refresh
                 and cached is not None
+                and self._business_account_cache_identity == identity
                 and time.monotonic() - cached[0] <= ttl
             ):
                 return (
@@ -503,12 +523,19 @@ class QianchuanOfficialApiService:
                 # failure must not make the plan catalog itself incomplete.
                 evidence["account_name_error"] = str(exc)
         result = list(resolved.values())
+        if self._business_account_identity() != identity:
+            from .token_provider import AuthorizationContextChanged
+            raise AuthorizationContextChanged()
         with self._business_account_cache_lock:
+            if cache_epoch != self._business_account_cache_epoch:
+                from .token_provider import AuthorizationContextChanged
+                raise AuthorizationContextChanged()
             self._business_account_cache = (
                 time.monotonic(),
                 [dict(item) for item in result],
                 json.loads(json.dumps(evidence, ensure_ascii=False)),
             )
+            self._business_account_cache_identity = identity
         return result, evidence
 
     @staticmethod
@@ -665,9 +692,9 @@ class QianchuanOfficialApiService:
             "fields": list(fields or []),
         }
         if not delivery_only:
-            # Legacy callers keep their existing spend ordering. The active
-            # scanner intentionally uses the API's stable default order so a
-            # changing spend value cannot move rows between parallel pages.
+            # Historical queries retain the documented spend ordering. The
+            # active API default is dynamic impression ordering, NOT a stable
+            # ID snapshot. Pagination must continue checking identity drift.
             query.update(
                 {
                     "order_type": "DESC",
@@ -679,6 +706,7 @@ class QianchuanOfficialApiService:
             query,
             advertiser_id=aid,
             page_size=100,
+            items_key="ad_material_infos",
             parallel_workers=(
                 max(1, min(3, int(parallel_workers or 1)))
                 if delivery_only
@@ -812,6 +840,31 @@ class QianchuanOfficialApiService:
             return None
         return block
 
+    @staticmethod
+    def _report_dimension_value(name: str, block: Any) -> Any:
+        if name != "material_id":
+            return QianchuanOfficialApiService._report_value(block)
+        if not isinstance(block, Mapping):
+            if isinstance(block, bool) or isinstance(block, float):
+                raise ApiRequestError("素材ID没有无损字符串或整数表示", code="client_identifier_precision")
+            text = str(block or "").strip()
+            if not text.isdigit():
+                raise ApiRequestError("素材ID缺失或格式错误", code="client_identifier_precision")
+            return text
+        raw = next((block.get(k) for k in ("Value", "value") if block.get(k) is not None), None)
+        display = next((block.get(k) for k in ("ValueStr", "value_str") if block.get(k) not in (None, "")), None)
+        display = str(display).strip() if display is not None else ""
+        precise = str(raw).strip() if isinstance(raw, (str, int)) and not isinstance(raw, bool) else ""
+        if display.isdigit():
+            if precise.isdigit() and int(precise) != int(display):
+                raise ApiRequestError("素材ID两种表示不一致", code="client_identifier_precision")
+            if isinstance(raw, float) and raw != float(display):
+                raise ApiRequestError("素材ID浮点值与精确字符串不一致", code="client_identifier_precision")
+            return display
+        if precise.isdigit():
+            return precise
+        raise ApiRequestError("素材ID缺少无损表示，未采用浮点舍入值", code="client_identifier_precision")
+
     def list_material_report(
         self,
         advertiser_id: Any,
@@ -893,20 +946,26 @@ class QianchuanOfficialApiService:
             },
             advertiser_id=aid,
             page_size=200,
-            identity_getter=lambda row: self._report_value(
-                (row.get("dimensions") or {}).get("material_id")
-            ),
+            items_key="rows",
+            identity_getter=lambda row: json.dumps([
+                self._report_dimension_value(name, (row.get("dimensions") or {}).get(name))
+                for name in self.REPORT_MATERIAL_DIMENSIONS[(system, scene)]
+            ], ensure_ascii=False, separators=(",", ":")),
             verify_stability=True,
         )
         normalized: list[dict[str, Any]] = []
+        seen_material_ids: set[str] = set()
         for row in rows:
             dimensions = row.get("dimensions") or {}
             raw_metrics = row.get("metrics") or {}
             material_id = text_id(
-                self._report_value(dimensions.get("material_id"))
+                self._report_dimension_value("material_id", dimensions.get("material_id"))
             )
             if not material_id:
                 continue
+            if material_id in seen_material_ids:
+                raise ApiRequestError("同一素材存在多个报表维度行，不能合并为单计划指标", code="client_metric_scope", endpoint=self.REPORT_DATA)
+            seen_material_ids.add(material_id)
             normalized.append(
                 {
                     "material_id": material_id,

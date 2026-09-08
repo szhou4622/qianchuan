@@ -33,11 +33,22 @@ class TrayLifecycleTests(unittest.TestCase):
 
     def test_close_hides_only_after_visible_tray_is_confirmed(self):
         tray = self._tray(ready=True, visible=True)
-
-        self.assertFalse(tray.on_window_closing())
+        with patch("gui_app.dispatch_window_action", return_value=True) as dispatch:
+            self.assertFalse(tray.on_window_closing())
+        dispatch.assert_called_once_with(tray.window, tray.window.hide)
         self.assertFalse(tray.force_close)
+        tray.window.hide.assert_not_called()  # deferred until the UI queue runs
+        dispatch.call_args.args[1]()
         tray.window.hide.assert_called_once()
         tray.icon.stop.assert_not_called()
+
+    def test_failed_hide_dispatch_does_not_trap_the_window_open(self):
+        tray = self._tray(ready=True, visible=True)
+        with patch("gui_app.dispatch_window_action", return_value=False):
+            self.assertTrue(tray.on_window_closing())
+        self.assertTrue(tray.force_close)
+        tray.window.hide.assert_not_called()
+        tray.icon.stop.assert_called_once()
 
 
 class JSApiBridgeTests(unittest.TestCase):

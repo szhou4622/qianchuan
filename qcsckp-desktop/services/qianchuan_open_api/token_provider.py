@@ -10,8 +10,10 @@ import secrets
 import shutil
 import threading
 import time
-from dataclasses import asdict, dataclass
-from typing import Any, Callable, Optional, Protocol
+import tempfile
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Callable, Mapping, Optional, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -22,6 +24,7 @@ from config import (
     QIANCHUAN_OFFICIAL_API_BASE_URL,
 )
 from .errors import ApiTokenError, OfficialApiNotConfigured
+from release_configuration import environment_value
 
 
 QIANCHUAN_OAUTH_PAGE = "https://qianchuan.jinritemai.com/openapi/qc/audit/oauth.html"
@@ -33,6 +36,63 @@ _oauth_browser_errors: dict[str, str] = {}
 _oauth_browser_threads: dict[str, threading.Thread] = {}
 _oauth_browser_cancel: dict[str, threading.Event] = {}
 _token_path_lock = threading.RLock()
+_credential_locks: dict[str, threading.RLock] = {}
+_operation_locks: dict[tuple[str, str], threading.Lock] = {}
+_credential_lock_state = threading.local()
+
+
+class AuthorizationContextChanged(ApiTokenError):
+    def __init__(self) -> None:
+        super().__init__("授权身份已经变化，旧请求结果已丢弃", code="authorization_context_changed")
+
+
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _operation_lock(kind: str, path: str) -> threading.Lock:
+    with _token_path_lock:
+        return _operation_locks.setdefault((kind, _path_key(path)), threading.Lock())
+
+
+@contextmanager
+def credential_file_guard(path: str):
+    """One short cross-thread/process lock for a credential/settings file.
+
+    Network requests and authorization-change callbacks must run outside it.
+    The lock file contains no credentials and is not the replaceable JSON file.
+    """
+    key = _path_key(path)
+    with _token_path_lock:
+        lock = _credential_locks.setdefault(key, threading.RLock())
+    with lock:
+        held = getattr(_credential_lock_state, "paths", set())
+        if key in held:
+            yield
+            return
+        os.makedirs(os.path.dirname(key), exist_ok=True)
+        with open(key + ".lock", "a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                _credential_lock_state.paths = held | {key}
+                yield
+            finally:
+                _credential_lock_state.paths = held
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _current_owner() -> str:
@@ -45,45 +105,56 @@ def _current_owner() -> str:
     return owner or "local_default"
 
 
-def _owner_token_path() -> str:
-    owner = _current_owner()
+def _owner_token_path(owner: Optional[str] = None) -> str:
+    owner = owner or _current_owner()
     digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:24]
     return os.path.join(DATA_DIR, "profiles", digest, "qianchuan_open_api_token.json")
 
 
-def resolve_token_path(path: Optional[str] = None) -> str:
-    """Resolve credentials for the active tool account.
-
-    An explicitly supplied path is kept untouched for tests and recovery tools.
-    The legacy global token is copied once for the first active owner; it is
-    deliberately not deleted so the pre-migration rollback remains complete.
-    """
+def resolve_token_path(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> str:
+    """Resolve once for an owner; claim the legacy file at most once."""
     if path:
         return os.path.abspath(str(path))
-    target = _owner_token_path()
+    owner = str(owner_username or _current_owner()).strip().casefold()
+    target = _owner_token_path(owner)
     if os.path.isfile(target) or not os.path.isfile(QIANCHUAN_API_TOKEN_FILE):
         return target
     marker = os.path.join(DATA_DIR, ".qianchuan_token_migrated_owner")
-    with _token_path_lock:
+    with credential_file_guard(marker):
         if os.path.isfile(target):
             return target
-        migrated_owner = ""
+        if os.path.isfile(marker):
+            # Migration is one-time even for the same owner. An explicit
+            # disconnect must not resurrect the retained rollback copy.
+            return target
         try:
             with open(marker, "r", encoding="utf-8") as handle:
                 migrated_owner = handle.read().strip().casefold()
         except OSError:
-            pass
-        owner = _current_owner()
+            migrated_owner = ""
         if migrated_owner and migrated_owner != owner:
             return target
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copy2(QIANCHUAN_API_TOKEN_FILE, target)
-        marker_tmp = marker + ".tmp"
-        with open(marker_tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(owner)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(marker_tmp, marker)
+        with credential_file_guard(target):
+            if not os.path.isfile(target):
+                fd, temporary = tempfile.mkstemp(prefix="token-migration-", suffix=".tmp",
+                                                 dir=os.path.dirname(target))
+                os.close(fd)
+                try:
+                    shutil.copy2(QIANCHUAN_API_TOKEN_FILE, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            fd, temporary = tempfile.mkstemp(prefix="owner-migration-", suffix=".tmp", dir=DATA_DIR)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(owner)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, marker)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
     return target
 
 
@@ -238,6 +309,9 @@ class AccessTokenBundle:
     oauth_state: str = ""
     oauth_started_at: float = 0.0
     oauth_poll_secret: str = ""
+    owner_username: str = ""
+    auth_generation: str = ""
+    token_revision: str = ""
 
     def usable(
         self, skew_seconds: int = 120, *, allow_non_expiring: bool = False
@@ -250,7 +324,8 @@ class AccessTokenBundle:
 
 
 class TokenProvider(Protocol):
-    def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle: ...
+    def get_token(self, *, force_refresh: bool = False,
+                  rejected_token_revision: Optional[str] = None) -> AccessTokenBundle: ...
 
 
 class InjectedTokenProvider:
@@ -265,7 +340,13 @@ class InjectedTokenProvider:
         self._refresh_callback = refresh_callback
         self._lock = threading.Lock()
 
-    def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
+    def get_identity(self) -> dict[str, str]:
+        return {"owner_username": self._bundle.owner_username or _current_owner(),
+                "app_id": self._bundle.app_id,
+                "auth_generation": self._bundle.auth_generation or "injected-" + str(id(self))}
+
+    def get_token(self, *, force_refresh: bool = False,
+                  rejected_token_revision: Optional[str] = None) -> AccessTokenBundle:
         if self._bundle.usable(allow_non_expiring=True) and not force_refresh:
             return self._bundle
         with self._lock:
@@ -295,39 +376,83 @@ def _unprotect(data: bytes) -> bytes:
     return win32crypt.CryptUnprotectData(data, None, None, None, 0)[1]
 
 
-def save_token_bundle(bundle: AccessTokenBundle, path: Optional[str] = None) -> None:
-    """为后续 OAuth 界面预留；磁盘上只保存 DPAPI 密文。"""
-    payload = json.dumps(asdict(bundle), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    wrapper = {
-        "format": "qcsckp-oceanengine-token-dpapi-v1",
-        "ciphertext": base64.b64encode(_protect(payload)).decode("ascii"),
-    }
-    path = resolve_token_path(path)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    temp = path + ".tmp"
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(wrapper, handle, ensure_ascii=False, separators=(",", ":"))
-    os.replace(temp, path)
+def _authorization_context(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> tuple[str, str]:
+    active_owner = _current_owner()
+    owner = str(owner_username or active_owner).strip().casefold()
+    if owner_username is not None and owner != active_owner:
+        raise AuthorizationContextChanged()
+    return owner, resolve_token_path(path, owner_username=owner)
+
+
+def _assert_current_owner(owner: str) -> None:
+    if _current_owner() != owner:
+        raise AuthorizationContextChanged()
+
+
+def _public_identity(bundle: Optional[AccessTokenBundle], owner: str) -> dict[str, str]:
+    if bundle and bundle.owner_username and bundle.owner_username != owner:
+        raise AuthorizationContextChanged()
+    return {"owner_username": owner, "app_id": bundle.app_id if bundle else "",
+            "auth_generation": bundle.auth_generation if bundle else "unconfigured"}
+
+
+def _save_token_bundle_locked(bundle: AccessTokenBundle, path: str, owner: str) -> AccessTokenBundle:
+    committed = replace(bundle, owner_username=owner,
+                        auth_generation=bundle.auth_generation or secrets.token_hex(16),
+                        token_revision=secrets.token_hex(16))
+    plain = json.dumps(asdict(committed), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    wrapper = {"format": "qcsckp-oceanengine-token-dpapi-v1",
+               "ciphertext": base64.b64encode(_protect(plain)).decode("ascii")}
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(wrapper, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return committed
+
+
+def save_token_bundle(bundle: AccessTokenBundle, path: Optional[str] = None, *, owner_username: Optional[str] = None) -> None:
+    """Compatibility writer; all writes use the same fixed-path file lock."""
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    with credential_file_guard(target):
+        _assert_current_owner(owner)
+        _public_identity(bundle, owner)
+        if bundle.token_revision and not _same_revision(bundle, _load_saved_bundle(target)):
+            raise AuthorizationContextChanged()
+        _save_token_bundle_locked(bundle, target, owner)
 
 
 def _load_saved_bundle(path: Optional[str] = None) -> Optional[AccessTokenBundle]:
+    # Replacing the complete JSON is atomic. Callers doing a read/modify/write
+    # or compare-and-swap additionally hold credential_file_guard.
     path = resolve_token_path(path)
     if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8-sig") as handle:
             wrapper = json.load(handle)
-        plain = _unprotect(base64.b64decode(str(wrapper.get("ciphertext") or "")))
+        ciphertext = str(wrapper.get("ciphertext") or "")
+        plain = _unprotect(base64.b64decode(ciphertext))
         data = json.loads(plain.decode("utf-8"))
+        legacy_revision = "legacy-" + hashlib.sha256(ciphertext.encode("ascii")).hexdigest()[:32]
         return AccessTokenBundle(
             access_token=str(data.get("access_token") or ""),
             refresh_token=str(data.get("refresh_token") or ""),
-            app_id=str(data.get("app_id") or ""),
-            app_secret=str(data.get("app_secret") or ""),
+            app_id=str(data.get("app_id") or ""), app_secret=str(data.get("app_secret") or ""),
             expires_at=float(data.get("expires_at") or 0),
             oauth_state=str(data.get("oauth_state") or ""),
             oauth_started_at=float(data.get("oauth_started_at") or 0),
             oauth_poll_secret=str(data.get("oauth_poll_secret") or ""),
+            owner_username=str(data.get("owner_username") or ""),
+            auth_generation=str(data.get("auth_generation") or legacy_revision),
+            token_revision=str(data.get("token_revision") or legacy_revision),
         )
     except OfficialApiNotConfigured:
         raise
@@ -335,14 +460,64 @@ def _load_saved_bundle(path: Optional[str] = None) -> Optional[AccessTokenBundle
         raise ApiTokenError("本机千川 Open API 令牌无法解密，请重新授权") from exc
 
 
+def _same_revision(left: Optional[AccessTokenBundle], right: Optional[AccessTokenBundle]) -> bool:
+    return bool(left and right and left.token_revision == right.token_revision
+                and left.auth_generation == right.auth_generation and left.app_id == right.app_id)
+
+
+def get_authorization_identity(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> dict[str, str]:
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    bundle = _load_saved_bundle(target)
+    _assert_current_owner(owner)
+    if bundle is None and path is None:
+        token = str(environment_value("QCSCKP_OE_ACCESS_TOKEN") or "").strip()
+        if token:
+            return {"owner_username": owner, "app_id": "",
+                    "auth_generation": "development-" + hashlib.sha256(token.encode()).hexdigest()[:32]}
+    return _public_identity(bundle, owner)
+
+
+@contextmanager
+def authorization_identity_guard(expected: Mapping[str, Any], path: Optional[str] = None):
+    """Keep the non-secret authorization generation stable during a DB commit.
+
+    Acquire before committing a local snapshot. No callbacks/network under
+    this guard; authorization-change callbacks always run after releasing it.
+    """
+    owner = str(expected.get("owner_username") or "").strip().casefold()
+    _assert_current_owner(owner)
+    target = resolve_token_path(path, owner_username=owner)
+    with credential_file_guard(target):
+        _assert_current_owner(owner)
+        bundle = _load_saved_bundle(target)
+        current = _public_identity(bundle, owner)
+        if bundle is None and path is None:
+            token = str(environment_value("QCSCKP_OE_ACCESS_TOKEN") or "").strip()
+            if token:
+                current["auth_generation"] = "development-" + hashlib.sha256(token.encode()).hexdigest()[:32]
+        if current != {field: str(expected.get(field) or "") for field in current}:
+            raise AuthorizationContextChanged()
+        yield
+
+
+def authorization_identity_is_current(expected: Mapping[str, Any], path: Optional[str] = None) -> bool:
+    try:
+        with authorization_identity_guard(expected, path):
+            return True
+    except (ApiTokenError, OfficialApiNotConfigured):
+        return False
+
+
 class DpapiTokenProvider:
     def __init__(self, path: Optional[str] = None) -> None:
         self._explicit_path = path
-        self._lock = threading.Lock()
 
     @property
     def path(self) -> str:
         return resolve_token_path(self._explicit_path)
+
+    def get_identity(self) -> dict[str, str]:
+        return get_authorization_identity(self._explicit_path)
 
     def _refresh(self, bundle: AccessTokenBundle) -> AccessTokenBundle:
         if not bundle.refresh_token or not bundle.app_id or not bundle.app_secret:
@@ -374,7 +549,8 @@ class DpapiTokenProvider:
             )
         data = result.get("data") if isinstance(result.get("data"), dict) else result
         expires_in = float(data.get("expires_in") or 0)
-        refreshed = AccessTokenBundle(
+        refreshed = replace(
+            bundle,
             access_token=str(data.get("access_token") or ""),
             refresh_token=str(data.get("refresh_token") or bundle.refresh_token),
             app_id=bundle.app_id,
@@ -386,33 +562,66 @@ class DpapiTokenProvider:
         )
         if not refreshed.access_token:
             raise ApiTokenError("千川 Open API 刷新响应缺少 access_token")
-        save_token_bundle(refreshed, self.path)
         return refreshed
 
-    def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
-        with self._lock:
-            bundle = _load_saved_bundle(self.path)
-            if not bundle:
-                raise OfficialApiNotConfigured(
-                    "千川官方 API 尚未配置；请先在千川账户管理页面保存 App ID、App Secret 并完成官方授权"
-                )
-            if bundle.usable() and not force_refresh:
-                return bundle
-            return self._refresh(bundle)
+    def get_token(self, *, force_refresh: bool = False,
+                  rejected_token_revision: Optional[str] = None) -> AccessTokenBundle:
+        owner, target = _authorization_context(self._explicit_path)
+        observed = _load_saved_bundle(target)
+        observed_revision = rejected_token_revision or (observed.token_revision if observed else "")
+        # All providers for this file coalesce refreshes, while user credential
+        # edits remain possible during HTTP. Every returned result uses CAS.
+        with _operation_lock("refresh", target):
+            with credential_file_guard(target):
+                _assert_current_owner(owner)
+                bundle = _load_saved_bundle(target)
+                if bundle is None:
+                    raise OfficialApiNotConfigured("千川官方 API 尚未配置，请保存应用并完成授权")
+                _public_identity(bundle, owner)
+                if bundle.usable() and (not force_refresh or bundle.token_revision != observed_revision):
+                    return replace(bundle, owner_username=owner)
+                if bundle.oauth_state and time.time() - bundle.oauth_started_at <= 10 * 60:
+                    raise ApiTokenError("千川官方授权正在进行，请等待授权完成", code="authorization_pending")
+            try:
+                refreshed = self._refresh(bundle)
+            except ApiTokenError:
+                with credential_file_guard(target):
+                    current = _load_saved_bundle(target)
+                    _assert_current_owner(owner)
+                    if not _same_revision(bundle, current):
+                        if current and current.usable():
+                            return replace(current, owner_username=owner)
+                        raise AuthorizationContextChanged() from None
+                raise
+            with credential_file_guard(target):
+                current = _load_saved_bundle(target)
+                if not _same_revision(bundle, current):
+                    _assert_current_owner(owner)
+                    if current and current.usable():
+                        return replace(current, owner_username=owner)
+                    raise AuthorizationContextChanged()
+                # Finish only the file/identity that initiated this refresh.
+                # A later tool-account switch cannot redirect the write to B.
+                committed = _save_token_bundle_locked(refreshed, target, owner)
+            _assert_current_owner(owner)
+            return committed
 
 
 class EnvironmentTokenProvider:
     """仅供开发联调；环境变量不会写入日志或数据库。"""
 
-    def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
-        token = str(os.getenv("QCSCKP_OE_ACCESS_TOKEN") or "").strip()
+    def get_token(self, *, force_refresh: bool = False,
+                  rejected_token_revision: Optional[str] = None) -> AccessTokenBundle:
+        token = str(environment_value("QCSCKP_OE_ACCESS_TOKEN") or "").strip()
         if not token:
             raise OfficialApiNotConfigured("未注入 QCSCKP_OE_ACCESS_TOKEN")
         try:
-            expires_at = float(os.getenv("QCSCKP_OE_EXPIRES_AT") or 0)
+            expires_at = float(environment_value("QCSCKP_OE_EXPIRES_AT") or 0)
         except ValueError:
             expires_at = 0
-        bundle = AccessTokenBundle(access_token=token, expires_at=expires_at)
+        bundle = AccessTokenBundle(access_token=token, expires_at=expires_at,
+                                   owner_username=_current_owner(),
+                                   auth_generation="development-" + hashlib.sha256(token.encode()).hexdigest()[:32])
         if force_refresh or not bundle.usable():
             raise ApiTokenError("开发注入的千川 access_token 已失效，请重新注入")
         return bundle
@@ -423,107 +632,90 @@ class DefaultTokenProvider:
         self._env = EnvironmentTokenProvider()
         self._dpapi = DpapiTokenProvider()
 
-    def get_token(self, *, force_refresh: bool = False) -> AccessTokenBundle:
+    def get_identity(self) -> dict[str, str]:
+        return get_authorization_identity(self._dpapi._explicit_path)
+
+    def get_token(self, *, force_refresh: bool = False, rejected_token_revision: Optional[str] = None) -> AccessTokenBundle:
         # 用户在页面保存的 DPAPI 配置始终优先。环境变量只是未配置
         # 本机文件时的开发联调后备，避免用户授权后仍读到旧令牌。
         if os.path.isfile(self._dpapi.path):
-            return self._dpapi.get_token(force_refresh=force_refresh)
-        if str(os.getenv("QCSCKP_OE_ACCESS_TOKEN") or "").strip():
+            return self._dpapi.get_token(force_refresh=force_refresh, rejected_token_revision=rejected_token_revision)
+        if str(environment_value("QCSCKP_OE_ACCESS_TOKEN") or "").strip():
             return self._env.get_token(force_refresh=force_refresh)
-        return self._dpapi.get_token(force_refresh=force_refresh)
+        return self._dpapi.get_token(force_refresh=force_refresh, rejected_token_revision=rejected_token_revision)
 
 
-def api_configuration_status(path: Optional[str] = None) -> dict[str, Any]:
-    """返回可向前端展示的脱敏状态，绝不返回 secret 或 token。"""
-    try:
-        bundle = _load_saved_bundle(path)
-    except ApiTokenError:
-        # DPAPI 密文只能由创建它的 Windows 用户解密。测试包若曾被连同
-        # data 目录复制到另一台电脑，状态查询必须退回可重新配置状态，
-        # 不能因为旧密文不可读而永久锁死“保存并授权”入口。
-        return {
-            "configured": False,
-            "authorized": False,
-            "app_id": "",
-            "app_secret_saved": False,
-            "authorization_pending": False,
-            "expires_at": 0,
-            "oauth_callback_url": "",
-            "oauth_capture_mode": "browser_navigation",
-            "oauth_callback_managed_by_platform": True,
-            "requires_reentry": True,
-            "configuration_error": "unreadable_local_encryption",
-        }
-    if bundle is None:
-        return {
-            "configured": False,
-            "authorized": False,
-            "app_id": "",
-            "app_secret_saved": False,
-            "authorization_pending": False,
-            "expires_at": 0,
-            "oauth_callback_url": "",
-            "oauth_capture_mode": "browser_navigation",
-            "oauth_callback_managed_by_platform": True,
-            "requires_reentry": False,
-            "configuration_error": "",
-        }
+def _configuration_status(bundle: Optional[AccessTokenBundle], owner: str, *, unreadable: bool = False) -> dict[str, Any]:
     return {
-        "configured": bool(bundle.app_id and bundle.app_secret),
-        "authorized": bool(bundle.usable()),
-        "app_id": bundle.app_id,
-        "app_secret_saved": bool(bundle.app_secret),
-        "authorization_pending": bool(
-            bundle.oauth_state
-            and bundle.oauth_started_at
-            and time.time() - bundle.oauth_started_at <= 10 * 60
-        ),
-        "expires_at": bundle.expires_at,
-        "oauth_callback_url": "",
-        "oauth_capture_mode": "browser_navigation",
+        "configured": bool(bundle and bundle.app_id and bundle.app_secret),
+        "authorized": bool(bundle and bundle.usable()),
+        "app_id": bundle.app_id if bundle else "",
+        "app_secret_saved": bool(bundle and bundle.app_secret),
+        "authorization_pending": bool(bundle and bundle.oauth_state and bundle.oauth_started_at
+                                      and time.time() - bundle.oauth_started_at <= 10 * 60),
+        "expires_at": bundle.expires_at if bundle else 0,
+        "oauth_callback_url": "", "oauth_capture_mode": "browser_navigation",
         "oauth_callback_managed_by_platform": True,
-        "requires_reentry": False,
-        "configuration_error": "",
+        "requires_reentry": unreadable,
+        "configuration_error": "unreadable_local_encryption" if unreadable else "",
+        "authorization_identity": _public_identity(bundle, owner),
     }
 
 
-def save_api_credentials(
-    app_id: Any,
-    app_secret: Any,
-    path: Optional[str] = None,
-) -> dict[str, Any]:
-    path = resolve_token_path(path)
+def api_configuration_status(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> dict[str, Any]:
+    """Public metadata only: never return a token, secret or credential path."""
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    try:
+        bundle = _load_saved_bundle(target)
+        _assert_current_owner(owner)
+        return _configuration_status(bundle, owner)
+    except AuthorizationContextChanged:
+        raise
+    except ApiTokenError:
+        return _configuration_status(None, owner, unreadable=True)
+
+
+def save_api_credentials(app_id: Any, app_secret: Any, path: Optional[str] = None, *, owner_username: Optional[str] = None) -> dict[str, Any]:
+    owner, target = _authorization_context(path, owner_username=owner_username)
     aid = str(app_id or "").strip()
     secret = str(app_secret or "").strip()
     if not aid.isdigit() or len(aid) < 6:
         raise ValueError("App ID 格式不正确")
-    try:
-        existing = _load_saved_bundle(path)
-    except ApiTokenError:
-        # 用户明确输入了新的 Secret 时，允许覆盖从另一台电脑复制过来、
-        # 当前 Windows 用户无法解密的 DPAPI 文件。否则用户会永远卡在
-        # “配置读取失败”，连重新配置的入口也无法使用。
-        if not secret:
-            raise
-        existing = None
-    if not secret and existing and existing.app_id == aid:
-        secret = existing.app_secret
-    if len(secret) < 6:
-        raise ValueError("请输入 App Secret")
-    same_credentials = bool(
-        existing and existing.app_id == aid and existing.app_secret == secret
-    )
-    save_token_bundle(
-        AccessTokenBundle(
-            access_token=existing.access_token if same_credentials else "",
-            refresh_token=existing.refresh_token if same_credentials else "",
-            app_id=aid,
-            app_secret=secret,
-            expires_at=existing.expires_at if same_credentials else 0,
-        ),
-        path,
-    )
-    return api_configuration_status(path)
+    with credential_file_guard(target):
+        _assert_current_owner(owner)
+        try:
+            existing = _load_saved_bundle(target)
+            if existing and existing.owner_username and existing.owner_username != owner:
+                if not secret:
+                    raise AuthorizationContextChanged()
+                existing = None
+        except ApiTokenError:
+            if not secret:
+                raise
+            existing = None
+        if not secret and existing and existing.app_id == aid:
+            secret = existing.app_secret
+        if len(secret) < 6:
+            raise ValueError("请输入 App Secret")
+        same = bool(existing and existing.app_id == aid and existing.app_secret == secret)
+        previous = _public_identity(existing, owner)
+        if same:
+            # Re-saving identical credentials is not a new grant and must not
+            # clear pending OAuth state or invalidate its in-flight code swap.
+            return {**_configuration_status(existing, owner),
+                    "previous_authorization_identity": previous,
+                    "authorization_changed": False, "authorization_event": "credentials_saved"}
+        committed = _save_token_bundle_locked(AccessTokenBundle(
+            access_token=existing.access_token if same else "",
+            refresh_token=existing.refresh_token if same else "",
+            app_id=aid, app_secret=secret, expires_at=existing.expires_at if same else 0,
+            auth_generation=existing.auth_generation if same else secrets.token_hex(16),
+        ), target, owner)
+        identity = _public_identity(committed, owner)
+        return {**_configuration_status(committed, owner),
+                "previous_authorization_identity": previous,
+                "authorization_changed": previous != identity,
+                "authorization_event": "credentials_saved"}
 
 
 def _relay_json_request(
@@ -574,12 +766,16 @@ def _relay_json_request(
 def begin_api_authorization(
     path: Optional[str] = None,
     *,
+    owner_username: Optional[str] = None,
     relay_request: Optional[
         Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
     ] = None,
 ) -> dict[str, Any]:
-    path = resolve_token_path(path)
-    bundle = _load_saved_bundle(path)
+    owner, path = _authorization_context(path, owner_username=owner_username)
+    with credential_file_guard(path):
+        _assert_current_owner(owner)
+        bundle = _load_saved_bundle(path)
+        _public_identity(bundle, owner)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     state = secrets.token_urlsafe(24)
@@ -594,38 +790,35 @@ def begin_api_authorization(
         )
         if status not in {200, 201} or not relay.get("success"):
             raise ApiTokenError(str(relay.get("message") or "创建千川授权会话失败"))
-    save_token_bundle(
-        AccessTokenBundle(
-            access_token=bundle.access_token,
-            refresh_token=bundle.refresh_token,
-            app_id=bundle.app_id,
-            app_secret=bundle.app_secret,
-            expires_at=bundle.expires_at,
-            oauth_state=state,
-            oauth_started_at=started,
-            oauth_poll_secret=poll_secret,
-        ),
-        path,
-    )
+    with credential_file_guard(path):
+        _assert_current_owner(owner)
+        if not _same_revision(bundle, _load_saved_bundle(path)):
+            raise AuthorizationContextChanged()
+        committed = _save_token_bundle_locked(replace(
+            bundle, oauth_state=state, oauth_started_at=started, oauth_poll_secret=poll_secret,
+        ), path, owner)
     return {
         "url": QIANCHUAN_OAUTH_PAGE
         + "?"
         + urlencode({"app_id": bundle.app_id, "state": state, "material_auth": "1"}),
         "started_at": started,
         "state": state,
+        "authorization_identity": _public_identity(committed, owner),
     }
 
 
 def poll_api_authorization(
     path: Optional[str] = None,
     *,
+    owner_username: Optional[str] = None,
     relay_request: Optional[
         Callable[[str, dict[str, Any]], tuple[int, dict[str, Any]]]
     ] = None,
 ) -> dict[str, Any]:
     """领取授权浏览器捕获的一次性授权码，并使用本机密钥换取令牌。"""
-    path = resolve_token_path(path)
+    owner, path = _authorization_context(path, owner_username=owner_username)
     bundle = _load_saved_bundle(path)
+    _public_identity(bundle, owner)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     if (
@@ -659,16 +852,23 @@ def poll_api_authorization(
         callback = _peek_oauth_browser_callback(bundle.oauth_state)
         if not callback:
             return {"completed": False, "authorized": False}
-    exchange_authorization_code(callback, path)
+    _assert_current_owner(owner)
+    exchange_authorization_code(callback, path, owner_username=owner)
     _discard_oauth_browser_callback(bundle.oauth_state)
     return {"completed": True, "authorized": True}
 
 
-def exchange_authorization_code(
+def exchange_authorization_code(authorization_callback: Any, path: Optional[str] = None, *, owner_username: Optional[str] = None) -> AccessTokenBundle:
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    with _operation_lock("exchange", target):
+        return _exchange_authorization_code_locked(authorization_callback, target, owner)
+
+
+def _exchange_authorization_code_locked(
     authorization_callback: Any,
-    path: Optional[str] = None,
+    path: str,
+    owner: str,
 ) -> AccessTokenBundle:
-    path = resolve_token_path(path)
     callback = str(authorization_callback or "").strip()
     query = urlparse(callback).query if "://" in callback else callback.lstrip("?")
     params = parse_qs(query, keep_blank_values=True)
@@ -676,7 +876,10 @@ def exchange_authorization_code(
     returned_state = str((params.get("state") or [""])[0]).strip()
     if not code or len(code) < 6 or not returned_state:
         raise ValueError("授权回调缺少 auth_code 或 state")
-    bundle = _load_saved_bundle(path)
+    with credential_file_guard(path):
+        _assert_current_owner(owner)
+        bundle = _load_saved_bundle(path)
+        _public_identity(bundle, owner)
     if not bundle or not bundle.app_id or not bundle.app_secret:
         raise OfficialApiNotConfigured("请先保存 App ID 和 App Secret")
     if (
@@ -704,7 +907,15 @@ def exchange_authorization_code(
         with urlopen(request, timeout=30) as response:
             result = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
+        with credential_file_guard(path):
+            _assert_current_owner(owner)
+            if not _same_revision(bundle, _load_saved_bundle(path)):
+                raise AuthorizationContextChanged() from None
         raise ApiTokenError("千川 Open API 授权码交换失败") from exc
+    with credential_file_guard(path):
+        _assert_current_owner(owner)
+        if not _same_revision(bundle, _load_saved_bundle(path)):
+            raise AuthorizationContextChanged()
     if str(result.get("code") or "0") not in {"", "0"}:
         raise ApiTokenError(
             str(result.get("message") or "千川 Open API 授权失败"),
@@ -719,38 +930,37 @@ def exchange_authorization_code(
         app_id=bundle.app_id,
         app_secret=bundle.app_secret,
         expires_at=time.time() + expires_in if expires_in else 0,
+        auth_generation=secrets.token_hex(16),
     )
     if not authorized.access_token or not authorized.refresh_token:
         raise ApiTokenError("千川 Open API 授权响应缺少令牌")
-    save_token_bundle(authorized, path)
-    return authorized
+    with credential_file_guard(path):
+        _assert_current_owner(owner)
+        if not _same_revision(bundle, _load_saved_bundle(path)):
+            raise AuthorizationContextChanged()
+        return _save_token_bundle_locked(authorized, path, owner)
 
 
-def clear_api_configuration(path: Optional[str] = None) -> None:
-    path = resolve_token_path(path)
-    if os.path.isfile(path):
-        os.remove(path)
+def clear_api_configuration(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> None:
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    with credential_file_guard(target):
+        _assert_current_owner(owner)
+        if os.path.isfile(target):
+            os.remove(target)
 
 
-def clear_api_tokens_keep_credentials(path: Optional[str] = None) -> None:
-    """Invalidate cached OceanEngine tokens without deleting App credentials."""
-    path = resolve_token_path(path)
-    bundle = _load_saved_bundle(path)
-    if bundle is None:
-        return
-    save_token_bundle(
-        AccessTokenBundle(
-            access_token="",
-            refresh_token="",
-            app_id=bundle.app_id,
-            app_secret=bundle.app_secret,
-            expires_at=0,
-            oauth_state="",
-            oauth_started_at=0,
-            oauth_poll_secret="",
-        ),
-        path,
-    )
+def clear_api_tokens_keep_credentials(path: Optional[str] = None, *, owner_username: Optional[str] = None) -> None:
+    owner, target = _authorization_context(path, owner_username=owner_username)
+    with credential_file_guard(target):
+        _assert_current_owner(owner)
+        bundle = _load_saved_bundle(target)
+        _public_identity(bundle, owner)
+        if bundle is None:
+            return
+        _save_token_bundle_locked(AccessTokenBundle(
+            access_token="", app_id=bundle.app_id, app_secret=bundle.app_secret,
+            auth_generation=secrets.token_hex(16),
+        ), target, owner)
 
 
 _DEFAULT_PROVIDER: Optional[DefaultTokenProvider] = None

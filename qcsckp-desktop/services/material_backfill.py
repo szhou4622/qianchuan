@@ -236,7 +236,8 @@ def _read_one_date(job: dict, target: dict, *, db: SQLiteStore) -> dict[str, Any
             day, entry = min(due, key=lambda item: (item[1].get("next_attempt_at", ""), item[0]))
             entry.update(status="running", attempts=int(entry.get("attempts") or 0) + 1)
             selected.update(day=day, **entry)
-    states = _mutate(db, uid, claim)
+    with collection.owned_transaction(db, target) as connection:
+        states = _mutate(db, uid, claim, connection=connection)
     if not selected:
         return {"success": True, "next_due_at": _next_due(states), "job_idle": not _next_due(states)}
     day = selected["day"]
@@ -254,12 +255,9 @@ def _read_one_date(job: dict, target: dict, *, db: SQLiteStore) -> dict[str, Any
         materials, request_ids = service.list_plan_materials(
             target["aadvid"], target["ad_id"], start_date=day, end_date=day,
             fields=metrics, delivery_only=False, parallel_workers=1)
-        reports, report_ids = service.list_material_report(
-            target["aadvid"], plan_system=target["plan_system"],
-            promotion_scene=target["promotion_scene"], start_date=day, end_date=day,
-            metrics=metrics, filter_context=capability.get("material_report_filter_context") or {})
-        request_ids = [*request_ids, *report_ids]
-        for material in collection._merge_material_report(materials, reports):
+        # Historical plan snapshots use the same ad-scoped source as hot reads.
+        # Do not fill holes using account-wide report totals.
+        for material in collection._merge_material_report(materials, ()):
             if not str(material.get("material_id") or ""):
                 continue
             row = collection._material_snapshot(material, target=target, units=units,
@@ -292,8 +290,7 @@ def _read_one_date(job: dict, target: dict, *, db: SQLiteStore) -> dict[str, Any
             entry.update(last_success_at=observed_at, rows=len(rows))
         states[day] = entry
 
-    with db.transaction() as connection:
-        db.execute("BEGIN IMMEDIATE", connection=connection)
+    with collection.owned_transaction(db, target) as connection:
         lease = db.select_one("collection_job", where={"id": job["id"]}, connection=connection) or {}
         current_target = db.select_one("promotion_target", where={"target_uid": uid}, connection=connection) or {}
         current_account = db.select_one("qianchuan_account", where={"account_uid": current_target.get("account_uid")},

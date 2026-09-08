@@ -1165,12 +1165,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             result = collect_target(target, db=store)
         self.assertTrue(result["success"])
         self.assertEqual(1, service.list_plan_materials.call_count)
-        self.assertEqual(1, service.list_material_report.call_count)
-        for call in service.list_material_report.call_args_list:
-            self.assertEqual(
-                report_filter_context,
-                call.kwargs["filter_context"],
-            )
+        service.list_material_report.assert_not_called()
         state = patch_state.call_args.kwargs["capability_updates"]
         self.assertTrue(state["material_sync_complete"])
         self.assertNotIn("material_backfill_state", state)
@@ -1848,7 +1843,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             )["aggregate_smart_bid_type"],
         )
 
-    def test_authoritative_report_metrics_override_zero_material_list_metrics(self):
+    def test_account_report_cannot_override_plan_scoped_zero_or_missing_metrics(self):
         merged = _merge_material_report(
             [
                 {
@@ -1867,11 +1862,8 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(3820.15, merged[0]["stats_info"]["stat_cost_for_roi2"])
-        self.assertEqual(
-            6.49,
-            merged[0]["stats_info"]["total_prepay_and_pay_order_roi2"],
-        )
+        self.assertEqual(0, merged[0]["stats_info"]["stat_cost_for_roi2"])
+        self.assertNotIn("total_prepay_and_pay_order_roi2", merged[0]["stats_info"])
 
     def test_ten_thousand_rows_keep_only_active_passed_materials(self):
         class _LargeMaterialClient(_CaptureClient):
@@ -2020,7 +2012,7 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         max_active = 0
         lock = threading.Lock()
 
-        def collect_one(target, *, db, interval_seconds):
+        def collect_one(target, *, db, interval_seconds, independent_controls=False):
             nonlocal active, max_active
             with lock:
                 active += 1
@@ -3370,7 +3362,8 @@ class OfficialApiBackendTests(unittest.TestCase):
             self.assertTrue(result["completed"])
             peek.assert_called_once_with("state-from-bundle")
             exchange.assert_called_once_with(
-                "auth_code=one-time-code&state=state-from-bundle", path
+                "auth_code=one-time-code&state=state-from-bundle", path,
+                owner_username=bundle.owner_username,
             )
             discard.assert_called_once_with("state-from-bundle")
 
@@ -4284,7 +4277,7 @@ class OfficialApiBackendTests(unittest.TestCase):
                 identity_getter=lambda row: row.get("id"),
             )
 
-    def test_parallel_pagination_rejects_dynamic_first_page(self):
+    def test_parallel_pagination_rescans_once_after_first_page_changes(self):
         class _DynamicClient(QianchuanOpenApiClient):
             def __init__(self):
                 super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
@@ -4306,8 +4299,29 @@ class OfficialApiBackendTests(unittest.TestCase):
                     request_id=f"r{page}-{self.page_one_calls}",
                 )
 
+        client = _DynamicClient()
+        rows, _ = client.get_all_pages(
+            "/open_api/v1.0/test/", {}, page_size=1, parallel_workers=2,
+            identity_getter=lambda row: row.get("id"), verify_stability=True,
+        )
+        self.assertEqual([row["id"] for row in rows], ["9", "2"])
+        self.assertEqual(client.page_one_calls, 4)
+
+    def test_parallel_pagination_rejects_first_page_changing_after_rescan(self):
+        class _AlwaysChangingClient(QianchuanOpenApiClient):
+            def __init__(self):
+                super().__init__(InjectedTokenProvider(AccessTokenBundle("token")))
+                self.page_one_calls = 0
+
+            def get(self, endpoint, query=None, *, advertiser_id=""):
+                page = int((query or {}).get("page") or 1)
+                if page == 1:
+                    self.page_one_calls += 1
+                return ApiResponse(data={"list": [{"id": f"first-{self.page_one_calls}" if page == 1 else "2"}],
+                    "page_info": {"total_page": 2, "total_number": 2}}, raw={}, request_id=f"r{page}")
+
         with self.assertRaisesRegex(ApiRequestError, "排序发生变化"):
-            _DynamicClient().get_all_pages(
+            _AlwaysChangingClient().get_all_pages(
                 "/open_api/v1.0/test/",
                 {},
                 page_size=1,

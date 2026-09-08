@@ -159,8 +159,10 @@ class MaterialBackfillTests(RecoveryFixture):
             stop_flag[0] = True
             return {"results": [{"target_uid": self.uid, "success": True}]}
         with patch.object(collection, "_STOP", stop), patch.object(collection, "_WAKE"), patch.object(
-            collection, "ThreadPoolExecutor", return_value=executor
+            collection, "_BACKFILL_WORKERS", executor
         ), patch.object(collection, "SQLiteStore", return_value=self.db), patch.object(
+            collection, "_new_collection_context", return_value=MagicMock()
+        ), patch.object(collection.collection_lifecycle, "resource_pressure", return_value={"critical": False}), patch.object(
             collection, "_take_pending_targets", return_value=set()
         ), patch.object(collection, "schedulable_promotion_targets", return_value=[self.target]), patch.object(
             collection, "_target_is_due", return_value=True
@@ -254,7 +256,7 @@ class MaterialBackfillTests(RecoveryFixture):
         def reports(*args, **kwargs):
             self.db.update("collection_job", {"fencing_token": int(job["fencing_token"]) + 1}, where={"id": job["id"]})
             return [], ["mock-report-request"]
-        self.service.list_material_report.side_effect = reports
+        self.service.list_plan_materials.side_effect = reports
         result = backfill.run_material_backfill_job(job, db=self.db)
         self.assertFalse(result["success"])
         self.assertEqual(0, self.db.count("pmc_material_metric_snapshot"))

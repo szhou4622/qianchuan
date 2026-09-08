@@ -58,6 +58,9 @@ PROJECT_ROOT = _get_project_root()
 
 from release_identity import VERSION as CURRENT_VERSION
 from channel_runtime import layout as _channel_layout
+from release_configuration import enforce_packaged_configuration, environment_value
+
+enforce_packaged_configuration()
 
 # The public application identity is also the PyInstaller product name used by
 # packaging/windows/build_windows.ps1.  Remote per-application services must
@@ -70,14 +73,14 @@ LICENSE_SERVICE_BASE_URL = "https://license.dadaozixun.com/api/license"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+    raw = environment_value(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_text(name: str) -> str:
-    return (os.getenv(name) or "").strip()
+    return (environment_value(name) or "").strip()
 
 
 # 常用目录
@@ -125,7 +128,9 @@ QIANCHUAN_BACKEND = (
     or str(_QIANCHUAN_RUNTIME_SETTINGS.get("backend") or "official_api")
 ).lower()
 if QIANCHUAN_BACKEND not in {"official_api", "browser_legacy"}:
-    QIANCHUAN_BACKEND = "browser_legacy"
+    QIANCHUAN_BACKEND = "official_api"
+if getattr(sys, "frozen", False):
+    QIANCHUAN_BACKEND = "official_api"
 QIANCHUAN_OFFICIAL_API_BASE_URL = (
     _env_text("QCSCKP_OE_API_BASE_URL") or "https://api.oceanengine.com"
 ).rstrip("/")
@@ -133,7 +138,7 @@ QIANCHUAN_OFFICIAL_API_BASE_URL = (
 # 桌面工具既不读取也不写死该地址；授权时只监听由工具启动的 Chrome
 # 导航，从回调跳转中取得一次性 auth_code，并在本机校验随机 state。
 # 真实 API 写入默认关闭。只有受控验收明确设置后才可创建/暂停/结束/调整调控任务。
-if os.getenv("QCSCKP_ALLOW_LIVE_API_WRITES") is not None:
+if environment_value("QCSCKP_ALLOW_LIVE_API_WRITES") is not None:
     ALLOW_LIVE_OFFICIAL_API_WRITES = _env_flag("QCSCKP_ALLOW_LIVE_API_WRITES")
 else:
     # Runtime settings are tool-user scoped and are restored only after login

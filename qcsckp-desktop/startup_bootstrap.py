@@ -24,18 +24,37 @@ from pathlib import Path
 from typing import Any, Optional
 from utils.log_redaction import redact_text
 
+# PyInstaller executes this entrypoint as __main__. GUI imports must reuse
+# this module rather than allocating a second ready event and watchdog state.
+if __name__ == "__main__":
+    sys.modules["startup_bootstrap"] = sys.modules[__name__]
 
 APP_NAME = "QCSCKP"
 APP_TITLE = "千川素材看盘工具"
 WEBVIEW2_CLIENT_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 WEBVIEW2_BOOTSTRAPPER_NAME = "MicrosoftEdgeWebview2Setup.exe"
 WINDOW_READY_TIMEOUT_SECONDS = 20
+REQUIRED_MANAGED_DEPENDENCIES = (
+    "bin/pythonnet/runtime/Python.Runtime.dll",
+    "bin/clr_loader/ffi/dlls/amd64/ClrLoader.dll",
+    "bin/webview/lib/Microsoft.Web.WebView2.Core.dll",
+    "bin/webview/lib/Microsoft.Web.WebView2.WinForms.dll",
+    "bin/webview/lib/runtimes/win-x64/native/WebView2Loader.dll",
+)
 
 _LOG_LOCK = threading.RLock()
 _FAULT_HANDLE: Optional[Any] = None
 _WINDOW_READY = threading.Event()
 _STATE_FILE: Optional[Path] = None
 _HOOKS_INSTALLED = False
+_STATE_LOCK = threading.RLock()
+_WATCHDOG_DONE = threading.Event()
+_WATCHDOG_ARMED = False
+_STARTUP_GENERATION = 0
+_STARTUP_PHASE = ""
+_STARTUP_TERMINAL = ""
+_FATAL_DIALOG_SHOWN = False
+_TERMINAL_PHASES = {"failed", "window_timeout", "cancelled", "stopped"}
 
 
 class StartupAbort(RuntimeError):
@@ -161,6 +180,18 @@ def _state_payload(phase: str, detail: str = "") -> dict[str, Any]:
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "updated_unix": time.time(),
     }
+    try:
+        from release_configuration import public_runtime_contract
+        contract = public_runtime_contract()
+        digest = str(contract.get("software_contract_sha256") or "").lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest):
+            payload["software_contract_sha256"] = digest
+            payload["configuration_policy_version"] = int(contract["policy_version"])
+            payload["packaged_policy_enforced"] = bool(contract.get("packaged_policy_enforced"))
+        else:
+            payload["configuration_policy_error"] = "invalid_public_fingerprint"
+    except Exception as exc:
+        payload["configuration_policy_error"] = type(exc).__name__
     for identity_path in (
         _app_root() / "bin" / "release.json",
         _app_root() / "release.json",
@@ -180,7 +211,53 @@ def _state_payload(phase: str, detail: str = "") -> dict[str, Any]:
     return payload
 
 
-def mark_startup_phase(phase: str, detail: str = "") -> None:
+def begin_startup_attempt() -> int:
+    global _WATCHDOG_DONE, _WATCHDOG_ARMED, _STARTUP_GENERATION
+    global _STARTUP_PHASE, _STARTUP_TERMINAL, _FATAL_DIALOG_SHOWN, _STATE_FILE
+    with _STATE_LOCK:
+        _WATCHDOG_DONE.set()
+        _WATCHDOG_DONE = threading.Event()
+        _WATCHDOG_ARMED = False
+        _WINDOW_READY.clear()
+        _STARTUP_GENERATION += 1
+        _STARTUP_PHASE = _STARTUP_TERMINAL = ""
+        _FATAL_DIALOG_SHOWN = False
+        _STATE_FILE = None
+        return _STARTUP_GENERATION
+
+
+def startup_state() -> dict[str, Any]:
+    with _STATE_LOCK:
+        return {"generation": _STARTUP_GENERATION, "phase": _STARTUP_PHASE,
+                "terminal": _STARTUP_TERMINAL, "ready": _WINDOW_READY.is_set(),
+                "watchdog_armed": _WATCHDOG_ARMED}
+
+
+def cancel_window_watchdog() -> None:
+    # Cancellation is not readiness. Never set _WINDOW_READY to stop a timer.
+    with _STATE_LOCK:
+        _WATCHDOG_DONE.set()
+
+
+def mark_startup_phase(phase: str, detail: str = "", *, generation: Optional[int] = None) -> bool:
+    global _STARTUP_PHASE, _STARTUP_TERMINAL
+    with _STATE_LOCK:
+        if generation is not None and generation != _STARTUP_GENERATION:
+            return False
+        if _STARTUP_TERMINAL:
+            return False
+        if phase in _TERMINAL_PHASES:
+            _STARTUP_TERMINAL = phase
+            _WATCHDOG_DONE.set()
+        if phase == "ready":
+            _WINDOW_READY.set()
+            _WATCHDOG_DONE.set()
+        _STARTUP_PHASE = phase
+        _write_startup_phase(phase, detail)
+    return True
+
+
+def _write_startup_phase(phase: str, detail: str = "") -> None:
     global _STATE_FILE
     try:
         directory = _state_dir()
@@ -216,9 +293,8 @@ def _record_diagnostic_event(phase: str, event: str, **kwargs: Any) -> None:
         startup_log(f"diagnostic_event_failed type={type(exc).__name__}")
 
 
-def mark_window_ready() -> None:
-    _WINDOW_READY.set()
-    mark_startup_phase("ready")
+def mark_window_ready(generation: Optional[int] = None) -> None:
+    mark_startup_phase("ready", generation=generation)
 
 
 def window_ready_was_reached() -> bool:
@@ -234,6 +310,11 @@ def _exception_text(exc_type: Any, exc: BaseException, tb: Any) -> str:
 
 
 def _show_fatal_error(summary: str, detail: str = "") -> None:
+    global _FATAL_DIALOG_SHOWN
+    with _STATE_LOCK:
+        if _FATAL_DIALOG_SHOWN:
+            return
+        _FATAL_DIALOG_SHOWN = True
     path = startup_log_path()
     message = (
         f"{summary}\n\n"
@@ -264,11 +345,12 @@ def install_exception_hooks() -> None:
         _FAULT_HANDLE = None
 
     def main_hook(exc_type: Any, exc: BaseException, tb: Any) -> None:
+        cancel_window_watchdog()
+        mark_startup_phase("failed", str(exc))
         _record_diagnostic_event("runtime", "runtime_failure", exception=exc)
         detail = _exception_text(exc_type, exc, tb)
         startup_log("unhandled_exception\n" + detail)
-        mark_startup_phase("failed", str(exc))
-        _show_fatal_error("软件启动失败。", str(exc))
+        _show_fatal_error("软件启动失败。", describe_startup_exception(exc))
 
     def thread_hook(args: Any) -> None:
         _record_diagnostic_event("runtime", "runtime_failure", exception=args.exc_value)
@@ -349,30 +431,140 @@ def validate_package_integrity() -> list[str]:
     if not manifest_path.is_file():
         return ["PACKAGE-MANIFEST.json 缺失"]
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         return [f"PACKAGE-MANIFEST.json 无法读取：{exc}"]
     issues: list[str] = []
     for item in manifest.get("critical_files") or []:
+        if not isinstance(item, dict):
+            issues.append("安装包清单包含无效条目")
+            continue
         relative = str(item.get("path") or "").replace("/", os.sep)
-        if not relative or relative.startswith(("..", os.sep)):
+        path = (root / relative).resolve()
+        if (not relative or Path(relative).is_absolute() or ".." in Path(relative).parts
+                or ":" in relative or not path.is_relative_to(root.resolve())):
             issues.append("安装包清单包含无效路径")
             continue
-        path = root / relative
         if not path.is_file():
             issues.append(f"缺少文件：{relative}")
             continue
         try:
             expected_size = int(item.get("size") or 0)
-            if expected_size and path.stat().st_size != expected_size:
+            if expected_size <= 0 or path.stat().st_size != expected_size:
                 issues.append(f"文件大小不一致：{relative}")
                 continue
             expected_hash = str(item.get("sha256") or "").strip().lower()
-            if expected_hash and _sha256(path) != expected_hash:
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or _sha256(path) != expected_hash:
                 issues.append(f"文件校验失败：{relative}")
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             issues.append(f"文件无法读取：{relative}（{exc}）")
     return issues
+
+
+def _verified_managed_dependencies() -> list[tuple[Path, dict[str, Any]]]:
+    root = _app_root().resolve()
+    try:
+        manifest = json.loads((root / "PACKAGE-MANIFEST.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise StartupAbort("启动依赖清单无法读取，未修改任何下载标记") from exc
+    entries = {}
+    for entry in manifest.get("critical_files") or []:
+        if isinstance(entry, dict):
+            entries[str(entry.get("path") or "").replace("\\", "/").casefold()] = entry
+    missing = [name for name in REQUIRED_MANAGED_DEPENDENCIES if name.casefold() not in entries]
+    if missing:
+        raise StartupAbort("安装包缺少关键运行依赖校验项：" + "、".join(missing))
+    selected = set(name.casefold() for name in REQUIRED_MANAGED_DEPENDENCIES)
+    dependency_names = {Path(name).name.casefold() for name in REQUIRED_MANAGED_DEPENDENCIES}
+    dependency_names.add("webbrowserinterop.x64.dll")
+    # PyInstaller may also load a root-bin copy. Check every matching copy
+    # declared by the package manifest, but never scan/unblock arbitrary files.
+    selected.update(name for name in entries if name.startswith("bin/")
+                    and (Path(name).name in dependency_names
+                         or Path(name).name.startswith("microsoft.web.webview2.")) and name.endswith(".dll"))
+    verified = []
+    for name in sorted(selected):
+        entry = entries[name]
+        relative = str(entry.get("path") or "").replace("\\", "/")
+        path = (root / relative).resolve()
+        digest = str(entry.get("sha256") or "").lower()
+        if (Path(relative).is_absolute() or ".." in Path(relative).parts or ":" in relative
+                or not path.is_relative_to(root) or not path.is_file()
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise StartupAbort(f"关键依赖路径或校验项无效：{relative}")
+        if path.stat().st_size != int(entry.get("size") or 0) or _sha256(path) != digest:
+            raise StartupAbort(f"关键依赖内容校验失败，未解除下载标记：{relative}")
+        verified.append((path, entry))
+    return verified
+
+
+def _download_zone(path: Path) -> Optional[int]:
+    try:
+        with Path(str(path) + ":Zone.Identifier").open("rb") as stream:
+            value = stream.read(4096).decode("utf-8", "replace")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise StartupAbort("无法检查关键依赖的下载标记：" + path.name) from exc
+    match = re.search(r"(?im)^ZoneId\s*=\s*(\d+)\s*$", value)
+    return int(match.group(1)) if match else None
+
+
+def ensure_managed_dependencies() -> None:
+    """Only a hash-matching, named dependency may have its own MOTW removed."""
+    if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+        return
+    verified = _verified_managed_dependencies()
+    blocked = [(path, entry) for path, entry in verified if (_download_zone(path) or 0) >= 3]
+    if not blocked:
+        return
+    names = "\n".join("• " + str(entry["path"]) for _, entry in blocked)
+    if not native_confirm(
+        "以下运行依赖已匹配本安装包的大小与 SHA256 清单，但仍带有互联网下载标记，"
+        "可能导致 Python/.NET 加载失败（0x80131515）。\n\n" + names
+        + "\n\n仅在确认安装包来源可信时继续。是否只解除以上具体文件的下载标记？"
+        "\n不会修改系统安全策略、其他文件或安装新的 .NET。"
+    ):
+        raise StartupAbort("已保留关键依赖下载标记，启动已取消；请使用来源可信的本地安装包")
+    # Recheck after the user dialog; never act on a file changed while waiting.
+    current = {path: entry for path, entry in _verified_managed_dependencies()}
+    for path, entry in blocked:
+        if current.get(path) != entry:
+            raise StartupAbort("确认期间依赖清单发生变化，未继续解除下载标记")
+        if (_download_zone(path) or 0) >= 3:
+            try:
+                Path(str(path) + ":Zone.Identifier").unlink()
+            except OSError as exc:
+                raise StartupAbort("该依赖下载标记无法解除：" + path.name) from exc
+            if (_download_zone(path) or 0) >= 3:
+                raise StartupAbort("该依赖仍被下载标记阻止：" + path.name)
+            startup_log("unblocked_verified_dependency=" + str(entry["path"]))
+
+
+def describe_startup_exception(exc: BaseException) -> str:
+    fragments, seen = [], set()
+    current = exc
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        fragments.append(str(current))
+        try:
+            hresult = getattr(current, "HResult", None)
+            if hresult is not None:
+                fragments.append(hex(int(hresult) & 0xFFFFFFFF))
+            current = getattr(current, "InnerException", None) or current.__cause__ or current.__context__
+        except Exception:
+            break
+    text = "\n".join(fragments)
+    if "0x80131515" in text.lower() or "-2146233067" in text:
+        return ("Windows 阻止了运行依赖加载（0x80131515）。请检查启动前的下载标记提示；"
+                "若安装位置是网络盘，请改用可信的本地安装包。不要全局关闭 .NET 安全限制。\n" + text)
+    if "0x8001010d" in text.lower():
+        return "窗口 COM 调用遇到同步输入回调限制（0x8001010d），并非已确认的 .NET 缺失。\n" + text
+    if "python.runtime.loader.initialize" in text.lower():
+        return "Python/.NET 桥接初始化失败，请查看启动日志中的最内层异常；不能仅凭此提示认定 WebView2 缺失。\n" + text
+    return text
 
 
 def _install_webview2() -> bool:
@@ -514,17 +706,28 @@ def _recent_windows_application_errors() -> list[str]:
     ][:5]
 
 
-def start_window_watchdog(window: Any, timeout: int = WINDOW_READY_TIMEOUT_SECONDS) -> threading.Thread:
+def start_window_watchdog(window: Any, timeout: int = WINDOW_READY_TIMEOUT_SECONDS,
+                          *, close_window: Optional[Any] = None) -> threading.Thread:
+    global _WATCHDOG_ARMED
+    with _STATE_LOCK:
+        generation = _STARTUP_GENERATION
+        done = _WATCHDOG_DONE
+        _WATCHDOG_ARMED = True
+
     def worker() -> None:
-        if _WINDOW_READY.wait(max(5, int(timeout))):
+        if done.wait(max(5, int(timeout))):
             return
-        mark_startup_phase("window_timeout", f"timeout_seconds={timeout}")
+        with _STATE_LOCK:
+            if done.is_set() or generation != _STARTUP_GENERATION or _WINDOW_READY.is_set():
+                return
+            if not mark_startup_phase("window_timeout", f"timeout_seconds={timeout}", generation=generation):
+                return
         _show_fatal_error(
             "软件窗口启动超时。",
             "WebView2没有在规定时间内完成页面加载",
         )
         try:
-            window.destroy()
+            (close_window or window.destroy)()
         except Exception as exc:
             startup_log(f"window_destroy_after_timeout_failed={exc}")
 
@@ -613,6 +816,9 @@ def _repair_license_connection() -> int:
 
 
 def _main_impl() -> int:
+    begin_startup_attempt()
+    from release_configuration import enforce_packaged_configuration
+    enforce_packaged_configuration()
     install_exception_hooks()
     mark_startup_phase("bootstrap", f"frozen={bool(getattr(sys, 'frozen', False))}")
     if "--diagnose-startup" in sys.argv[1:]:
@@ -624,27 +830,40 @@ def _main_impl() -> int:
         issues = validate_package_integrity()
         if issues:
             raise StartupAbort("；".join(issues[:5]))
+        mark_startup_phase("managed_dependency_check")
+        ensure_managed_dependencies()
         mark_startup_phase("webview2_check")
         ensure_webview2()
         mark_startup_phase("app_import")
         import gui_app
 
         mark_startup_phase("app_main")
-        gui_app.main()
+        gui_code = gui_app.main()
+        state = startup_state()
+        if state["terminal"] in {"failed", "window_timeout"}:
+            return 1
+        if isinstance(gui_code, int) and gui_code:
+            mark_startup_phase("cancelled", "窗口启动被用户中断")
+            return gui_code
+        if state["watchdog_armed"] and not state["ready"]:
+            raise StartupAbort("窗口在就绪前已退出")
         return 0
     except StartupAbort as exc:
+        cancel_window_watchdog()
         startup_log(f"startup_aborted={exc}")
         mark_startup_phase("failed", str(exc))
         _show_fatal_error("软件无法启动。", str(exc))
         return 2
     except Exception as exc:
+        cancel_window_watchdog()
         _record_diagnostic_event("bootstrap", "startup_failure", exception=exc)
         detail = traceback.format_exc()
         startup_log("startup_failed\n" + detail)
         mark_startup_phase("failed", str(exc))
-        _show_fatal_error("软件启动失败。", str(exc))
+        _show_fatal_error("软件启动失败。", describe_startup_exception(exc))
         return 1
     finally:
+        cancel_window_watchdog()
         if not _WINDOW_READY.is_set():
             startup_log("bootstrap_exit_before_window_ready")
 

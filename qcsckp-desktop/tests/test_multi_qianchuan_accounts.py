@@ -764,7 +764,8 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(".card{height:620px", html)
         self.assertIn(".plans{min-height:0", html)
-        self.assertIn("overflow-y:auto", html)
+        self.assertRegex(html, r"\.card\{[^}]*grid-template-rows:auto minmax\(0,1fr\) auto[^}]*overflow:hidden")
+        self.assertRegex(html, r"\.plans\{[^}]*overflow-y:auto[^}]*overscroll-behavior:contain")
         self.assertIn("该账户全部计划（全域/乘方 × 推直播/推商品）", html)
         self.assertIn("请先启用此千川账户，再选择", html)
         self.assertIn('id="diagnostics"', html)
@@ -777,8 +778,11 @@ class MultiQianchuanAccountTests(unittest.TestCase):
         self.assertIn('id="catalogProgress"', html)
         self.assertIn("等待开始只读同步", html)
         self.assertIn("刷新任务已进入官方API后台队列", html)
-        self.assertIn("const collectionHealth=String(p.collection_health||'').toLowerCase()", html)
-        self.assertIn("collectionFailed?'数据延迟，自动重试中'", html)
+        # Health now uses the shared display mapping so auth/resource failures
+        # are not mislabeled as rate limits or generic automatic retries.
+        self.assertIn("const display=collectionDisplay(p)", html)
+        self.assertIn("const collectionHealth=display.health", html)
+        self.assertIn("素材采集未完成，保留上次数据", html)
         self.assertIn("firstRun?'等待采集':late?'数据延迟'", html)
         self.assertIn("正在核验计划", html)
         self.assertIn("正在采集素材", html)

@@ -811,14 +811,7 @@ class Api:
     def saveQianchuanOfficialApiConfig(self, config=None):
         from services.qianchuan_open_api.configuration import save_configuration
         payload = config if isinstance(config, dict) else {}
-        result = save_configuration(payload.get("app_id"), payload.get("app_secret"))
-        try:
-            from services.qianchuan_open_api.runtime import get_official_api_service
-
-            get_official_api_service().clear_business_account_cache()
-        except Exception:
-            pass
-        return result
+        return save_configuration(payload.get("app_id"), payload.get("app_secret"))
 
     def startQianchuanOfficialApiAuthorization(self):
         from services.qianchuan_open_api.configuration import start_authorization
@@ -827,49 +820,29 @@ class Api:
     def saveAndStartQianchuanOfficialApiAuthorization(self, config=None):
         from services.qianchuan_open_api.configuration import save_and_start_authorization
         payload = config if isinstance(config, dict) else {}
-        result = save_and_start_authorization(
-            payload.get("app_id"),
-            payload.get("app_secret"),
-        )
-        try:
-            from services.qianchuan_open_api.runtime import get_official_api_service
-
-            get_official_api_service().clear_business_account_cache()
-        except Exception:
-            pass
-        return result
+        return save_and_start_authorization(payload.get("app_id"), payload.get("app_secret"))
 
     def finishQianchuanOfficialApiAuthorization(self, authCode=None):
         from services.qianchuan_open_api.configuration import finish_authorization
+        from services.qianchuan_open_api.token_provider import authorization_identity_is_current
         result = finish_authorization(authCode)
         if result.get("success") and result.get("completed") and result.get("authorized"):
-            try:
-                from services.qianchuan_open_api.runtime import get_official_api_service
-
-                get_official_api_service().clear_business_account_cache()
-            except Exception:
-                pass
+            identity = result.get("authorization_identity")
+            if not isinstance(identity, dict) or not authorization_identity_is_current(identity):
+                return {**result, "monitoring": {"success": False, "running": False,
+                        "phase": "authorization_changed", "message": "授权身份已变化，未启动旧身份采集"}}
             try:
                 result["monitoring"] = self.service.start_from_saved_session()
             except Exception as exc:
                 result["monitoring"] = {
-                    "success": False,
-                    "running": False,
-                    "phase": "start_failed",
+                    "success": False, "running": False, "phase": "start_failed",
                     "message": f"Authorization succeeded, but the official API collector failed to start: {exc}",
                 }
         return result
 
     def clearQianchuanOfficialApiConfig(self):
         from services.qianchuan_open_api.configuration import disconnect_configuration
-        result = disconnect_configuration()
-        try:
-            from services.qianchuan_open_api.runtime import get_official_api_service
-
-            get_official_api_service().clear_business_account_cache()
-        except Exception:
-            pass
-        return result
+        return disconnect_configuration()
 
     def startQianchuanRelogin(self):
         try:

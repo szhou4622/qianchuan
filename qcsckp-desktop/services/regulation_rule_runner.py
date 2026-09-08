@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 规则化停投调度：按固定间隔（默认 5 分钟）从 pmc_roi2_assist_task（与 DashboardApi.get_roi2_assist_table_data 一致）
-拉取「ad_delivery_type=0 调控中、updated_at 近 N 分钟（默认 30，见 REGULATION_ASSIST_UPDATED_WITHIN_MINUTES；传 0 则仍按近 1 天）」任务，
+拉取「ad_delivery_type=0 调控中」任务，并按 metrics_observed_at 校验真实指标读取时间，
 按 stat_cost_for_roi2_assist 降序；再按每条策略的 trigger（ROI2 调控指标）筛选，
 对任务执行暂停或结束（见 regulation_service）。写入 pmc_regulation_run（停投不做素材级限频）。
 多策略并行默认最多 3 路（环境变量 REGULATION_STRATEGY_PARALLEL）。
@@ -18,7 +18,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from api.dashboard import DashboardApi
 from api.rule_regulation_config import (
@@ -64,6 +64,27 @@ def _shadow_mode_enabled() -> bool:
     }
 
 
+def _stop_target_status_usable(target: Mapping[str, Any]) -> bool:
+    status = str(target.get("last_status") or "").strip().lower()
+    if status == "ok":
+        return True
+    # Only a verified, independently scoped control read may bypass errors
+    # belonging to material collection. Identity/verification failures never do.
+    return bool(parse_target_capability(target).get("assist_independent_sync")) and status in {
+        "pending", "collecting", "error", "pagination_error", "rate_limited",
+        "suspicious_empty", "data_delay",
+    }
+
+
+def _observation_age(value: Any) -> Optional[timedelta]:
+    try:
+        observed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        now = datetime.now(observed.tzinfo) if observed.tzinfo else datetime.now()
+        return now - observed
+    except (TypeError, ValueError):
+        return None
+
+
 def _target_assist_sync_ready(
     target: Dict[str, Any],
     *,
@@ -76,12 +97,45 @@ def _target_assist_sync_ready(
         return False, "调控任务采集未启用"
     if not bool(capability.get("assist_sync_ok")):
         return False, "最近一轮调控任务未完整同步"
+    if capability.get("assist_independent_sync"):
+        if (not _stop_target_status_usable(target)
+                or str(target.get("verification_state") or "") != "verified"
+                or str(target.get("last_verification_error") or "").strip()
+                or str(target.get("platform_status") or "") not in {"active", "learning"}
+                or capability.get("control_plan_status") not in {"active", "learning"}
+                or capability.get("control_metric_source") != "control_task_list"
+                or capability.get("control_scene_scope") != "MATERIAL_ADD_BUDGET"):
+            return False, "调控数据不能替代失效的计划身份、场景或投放状态核验"
+        scope = capability.get("control_scope")
+        if not isinstance(scope, dict) or any(
+            str(scope.get(key) or "") != str(target.get(key) or "")
+            for key in ("target_uid", "account_uid", "aadvid", "ad_id", "promotion_scene", "plan_system")
+        ):
+            return False, "独立调控快照的账户或目标范围已变化"
+        from services.qianchuan_session import current_session_owner
+        scope_owner = str(scope.get("owner_username") or "").strip().casefold()
+        if not scope_owner or scope_owner != str(current_session_owner() or "").strip().casefold():
+            return False, "独立调控快照的工具账户已变化"
+        identity = capability.get("control_authorization_identity")
+        if identity:
+            try:
+                from services.qianchuan_open_api.token_provider import authorization_identity_is_current
+                if not authorization_identity_is_current(identity):
+                    return False, "独立调控快照的授权代次已变化"
+            except Exception:
+                return False, "独立调控快照的授权标识不可核验"
+        generation = str(capability.get("control_collection_generation") or "")
+        if generation:
+            from services.collection_lifecycle import generation as current_generation
+            if generation != current_generation():
+                return False, "独立调控快照的采集代次已失效"
+        detail_age = _observation_age(capability.get("control_plan_verified_at"))
+        if detail_age is None or detail_age < timedelta(minutes=-5) or detail_age > timedelta(minutes=max(1, int(max_age_minutes))):
+            return False, "调控快照的计划详情核验已过期"
     raw = str(capability.get("assist_synced_at") or "").strip()
-    try:
-        synced_at = datetime.fromisoformat(raw)
-    except ValueError:
+    age = _observation_age(raw)
+    if age is None:
         return False, "调控任务同步时间无效"
-    age = datetime.now() - synced_at
     if age < timedelta(minutes=-5) or age > timedelta(
         minutes=max(1, int(max_age_minutes))
     ):
@@ -229,7 +283,7 @@ def _revalidate_stop_candidate(
         or not account
         or not bool(account.get("enabled"))
         or bool(target.get("automation_write_blocked"))
-        or str(target.get("last_status") or "").strip().lower() != "ok"
+        or not _stop_target_status_usable(target)
         or str(target.get("aadvid") or "") != aavid
         or str(target.get("ad_id") or "") != ad_id
         or str(target.get("promotion_scene") or "") != promotion_scene
@@ -261,12 +315,24 @@ def _revalidate_stop_candidate(
     )
     if not assist_ready:
         return None, None, target_system, assist_error
-    try:
-        metric_age = datetime.now() - datetime.fromisoformat(str(row.get("metrics_observed_at") or ""))
-    except (TypeError, ValueError):
+    independent = bool(parse_target_capability(target).get("assist_independent_sync"))
+    if independent and (row.get("data_source") != "qianchuan_open_api"
+            or row_account_uid != str(target.get("account_uid") or "") or row_system != target_system):
+        return None, None, target_system, "独立调控指标缺少明确账户、来源或计划体系"
+    metric_age = _observation_age(row.get("metrics_observed_at"))
+    if metric_age is None:
         return None, None, target_system, "调控任务指标采集时间无效"
     if metric_age < timedelta(minutes=-5) or metric_age > timedelta(minutes=max_age_minutes):
         return None, None, target_system, "调控任务指标已过期"
+    if independent:
+        status_age = _observation_age(row.get("task_status_observed_at"))
+        if (status_age is None or status_age < timedelta(minutes=-5)
+                or status_age > timedelta(minutes=max_age_minutes)
+                or row.get("task_status_source") not in {"api", "api_filtered", "request_filter_inferred"}
+                or str(row.get("ad_delivery_name") or "").upper() not in {
+                    "PROCESSING", "ENABLE", "ENABLED", "ACTIVE", "RUNNING", "DELIVERING"
+                } or row.get("ad_delivery_type") != 0):
+            return None, None, target_system, "调控任务缺少新鲜且明确的运行状态"
     capability_ok, capability_error = check_target_capability(
         target,
         action="regulation",

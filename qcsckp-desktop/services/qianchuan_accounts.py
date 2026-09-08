@@ -1179,12 +1179,14 @@ def record_target_duration(
     cycle_started_at: Optional[datetime] = None,
     refresh_capacity: bool = True,
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> None:
     store = db or SQLiteStore()
     target = store.select_one(
         "promotion_target",
         fields="last_duration_ms",
         where={"target_uid": str(target_uid or "").strip()},
+        connection=connection,
     )
     if not target:
         return
@@ -1231,6 +1233,7 @@ def record_target_duration(
             "last_lag_seconds": 0,
         },
         where={"target_uid": str(target_uid or "").strip()},
+        connection=connection,
     )
     if refresh_capacity:
         refresh_monitor_capacity(db=store)

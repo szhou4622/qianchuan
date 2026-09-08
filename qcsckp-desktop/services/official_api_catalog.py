@@ -24,7 +24,12 @@ from services.qianchuan_catalog import (
     mark_catalog_sync_progress,
     mark_catalog_sync_started,
 )
-from services.qianchuan_open_api.errors import OfficialApiNotConfigured
+from services.qianchuan_open_api.errors import OfficialApiNotConfigured, CollectionCancelledError, CollectionDeadlineExceeded
+from services.qianchuan_open_api.collection_context import CollectionContext, current_collection_context, use_collection_context
+from services.qianchuan_open_api.token_provider import (
+    _authorization_context, get_authorization_identity, authorization_identity_guard, AuthorizationContextChanged,
+)
+from services import collection_lifecycle
 from services.qianchuan_open_api.runtime import get_official_api_service
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
@@ -189,7 +194,7 @@ def _sync_account(
     service = get_official_api_service()
     aavid = str(account.get("aavid") or "")
     account_name = account.get("account_name") or aavid
-    mark_catalog_sync_progress(
+    _catalog_local_call(mark_catalog_sync_progress,
         processed_accounts=processed_accounts,
         total_accounts=total_accounts,
         current_account=account_name,
@@ -206,7 +211,7 @@ def _sync_account(
     if not official_account:
         raise RuntimeError("该账户不在当前官方 API 授权链中")
     if official_account:
-        ensure_qianchuan_account(
+        _catalog_local_call(ensure_qianchuan_account,
             aavid,
             account_name=official_account.get("advertiser_name") or account.get("account_name") or "",
             owner_username=account.get("owner_username"),
@@ -214,7 +219,7 @@ def _sync_account(
             seen=True,
             db=db,
         )
-    mark_catalog_sync_progress(
+    _catalog_local_call(mark_catalog_sync_progress,
         processed_accounts=processed_accounts,
         total_accounts=total_accounts,
         current_account=account_name,
@@ -239,7 +244,7 @@ def _sync_account(
         total = max(1, int(progress.get("class_total") or 4))
         class_key = str(progress.get("class_key") or "")
         found = int(progress.get("discovered_plans") or 0)
-        mark_catalog_sync_progress(
+        _catalog_local_call(mark_catalog_sync_progress,
             processed_accounts=processed_accounts,
             total_accounts=total_accounts,
             current_account=account_name,
@@ -264,7 +269,7 @@ def _sync_account(
         evidence["complete"] = False
     existing = {
         str(row.get("ad_id") or ""): row
-        for row in list_promotion_targets(owner_username=account.get("owner_username"), db=db)
+        for row in _catalog_local_call(list_promotion_targets, owner_username=account.get("owner_username"), db=db)
         if str(row.get("account_uid") or "") == str(account.get("account_uid") or "")
     }
     seen: set[str] = set()
@@ -275,7 +280,7 @@ def _sync_account(
         "chengfang_product": 0,
     }
     total_plans = len(plans)
-    mark_catalog_sync_progress(
+    _catalog_local_call(mark_catalog_sync_progress,
         processed_accounts=processed_accounts,
         total_accounts=total_accounts,
         current_account=account_name,
@@ -304,7 +309,7 @@ def _sync_account(
             scene in {"live", "product"}
             and system in {"global", "chengfang"}
         )
-        upsert_promotion_target(
+        _catalog_local_call(upsert_promotion_target,
             {
                 "aavid": aavid,
                 "ad_id": ad_id,
@@ -332,7 +337,7 @@ def _sync_account(
             ensure_schema=False,
             refresh_capacity=False,
         )
-        mark_catalog_sync_progress(
+        _catalog_local_call(mark_catalog_sync_progress,
             processed_accounts=processed_accounts,
             total_accounts=total_accounts,
             current_account=account_name,
@@ -350,7 +355,7 @@ def _sync_account(
 
     from services.qianchuan_accounts import refresh_monitor_capacity
 
-    refresh_monitor_capacity(db=db)
+    _catalog_local_call(refresh_monitor_capacity, db=db)
 
     # 只有两类 marketing_goal 的全部分页都成功时，才把本轮未见计划标为历史；
     # 部分失败时保留上次完整目录，绝不以异常空结果覆盖。
@@ -358,7 +363,7 @@ def _sync_account(
         for ad_id, prior in existing.items():
             if ad_id in seen:
                 continue
-            db.update(
+            _catalog_local_call(db.update,
                 "promotion_target",
                 {
                     "verification_state": "missing",
@@ -379,7 +384,7 @@ def _sync_account(
         for item in (evidence.get("classes") or {}).values()
         if isinstance(item, dict) and item.get("error")
     )
-    mark_catalog_sync_progress(
+    _catalog_local_call(mark_catalog_sync_progress,
         processed_accounts=processed_accounts,
         total_accounts=total_accounts,
         current_account=account_name,
@@ -395,17 +400,62 @@ def _sync_account(
     return evidence
 
 
+
+def _catalog_local_call(action, *args, _allow_deadline=False, **kwargs):
+    """Hold only the captured credential lock around local state, never HTTP."""
+    context = current_collection_context()
+    identity = getattr(context, "catalog_authorization_identity", None) if context else None
+    if identity is None:
+        return action(*args, **kwargs)
+    with authorization_identity_guard(identity, context.catalog_token_path):
+        try:
+            context.check_active("catalog_before_local_commit")
+        except CollectionDeadlineExceeded:
+            if not _allow_deadline:
+                raise
+        return action(*args, **kwargs)
+
+
 def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
+    owner, path = _authorization_context()
+    identity = get_authorization_identity(path, owner_username=owner)
+    epoch = collection_lifecycle.generation()
+    # Each catalog pass owns a fresh bounded budget, independent of an
+    # unbounded scheduler or another collector's remaining time.
+    context = CollectionContext(300, generation=epoch,
+        is_current=lambda: _owner_key() == owner and epoch == collection_lifecycle.generation())
+    context.authorization_identity = identity
+    context.catalog_authorization_identity = identity
+    context.catalog_token_path = path
+    collection_lifecycle.register(context)
+    try:
+        with use_collection_context(context):
+            try:
+                return _run_catalog_sync(account_uid, db=db)
+            except (AuthorizationContextChanged, CollectionCancelledError):
+                return {"success": False, "status": "authorization_superseded",
+                        "message": "授权已变化，旧目录结果未提交"}
+            except Exception as exc:
+                # A failed old pass must not finalize the new owner's catalog.
+                return _catalog_local_call(finalize_catalog_sync, owner_username=owner,
+                    refreshed_account_uids=[], account_results={}, error=str(exc), db=db, _allow_deadline=True)
+    except (AuthorizationContextChanged, CollectionCancelledError):
+        return {"success": False, "status": "authorization_superseded",
+                "message": "授权已变化，旧目录结果未提交"}
+    finally:
+        collection_lifecycle.release(context)
+
+def _run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None) -> dict[str, Any]:
     store = db or SQLiteStore()
-    init_sqlite_schema(database=store.config.get("database"))
+    _catalog_local_call(init_sqlite_schema, database=store.config.get("database"))
     owner = _owner_key()
     requested_uid = str(account_uid or "").strip()
-    accounts = list_qianchuan_accounts(owner_username=owner, db=store)
+    accounts = _catalog_local_call(list_qianchuan_accounts, owner_username=owner, db=store)
     if requested_uid:
         accounts = [row for row in accounts if str(row.get("account_uid") or "") == requested_uid]
     accounts = [row for row in accounts if row.get("directory_selected")]
     if not accounts:
-        return finalize_catalog_sync(
+        return _catalog_local_call(finalize_catalog_sync,
             owner_username=owner,
             refreshed_account_uids=[],
             account_results={},
@@ -416,7 +466,7 @@ def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None)
     complete: list[str] = []
     for index, account in enumerate(accounts, 1):
         uid = str(account.get("account_uid") or "")
-        mark_catalog_sync_progress(
+        _catalog_local_call(mark_catalog_sync_progress,
             processed_accounts=index - 1,
             total_accounts=len(accounts),
             current_account=account.get("account_name") or account.get("aavid"),
@@ -441,14 +491,16 @@ def run_catalog_sync(account_uid: Any = "", *, db: Optional[SQLiteStore] = None)
             results[uid] = result
             if result.get("complete"):
                 complete.append(uid)
+        except (AuthorizationContextChanged, CollectionCancelledError):
+            raise
         except Exception as exc:
             results[uid] = {"complete": False, "error": str(exc), "classes": {}}
-            store.update(
+            _catalog_local_call(store.update,
                 "qianchuan_account",
                 {"last_status": "api_sync_failed", "last_error": str(exc)[:2000]},
                 where={"account_uid": uid},
             )
-    return finalize_catalog_sync(
+    return _catalog_local_call(finalize_catalog_sync,
         owner_username=owner,
         complete_account_uids=complete,
         account_results=results,
@@ -480,15 +532,10 @@ def _thread_entry(account_uid: str) -> None:
         while True:
             try:
                 run_catalog_sync(scope)
-            except Exception as exc:
-                # Never leave the account page in a permanent ``syncing`` state
-                # after an unexpected worker failure.
-                finalize_catalog_sync(
-                    owner_username=_owner_key(),
-                    refreshed_account_uids=[],
-                    account_results={},
-                    error=str(exc),
-                )
+            except Exception:
+                # No captured owner/generation here: never project a stale failure
+                # into a possibly newly authorized user's catalog.
+                pass
             has_pending, scope = _next_pending_scope()
             if not has_pending:
                 break

@@ -1,12 +1,8 @@
-# -*- coding: utf-8 -*-
-"""Own the lifecycle of production background workers.
-
-Window hiding does not call ``stop``.  A tray "complete exit" or a normal
-WebView shutdown does, so no worker can keep collecting or sending daily
-reports after the desktop process has been intentionally closed.
-"""
+"""Transactional lifecycle and observable recovery of background workers."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+import importlib
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -15,208 +11,281 @@ from config import QIANCHUAN_BACKEND
 from utils.log import logger
 
 
+@dataclass(frozen=True)
+class ServiceSpec:
+    name: str
+    start: Callable[[], Any]
+    stop: Callable[[], Any]
+    watched: bool = True
+    observe: Optional[Callable[[], Any]] = None
+
+
 class BackgroundRuntimeSupervisor:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._started = False
+        self._starting = False
         self._stop = threading.Event()
         self._resume_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._active: list[ServiceSpec] = []
+        self._handles: dict[str, Any] = {}
+        self._health: dict[str, Any] = {"state": "stopped", "services": {}, "collector": {}}
+        self._next_recovery: dict[str, float] = {}
+        self._observed_since: dict[str, float] = {}
+
+    def health_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {**self._health, "started": self._started, "starting": self._starting,
+                    "services": {k: dict(v) for k, v in self._health["services"].items()},
+                    "collector": dict(self._health.get("collector") or {})}
+
+    @staticmethod
+    def _alive(handle: Any) -> Optional[bool]:
+        if isinstance(handle, (tuple, list)):
+            states = [BackgroundRuntimeSupervisor._alive(item) for item in handle if item is not None]
+            return any(states) if states and all(state is not None for state in states) else None
+        method = getattr(handle, "is_alive", None)
+        return bool(method()) if callable(method) else None
+
+    def _build_service_specs(self, js_api: Any) -> list[ServiceSpec]:
+        definitions = [
+            ("prune", "utils.sqlite_prune_scheduler", "start_sqlite_prune_background_thread", "stop_sqlite_prune_background_thread", False),
+            ("webhook", "services.webhook_push_runtime", "start_webhook_push_background_threads", "stop_webhook_push_background_threads", False),
+            ("feishu", "services.local_feishu_bridge", "restore_local_feishu_account_from_device_session", "deactivate_local_feishu_account", False),
+            ("retarget_rules", "services.retargeting_rule_runner", "start_retargeting_rule_runner_background_thread", "stop_retargeting_rule_runner_background_thread", True),
+            ("retarget_tasks", "services.retarget_task_worker", "start_retarget_task_worker_background_thread", "stop_retarget_task_worker_background_thread", True),
+            ("operation_logs", "services.operation_log_monitor", "start_platform_log_sync_background_thread", "stop_platform_log_sync_background_thread", True),
+            ("daily_report", "services.operation_daily_report", "start_operation_daily_report_background_thread", "stop_operation_daily_report_background_thread", True),
+            ("stop_rules", "services.regulation_rule_runner", "start_regulation_rule_runner_background_thread", "stop_regulation_rule_runner_background_thread", True),
+            ("reconciliation", "services.official_api_reconciliation", "start_official_api_reconciliation_background_thread", "stop_official_api_reconciliation_background_thread", True),
+        ]
+        if QIANCHUAN_BACKEND == "official_api":
+            definitions.extend([
+                ("catalog", "services.official_api_catalog", "start_official_api_catalog_scheduler", "stop_official_api_catalog_scheduler", True),
+                ("collection", "services.official_api_collection", "start_official_api_collection_background_thread", "stop_official_api_collection_background_thread", True),
+            ])
+        specs = []
+        # Resolve every counterpart before any service can start.
+        for name, module_name, starter, stopper, watched in definitions:
+            module = importlib.import_module(module_name)
+            observe = (lambda module=module: module.SCHEDULER_THREAD) if name == "daily_report" else None
+            specs.append(ServiceSpec(name, getattr(module, starter), getattr(module, stopper), watched, observe))
+        if QIANCHUAN_BACKEND != "official_api":
+            service = js_api.api.service
+            specs.append(ServiceSpec("catalog", service.start_catalog_scheduler, service.stop_catalog_scheduler))
+        return specs
+
+    def _stop_children(self) -> list[str]:
+        errors = []
+        for spec in list(reversed(self._active)):
+            try:
+                spec.stop()
+                handle = self._handles.get(spec.name)
+                if self._alive(handle) is True:
+                    raise RuntimeError("停止请求返回后线程仍存活；禁止启动重复实例")
+                self._active.remove(spec)
+                self._handles.pop(spec.name, None)
+                with self._lock:
+                    self._health["services"][spec.name] = {"status": "stopped"}
+            except Exception as exc:
+                errors.append(spec.name)
+                logger.warning("[运行主管] 停止%s失败: %s", spec.name, exc)
+                with self._lock:
+                    self._health["services"][spec.name] = {"status": "stop_incomplete", "error": str(exc)[:400]}
+        return errors
+
+    def _join_own_threads(self) -> list[str]:
+        remaining = []
+        for attr in ("_resume_thread", "_watchdog_thread"):
+            thread = getattr(self, attr)
+            if thread is not None and thread is not threading.current_thread():
+                if self._alive(thread):
+                    thread.join(timeout=3.0)
+                if self._alive(thread):
+                    remaining.append(attr)
+                    continue
+            setattr(self, attr, None)
+        return remaining
 
     def start(self, js_api: Any) -> None:
-        with self._lock:
-            if self._started:
-                return
-            self._started = True
-            self._stop.clear()
-
-        from services.local_feishu_bridge import (
-            restore_local_feishu_account_from_device_session,
-        )
-        from services.operation_daily_report import (
-            start_operation_daily_report_background_thread,
-        )
-        from services.operation_log_monitor import (
-            start_platform_log_sync_background_thread,
-        )
-        from services.official_api_reconciliation import (
-            start_official_api_reconciliation_background_thread,
-        )
-        from services.regulation_rule_runner import (
-            start_regulation_rule_runner_background_thread,
-        )
-        from services.retarget_task_worker import (
-            start_retarget_task_worker_background_thread,
-        )
-        from services.retargeting_rule_runner import (
-            start_retargeting_rule_runner_background_thread,
-        )
-        from services.webhook_push_runtime import start_webhook_push_background_threads
-        from utils.sqlite_prune_scheduler import start_sqlite_prune_background_thread
-
-        start_sqlite_prune_background_thread()
-        start_webhook_push_background_threads()
-        try:
-            restore_local_feishu_account_from_device_session()
-        except Exception as exc:
-            logger.warning("[运行主管] 飞书连接恢复失败: %s", exc)
-        start_retargeting_rule_runner_background_thread()
-        start_retarget_task_worker_background_thread()
-        start_platform_log_sync_background_thread()
-        start_operation_daily_report_background_thread()
-        start_regulation_rule_runner_background_thread()
-        start_official_api_reconciliation_background_thread()
-
-        critical_starters: list[tuple[str, Callable[[], Any]]] = [
-            ("追投规则", start_retargeting_rule_runner_background_thread),
-            ("停投规则", start_regulation_rule_runner_background_thread),
-            ("追投任务", start_retarget_task_worker_background_thread),
-            ("操作日志", start_platform_log_sync_background_thread),
-            ("日报", start_operation_daily_report_background_thread),
-            ("写入对账", start_official_api_reconciliation_background_thread),
-        ]
-
-        if QIANCHUAN_BACKEND == "official_api":
-            from services.official_api_catalog import start_official_api_catalog_scheduler
-            from services.official_api_collection import (
-                start_official_api_collection_background_thread,
-            )
-
-            start_official_api_catalog_scheduler()
-            start_official_api_collection_background_thread()
-            critical_starters.extend(
-                [
-                    ("账户目录", start_official_api_catalog_scheduler),
-                    ("官方API采集", start_official_api_collection_background_thread),
-                ]
-            )
-        else:
-            js_api.api.service.start_catalog_scheduler()
-
-        def _resume_saved_monitoring() -> None:
-            if self._stop.wait(1.0):
-                return
-            for attempt in range(1, 4):
-                if self._stop.is_set():
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._started:
                     return
-                try:
-                    result = js_api.api.service.start_from_saved_session()
-                    logger.info("[MONITOR] %s", result.get("message") or result.get("phase"))
-                    if result.get("phase") != "tool_login_required":
-                        return
-                except Exception as exc:
-                    logger.warning("[MONITOR] 自动恢复后台监控失败（第%s次）: %s", attempt, exc)
-                self._stop.wait(2.0)
+                if self._active:
+                    raise RuntimeError("上轮后台服务尚未完全停止，不能重复启动")
+            if self._join_own_threads():
+                raise RuntimeError("上轮恢复/主管线程尚未停止，不能重复启动")
+            with self._lock:
+                self._starting = True
+                self._stop = threading.Event()
+                stop_event = self._stop
+                self._next_recovery.clear()
+                self._observed_since.clear()
+                self._health = {"state": "starting", "services": {}, "collector": {}}
+            try:
+                for spec in self._build_service_specs(js_api):
+                    if stop_event.is_set():
+                        raise RuntimeError("后台服务启动已取消")
+                    # Include a failing starter: it may have spawned a child
+                    # before throwing, so its stopper must also be attempted.
+                    self._active.append(spec)
+                    handle = spec.start()
+                    if spec.observe is not None:
+                        handle = spec.observe()
+                    self._handles[spec.name] = handle
+                    if spec.watched and self._alive(handle) is False:
+                        raise RuntimeError(f"关键服务 {spec.name} 启动后未存活")
+                    with self._lock:
+                        self._health["services"][spec.name] = {"status": "running", "alive": self._alive(handle)}
+                self._resume_thread = threading.Thread(
+                    target=self._resume_saved_monitoring, args=(js_api, stop_event),
+                    name="qianchuan-monitor-resume", daemon=True,
+                )
+                self._resume_thread.start()
+                self._watchdog_thread = threading.Thread(
+                    target=self._watchdog, args=(stop_event,),
+                    name="qcsckp-runtime-watchdog", daemon=True,
+                )
+                self._watchdog_thread.start()
+                if stop_event.is_set():
+                    raise RuntimeError("后台服务启动已取消")
+                with self._lock:
+                    self._started = True
+                    self._starting = False
+                    self._health["state"] = "running"
+                logger.info("[运行主管] 后台服务已统一启动")
+            except Exception as exc:
+                stop_event.set()
+                errors = self._stop_children()
+                errors.extend(self._join_own_threads())
+                with self._lock:
+                    self._started = self._starting = False
+                    self._health.update(state="rollback_incomplete" if errors else "start_failed",
+                                        last_error=str(exc)[:400], rollback_pending=errors)
+                logger.exception("[运行主管] 启动失败，已回滚本轮后台服务")
+                raise
 
-        self._resume_thread = threading.Thread(
-            target=_resume_saved_monitoring,
-            name="qianchuan-monitor-resume",
-            daemon=True,
-        )
-        self._resume_thread.start()
+    def _resume_saved_monitoring(self, js_api: Any, stop_event: threading.Event) -> None:
+        if stop_event.wait(1.0):
+            return
+        for attempt in range(1, 4):
+            if stop_event.is_set():
+                return
+            try:
+                result = js_api.api.service.start_from_saved_session()
+                phase = str(result.get("phase") or "")
+                with self._lock:
+                    self._health["resume"] = {"phase": phase, "message": str(result.get("message") or "")[:400],
+                                              "attempt": attempt}
+                if phase == "resource_pressure":
+                    self._check_collection_progress(force_reason="resource_pressure")
+                elif phase != "tool_login_required":
+                    return
+            except Exception as exc:
+                with self._lock:
+                    self._health["resume"] = {"phase": "failed", "error": str(exc)[:400], "attempt": attempt}
+                logger.warning("[运行主管] 自动恢复监控失败: %s", exc)
+            if stop_event.wait(2.0):
+                return
 
-        def _watchdog() -> None:
-            while not self._stop.wait(30.0):
-                for name, starter in critical_starters:
+    def _check_collection_progress(self, *, force_reason: str = "") -> None:
+        if QIANCHUAN_BACKEND != "official_api" or self._stop.is_set():
+            return
+        try:
+            from services.official_api_collection import (
+                get_official_api_collection_watchdog_state,
+                request_official_api_collection_recovery,
+            )
+            state = dict(get_official_api_collection_watchdog_state())
+            now = time.monotonic()
+            heartbeat = float(state.get("last_heartbeat_monotonic") or 0)
+            first_seen = self._observed_since.setdefault("collection", now)
+            age = max(0.0, now - (heartbeat or first_seen))
+            status = str(state.get("status") or "unknown")
+            limit = max(30.0, float(state.get("stalled_after_seconds") or 330))
+            reason = force_reason or (
+                "thread_dead" if not state.get("thread_alive")
+                else "resource_pressure" if status == "resource_pressure"
+                else "heartbeat_stalled" if age is not None and age > limit else ""
+            )
+            with self._lock:
+                self._health["collector"] = {**state, "heartbeat_age_seconds": age, "watchdog_reason": reason}
+                if not reason and self._started:
+                    self._health["state"] = "running"
+            if not reason or now < self._next_recovery.get("collection", 0):
+                return
+            generation = str(state.get("generation") or "")
+            if not generation:
+                outcome = {"status": "unsafe", "message": "采集代次不可观察，未启动重复线程"}
+            else:
+                # Only the collector can fence the old generation and decide
+                # whether recovery is safe. Never call its starter here.
+                with self._lifecycle_lock:
                     if self._stop.is_set():
                         return
-                    try:
-                        thread = starter()
-                        if isinstance(thread, threading.Thread) and not thread.is_alive():
-                            logger.warning("[运行主管] %s线程未存活，已请求重启", name)
-                    except Exception as exc:
-                        logger.exception("[运行主管] %s看门狗重启失败: %s", name, exc)
+                    outcome = dict(request_official_api_collection_recovery(
+                        expected_generation=generation, reason=reason,
+                    ))
+            self._next_recovery["collection"] = now + max(30.0, float(outcome.get("retry_after_seconds") or state.get("retry_after_seconds") or 30))
+            with self._lock:
+                self._health["collector"]["recovery"] = outcome
+                self._health["state"] = "running" if outcome.get("status") == "restarted" else "degraded"
+        except Exception as exc:
+            with self._lock:
+                self._health["collector"] = {"status": "health_check_failed", "error": str(exc)[:400]}
+                self._health["state"] = "degraded"
+            logger.warning("[运行主管] 采集进度检查失败，未盲目重开: %s", exc)
 
-        self._watchdog_thread = threading.Thread(
-            target=_watchdog,
-            name="qcsckp-runtime-watchdog",
-            daemon=True,
-        )
-        self._watchdog_thread.start()
-        logger.info("[运行主管] 后台服务已统一启动")
+    def _watchdog_once(self) -> None:
+        if self._stop.is_set():
+            return
+        for spec in list(self._active):
+            if not spec.watched or self._stop.is_set():
+                continue
+            if spec.name == "collection":
+                self._check_collection_progress()
+                continue
+            if spec.observe is not None:
+                self._handles[spec.name] = spec.observe()
+            alive = self._alive(self._handles.get(spec.name))
+            with self._lock:
+                self._health["services"][spec.name] = {"status": "running" if alive else "unobservable" if alive is None else "stopped", "alive": alive}
+            if alive is not False or time.monotonic() < self._next_recovery.get(spec.name, 0):
+                continue
+            self._next_recovery[spec.name] = time.monotonic() + 60
+            try:
+                with self._lifecycle_lock:
+                    if self._stop.is_set():
+                        return
+                    spec.stop()
+                    self._handles[spec.name] = spec.start()
+                    if spec.observe is not None:
+                        self._handles[spec.name] = spec.observe()
+                with self._lock:
+                    self._health["services"][spec.name] = {"status": "restart_requested", "alive": self._alive(self._handles[spec.name])}
+            except Exception as exc:
+                with self._lock:
+                    self._health["services"][spec.name] = {"status": "restart_failed", "error": str(exc)[:400]}
+                logger.warning("[运行主管] %s恢复失败: %s", spec.name, exc)
+
+    def _watchdog(self, stop_event: threading.Event) -> None:
+        while not stop_event.wait(30.0):
+            self._watchdog_once()
 
     def stop(self) -> None:
+        self._stop.set()
+        with self._lifecycle_lock:
+            errors = self._stop_children()
+        # A watchdog can be waiting for the lifecycle lock. Release it before
+        # joining so shutdown does not manufacture an unresponsive own thread.
+        errors.extend(self._join_own_threads())
         with self._lock:
-            if not self._started:
-                return
-            self._started = False
-            self._stop.set()
-
-        # Stop intake first, then workers that may persist final state, and
-        # finally the local Feishu transport.
-        stoppers = []
-        try:
-            from services.official_api_catalog import stop_official_api_catalog_scheduler
-            stoppers.append(stop_official_api_catalog_scheduler)
-        except Exception:
-            pass
-        try:
-            from services.official_api_collection import stop_official_api_collection_background_thread
-            stoppers.append(stop_official_api_collection_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.retargeting_rule_runner import stop_retargeting_rule_runner_background_thread
-            stoppers.append(stop_retargeting_rule_runner_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.regulation_rule_runner import stop_regulation_rule_runner_background_thread
-            stoppers.append(stop_regulation_rule_runner_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.operation_log_monitor import stop_platform_log_sync_background_thread
-            stoppers.append(stop_platform_log_sync_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.operation_daily_report import stop_operation_daily_report_background_thread
-            stoppers.append(stop_operation_daily_report_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.retarget_task_worker import stop_retarget_task_worker_background_thread
-            stoppers.append(stop_retarget_task_worker_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.official_api_reconciliation import stop_official_api_reconciliation_background_thread
-            stoppers.append(stop_official_api_reconciliation_background_thread)
-        except Exception:
-            pass
-        try:
-            from services.webhook_push_runtime import stop_webhook_push_background_threads
-            stoppers.append(stop_webhook_push_background_threads)
-        except Exception:
-            pass
-        try:
-            from utils.sqlite_prune_scheduler import stop_sqlite_prune_background_thread
-            stoppers.append(stop_sqlite_prune_background_thread)
-        except Exception:
-            pass
-
-        for stopper in stoppers:
-            try:
-                stopper()
-            except Exception as exc:
-                logger.warning("[运行主管] 停止后台服务失败 %s: %s", stopper.__name__, exc)
-
-        try:
-            from services.local_feishu_bridge import deactivate_local_feishu_account
-            deactivate_local_feishu_account()
-        except Exception as exc:
-            logger.warning("[运行主管] 停止飞书连接失败: %s", exc)
-
-        thread = self._resume_thread
-        self._resume_thread = None
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
-        watchdog = self._watchdog_thread
-        self._watchdog_thread = None
-        if watchdog and watchdog.is_alive() and watchdog is not threading.current_thread():
-            watchdog.join(timeout=3.0)
-        logger.info("[运行主管] 后台服务已停止")
+            self._started = self._starting = False
+            self._health.update(state="stop_incomplete" if errors else "stopped", rollback_pending=errors)
+        logger.info("[运行主管] 后台服务停止状态: %s", self._health["state"])
 
 
 RUNTIME_SUPERVISOR = BackgroundRuntimeSupervisor()

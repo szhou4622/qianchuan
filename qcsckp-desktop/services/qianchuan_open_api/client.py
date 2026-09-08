@@ -8,12 +8,12 @@ GET 可针对网络、429、5xx 做有界退避；POST 从不盲目重试。POST
 from __future__ import annotations
 
 import json
+import inspect
 import random
 import socket
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
@@ -29,6 +29,9 @@ from .errors import (
     ApiWriteOutcomeUnknown,
 )
 from .token_provider import TokenProvider, get_default_token_provider
+from .collection_context import CollectionContext, current_collection_context, request_fingerprint, use_collection_context
+from .managed_workers import run_bounded
+from .pagination_evidence import help_evidence, page_evidence, safe_error_message
 
 
 @dataclass(frozen=True)
@@ -123,7 +126,8 @@ class EndpointRateLimiter:
             delay = max(0.0, due - now)
             self._next[key] = max(now, due) + self.interval
         if delay:
-            time.sleep(delay)
+            ctx = current_collection_context()
+            ctx.wait(delay, "rate_limit") if ctx is not None else time.sleep(delay)
 
     def wait_for_request(self, endpoint: str, advertiser_id: Any = "") -> None:
         """Atomically reserve all applicable quota lanes for one request."""
@@ -144,7 +148,8 @@ class EndpointRateLimiter:
             for key, interval in lanes:
                 self._next[key] = due + interval
         if delay:
-            time.sleep(delay)
+            ctx = current_collection_context()
+            ctx.wait(delay, "rate_limit") if ctx is not None else time.sleep(delay)
 
 
 class QianchuanOpenApiClient:
@@ -259,7 +264,7 @@ class QianchuanOpenApiClient:
         headers: Any = None,
     ) -> None:
         code = str(payload.get("code") or payload.get("err_no") or "")
-        message = str(payload.get("message") or payload.get("msg") or "千川官方 API 请求失败")
+        message = safe_error_message(payload.get("message") or payload.get("msg") or "千川官方 API 请求失败")
         request_id = self._request_id(payload, headers)
         retry_after = 0.0
         if headers is not None:
@@ -267,12 +272,16 @@ class QianchuanOpenApiClient:
                 retry_after = float(headers.get("Retry-After") or 0)
             except (TypeError, ValueError, AttributeError):
                 retry_after = 0.0
+        details = help_evidence(payload.get("help_message"))
+        if help_evidence(message).get("parameter_error"):
+            details["parameter_error"] = True
         kwargs = {
             "code": code,
             "request_id": request_id,
             "endpoint": endpoint,
             "http_status": http_status,
             "retry_after": retry_after,
+            "help_message": details,
         }
         lowered_message = message.lower()
         explicit_rate_limit = any(
@@ -307,6 +316,169 @@ class QianchuanOpenApiClient:
             return
 
     def request(
+        self, method: str, endpoint: str, *, query=None, body=None, advertiser_id="", before_send=None
+    ) -> ApiResponse:
+        verb = str(method or "GET").upper()
+        if verb == "POST":
+            # Keep the established one-send / unknown-outcome write contract.
+            return self._request_post_legacy(verb, endpoint, query=query, body=body,
+                                             advertiser_id=advertiser_id, before_send=before_send)
+        if verb != "GET":
+            raise ValueError("仅支持 GET/POST")
+        context = current_collection_context() or CollectionContext()
+        with use_collection_context(context):
+            return self._request_get(endpoint, query=query, advertiser_id=advertiser_id,
+                                     before_send=before_send, context=context)
+
+    def _read_get_response(self, response, context: CollectionContext) -> bytes:
+        read1 = getattr(response, "read1", None)
+        if not callable(read1):
+            # Compatibility with simple response doubles; real HTTPResponse
+            # provides read1, so production reads check the deadline per chunk.
+            raw = response.read()
+            context.check_active("after_response_read")
+            if len(raw) > 16 * 1024 * 1024:
+                raise ApiRequestError("单页响应超过安全容量", code="client_response_size")
+            return raw
+        chunks, size = [], 0
+        while True:
+            context.check_active("response_read")
+            sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                sock.settimeout(max(0.001, min(self.timeout, context.remaining_seconds())))
+            chunk = read1(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 16 * 1024 * 1024:
+                raise ApiRequestError("单页响应超过安全容量", code="client_response_size")
+            chunks.append(chunk)
+        context.check_active("after_response_read")
+        return b"".join(chunks)
+
+    def _request_get(self, endpoint, *, query, advertiser_id, before_send, context):
+        attempts = min(4, self.max_get_attempts, context.max_request_attempts)
+        logical_uid = f"oe_call_{uuid.uuid4().hex}"
+        page_key = request_fingerprint(endpoint, query, advertiser_id=advertiser_id) if "page" in (query or {}) else ""
+        refreshed = False
+        rejected_revision = None
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            context.check_active("before_token")
+            uid = f"oe_{uuid.uuid4().hex}"
+            state = {"sent": False, "page_attempt": None}
+            attempt_started = time.monotonic()
+            decoded, status, response_headers, bundle = {}, None, None, None
+            outcome, error_code, request_id = "failed", "", ""
+            error = None
+            result = None
+            try:
+                token_kwargs = {"force_refresh": refreshed}
+                if rejected_revision is not None:
+                    signature = inspect.signature(self.token_provider.get_token)
+                    if "rejected_token_revision" in signature.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+                        token_kwargs["rejected_token_revision"] = rejected_revision
+                bundle = run_bounded(lambda: self.token_provider.get_token(**token_kwargs), context=context, lane="token")
+                context.check_active("after_token")
+                request = Request(self._url(endpoint, query), headers={"Access-Token": bundle.access_token,
+                                  "Accept": "application/json"}, method="GET")
+
+                def transport():
+                    wait = getattr(self.rate_limiter, "wait_for_request", None)
+                    if callable(wait):
+                        wait(endpoint, advertiser_id)
+                    else:
+                        self.rate_limiter.wait(f"{endpoint}:{str(advertiser_id or '')}")
+                    context.check_active("before_http_send")
+                    if before_send is not None:
+                        before_send()
+                    context.check_active("before_http_send")
+                    context.progress("http_send", endpoint=endpoint, page=(query or {}).get("page"),
+                                     attempt=attempt, request_uid=uid)
+                    context.check_active("before_http_send")
+                    if page_key:
+                        state["page_attempt"] = context.reserve_page_attempt(page_key)
+                    state.update(sent=True, sent_at=time.time())
+                    try:
+                        with urlopen(request, timeout=max(0.001, min(self.timeout, context.remaining_seconds()))) as response:
+                            raw = self._read_get_response(response, context)
+                            return self._decode(raw), int(getattr(response, "status", 200) or 200), response.headers
+                    except HTTPError as response:
+                        try:
+                            raw = self._read_get_response(response, context)
+                            try:
+                                payload = self._decode(raw)
+                            except ApiRequestError:
+                                payload = {"message": f"HTTP {response.code}"}
+                            return payload, int(response.code), response.headers
+                        finally:
+                            response.close()
+
+                def gated_transport():
+                    scope_key = getattr(context, "pagination_info", {}).get("scope_fingerprint", page_key)
+                    # Old cancelled IO retains its slot until it really exits;
+                    # a rescan cannot pile three more sends on top of it.
+                    with context.io_slot(scope_key):
+                        return transport()
+                decoded, status, response_headers = run_bounded(gated_transport, context=context, lane="io")
+                context.check_active("after_http")
+                code = str(decoded.get("code") or "0")
+                request_id = self._request_id(decoded, response_headers)
+                if status < 200 or status >= 300 or code not in {"", "0"}:
+                    self._raise_api_error(decoded, endpoint=endpoint, http_status=status, headers=response_headers)
+                outcome, error_code = "success", code
+                result = ApiResponse(data=decoded.get("data", decoded), raw=decoded, request_id=request_id,
+                                   code=code, message=safe_error_message(decoded.get("message")), request_uid=uid)
+            except BaseException as exc:
+                error = last_error = exc
+                error_code = str(getattr(exc, "code", "") or getattr(exc, "http_status", "") or type(exc).__name__)
+                request_id = str(getattr(exc, "request_id", "") or request_id)
+                if isinstance(exc, ApiRequestError):
+                    exc.request_uid = exc.request_uid or uid
+            finally:
+                page_options = getattr(context, "pagination_info", {})
+                evidence = page_evidence(decoded.get("data", decoded),
+                    items_key=page_options.get("items_key"), identity_getter=page_options.get("identity_getter")) if decoded else {}
+                evidence.update(scope_fingerprint=page_options.get("scope_fingerprint", page_key),
+                                batch_id=page_options.get("batch_id", ""))
+                self._audit({"request_uid": uid, "endpoint": endpoint, "method": "GET",
+                    "aavid": str(advertiser_id or ""), "request": {"query": query or {}, "body": {}},
+                    "request_id": request_id, "status": outcome, "error_code": error_code,
+                    "permission_status": "denied" if isinstance(error, (ApiTokenError, ApiPermissionError)) else "granted" if outcome == "success" else "unknown",
+                    "response": {"code": error_code, "message": safe_error_message(decoded.get("message") or decoded.get("msg") or str(error or "")),
+                        "help_message": help_evidence(decoded.get("help_message")), "pagination": evidence,
+                        "attempt": attempt, "page_attempt": state["page_attempt"], "http_attempt": state["sent"],
+                        "sent_at": state.get("sent_at"), "elapsed_ms": int((time.monotonic() - attempt_started) * 1000),
+                        "logical_request_uid": logical_uid}})
+            context.check_active("after_http_attempt")
+            if result is not None:
+                return result
+            if str(getattr(error, "code", "")) == "authorization_context_changed":
+                context.cancel("API授权上下文已变化，旧请求作废")
+                raise error
+            if isinstance(error, ApiTokenError) and state["sent"] and not refreshed and attempt < attempts:
+                refreshed = True
+                rejected_revision = getattr(bundle, "token_revision", None)
+                continue
+            retryable = isinstance(error, (URLError, socket.timeout, TimeoutError, ConnectionError, OSError)) or (
+                isinstance(error, ApiRateLimitError)) or (
+                isinstance(error, ApiRequestError) and not isinstance(error, (ApiTokenError, ApiPermissionError))
+                and str(error.code) != "400153"
+                and ((getattr(error, "http_status", None) or 0) >= 500 or self._is_transient_service_error(error.code, str(error))))
+            if retryable and attempt < attempts:
+                delay = max(float(getattr(error, "retry_after", 0) or 0), 2 ** (attempt - 1) + random.random() * 0.25)
+                if self._sleep is time.sleep:
+                    context.wait(delay, "http_retry_backoff")
+                else:
+                    run_bounded(lambda: self._sleep(delay), context=context, lane="io")
+                continue
+            if isinstance(error, (URLError, socket.timeout, TimeoutError, ConnectionError, OSError)):
+                raise ApiRequestError("千川官方 API 网络请求失败", endpoint=endpoint, request_uid=uid) from error
+            raise error
+        raise last_error or ApiRequestError("千川官方 API 请求失败", endpoint=endpoint)
+
+    def _request_post_legacy(
         self,
         method: str,
         endpoint: str,
@@ -559,309 +731,26 @@ class QianchuanOpenApiClient:
                             **({"before_send": before_send} if before_send is not None else {}))
 
     @staticmethod
-    def extract_items(data: Any) -> list[dict[str, Any]]:
-        if isinstance(data, list):
-            return [dict(item) for item in data if isinstance(item, Mapping)]
-        if not isinstance(data, Mapping):
-            return []
-        # Ocean Engine uses endpoint-specific collection keys.  Keep the
-        # explicit list ordered so pagination never mistakes a nested metric
-        # array for the endpoint's primary result set.
-        for key in (
-            "adv_id_list",
-            "account_list",
-            "ad_list",
-            "ad_material_infos",
-            "material_list",
-            "product_list",
-            "task_list",
-            "log_list",
-            "logs",
-            "advertisers",
-            "data_list",
-            "items",
-            "rows",
-            "list",
-        ):
-            value = data.get(key)
-            if isinstance(value, list):
-                rows = [dict(item) for item in value if isinstance(item, Mapping)]
-                # Some Ocean Engine responses contain both a generic ``list``
-                # of bare numeric IDs and a richer endpoint-specific list such
-                # as ``adv_id_list``.  A primitive list must not hide the
-                # structured rows needed by the normalizer.
-                if rows:
-                    return rows
-        for value in data.values():
-            if isinstance(value, Mapping):
-                found = QianchuanOpenApiClient.extract_items(value)
-                if found:
-                    return found
-        return []
+    def extract_items(data: Any, *, items_key: Optional[str] = None) -> list[dict[str, Any]]:
+        from .pagination import extract_items
+        return extract_items(data, items_key=items_key)
 
     @staticmethod
-    def _has_more(
-        data: Any, *, page: int, page_size: int, item_count: int
-    ) -> Optional[bool]:
-        if isinstance(data, Mapping):
-            for key in ("page_info", "pageInfo", "pagination"):
-                info = data.get(key)
-                if isinstance(info, Mapping):
-                    echoed_size = info.get("page_size") or info.get("pageSize")
-                    if echoed_size not in (None, "") and int(echoed_size) != int(page_size):
-                        raise ApiRequestError(
-                            "千川官方 API 回显分页大小与请求不一致，结果已标记为不完整"
-                        )
-                    if "has_more" in info:
-                        return bool(info.get("has_more"))
-                    total_page = info.get("total_page")
-                    if total_page is None:
-                        total_page = info.get("total_pages")
-                    if total_page is not None:
-                        return page < max(0, int(total_page))
-                    total = info.get("total_number")
-                    if total is None:
-                        total = info.get("total_num")
-                    if total is None:
-                        total = info.get("total")
-                    if total is None:
-                        total = info.get("count")
-                    if total is not None:
-                        return page * page_size < int(total)
-            if "has_more" in data:
-                return bool(data.get("has_more"))
-        # A short first page is not proof of completion when the endpoint
-        # omits pagination metadata or silently caps page_size. Fail closed so
-        # callers retain the last complete snapshot.
-        return None
+    def _has_more(data: Any, *, page: int, page_size: int, item_count: int) -> Optional[bool]:
+        from .pagination import metadata
+        return metadata(data, page=page, page_size=page_size, item_count=item_count).has_more
 
     def get_all_pages(
-        self,
-        endpoint: str,
-        query: Mapping[str, Any],
-        *,
-        advertiser_id: Any = "",
-        page_size: int = 100,
-        max_pages: int = 1000,
-        parallel_workers: int = 1,
+        self, endpoint: str, query: Mapping[str, Any], *, advertiser_id: Any = "",
+        page_size: int = 100, max_pages: int = 1000, parallel_workers: int = 1,
         identity_getter: Optional[Callable[[Mapping[str, Any]], Any]] = None,
-        verify_stability: bool = False,
+        verify_stability: bool = False, items_key: Optional[str] = None,
+        pagination_context: Optional[CollectionContext] = None,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        page_limit = max(1, int(max_pages))
-        workers = max(1, min(8, int(parallel_workers or 1)))
-        first_query = dict(query)
-        first_query["page"] = 1
-        first_query["page_size"] = page_size
-        first_response = self.get(endpoint, first_query, advertiser_id=advertiser_id)
-        first_items = self.extract_items(first_response.data)
-        first_has_more = self._has_more(
-            first_response.data,
-            page=1,
-            page_size=page_size,
-            item_count=len(first_items),
-        )
-        expected_total: Optional[int] = None
-        if isinstance(first_response.data, Mapping):
-            for key in ("page_info", "pageInfo", "pagination"):
-                info = first_response.data.get(key)
-                if not isinstance(info, Mapping):
-                    continue
-                raw_total = None
-                for total_key in (
-                    "total_number",
-                    "total_num",
-                    "total",
-                    "count",
-                ):
-                    if info.get(total_key) not in (None, ""):
-                        raw_total = info.get(total_key)
-                        break
-                if raw_total not in (None, ""):
-                    expected_total = max(0, int(raw_total))
-                break
-
-        def finalize(
-            collected: list[dict[str, Any]], request_ids: list[str]
-        ) -> tuple[list[dict[str, Any]], list[str]]:
-            if expected_total is not None and len(collected) != expected_total:
-                raise ApiRequestError(
-                    "千川官方 API 分页记录数与总数不一致，结果已标记为不完整",
-                    endpoint=endpoint,
-                    request_id=first_response.request_id,
-                )
-            if identity_getter is not None:
-                identities = [
-                    str(identity_getter(item) or "").strip() for item in collected
-                ]
-                if any(not value for value in identities):
-                    raise ApiRequestError(
-                        "千川官方 API 分页返回了缺少唯一标识的记录",
-                        endpoint=endpoint,
-                        request_id=first_response.request_id,
-                    )
-                if len(set(identities)) != len(identities):
-                    raise ApiRequestError(
-                        "千川官方 API 分页返回重复记录，结果已标记为不完整",
-                        endpoint=endpoint,
-                        request_id=first_response.request_id,
-                    )
-            if verify_stability and len(collected) > page_size:
-                verify_response = self.get(
-                    endpoint, first_query, advertiser_id=advertiser_id
-                )
-                verify_items = self.extract_items(verify_response.data)
-                verify_total: Optional[int] = None
-                if isinstance(verify_response.data, Mapping):
-                    for key in ("page_info", "pageInfo", "pagination"):
-                        info = verify_response.data.get(key)
-                        if not isinstance(info, Mapping):
-                            continue
-                        for total_key in (
-                            "total_number",
-                            "total_num",
-                            "total",
-                            "count",
-                        ):
-                            if info.get(total_key) not in (None, ""):
-                                verify_total = int(info[total_key])
-                                break
-                        break
-                if verify_total != expected_total:
-                    raise ApiRequestError(
-                        "千川官方 API 分页期间总记录数发生变化，已保留上次可信数据",
-                        endpoint=endpoint,
-                        request_id=verify_response.request_id,
-                    )
-                if identity_getter is not None:
-                    initial_ids = [
-                        str(identity_getter(item) or "").strip()
-                        for item in first_items
-                    ]
-                    verify_ids = [
-                        str(identity_getter(item) or "").strip()
-                        for item in verify_items
-                    ]
-                    if initial_ids != verify_ids:
-                        raise ApiRequestError(
-                            "千川官方 API 分页期间排序发生变化，已保留上次可信数据",
-                            endpoint=endpoint,
-                            request_id=verify_response.request_id,
-                        )
-                if verify_response.request_id:
-                    request_ids.append(verify_response.request_id)
-            return collected, request_ids
-        if first_has_more is None:
-            raise ApiRequestError(
-                "千川官方 API 未返回可验证的分页信息，结果已标记为不完整",
-                endpoint=endpoint,
-                request_id=first_response.request_id,
-            )
-        if not first_has_more:
-            return finalize(
-                first_items,
-                [first_response.request_id] if first_response.request_id else [],
-            )
-
-        total_pages = 0
-        if isinstance(first_response.data, Mapping):
-            for key in ("page_info", "pageInfo", "pagination"):
-                info = first_response.data.get(key)
-                if isinstance(info, Mapping):
-                    raw_total = info.get("total_page")
-                    if raw_total is None:
-                        raw_total = info.get("total_pages")
-                    if raw_total not in (None, ""):
-                        total_pages = int(raw_total)
-                    break
-        if workers > 1 and total_pages:
-            if total_pages > page_limit:
-                raise ApiRequestError(
-                    "千川官方 API 分页超过安全上限，结果已标记为不完整",
-                    endpoint=endpoint,
-                    request_id=first_response.request_id,
-                )
-
-            def fetch_page(page: int) -> tuple[int, ApiResponse, list[dict[str, Any]]]:
-                current = dict(query)
-                current["page"] = page
-                current["page_size"] = page_size
-                response = self.get(endpoint, current, advertiser_id=advertiser_id)
-                return page, response, self.extract_items(response.data)
-
-            pages: dict[int, tuple[ApiResponse, list[dict[str, Any]]]] = {
-                1: (first_response, first_items)
-            }
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="oe-api-page") as pool:
-                futures = {pool.submit(fetch_page, page): page for page in range(2, total_pages + 1)}
-                for future in as_completed(futures):
-                    page, response, items = future.result()
-                    pages[page] = (response, items)
-
-            rows: list[dict[str, Any]] = []
-            request_ids: list[str] = []
-            seen_fingerprints: set[str] = set()
-            for page in range(1, total_pages + 1):
-                response, items = pages[page]
-                fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
-                if fingerprint in seen_fingerprints:
-                    raise ApiRequestError(
-                        "千川官方 API 分页返回重复页面，目录已标记为不完整",
-                        endpoint=endpoint,
-                        request_id=response.request_id,
-                    )
-                if page < total_pages and not items:
-                    raise ApiRequestError(
-                        "千川官方 API 在分页中间返回空页，结果已标记为不完整",
-                        endpoint=endpoint,
-                        request_id=response.request_id,
-                    )
-                seen_fingerprints.add(fingerprint)
-                rows.extend(items)
-                if response.request_id:
-                    request_ids.append(response.request_id)
-            return finalize(rows, request_ids)
-
-        rows: list[dict[str, Any]] = []
-        request_ids: list[str] = []
-        seen_fingerprints: set[str] = set()
-        for page in range(1, page_limit + 1):
-            if page == 1:
-                response, items = first_response, first_items
-            else:
-                current = dict(query)
-                current["page"] = page
-                current["page_size"] = page_size
-                response = self.get(endpoint, current, advertiser_id=advertiser_id)
-                items = self.extract_items(response.data)
-            fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
-            if page > 1 and fingerprint in seen_fingerprints:
-                raise ApiRequestError(
-                    "千川官方 API 分页返回重复页面，目录已标记为不完整",
-                    endpoint=endpoint,
-                    request_id=response.request_id,
-                )
-            seen_fingerprints.add(fingerprint)
-            rows.extend(items)
-            if response.request_id:
-                request_ids.append(response.request_id)
-            has_more = self._has_more(
-                response.data,
-                page=page,
-                page_size=page_size,
-                item_count=len(items),
-            )
-            if has_more is None:
-                raise ApiRequestError(
-                    "千川官方 API 未返回可验证的分页信息，结果已标记为不完整",
-                    endpoint=endpoint,
-                    request_id=response.request_id,
-                )
-            if not has_more:
-                return finalize(rows, request_ids)
-            if not items:
-                raise ApiRequestError(
-                    "千川官方 API 声明仍有下一页但返回空页，结果已标记为不完整",
-                    endpoint=endpoint,
-                    request_id=response.request_id,
-                )
-        raise ApiRequestError("千川官方 API 分页超过安全上限，结果已标记为不完整", endpoint=endpoint)
+        from .pagination import collect_pages
+        return collect_pages(self, endpoint, query, advertiser_id=advertiser_id,
+                             page_size=page_size, max_pages=max_pages,
+                             parallel_workers=parallel_workers, identity_getter=identity_getter,
+                             verify_stability=verify_stability, items_key=items_key,
+                             pagination_context=pagination_context, progress_callback=progress_callback)

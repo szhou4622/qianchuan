@@ -17,12 +17,16 @@ import time
 import json
 from functools import wraps
 from startup_bootstrap import (
+    cancel_window_watchdog,
+    describe_startup_exception,
     install_exception_hooks,
     mark_normal_exit,
     mark_startup_phase,
     mark_window_ready,
     recover_stuck_instance_if_requested,
     start_window_watchdog,
+    startup_log,
+    startup_state,
     window_ready_was_reached,
 )
 import webview
@@ -49,6 +53,35 @@ from services.contact_http import ContactLocalHttpServer
 from services.control_panel_config import ensure_all_control_defaults
 from services.license_manager import LicenseManager
 from services.runtime_supervisor import RUNTIME_SUPERVISOR
+
+
+def dispatch_window_action(window, action):
+    """Defer WinForms calls out of synchronous input/COM event callbacks."""
+    def perform():
+        try:
+            action()
+        except Exception as exc:
+            startup_log("ui_action_failed=" + describe_startup_exception(exc))
+    try:
+        if sys.platform == "win32":
+            native = getattr(window, "native", None)
+            if native is not None and callable(getattr(native, "BeginInvoke", None)):
+                from System import Action
+                native.BeginInvoke(Action(perform))
+                return True
+            # Do not call an uninitialized COM/window backend on a worker.
+            if threading.current_thread() is not threading.main_thread():
+                startup_log("ui_action_deferred_native_not_ready")
+                return False
+        elif sys.platform == "darwin":
+            from PyObjCTools.AppHelper import callAfter
+            callAfter(perform)
+            return True
+        perform()
+        return True
+    except Exception as exc:
+        startup_log("ui_dispatch_failed=" + describe_startup_exception(exc))
+        return False
 
 
 # ── 打包环境强制 stdout/stderr 使用 UTF-8 ───────────────────────────────
@@ -344,9 +377,12 @@ class SingleInstanceChecker:
             if data.get("show_window"):
                 if webview.windows:
                     w = webview.windows[0]
-                    w.show()
-                    w.restore()
-                    self._activate_windows_process(os.getpid())
+                    def restore():
+                        w.show()
+                        w.restore()
+                        self._activate_windows_process(os.getpid())
+                    if not dispatch_window_action(w, restore):
+                        return
                     # 清除命令
                     with open(self.command_file, 'w', encoding='utf-8') as f:
                         json.dump({"show_window": False}, f)
@@ -413,8 +449,7 @@ class TrayApplication:
         """处理托盘菜单点击"""
         action = str(item)
         if action in ("显示", "Show"):
-            self.window.show()
-            self.window.restore()
+            dispatch_window_action(self.window, lambda: (self.window.show(), self.window.restore()))
         elif action in ("退出", "Quit"):
             self.quit_app()
 
@@ -423,8 +458,11 @@ class TrayApplication:
         print("[托盘] 触发退出...")
         self.force_close = True
         if self.icon:
-            self.icon.stop()
-        self.window.destroy()
+            try:
+                self.icon.stop()
+            except Exception as exc:
+                startup_log("tray_stop_failed=" + str(exc))
+        dispatch_window_action(self.window, self.window.destroy)
 
     def _setup_tray(self):
         """配置托盘图标"""
@@ -511,8 +549,9 @@ class TrayApplication:
                 tray_visible = False
         if tray_visible:
             print("[窗口] 关闭 -> 隐藏到托盘")
-            self.window.hide()
-            return False  # 阻止关闭
+            if dispatch_window_action(self.window, self.window.hide):
+                return False  # Only suppress close after accepting UI dispatch.
+            startup_log("tray_hide_dispatch_failed_allowing_close")
         # 托盘未真正显示时绝不保留隐形后台进程。
         self.force_close = True
         if self.icon:
@@ -721,6 +760,8 @@ class JSApi:
         return manager.client.diagnose_and_repair()
 
     def enterLicensedApplication(self):
+        if startup_state()["terminal"]:
+            return {"success": False, "authorized": False, "message": "窗口启动已结束，请重新打开软件"}
         manager = self.license_manager
         if manager is not None and not manager.is_runtime_authorized():
             return {
@@ -1539,7 +1580,8 @@ def main():
         )
         js_api._window = window
         try:
-            window.events.loaded += mark_window_ready
+            generation = startup_state()["generation"]
+            window.events.loaded += lambda: mark_window_ready(generation)
         except AttributeError:
             # Old pywebview builds should still be diagnosable.  The watchdog
             # will surface the missing readiness event instead of leaving a
@@ -1622,17 +1664,32 @@ def main():
         # ===== 启动 webview =====
         print("[START] 启动窗口...")
         mark_startup_phase("webview_start")
-        start_window_watchdog(window)
+        def close_failed_startup():
+            if tray_app is not None:
+                tray_app.force_close = True
+                if tray_app.icon:
+                    try:
+                        tray_app.icon.stop()
+                    except Exception as exc:
+                        startup_log("failed_startup_tray_stop_failed=" + str(exc))
+            if not dispatch_window_action(window, window.destroy):
+                startup_log("failed_startup_close_not_dispatched")
+        start_window_watchdog(window, close_window=close_failed_startup)
         webview.start(debug=False, http_server=False, private_mode=False, storage_path=storage_path)
 
     except KeyboardInterrupt:
+        cancel_window_watchdog()
         print("\n用户中断")
+        return 130
     except Exception as e:
+        cancel_window_watchdog()
+        mark_startup_phase("failed", str(e))
         print(f"[ERR] 错误: {e}")
         import traceback
         traceback.print_exc()
         raise
     finally:
+        cancel_window_watchdog()
         try:
             if js_api is not None:
                 js_api._stop_licensed_runtime()
@@ -1647,7 +1704,10 @@ def main():
             RUNTIME_SUPERVISOR.stop()
         except Exception:
             pass
-        single_instance_checker.release_runtime_lease()
+        try:
+            single_instance_checker.release_runtime_lease()
+        except Exception as exc:
+            startup_log("runtime_lease_release_failed=" + str(exc))
         if window_ready_was_reached():
             mark_normal_exit()
         print("程序已退出")

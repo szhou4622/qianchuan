@@ -14,6 +14,12 @@ import startup_bootstrap as bootstrap
 
 
 class StartupBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        bootstrap.begin_startup_attempt()
+
+    def tearDown(self):
+        bootstrap.begin_startup_attempt()
+
     def test_diagnostic_failure_cannot_hide_unhandled_exception(self):
         def fail_diagnostics(*args, **kwargs):
             raise RuntimeError('diagnostics broken')

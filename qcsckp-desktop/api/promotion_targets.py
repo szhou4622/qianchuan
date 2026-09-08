@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
@@ -485,18 +486,40 @@ def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     )
     out["last_lag_seconds"] = lag_seconds
     status = str(out.get("last_status") or "").strip().lower()
+    capability = out.get("capability") if isinstance(out.get("capability"), dict) else {}
+    error_kind = str(capability.get("collection_error_kind") or "").lower()
+    error_code = str(capability.get("collection_error_code") or "")
+    progress = {}
+    if status == "collecting":
+        try:
+            from services.official_api_collection import get_target_collection_progress
+            live = get_target_collection_progress(str(out.get("target_uid") or ""))
+            progress = {key: live[key] for key in ("phase", "page", "page_count", "actual_list_count",
+                        "attempt", "observed_at", "rescan_count") if key in live}
+        except Exception:
+            # A diagnostics read cannot make the local account list fail.
+            pass
+    out["collection_progress"] = progress
     selected = bool(out.get("enabled")) and bool(out.get("account_enabled", True))
     active = str(out.get("capacity_state") or "") == "active"
     if not selected or not active:
         health = "inactive"
-    elif status == "rate_limited":
-        health = "backoff"
-    elif status in {"error", "failed"}:
-        health = "error"
     elif status == "collecting":
         health = "collecting"
     elif status == "queued":
         health = "queued"
+    elif status in {"auth_required", "token"} or error_kind in {"token", "auth_required"} or error_code in {"41013", "authorization_context_changed"}:
+        health = "auth_required"
+    elif status == "permission_denied" or error_kind in {"permission", "permission_denied"}:
+        health = "permission_denied"
+    elif status == "resource_pressure" or error_kind == "resource_pressure":
+        health = "resource_pressure"
+    elif status in {"deadline", "collection_deadline"} or error_kind in {"deadline", "collection_deadline"} or error_code == "client_deadline":
+        health = "deadline"
+    elif status == "rate_limited":
+        health = "backoff"
+    elif status in {"error", "failed", "pagination_error", "suspicious_empty", "worker_unavailable", "collection_cancelled"} or error_kind in {"worker_unavailable", "collection_cancelled"}:
+        health = "error"
     elif lag_seconds is None:
         health = "pending"
     elif lag_seconds > 10 * 60:
@@ -504,6 +527,21 @@ def _target_row(row: Dict[str, Any]) -> Dict[str, Any]:
     else:
         health = "healthy"
     out["collection_health"] = health
+    control_complete = bool(capability.get("assist_sync_ok")) and bool(capability.get("control_task_sync_complete"))
+    control_error = str(capability.get("control_error") or "")
+    control_state = (
+        "collecting" if capability.get("assist_sync_in_progress") else
+        "error" if control_error else "healthy" if control_complete else "pending"
+    )
+    out["collection_streams"] = {
+        "material": {"status": health, "last_success_at": out.get("last_sync_at") or None,
+                     "observed_at": capability.get("material_observed_at") or None,
+                     "error": "" if health in {"collecting", "queued"} else str(out.get("last_error") or "")},
+        "control": {"status": control_state,
+                    "last_success_at": capability.get("control_last_success_at") or (capability.get("assist_synced_at") if control_complete else None),
+                    "observed_at": capability.get("control_observed_at") or None,
+                    "error": "" if control_state == "collecting" else control_error},
+    }
     return out
 
 
@@ -575,13 +613,14 @@ def refresh_target_eligibility(
     target_uid: Any,
     *,
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> Optional[Dict[str, Any]]:
     """Recalculate persisted gates after capability or catalog evidence changes."""
     uid = str(target_uid or "").strip()
     if not uid:
         return None
     store = db or SQLiteStore()
-    row = store.select_one("promotion_target", where={"target_uid": uid})
+    row = store.select_one("promotion_target", where={"target_uid": uid}, connection=connection)
     if not row:
         return None
     try:
@@ -606,8 +645,9 @@ def refresh_target_eligibility(
             "ineligible_reason": str(eligibility["ineligible_reason"] or "")[:1000],
         },
         where={"target_uid": uid},
+        connection=connection,
     )
-    saved = store.select_one("promotion_target", where={"target_uid": uid})
+    saved = store.select_one("promotion_target", where={"target_uid": uid}, connection=connection)
     return _target_row(saved) if saved else None
 
 
@@ -619,6 +659,7 @@ def update_target_catalog_evidence(
     plan_system: Any = None,
     promotion_scene: Any = None,
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> Dict[str, Any]:
     """Persist trusted read-only catalog evidence and recompute safety gates."""
     uid = str(target_uid or "").strip()
@@ -629,8 +670,9 @@ def update_target_catalog_evidence(
     )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     account_uid = ""
-    with store.transaction() as conn:
-        store.execute("BEGIN IMMEDIATE", connection=conn)
+    with (nullcontext(connection) if connection is not None else store.transaction()) as conn:
+        if connection is None:
+            store.execute("BEGIN IMMEDIATE", connection=conn)
         row = store.select_one(
             "promotion_target",
             where={"target_uid": uid},
@@ -708,12 +750,11 @@ def update_target_catalog_evidence(
         "qianchuan_account",
         fields="owner_username",
         where={"account_uid": account_uid},
+        connection=connection,
     )
-    refresh_monitor_capacity(
-        owner_username=(account or {}).get("owner_username"),
-        db=store,
-    )
-    saved = store.select_one("promotion_target", where={"target_uid": uid})
+    if connection is None:
+        refresh_monitor_capacity(owner_username=(account or {}).get("owner_username"), db=store)
+    saved = store.select_one("promotion_target", where={"target_uid": uid}, connection=connection)
     assert saved is not None
     return _target_row(saved)
 
@@ -723,13 +764,15 @@ def record_target_verification_failure(
     error: Any,
     *,
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> Dict[str, Any]:
     """原子关闭自动化权力，且不改写上一次成功核验时间。"""
     uid = str(target_uid or "").strip()
     store = db or SQLiteStore()
     reason = str(error or "本轮未取得明确投放状态")[:1000]
-    with store.transaction() as conn:
-        store.execute("BEGIN IMMEDIATE", connection=conn)
+    with (nullcontext(connection) if connection is not None else store.transaction()) as conn:
+        if connection is None:
+            store.execute("BEGIN IMMEDIATE", connection=conn)
         row = store.select_one(
             "promotion_target",
             where={"target_uid": uid},
@@ -765,7 +808,7 @@ def record_target_verification_failure(
             where={"target_uid": uid},
             connection=conn,
         )
-    saved = store.select_one("promotion_target", where={"target_uid": uid})
+    saved = store.select_one("promotion_target", where={"target_uid": uid}, connection=connection)
     assert saved is not None
     return _target_row(saved)
 
@@ -1180,16 +1223,19 @@ def patch_target_sync_state(
     capability_updates: Optional[Dict[str, Any]] = None,
     capability_remove_keys: Iterable[str] = (),
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> Dict[str, Any]:
     """原子合并采集状态，避免覆盖同时写入的受控追投/停投能力证据。"""
     uid = str(target_uid or "").strip()
     if not uid:
         raise ValueError("缺少监控目标")
-    init_sqlite_schema()
+    if connection is None:
+        init_sqlite_schema()
     store = db or SQLiteStore()
-    with store.transaction() as conn:
+    with (nullcontext(connection) if connection is not None else store.transaction()) as conn:
         # 先取得写锁，再读取能力快照；其他线程只能在本事务提交后写入。
-        store.execute("BEGIN IMMEDIATE", connection=conn)
+        if connection is None:
+            store.execute("BEGIN IMMEDIATE", connection=conn)
         row = store.select_one(
             "promotion_target",
             fields="capability_json,last_status,last_error",
@@ -1242,7 +1288,7 @@ def patch_target_sync_state(
                 where={"target_uid": uid},
                 connection=conn,
             )
-    refresh_target_eligibility(uid, db=store)
+        refresh_target_eligibility(uid, db=store, connection=conn)
     return capability
 
 
@@ -1251,11 +1297,13 @@ def upsert_products(
     products: Iterable[Dict[str, Any]],
     *,
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> int:
     uid = str(target_uid or "").strip()
     if not uid:
         raise ValueError("缺少 target_uid")
-    init_sqlite_schema()
+    if connection is None:
+        init_sqlite_schema()
     store = db or SQLiteStore()
     count = 0
     for product in products or []:
@@ -1296,6 +1344,7 @@ def upsert_products(
                 "raw_json": _json_dumps(product),
             },
             unique_fields=["target_uid", "product_id"],
+            connection=connection,
         )
         count += 1
     return count
@@ -1308,15 +1357,17 @@ def replace_material_product_links(
     *,
     material_name: str = "",
     db: Optional[SQLiteStore] = None,
+    connection=None,
 ) -> int:
     uid = str(target_uid or "").strip()
     mid = str(material_id or "").strip()
     if not uid or not mid:
         return 0
     ids = _json_list(list(product_ids or []))
-    init_sqlite_schema()
+    if connection is None:
+        init_sqlite_schema()
     store = db or SQLiteStore()
-    with store.transaction() as conn:
+    with (nullcontext(connection) if connection is not None else store.transaction()) as conn:
         store.execute(
             "DELETE FROM promotion_material_product WHERE target_uid=? AND material_id=?",
             (uid, mid),

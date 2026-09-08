@@ -6,6 +6,69 @@ param(
     [switch]$SkipArchive
 )
 
+
+function Get-CriticalReleasePaths {
+    param([Parameter(Mandatory=$true)][string]$ReleaseDir)
+    $required = @(
+        "QCSCKP.exe", "VERSION.txt", "bin\python312.dll", "bin\release.json",
+        "bin\DEFAULT-CONFIG.json", "bin\apply_channel_update.ps1",
+        "bin\static\index.html", "bin\static\license.html",
+        "bin\pythonnet\runtime\Python.Runtime.dll",
+        "bin\clr_loader\ffi\dlls\amd64\ClrLoader.dll",
+        "bin\webview\lib\Microsoft.Web.WebView2.Core.dll",
+        "bin\webview\lib\Microsoft.Web.WebView2.WinForms.dll",
+        "bin\webview\lib\WebBrowserInterop.x64.dll",
+        "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
+        "runtime\MicrosoftEdgeWebview2Setup.exe"
+    )
+    foreach ($relative in $required) {
+        if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDir $relative) -PathType Leaf)) {
+            throw "Critical release file is missing: $relative"
+        }
+    }
+    # Some PyInstaller hooks also place copies in bin's root. Verify every
+    # actual load candidate, including optional Wpf from dependency upgrades.
+    $runtimeNames = @("Python.Runtime.dll", "ClrLoader.dll", "Microsoft.Web.WebView2.Core.dll",
+        "Microsoft.Web.WebView2.WinForms.dll", "Microsoft.Web.WebView2.Wpf.dll",
+        "WebBrowserInterop.x64.dll", "WebView2Loader.dll")
+    $root = [IO.Path]::GetFullPath($ReleaseDir).TrimEnd('\') + '\'
+    $additional = @(Get-ChildItem -LiteralPath (Join-Path $ReleaseDir "bin") -Recurse -File |
+        Where-Object { $_.Name -in $runtimeNames } |
+        ForEach-Object {
+            $resolved = [IO.Path]::GetFullPath($_.FullName)
+            if (-not $resolved.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Unexpected dependency path outside release."
+            }
+            $resolved.Substring($root.Length)
+        })
+    return @(($required + $additional) | Sort-Object -Unique)
+}
+
+function Get-ReleaseSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Get-CriticalReleaseHashes {
+    param([Parameter(Mandatory=$true)][string]$ReleaseDir)
+    foreach ($relative in (Get-CriticalReleasePaths -ReleaseDir $ReleaseDir)) {
+        $absolute = Join-Path $ReleaseDir $relative
+        [ordered]@{
+            path = ($relative -replace "\\", "/")
+            size = (Get-Item -LiteralPath $absolute).Length
+            sha256 = Get-ReleaseSha256 -Path $absolute
+        }
+    }
+}
+
 $ErrorActionPreference = "Stop"
 
 if ($env:OS -ne "Windows_NT") {
@@ -39,6 +102,8 @@ foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $conta
         throw "Required build input does not exist: $required"
     }
 }
+& $python -B -c "import os,struct,sys; sys.exit(0 if os.name=='nt' and struct.calcsize('P')==8 and sys.version_info[:2]==(3,12) else 'This release requires Windows x64 Python 3.12.')"
+if ($LASTEXITCODE -ne 0) { throw 'Unsupported Python build runtime.' }
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $BuildRevision -lt 1) { throw 'Invalid release identity' }
 $outputRoot = Join-Path $projectRoot "output\windows\v$Version\$Channel\r$BuildRevision"
@@ -60,6 +125,18 @@ $metadataPath = Join-Path $outputRoot 'release.json'
 $releaseIdentity = [ordered]@{app_name='QCSCKP';version=$Version;channel=$Channel;build_revision=$BuildRevision;source_commit=$sourceCommit;business_baseline='0.1.65'}
 [IO.File]::WriteAllText($metadataPath, ($releaseIdentity | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 $updateHelper = Join-Path $scriptDir 'apply_channel_update.ps1'
+$defaultConfigPath = Join-Path $outputRoot 'DEFAULT-CONFIG.json'
+# Generate only public defaults from the exact requested release identity.
+# Importing this standard-library policy never initializes services or a DB.
+Push-Location $projectRoot
+try {
+    & $python -B -c "import json,sys; from pathlib import Path; from release_configuration import public_default_configuration; identity=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8-sig')); Path(sys.argv[2]).write_text(json.dumps(public_default_configuration(identity),ensure_ascii=False,indent=2)+'\n',encoding='utf-8')" $metadataPath $defaultConfigPath
+    if ($LASTEXITCODE -ne 0) { throw 'Public default configuration generation failed.' }
+    $dependencyVersionsJson = & $python -B -c "import importlib.metadata as m,json; print(json.dumps({p:m.version(p) for p in ['pythonnet','clr-loader','pywebview','pyinstaller','pyinstaller-hooks-contrib']}))"
+    if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency version discovery failed.' }
+    $dependencyVersions = $dependencyVersionsJson | ConvertFrom-Json
+}
+finally { Pop-Location }
 
 $appName = "QCSCKP"
 $pyinstallerArgs = @(
@@ -72,9 +149,15 @@ $pyinstallerArgs = @(
     "--icon", $icon,
     "--add-data", "$staticDir;static",
     "--add-data", "$metadataPath;.",
+    "--add-data", "$defaultConfigPath;.",
     "--add-data", "$updateHelper;.",
     "--collect-all", "playwright",
     "--collect-all", "webview",
+    "--collect-binaries", "pythonnet",
+    "--collect-binaries", "clr_loader",
+    "--hidden-import", "clr",
+    "--hidden-import", "pythonnet",
+    "--hidden-import", "clr_loader",
     "--collect-all", "lark_oapi",
     "--collect-all", "baseopensdk",
     "--collect-all", "pystray",
@@ -98,7 +181,9 @@ $pyinstallerArgs = @(
 
 Push-Location $projectRoot
 try {
-    & $python -m PyInstaller @pyinstallerArgs
+    # Clean only the build child environment; do not set sys.frozen or mutate
+    # this PowerShell process's developer settings.
+    & $python -B -c "import sys; from release_configuration import enforce_packaged_configuration; enforce_packaged_configuration(for_build=True); import PyInstaller.__main__; PyInstaller.__main__.run(sys.argv[1:])" @pyinstallerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }
@@ -115,6 +200,12 @@ if (-not (Test-Path -LiteralPath $builtDir)) {
 }
 if (Test-Path -LiteralPath $releaseDir) {
     throw "Release directory already exists: $releaseDir"
+}
+foreach ($movingPath in @($builtDir, $releaseDir)) {
+    $resolvedMove = [IO.Path]::GetFullPath($movingPath)
+    if (-not $resolvedMove.StartsWith([IO.Path]::GetFullPath($distRoot).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to move a path outside the checked distribution directory.'
+    }
 }
 Move-Item -LiteralPath $builtDir -Destination $releaseDir
 Copy-Item -LiteralPath $usageFile -Destination (Join-Path $releaseDir "README-Windows.txt") -Force
@@ -151,42 +242,6 @@ if ($webViewSignature.Status -ne "Valid" -or -not $webViewSignature.SignerCertif
     throw "The downloaded WebView2 bootstrapper is not validly signed by Microsoft Corporation."
 }
 
-$criticalRelativePaths = @(
-    "QCSCKP.exe",
-    "VERSION.txt",
-    "bin\python312.dll",
-    "bin\release.json",
-    "bin\apply_channel_update.ps1",
-    "bin\static\index.html",
-    "bin\static\license.html",
-    "bin\webview\lib\runtimes\win-x64\native\WebView2Loader.dll",
-    "runtime\MicrosoftEdgeWebview2Setup.exe"
-)
-$criticalFiles = foreach ($relative in $criticalRelativePaths) {
-    $absolute = Join-Path $releaseDir $relative
-    if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
-        throw "Critical release file is missing: $relative"
-    }
-    [ordered]@{
-        path = ($relative -replace "\\", "/")
-        size = (Get-Item -LiteralPath $absolute).Length
-        sha256 = (Get-FileHash -LiteralPath $absolute -Algorithm SHA256).Hash.ToLowerInvariant()
-    }
-}
-$packageManifest = [ordered]@{
-    app_name = "QCSCKP"
-    version = $Version
-    channel = $Channel
-    build_revision = $BuildRevision
-    source_commit = $sourceCommit
-    critical_files = @($criticalFiles)
-}
-[IO.File]::WriteAllText(
-    (Join-Path $releaseDir "PACKAGE-MANIFEST.json"),
-    ($packageManifest | ConvertTo-Json -Depth 5),
-    [Text.UTF8Encoding]::new($false)
-)
-
 # A public package must start with a completely blank local runtime. In
 # particular, never ship another Windows user's DPAPI ciphertext: it cannot be
 # decrypted on the recipient's computer and would make API setup appear broken.
@@ -197,6 +252,23 @@ $packageManifest = [ordered]@{
 if ($LASTEXITCODE -ne 0) {
     throw "Release privacy cleanup or verification failed with exit code $LASTEXITCODE"
 }
+
+$criticalFiles = @(Get-CriticalReleaseHashes -ReleaseDir $releaseDir)
+$packageManifest = [ordered]@{
+    app_name = "QCSCKP"
+    version = $Version
+    channel = $Channel
+    build_revision = $BuildRevision
+    source_commit = $sourceCommit
+    runtime_dependencies = $dependencyVersions
+    software_contract_sha256 = (Get-Content -LiteralPath $defaultConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json).software_contract_sha256
+    critical_files = @($criticalFiles)
+}
+[IO.File]::WriteAllText(
+    (Join-Path $releaseDir "PACKAGE-MANIFEST.json"),
+    ($packageManifest | ConvertTo-Json -Depth 5),
+    [Text.UTF8Encoding]::new($false)
+)
 
 $exePath = Join-Path $releaseDir "$appName.exe"
 if (-not (Test-Path -LiteralPath $exePath)) {
@@ -221,7 +293,7 @@ try {
 finally {
     Pop-Location
 }
-$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipHash = Get-ReleaseSha256 -Path $zipPath
 $checksumPath = "$zipPath.sha256.txt"
 Set-Content -LiteralPath $checksumPath -Value "$zipHash  $([System.IO.Path]::GetFileName($zipPath))" -Encoding ASCII
 
