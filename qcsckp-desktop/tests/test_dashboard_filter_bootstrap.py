@@ -78,7 +78,8 @@ class DashboardFilterBootstrapTests(unittest.TestCase):
         self.assertIn("fetchTop20ByCost(1, scope)", self.dashboard)
         self.assertIn("fetchLatestCrawlCostSum(hours, scope)", self.dashboard)
         self.assertIn("generation !== dashboardScopeGeneration", self.dashboard)
-        self.assertIn("官方API本轮指标为0", self.dashboard)
+        self.assertNotIn("官方API本轮指标为0", self.dashboard)
+        self.assertIn("待核对原始指标", self.dashboard)
 
 
 if __name__ == "__main__":

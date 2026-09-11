@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 from utils.operation_log_identity import operation_log_row_identity
 
 from .client import ApiResponse, QianchuanOpenApiClient
-from .errors import OfficialApiWriteDisabled
+from .errors import ApiRequestError, OfficialApiWriteDisabled
 from .normalizers import (
     build_metric_unit_map,
     first,
@@ -53,6 +53,13 @@ CONTROL_TASK_METRIC_FIELDS = (
     "total_prepay_and_pay_settle_roi2_1h_assist",
     "total_order_settle_count_for_roi2_1h_assist",
 )
+
+# These traffic fields are advertised by config/get but currently fail on some
+# Chengfang live accounts. They cannot make verified financial metrics vanish.
+CHENGFANG_OPTIONAL_TRAFFIC_METRICS = frozenset({
+    "live_show_count_for_roi2_v2", "live_watch_count_for_roi2_v2",
+    "live_cvr_rate_for_roi2_v2", "live_convert_rate_for_roi2_v2",
+})
 
 
 def material_report_filter_context(plan: Mapping[str, Any]) -> dict[str, str]:
@@ -554,6 +561,7 @@ class QianchuanOfficialApiService:
         end_time: str = "",
         fields: Optional[Iterable[str]] = None,
         filtering: Optional[Mapping[str, Any]] = None,
+        verify_stability: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         aid = require_digit_id(advertiser_id, "advertiser_id")
         goal = str(marketing_goal or "").strip().upper()
@@ -575,8 +583,10 @@ class QianchuanOfficialApiService:
             query["adlab_scene"] = scene
         if filtering:
             query["filtering"] = dict(filtering)
+        integrity = {"verify_stability": True,
+                     "identity_getter": lambda row: normalize_plan(row, advertiser_id=aid)["ad_id"]} if verify_stability else {}
         rows, request_ids = self.client.get_all_pages(
-            self.PLAN_LIST, query, advertiser_id=aid, page_size=100
+            self.PLAN_LIST, query, advertiser_id=aid, page_size=100, **integrity
         )
         return [normalize_plan(row, advertiser_id=aid) for row in rows], request_ids
 
@@ -801,7 +811,8 @@ class QianchuanOfficialApiService:
             raise ValueError("plan_system/promotion_scene 必须是已确认的乘方/全域 × 推直播/推商品")
         response = self.client.get(
             self.REPORT_CONFIG,
-            {"advertiser_id": aid, "data_topics": [topic]},
+            {"advertiser_id": aid, "data_topics": [topic],
+             **({"data_period": "ALL_DATA"} if system == "chengfang" else {})},
             advertiser_id=aid,
         )
         units = build_metric_unit_map(response.data)
@@ -865,6 +876,20 @@ class QianchuanOfficialApiService:
             return precise
         raise ApiRequestError("素材ID缺少无损表示，未采用浮点舍入值", code="client_identifier_precision")
 
+    @staticmethod
+    def _is_material_report_summary(row: Mapping[str, Any]) -> bool:
+        """Recognize only the observed official summary sentinel, never a video."""
+        dimensions = row.get("dimensions")
+        block = dimensions.get("material_id") if isinstance(dimensions, Mapping) else None
+        if not isinstance(block, Mapping):
+            return False
+        values = [block[key] for key in ("Value", "value") if key in block]
+        displays = [block[key] for key in ("ValueStr", "value_str") if key in block]
+        return (bool(values) and bool(displays)
+                and all(not isinstance(value, bool) and isinstance(value, (int, str))
+                        and str(value) == "-2" for value in values)
+                and all(value == "-" for value in displays))
+
     def list_material_report(
         self,
         advertiser_id: Any,
@@ -875,6 +900,7 @@ class QianchuanOfficialApiService:
         end_date: str,
         metrics: Iterable[str],
         filter_context: Optional[Mapping[str, Any]] = None,
+        data_period: str = "ALL_DATA",
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Read authoritative material metrics for one account/topic/day.
 
@@ -893,6 +919,8 @@ class QianchuanOfficialApiService:
         if not metric_fields:
             raise ValueError("素材报表至少需要一个指标")
         filters: list[dict[str, Any]] = []
+        if data_period not in {"ALL_DATA", "OVER_ALL_DATA"}:
+            raise ValueError("素材报表统计范围无效")
         if system == "chengfang":
             # Chengfang material topics require the explicit video material
             # type even though the topic name itself already says VIDEO.
@@ -903,6 +931,17 @@ class QianchuanOfficialApiService:
                     "values": ["3"],
                 }
             )
+            if filter_context is not None:
+                context = dict(filter_context)
+                if scene != "live":
+                    raise ValueError("显式乘方报表筛选目前仅验证推直播")
+                anchor_id = require_digit_id(context.get("anchor_id"), "anchor_id")
+                if str(context.get("ecp_app_id") or "") != "1":
+                    raise ValueError("乘方推直播下单平台证据无效")
+                filters.extend([
+                    {"field": "anchor_id", "operator": 7, "values": [anchor_id]},
+                    {"field": "ecp_app_id", "operator": 7, "values": ["1"]},
+                ])
         elif system == "global" and scene == "live":
             context = {
                 str(key): str(value or "").strip()
@@ -942,13 +981,14 @@ class QianchuanOfficialApiService:
                 "start_time": f"{str(start_date).strip()} 00:00:00",
                 "end_time": f"{str(end_date).strip()} 23:59:59",
                 "order_by": [{"field": "material_id", "type": 1}],
-                "data_period": "ALL_DATA",
+                "data_period": data_period,
             },
             advertiser_id=aid,
             page_size=200,
             items_key="rows",
             identity_getter=lambda row: json.dumps([
-                self._report_dimension_value(name, (row.get("dimensions") or {}).get(name))
+                "official_material_summary:-2" if name == "material_id" and self._is_material_report_summary(row)
+                else self._report_dimension_value(name, (row.get("dimensions") or {}).get(name))
                 for name in self.REPORT_MATERIAL_DIMENSIONS[(system, scene)]
             ], ensure_ascii=False, separators=(",", ":")),
             verify_stability=True,
@@ -956,6 +996,10 @@ class QianchuanOfficialApiService:
         normalized: list[dict[str, Any]] = []
         seen_material_ids: set[str] = set()
         for row in rows:
+            # Keep the sentinel during paging so declared totals and duplicate
+            # checks remain exact; omit it only after all pages were validated.
+            if self._is_material_report_summary(row):
+                continue
             dimensions = row.get("dimensions") or {}
             raw_metrics = row.get("metrics") or {}
             material_id = text_id(
@@ -983,6 +1027,114 @@ class QianchuanOfficialApiService:
                 }
             )
         return normalized, request_ids
+
+    def list_chengfang_live_material_report(
+        self, advertiser_id: Any, ad_id: Any, *, start_date: str, end_date: str,
+        metrics: Iterable[str], plan_detail: Optional[Mapping[str, Any]] = None,
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+        """Fresh official scope proof, then anchor/PC/whole-data report.
+
+        A supplied detail is a consistency hint only; it never replaces the
+        fresh GET. The complete catalog includes paused and waiting-live peers.
+        Any peer whose anchor cannot be established prevents attribution.
+        """
+        from services.chengfang_material_metrics import DATA_PERIOD, chengfang_live_context
+
+        requested_metrics = tuple(dict.fromkeys(str(field) for field in metrics if str(field)))
+        if not requested_metrics:
+            raise ValueError("乘方素材报表至少需要一个指标")
+        aid = require_digit_id(advertiser_id, "advertiser_id")
+        pid = require_digit_id(ad_id, "ad_id")
+        observed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detail, response = self.get_plan_detail(aid, pid)
+        context = chengfang_live_context(detail, advertiser_id=aid, ad_id=pid)
+        if plan_detail is not None:
+            prior = chengfang_live_context(plan_detail, advertiser_id=aid, ad_id=pid)
+            if prior != context:
+                raise ApiRequestError("乘方计划报表归属在采集期间变化", code="client_metric_scope")
+        catalog_start, catalog_end = f"{start_date} 00:00:00", f"{end_date} 23:59:59"
+        request_ids = [str(response.request_id or "")]
+        found_target = False
+        proven_peers = {}
+        # The list endpoint otherwise silently defaults to CUSTOM and can
+        # omit a competing volume plan using the same anchor and material.
+        bid_types = ("SMART_BID_CUSTOM", "SMART_BID_CONSERVATIVE")
+        for bid_type in bid_types:
+            plans, catalog_requests = self.list_plans(
+                aid, marketing_goal="LIVE_PROM_GOODS", adlab_scene="OVERALL_PROJECT",
+                start_time=catalog_start, end_time=catalog_end, verify_stability=True,
+                filtering={"smart_bid_type": bid_type})
+            request_ids.extend(catalog_requests)
+            seen = set()
+            for peer in plans:
+                peer_id = require_digit_id(peer.get("ad_id"), "ad_id")
+                if peer_id in seen:
+                    raise ApiRequestError("乘方计划目录重复，无法证明唯一归属", code="client_metric_scope")
+                seen.add(peer_id)
+                try:
+                    peer_context = chengfang_live_context(peer, advertiser_id=aid, ad_id=peer_id)
+                except ApiRequestError as exc:
+                    if exc.code != "client_metric_scope_missing":
+                        raise
+                    peer, peer_response = self.get_plan_detail(aid, peer_id)
+                    request_ids.append(str(peer_response.request_id or ""))
+                    peer_context = chengfang_live_context(peer, advertiser_id=aid, ad_id=peer_id)
+                if peer_id in proven_peers and proven_peers[peer_id] != peer_context:
+                    raise ApiRequestError("乘方计划归属在目录查询期间变化", code="client_metric_scope")
+                proven_peers[peer_id] = peer_context
+                if peer_id == pid:
+                    found_target = True
+                    if peer_context != context:
+                        raise ApiRequestError("乘方计划详情与目录归属不一致", code="client_metric_scope")
+                elif peer_context["anchor_id"] == context["anchor_id"]:
+                    raise ApiRequestError("同一抖音号存在多个乘方直播计划，素材报表不能唯一归属当前计划", code="client_metric_scope")
+        if not found_target:
+            raise ApiRequestError("完整乘方计划目录未包含当前计划", code="client_metric_scope")
+        # ALL_DATA includes the anchor's whole reporting period. A different
+        # global plan on that anchor would make attribution to this ad unsafe.
+        from services.chengfang_material_metrics import _blocks, _one_id
+        for bid_type in bid_types:
+            global_plans, global_requests = self.list_plans(
+                aid, marketing_goal="LIVE_PROM_GOODS", adlab_scene="UNI_PROJECT",
+                start_time=catalog_start, end_time=catalog_end, verify_stability=True,
+                filtering={"smart_bid_type": bid_type})
+            request_ids.extend(global_requests)
+            for peer in global_plans:
+                peer_id = require_digit_id(peer.get("ad_id"), "ad_id")
+                try:
+                    anchor = _one_id(_blocks(peer), ("anchor_id", "aweme_id", "aweme_uid"), "抖音号ID")
+                except ApiRequestError as exc:
+                    if exc.code != "client_metric_scope_missing":
+                        raise
+                    peer, peer_response = self.get_plan_detail(aid, peer_id)
+                    request_ids.append(str(peer_response.request_id or ""))
+                    anchor = _one_id(_blocks(peer), ("anchor_id", "aweme_id", "aweme_uid"), "抖音号ID")
+                if anchor == context["anchor_id"] and peer_id != pid:
+                    raise ApiRequestError("同一抖音号还存在其他全域计划，整体素材数据无法唯一归属", code="client_metric_scope")
+        proof_requests = list(request_ids)
+        rows, report_requests = self.list_material_report(
+            aid, plan_system="chengfang", promotion_scene="live", start_date=start_date,
+            end_date=end_date, metrics=requested_metrics, filter_context=context, data_period=DATA_PERIOD)
+        core_requests = list(report_requests)
+        # Config and data use the same ALL_DATA scope. A single combined read
+        # preserves zero-cost materials that have impressions/clicks; splitting
+        # and joining onto cost-only rows would silently lose those materials.
+        for row in rows:
+            row["stats_info"] = {field: value for field, value in row["stats_info"].items() if field in requested_metrics}
+            row["raw"] = {**row["raw"], "metrics": {
+                field: value for field, value in (row["raw"].get("metrics") or {}).items() if field in requested_metrics}}
+        request_ids.extend(report_requests)
+        scope = {**context, "metric_scope": "chengfang_anchor_material",
+                 "attribution": "unique_plan_in_complete_catalog", "observed_at": observed_at,
+                 "catalog_start_time": catalog_start, "catalog_end_time": catalog_end,
+                 "catalog_plan_count": len(proven_peers), "catalog_bid_types": list(bid_types),
+                 "catalog_plan_systems": ["OVERALL_PROJECT", "UNI_PROJECT"],
+                 "start_date": start_date, "end_date": end_date,
+                 "core_metric_fields": list(requested_metrics), "core_metric_request_ids": core_requests,
+                 "optional_metric_fields": [],
+                 "optional_metric_errors": [], "optional_metric_request_ids": [],
+                 "report_request_ids": list(report_requests), "proof_request_ids": proof_requests}
+        return rows, [value for value in request_ids if value], scope
 
     def list_control_tasks(
         self,

@@ -90,6 +90,7 @@ class SQLiteStore:
                 'promotion_scene': "TEXT NOT NULL DEFAULT 'live'",
                 'plan_system': "TEXT NOT NULL DEFAULT 'unknown'",
                 'material_id': 'TEXT NOT NULL',
+                'metric_row_state': "TEXT NOT NULL DEFAULT 'legacy_unknown'",
                 'product_ids_json': 'TEXT',
                 'video_name': 'TEXT',
                 'material_status': 'INTEGER',
@@ -150,6 +151,7 @@ class SQLiteStore:
                 'target_uid': "TEXT NOT NULL DEFAULT 'legacy_unscoped'",
                 'ad_id': "TEXT NOT NULL DEFAULT ''",
                 'material_id': 'TEXT NOT NULL',
+                'metric_row_state': "TEXT NOT NULL DEFAULT 'legacy_unknown'",
                 'bucket_key': 'TEXT NOT NULL',
                 'collected_at': "TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))",
                 'stat_date': "TEXT NOT NULL DEFAULT (date('now', '+8 hours'))",
@@ -279,6 +281,9 @@ class SQLiteStore:
                 # 只有用户明确选择/添加的账户才进入账户管理和自动化。
                 # NULL 仅用于从旧版本一次性迁移，0 为已移除，1 为已选择。
                 'directory_selected': 'INTEGER CHECK (directory_selected IN (0, 1))',
+                # The grant under which the user explicitly selected this account.
+                # Empty legacy values never prove a post-clear selection.
+                'selection_authorization_json': "TEXT NOT NULL DEFAULT '{}'",
                 'enabled': 'INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))',
                 'report_enabled': 'INTEGER NOT NULL DEFAULT 0 CHECK (report_enabled IN (0, 1))',
                 'route_mode': "TEXT NOT NULL DEFAULT 'default' CHECK (route_mode IN ('default', 'custom'))",

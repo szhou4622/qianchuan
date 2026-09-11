@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import hashlib
 import math
 import os
 import threading
@@ -281,6 +282,7 @@ def _metric_snapshot_row(
         "target_uid": str(row.get("target_uid") or target.get("target_uid") or ""),
         "ad_id": str(row.get("ad_id") or target.get("ad_id") or ""),
         "material_id": str(row.get("material_id") or ""),
+        "metric_row_state": str(row.get("metric_row_state") or "legacy_unknown"),
         "bucket_key": _five_minute_bucket(observed_at),
         "collected_at": observed_at,
         "stat_date": str(row.get("stat_date") or observed_at[:10]),
@@ -303,6 +305,8 @@ def _metric_values_changed(
     if not previous:
         return True
     if previous.get("stat_date") != current.get("stat_date"):
+        return True
+    if previous.get("metric_row_state") != current.get("metric_row_state"):
         return True
     for field in _METRIC_SNAPSHOT_FIELDS:
         old = previous.get(field)
@@ -827,6 +831,8 @@ def _material_snapshot(
     units: Mapping[str, str],
     request_id: str,
 ) -> dict[str, Any]:
+    from services.material_metric_contract import native_metric
+
     raw = _mapping(material.get("raw"))
     stats = _mapping(material.get("stats_info"))
     if not stats:
@@ -845,6 +851,7 @@ def _material_snapshot(
         "promotion_scene": str(target.get("promotion_scene") or "product"),
         "plan_system": normalize_plan_system(target.get("plan_system")),
         "material_id": text_id(material.get("material_id")),
+        "metric_row_state": str(material.get("metric_row_state") or "reported"),
         "product_ids_json": json.dumps(product_ids, ensure_ascii=False, separators=(",", ":")),
         "video_name": str(material.get("material_name") or "")[:512],
         "material_status": _status_number(material.get("material_status")),
@@ -862,32 +869,32 @@ def _material_snapshot(
         "lego_source": first(video, "lego_source", "legoSource"),
         "video_create_time": str(material.get("create_time") or first(video, "create_time", "createTime"))[:64],
         "tag_list": raw_json(first(raw, "tags", "tag_list", "tagList", default=[])),
-        "stat_cost": _metric(stats, units, "stat_cost_for_roi2", "statCostForRoi2"),
-        "order_settle_count_1h": _metric(stats, units, "total_order_settle_count_for_roi2_1h", "totalOrderSettleCountForRoi21H"),
-        "order_settle_amount_1h": _metric(stats, units, "total_order_settle_amount_for_roi2_1h", "totalOrderSettleAmountForRoi21H"),
-        "order_settle_rate_1h": _metric(stats, units, "total_order_settle_amount_rate_for_roi2_1h", "totalOrderSettleAmountRateForRoi21H"),
-        "prepay_pay_order_count": _metric(stats, units, "total_prepay_and_pay_order_roi2", "totalPrepayAndPayOrderRoi2"),
-        "pay_gmv_include_coupon": _metric(stats, units, "total_pay_order_gmv_include_coupon_for_roi2", "totalPayOrderGmvIncludeCouponForRoi2"),
-        "prepay_pay_settle_1h": _metric(stats, units, "total_prepay_and_pay_settle_roi2_1h", "totalPrepayAndPaySettleRoi21H"),
-        "refund_rate_1h": _metric(stats, units, "total_refund_order_gmv_for_roi2_1h_rate", "totalRefundOrderGmvForRoi21HRate"),
-        "overall_order_count": _metric(stats, units, "total_pay_order_count_for_roi2", "totalPayOrderCountForRoi2"),
-        "overall_show_count": _metric(
-            stats, units,
+        "stat_cost": native_metric(stats, "stat_cost_for_roi2", "statCostForRoi2"),
+        "order_settle_count_1h": native_metric(stats, "total_order_settle_count_for_roi2_1h", "totalOrderSettleCountForRoi21H"),
+        "order_settle_amount_1h": native_metric(stats, "total_order_settle_amount_for_roi2_1h", "totalOrderSettleAmountForRoi21H"),
+        "order_settle_rate_1h": native_metric(stats, "total_order_settle_amount_rate_for_roi2_1h", "totalOrderSettleAmountRateForRoi21H"),
+        "prepay_pay_order_count": native_metric(stats, "total_prepay_and_pay_order_roi2", "totalPrepayAndPayOrderRoi2"),
+        "pay_gmv_include_coupon": native_metric(stats, "total_pay_order_gmv_include_coupon_for_roi2", "totalPayOrderGmvIncludeCouponForRoi2"),
+        "prepay_pay_settle_1h": native_metric(stats, "total_prepay_and_pay_settle_roi2_1h", "totalPrepayAndPaySettleRoi21H"),
+        "refund_rate_1h": native_metric(stats, "total_refund_order_gmv_for_roi2_1h_rate", "totalRefundOrderGmvForRoi21HRate"),
+        "overall_order_count": native_metric(stats, "total_pay_order_count_for_roi2", "totalPayOrderCountForRoi2"),
+        "overall_show_count": native_metric(
+            stats,
             "live_show_count_for_roi2_v2", "liveShowCountForRoi2V2",
             "product_show_count_for_roi2", "productShowCountForRoi2",
         ),
-        "overall_click_count": _metric(
-            stats, units,
+        "overall_click_count": native_metric(
+            stats,
             "live_watch_count_for_roi2_v2", "liveWatchCountForRoi2V2",
             "product_click_count_for_roi2", "productClickCountForRoi2",
         ),
-        "overall_ctr": _metric(
-            stats, units,
+        "overall_ctr": native_metric(
+            stats,
             "live_cvr_rate_for_roi2_v2", "liveCvrRateForRoi2V2",
             "product_cvr_rate_for_roi2", "productCvrRateForRoi2",
         ),
-        "overall_conversion_rate": _metric(
-            stats, units,
+        "overall_conversion_rate": native_metric(
+            stats,
             "live_convert_rate_for_roi2_v2", "liveConvertRateForRoi2V2",
             "product_convert_rate_for_roi2", "productConvertRateForRoi2",
         ),
@@ -1382,6 +1389,29 @@ def _read_control_bundle(target, *, store, service, goal, units, phase_plan,
     return {"available": True, "control_rows": control_rows, "control_tasks": control_tasks, "control_request_ids": control_request_ids, "control_request_id": control_request_id, "control_observed_at": control_observed_at, "active_control_task_count": active_control_task_count, "refresh_control_history": refresh_control_history}
 
 
+def read_target_material_metrics(service, target, *, start_date, end_date, fields,
+                                 units, delivery_only=True, parallel_workers=3):
+    """Use the verified source for each plan class before any snapshot write."""
+    aid, pid = text_id(target.get("aadvid")), text_id(target.get("ad_id"))
+    reports, report_ids, scope = [], [], {}
+    chengfang_live = (normalize_plan_system(target.get("plan_system")) == "chengfang"
+                      and str(target.get("promotion_scene") or "") == "live")
+    if chengfang_live:
+        # Resolve the anchor and prove its unique plan mapping from a complete
+        # official catalog; an advertiser-wide report is never a fallback.
+        reports, report_ids, scope = service.list_chengfang_live_material_report(
+            aid, pid, start_date=start_date, end_date=end_date, metrics=fields)
+    materials, material_ids = service.list_plan_materials(
+        aid, pid, start_date=start_date, end_date=end_date, fields=fields,
+        delivery_only=delivery_only, parallel_workers=parallel_workers)
+    if chengfang_live:
+        from services.chengfang_material_metrics import merge_chengfang_material_metrics
+        materials = merge_chengfang_material_metrics(materials, reports, scope=scope, units=units)
+    else:
+        materials = _merge_material_report(materials, ())
+    return materials, material_ids, reports, report_ids, scope
+
+
 def collect_target(
     target: Mapping[str, Any],
     *,
@@ -1472,6 +1502,8 @@ def collect_target(
     report_config_refreshed = bool(phase_plan["refresh_report_config"]) and (
         not rotate_maintenance or maintenance_phase == "report_config"
     )
+    if expected_system == "chengfang" and expected_scene == "live" and capability.get("report_config_data_period") != "ALL_DATA":
+        report_config_refreshed = True
     report_config_request_id = str(
         capability.get("report_config_request_id") or ""
     )
@@ -1521,26 +1553,25 @@ def collect_target(
         db=store,
     )
     material_observed_at = _now()
-    materials, material_request_ids = service.list_plan_materials(
-        aavid,
-        ad_id,
+    materials, material_request_ids, material_report_rows, material_report_request_ids, metric_scope = read_target_material_metrics(
+        service, target,
         start_date=start_date,
         end_date=end_date,
         fields=supported_material_metrics,
+        units=units,
         delivery_only=True,
         parallel_workers=3,
     )
-    # This endpoint is scoped by advertiser_id + ad_id. Account/topic reports
-    # have no equivalent plan attribution and must not gate or overwrite the
-    # plan's metrics. Unit capability lookup remains separate from data reads.
-    materials = _merge_material_report(materials, ())
+    material_source = "chengfang_anchor_material_report" if metric_scope else "ad_material_stats_info"
+    metric_contract = ("chengfang_anchor_report_v1:" + hashlib.sha256(json.dumps(
+        {key: metric_scope.get(key) for key in ("advertiser_id", "aadvid", "ad_id", "anchor_id", "ecp_app_id", "data_period")},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]) if metric_scope else "native_v1"
     material_request_id = (
-        material_request_ids[-1]
+        metric_scope["core_metric_request_ids"][-1] if metric_scope.get("core_metric_request_ids")
+        else material_report_request_ids[-1] if material_report_request_ids else material_request_ids[-1]
         if material_request_ids
         else detail_request_id
     )
-    material_report_rows: list[dict[str, Any]] = []
-    material_report_request_ids: list[str] = []
     snapshots = [
         {
             **_material_snapshot(item, target=target, units=units, request_id=material_request_id),
@@ -1559,7 +1590,7 @@ def collect_target(
         synced=False,
         capability_updates={
             "collection_stage": "updating_metrics",
-            "material_metric_source": "ad_material_stats_info",
+            "material_metric_source": material_source,
             "material_metrics_plan_scoped": True,
             "account_report_overlay_enabled": False,
             "active_material_count": len(snapshots),
@@ -1671,9 +1702,16 @@ def collect_target(
     core_capability_updates: dict[str, Any] = {
         "source": "qianchuan_open_api",
         "material_sync_complete": not material_suspicious,
-        "material_metric_source": "ad_material_stats_info",
+        "material_metric_source": material_source,
+        "material_metric_scope": metric_scope,
         "material_metrics_plan_scoped": True,
         "account_report_overlay_enabled": False,
+        "material_metric_contract": metric_contract,
+        "material_metric_contract_since": (
+            capability.get("material_metric_contract_since")
+            if capability.get("material_metric_contract") == metric_contract and capability.get("material_metric_contract_since")
+            else material_observed_at
+        ),
         "material_count": (
             previous_material_count if material_suspicious else len(snapshots)
         ),
@@ -1725,6 +1763,15 @@ def collect_target(
         "account_qps_limit": 2,
         **detail_capability_updates,
     }
+    from services.material_metric_contract import evidence as material_metric_evidence
+    core_capability_updates["material_metric_evidence"] = material_metric_evidence(
+        materials, snapshots, requested_fields=supported_material_metrics, report_units=units,
+        observed_at=material_observed_at, stat_date=start_date,
+        source=material_source, scope=metric_scope,
+    )
+    core_capability_updates["material_metric_evidence"]["request_ids"] = [*material_report_request_ids, *material_request_ids][-100:]
+    core_capability_updates["material_metric_evidence"]["snapshot_version"] = core_capability_updates["snapshot_version"]
+    core_capability_updates["material_metric_evidence"]["contract_since"] = core_capability_updates["material_metric_contract_since"]
     if controls_prefetched is not None:
         for field in tuple(core_capability_updates):
             if field.startswith(("control_", "assist_", "active_control_")):
@@ -1762,6 +1809,7 @@ def collect_target(
                 "report_config_request_id": report_config_request_id,
                 "report_config_synced_at": _now(),
                 "report_metric_units": dict(units),
+                "report_config_data_period": "ALL_DATA" if expected_system == "chengfang" else "",
             }
         )
     current_snapshot_ids = [
@@ -1796,9 +1844,15 @@ def collect_target(
         material_id = str(row.get("material_id") or "")
         previous_latest = previous_latest_by_material.get(material_id) or {}
         effective_row = dict(row)
+        if (effective_row.get("metric_row_state") == "not_in_report"
+                and previous_latest.get("stat_date") == effective_row.get("stat_date")
+                and capability.get("material_metric_contract") == metric_contract
+                and float(previous_latest.get("stat_cost") or 0) > 0):
+            raise ApiRequestError("同日已取得消耗的素材从报表消失，保留上轮数据并等待复核", code="client_report_row_disappeared")
         # Missing metrics describe this response, not the previous response.
         # Preserve NULL for unknown values instead of manufacturing freshness.
-        metrics_changed = _metric_values_changed(previous_latest, effective_row)
+        metrics_changed = (capability.get("material_metric_contract") != metric_contract
+                           or _metric_values_changed(previous_latest, effective_row))
         latest_row = dict(effective_row)
         latest_row.update(
             {

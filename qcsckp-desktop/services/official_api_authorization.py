@@ -178,9 +178,103 @@ def set_backoff(api, account_key, seconds, *, db=None, include_application=False
                 persist_window(db, identity, "application", scope_key(owner, app, ""), seconds, reason=reason, now=api.datetime.now())
 
 
+def _detach_directory_accounts(store, owner, account_uids, *, connection, now, reason):
+    """Detach current selections, preserving all metrics and completed business history.
+
+    The caller owns the directory lock, authorization guard and write transaction.
+    A claimed/executing card is revoked only when no durable send intent exists;
+    uncertain/submitted platform operations retain their original reconciliation.
+    """
+    ids = sorted({str(uid) for uid in account_uids if uid})
+    if not ids:
+        return {"accounts_detached": 0, "cards_cancelled": 0}
+    marks = ",".join("?" for _ in ids)
+    params = [owner, *ids]
+    store.execute(
+        "UPDATE qianchuan_account SET directory_selected=0,enabled=0,report_enabled=0,"
+        "last_status='removed',last_error='',catalog_status='not_synced',catalog_error='',updated_at=? "
+        f"WHERE owner_username=? AND account_uid IN ({marks})",
+        [now, *params], connection=connection,
+    )
+    store.execute(
+        "UPDATE promotion_target SET enabled=0,capacity_state='disabled',monitor_eligible=0,"
+        "retarget_eligible=0,stop_eligible=0,verification_state='candidate',last_verified_at=NULL,"
+        "last_status='authorization_required',ineligible_reason=?,updated_at=? "
+        f"WHERE account_uid IN (SELECT account_uid FROM qianchuan_account WHERE owner_username=? AND account_uid IN ({marks}))",
+        [reason, now, *params], connection=connection,
+    )
+    store.execute(
+        "UPDATE collection_job SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,"
+        "fencing_token=fencing_token+1,last_error=?,updated_at=? WHERE owner_username=? "
+        f"AND account_uid IN ({marks}) AND status IN ('queued','retry','leased')",
+        [reason, now, *params], connection=connection,
+    )
+    store.execute(
+        "UPDATE operation_log_sync_window SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,"
+        "fencing_token=fencing_token+1,last_error=?,updated_at=? WHERE owner_username=? "
+        f"AND account_uid IN ({marks}) AND status IN ('queued','running','backoff')",
+        [reason, now, *params], connection=connection,
+    )
+    # Old cards without a Qianchuan account UID cannot prove which selection
+    # produced them; revoke only unsubmitted cards for this tool owner as well.
+    rows = store.execute(
+        "SELECT task_uid FROM local_retarget_task t WHERE account_username=? "
+        f"AND (qianchuan_account_uid IN ({marks}) OR COALESCE(qianchuan_account_uid,'')='') "
+        "AND status IN ('pending','approved_queued','claimed','executing') "
+        "AND NOT EXISTS (SELECT 1 FROM execution_reconciliation e WHERE e.account_username=t.account_username "
+        "AND (e.task_uid=t.task_uid OR substr(e.task_uid,1,length(t.task_uid)+1)=t.task_uid || ':'))",
+        params, fetch=True, connection=connection,
+    ) or []
+    task_ids = [str(row["task_uid"]) for row in rows]
+    for uid in task_ids:
+        store.execute(
+            "UPDATE local_retarget_task SET status='cancelled',active_dedupe_key=NULL,claim_token=NULL,"
+            "claim_expires_at=NULL,claimed_at=NULL,fencing_token=fencing_token+1,"
+            "result_message=?,finished_at=?,updated_at=? WHERE task_uid=? AND account_username=?",
+            [reason + "；本卡已取消，未向千川提交", now, now, uid, owner], connection=connection,
+        )
+        # Never start a new delivery for a cancelled card. In-flight sends keep
+        # their receipt path and will read the now-terminal task for PATCH.
+        store.execute(
+            "UPDATE feishu_outbox SET status='cancelled',last_error=?,updated_at=? "
+            "WHERE account_username=? AND task_uid=? AND operation='send' AND status='queued'",
+            [reason, now, owner, uid], connection=connection,
+        )
+    return {"accounts_detached": len(ids), "cards_cancelled": len(task_ids)}
+
+
+def reconcile_selected_authorized_accounts(identity, accounts, evidence, *, db):
+    """Repair legacy stale selections only against a complete current grant list.
+
+    Legacy selection time cannot be reconstructed. Still-authorized selections
+    remain untouched; this helper never guesses which account was newly added.
+    """
+    if not evidence.get("complete"):
+        return {"status": "incomplete", "accounts_detached": 0, "cards_cancelled": 0}
+    from services.qianchuan_accounts import _ACCOUNT_DIRECTORY_LOCK
+    from services.qianchuan_open_api.token_provider import authorization_identity_guard
+    owner = str(identity.get("owner_username") or "").casefold()
+    allowed = set()
+    for row in accounts:
+        aid = str(row.get("advertiser_id") or row.get("aavid") or "").strip() if isinstance(row, Mapping) else ""
+        if not aid.isdigit():
+            raise ValueError("完整授权账户列表中存在无法识别的账户，保留原选择")
+        allowed.add(aid)
+    if not owner or not identity.get("app_id"):
+        raise ValueError("缺少当前千川授权身份")
+    with authorization_identity_guard(identity), _ACCOUNT_DIRECTORY_LOCK, db.transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = db.select("qianchuan_account", where={"owner_username": owner, "directory_selected": 1}, connection=conn)
+        detached = [row["account_uid"] for row in existing if str(row.get("aavid") or "") not in allowed]
+        counts = _detach_directory_accounts(db, owner, detached, connection=conn,
+            now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), reason="账户不在当前完整千川授权范围内")
+    return {"status": "reconciled", **counts}
+
+
 def handle_change(api, previous, current, *, event, db=None, notify_catalog=None):
     """Invalidate access evidence, not user strategy or historical metrics."""
     from services.qianchuan_open_api.token_provider import authorization_identity_guard, authorization_identity_is_current, AuthorizationContextChanged
+    from services.qianchuan_accounts import _ACCOUNT_DIRECTORY_LOCK
     if not authorization_identity_is_current(current):
         return {"status": "superseded", "cancelled_batches": 0}
     store = db or api.SQLiteStore()
@@ -197,7 +291,7 @@ def handle_change(api, previous, current, *, event, db=None, notify_catalog=None
                 affected.append(context)
     api._release_cancelled_collection_leases(affected)
     try:
-        with authorization_identity_guard(current):
+        with authorization_identity_guard(current), _ACCOUNT_DIRECTORY_LOCK:
             with store.transaction() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 # Before switching apps, pin legacy real limits to the OLD app.
@@ -213,7 +307,18 @@ def handle_change(api, previous, current, *, event, db=None, notify_catalog=None
                 targets = store.execute("SELECT t.* FROM promotion_target t JOIN qianchuan_account a "
                     "ON a.account_uid=t.account_uid WHERE a.owner_username=?", (owner,), fetch=True, connection=conn) or []
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                detach = event == "disconnected" or str(previous.get("app_id") or "") != str(current.get("app_id") or "")
+                detached_ids = set()
+                detached_counts = {"accounts_detached": 0, "cards_cancelled": 0}
+                if detach:
+                    accounts = store.select("qianchuan_account", where={"owner_username": owner}, connection=conn) or []
+                    detached_ids = {row["account_uid"] for row in accounts
+                        if event == "disconnected" or metadata(row.get("selection_authorization_json")) != current}
+                    detached_counts = _detach_directory_accounts(store, owner, detached_ids,
+                        connection=conn, now=now, reason="本机千川 API 配置已清除或应用已切换，请重新添加账户")
                 for target in targets:
+                    if detach and target.get("account_uid") not in detached_ids:
+                        continue
                     capability = metadata(target.get("capability_json"))
                     # Retain collection history, but discard every cached write/access proof.
                     history = {k: v for k, v in capability.items() if k in {
@@ -253,4 +358,5 @@ def handle_change(api, previous, current, *, event, db=None, notify_catalog=None
         notify_catalog()
         queued = True
     return {"status": "revalidation_queued", "cancelled_batches": len(affected),
-            "auth_backoffs_cleared": cleared, "targets_revalidating": len(targets), "catalog_queued": queued}
+            "auth_backoffs_cleared": cleared, "targets_revalidating": len(targets), "catalog_queued": queued,
+            **detached_counts}

@@ -150,6 +150,7 @@ def ensure_qianchuan_account(
     report_enabled: Optional[bool] = None,
     seen: bool = False,
     allow_reactivate_removed: bool = False,
+    selection_authorization: Optional[Dict[str, str]] = None,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     with _ACCOUNT_DIRECTORY_LOCK:
@@ -162,6 +163,7 @@ def ensure_qianchuan_account(
             report_enabled=report_enabled,
             seen=seen,
             allow_reactivate_removed=allow_reactivate_removed,
+            selection_authorization=selection_authorization,
             db=db,
         )
 
@@ -176,6 +178,7 @@ def _ensure_qianchuan_account_unlocked(
     report_enabled: Optional[bool] = None,
     seen: bool = False,
     allow_reactivate_removed: bool = False,
+    selection_authorization: Optional[Dict[str, str]] = None,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
     store = db or SQLiteStore()
@@ -252,6 +255,12 @@ def _ensure_qianchuan_account_unlocked(
         values["last_seen_at"] = _now_text()
         values["last_status"] = "available"
         values["last_error"] = ""
+    if selection_authorization is not None and reactivating:
+        identity = {key: str(selection_authorization.get(key) or "")
+                    for key in ("owner_username", "app_id", "auth_generation")}
+        if identity["owner_username"].casefold() != owner or not identity["app_id"] or not identity["auth_generation"]:
+            raise ValueError("账户选择缺少当前千川授权身份")
+        values["selection_authorization_json"] = json.dumps(identity, ensure_ascii=False)
     store.insert_or_update(
         "qianchuan_account",
         values,
@@ -749,14 +758,24 @@ def save_qianchuan_account_settings(
     owner_username: Any = None,
     db: Optional[SQLiteStore] = None,
 ) -> Dict[str, Any]:
+    with _ACCOUNT_DIRECTORY_LOCK:
+        return _save_qianchuan_account_settings_unlocked(
+            value, settings, owner_username=owner_username, db=db,
+        )
+
+
+def _save_qianchuan_account_settings_unlocked(
+    value: Any, settings: Dict[str, Any], *, owner_username: Any = None,
+    db: Optional[SQLiteStore] = None,
+) -> Dict[str, Any]:
     store = db or SQLiteStore()
     account = get_qianchuan_account(
         value,
         owner_username=owner_username,
         db=store,
     )
-    if not account:
-        raise ValueError("千川账户不存在")
+    if not account or not account.get("directory_selected"):
+        raise ValueError("千川账户已移除，请从当前授权账户中重新添加")
     route_mode = str(settings.get("route_mode", account.get("route_mode") or "default")).strip()
     if route_mode not in {"default", "custom"}:
         raise ValueError("飞书路由模式无效")

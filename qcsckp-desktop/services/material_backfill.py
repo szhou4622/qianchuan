@@ -252,16 +252,17 @@ def _read_one_date(job: dict, target: dict, *, db: SQLiteStore) -> dict[str, Any
             service = QianchuanOfficialApiService(
                 client=_HistoryReadClient(service.client, _request_admission(job, target, db=db)),
                 allow_writes=False)
-        materials, request_ids = service.list_plan_materials(
-            target["aadvid"], target["ad_id"], start_date=day, end_date=day,
-            fields=metrics, delivery_only=False, parallel_workers=1)
-        # Historical plan snapshots use the same ad-scoped source as hot reads.
-        # Do not fill holes using account-wide report totals.
-        for material in collection._merge_material_report(materials, ()):
+        materials, request_ids, reports, report_ids, scope = collection.read_target_material_metrics(
+            service, target, start_date=day, end_date=day, fields=metrics, units=units,
+            delivery_only=False, parallel_workers=1)
+        request_ids = [*request_ids, *report_ids]
+        for material in materials:
             if not str(material.get("material_id") or ""):
                 continue
             row = collection._material_snapshot(material, target=target, units=units,
-                                                request_id=request_ids[-1] if request_ids else "")
+                                                request_id=(scope["core_metric_request_ids"][-1]
+                                                            if scope.get("core_metric_request_ids")
+                                                            else request_ids[-1] if request_ids else ""))
             row["stat_date"] = day
             rows.append(collection._metric_snapshot_row(row, target=target, observed_at=f"{day} 23:59:59"))
     except Exception as exc:

@@ -106,6 +106,10 @@ def _diagnostic_text(value: Any, private_values: tuple[str, ...] = ()) -> dict[s
 
 def sanitize(value: Any, *, key: str = "", private_values: tuple[str, ...] = ()) -> Any:
     normalized = str(key or "").strip().lower()
+    if normalized in {"request_ids", "proof_request_ids", "report_request_ids", "optional_metric_request_ids"} and isinstance(value, (list, tuple)):
+        return [sanitize(item, key="request_id") for item in value]
+    if normalized == "document_id" and str(value) in {"1804363488115850", "1823297941140569"}:
+        return str(value)
     if normalized in _SECRET_KEYS or any(token in normalized for token in ("password", "credential", "secret", "token")):
         return "<redacted>"
     if normalized == "request_id":
@@ -201,12 +205,57 @@ def _current_process_health(targets: list[dict[str, Any]]) -> dict[str, Any]:
     return {"scope": "current_process", **sanitize(public)}
 
 
+def _append_metric_evidence(conn, report):
+    try:
+        # Successful batches are also evidence: a zero-valued or partial
+        # batch need not have raised an exception. Never read other hosts.
+        from services.material_metric_contract import FIELDS
+        from api.dashboard_optimized import _optional_float
+        candidates = conn.execute("SELECT target_uid,ad_id,aadvid,capability_json FROM promotion_target WHERE enabled=1 ORDER BY updated_at DESC LIMIT 30").fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM promotion_target WHERE enabled=1").fetchone()[0]
+        report["metric_evidence_coverage"] = {"target_count": total, "included_targets": len(candidates), "truncated": total > len(candidates), "samples_per_target_limit": 6}
+        for target in candidates:
+            capability = _parse_json(target["capability_json"])
+            trace = capability.get("material_metric_evidence") if isinstance(capability, dict) else None
+            if not isinstance(trace, dict):
+                report["metric_findings"].append(sanitize({"target_uid": target["target_uid"], "finding": "raw_metric_evidence_not_recorded"}))
+                continue
+            samples = []
+            for sample in trace.get("samples", [])[:6]:
+                mid = str(sample.get("material_id") or "")
+                columns = ",".join(FIELDS.values())
+                stored = conn.execute("SELECT collected_at,stat_date," + columns + " FROM pmc_promotion_material_latest WHERE target_uid=? AND material_id=?", (target["target_uid"], mid)).fetchone()
+                fields = {}
+                for field, entry in sample.get("fields", {}).items():
+                    if field not in FIELDS or not isinstance(entry, dict):
+                        continue
+                    fields[field] = {**entry, "stored_value": stored[FIELDS[field]] if stored else None,
+                                         "dashboard_value": _optional_float(stored[FIELDS[field]]) if stored else None}
+                samples.append({**sample, "fields": fields, "row_found": stored is not None,
+                                "stored_observed_at": stored["collected_at"] if stored else None,
+                                "same_observation": bool(stored and stored["collected_at"] == trace.get("observed_at") and stored["stat_date"] == trace.get("stat_date"))})
+            report["material_metric_evidence"].append(sanitize({"target_uid": target["target_uid"], "ad_id": target["ad_id"], "aadvid": target["aadvid"], **trace, "samples": samples,
+                "dashboard_value_source": "server_numeric_conversion_not_browser_capture"}))
+            counts = trace.get("reported_field_counts", trace.get("field_counts", {}))
+            incomplete = any(int(item.get("missing", 0))+int(item.get("null", 0))+int(item.get("invalid", 0)) for item in counts.values())
+            cost = counts.get("stat_cost_for_roi2", {})
+            finding = "missing_or_invalid_metrics" if incomplete else "sparse_report_complete" if trace.get("report_rows_absent", 0) else "all_cost_values_zero_requires_comparison" if cost.get("valid", 0) and cost.get("valid") == cost.get("zero") else "metric_evidence_available"
+            optional_error_count = int(trace.get("optional_metric_error_count") or 0)
+            report["metric_findings"].append(sanitize({"target_uid": target["target_uid"], "finding": finding,
+                "source": trace.get("source"), "scope": trace.get("scope"),
+                "optional_metric_error_count": optional_error_count,
+                "warning": "optional_metrics_unavailable_core_values_preserved" if optional_error_count else "",
+                "report_rows_present": trace.get("report_rows_present"), "observed_at": trace.get("observed_at")}))
+    except (sqlite3.Error, TypeError, ValueError, KeyError) as exc:
+        report["metric_evidence_read_error"] = {"type": type(exc).__name__, "message": _safe_text(str(exc))}
+
+
 def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
     from release_configuration import public_runtime_contract
 
     report: dict[str, Any] = {
         "schema": "qcsckp-failure-report-v1",
-        "report_revision": 2,
+        "report_revision": 4,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "application": {
             "version": IDENTITY.get("version"),
@@ -226,6 +275,8 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
             "names_redacted": True,
         },
         "database": {"available": False, "quick_check": "not_run"},
+        "metric_findings": [],
+        "material_metric_evidence": [],
         "api_recent": [],
         "api_failures": [],
         "task_lifecycle": [],
@@ -321,6 +372,7 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
                 )
                 report["feishu_outbox"] = [sanitize(row) for row in rows]
         if _table_exists(conn, "promotion_target"):
+            _append_metric_evidence(conn, report)
             fields = "target_uid,aadvid,ad_id,promotion_scene,plan_system,platform_status,last_status,last_error,last_sync_at,updated_at"
             rows = _rows(conn, "SELECT " + fields + " FROM promotion_target WHERE enabled=1 AND COALESCE(last_status,'') NOT IN ('collecting','queued') AND (COALESCE(last_error,'')<>'' OR last_status IN ('error','failed','pagination_error','rate_limited','auth_required','permission_denied','suspicious_empty','resource_pressure','deadline','collection_deadline')) ORDER BY updated_at DESC LIMIT 100")
             report["target_errors"] = [sanitize(row) for row in rows]

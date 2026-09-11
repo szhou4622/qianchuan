@@ -5,23 +5,61 @@ import json
 import hashlib
 import os
 import sys
+import math
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from config import CURRENT_VERSION, DATA_DIR, TEST_MODE
 from services.qianchuan_session import current_session_owner
+from services.material_metric_contract import REPORT_SCOPE_LABEL
 from utils.log import logger
 from utils.sqlite_store import SQLiteStore, init_sqlite_schema
 
 
 DASHBOARD_CONTRACT_VERSION = 2
 
+# Display convention only. These keys never replace the numeric API values
+# consumed by rule evaluation, exports, history or execution preflight.
+_ZERO_DISPLAY_FIELDS = {
+    "stat_cost_for_roi2": "currentCost", "total_pay_order_count_for_roi2": "overallOrderCount",
+    "total_pay_order_gmv_include_coupon_for_roi2": "overallAmount",
+    "total_prepay_and_pay_order_roi2": "overallPayRoi",
+    "total_order_settle_amount_for_roi2_1h": "netAmount",
+    "total_order_settle_count_for_roi2_1h": "netOrderCount",
+    "total_prepay_and_pay_settle_roi2_1h": "netRoi",
+    "total_order_settle_amount_rate_for_roi2_1h": "netSettleRate",
+    "total_refund_order_gmv_for_roi2_1h_rate": "hourRefundRate",
+    "live_show_count_for_roi2_v2": "overallShowCount", "live_watch_count_for_roi2_v2": "overallClickCount",
+    "live_cvr_rate_for_roi2_v2": "overallCtr", "live_convert_rate_for_roi2_v2": "overallConversionRate",
+}
+
+
+def _zero_display_eligible():
+    return ("CASE WHEN l.metric_row_state='not_in_report' AND t.last_status='ok' "
+            "AND l.stat_date=date('now','+8 hours') "
+            "AND l.collected_at BETWEEN datetime('now','+8 hours','-10 minutes') AND datetime('now','+8 hours') "
+            "AND CASE WHEN json_valid(t.capability_json) THEN "
+            "json_extract(t.capability_json,'$.material_sync_complete')=1 "
+            "AND json_extract(t.capability_json,'$.material_metric_source')='chengfang_anchor_material_report' "
+            "AND json_extract(t.capability_json,'$.material_metric_scope.data_period')='ALL_DATA' "
+            "AND json_array_length(t.capability_json,'$.material_metric_evidence.requested_fields')>0 "
+            "ELSE 0 END THEN 1 ELSE 0 END")
+
+
+def _metric_contract_since(alias="t"):
+    return f"COALESCE(CASE WHEN json_valid({alias}.capability_json) THEN json_extract({alias}.capability_json,'$.material_metric_contract_since') END,'')"
+
+
+def _report_metric_source(alias="t"):
+    return f"COALESCE(CASE WHEN json_valid({alias}.capability_json) THEN json_extract({alias}.capability_json,'$.material_metric_source')='chengfang_anchor_material_report' END,0)"
+
 
 def _optional_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -199,7 +237,17 @@ class OptimizedDashboardQueries:
         scope_where, scope_params = self._scope_where(aavid, target_uid)
         row = self.db.execute(
             "SELECT COUNT(*) AS material_count,MAX(l.collected_at) AS newest_at,"
-            "MIN(l.collected_at) AS oldest_at "
+            "MIN(l.collected_at) AS oldest_at, "
+            "COUNT(l.stat_cost) AS cost_count, COUNT(l.prepay_pay_order_count) AS roi_count, "
+            "COUNT(l.pay_gmv_include_coupon) AS gmv_count, "
+            "SUM(CASE WHEN l.stat_cost=0 THEN 1 ELSE 0 END) AS zero_cost_count, "
+            "SUM(CASE WHEN l.metric_row_state='not_in_report' THEN 1 ELSE 0 END) AS no_report_count, "
+            "SUM(CASE WHEN l.metric_row_state<>'not_in_report' AND "
+            "(l.stat_cost IS NULL OR l.prepay_pay_order_count IS NULL OR l.pay_gmv_include_coupon IS NULL) THEN 1 ELSE 0 END) AS missing_reported_count, "
+            "MAX(CASE WHEN t.last_status IN ('error','failed','authorization_required') THEN 1 ELSE 0 END) AS collection_failed, "
+            "MAX(CASE WHEN t.last_status='collecting' THEN 1 ELSE 0 END) AS collecting, "
+            f"SUM({_zero_display_eligible()}) AS zero_display_count, "
+            f"SUM({_report_metric_source()}) AS report_scope_count "
             "FROM pmc_promotion_material_latest l "
             "INNER JOIN promotion_target t ON t.target_uid=l.target_uid "
             "INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -231,6 +279,18 @@ class OptimizedDashboardQueries:
             "oldestAt": oldest,
             "dataAgeSeconds": age,
             "materialCount": int(data.get("material_count") or 0),
+            "noReportMaterialCount": int(data.get("no_report_count") or 0),
+            "zeroDisplayMaterialCount": int(data.get("zero_display_count") or 0),
+            "reportedMaterialCount": int(data.get("material_count") or 0)-int(data.get("no_report_count") or 0),
+            "missingReportedMetricCount": int(data.get("missing_reported_count") or 0),
+            "collectionStatus": "failed" if data.get("collection_failed") else "collecting" if data.get("collecting") else "complete",
+            "metricScopeLabel": REPORT_SCOPE_LABEL if int(data.get("report_scope_count") or 0) else "",
+            "metricQuality": (
+                "empty" if not int(data.get("material_count") or 0) else
+                "missing" if int(data.get("missing_reported_count") or 0) else
+                "sparse_report" if int(data.get("no_report_count") or 0) else
+                "all_zero" if int(data.get("zero_cost_count") or 0) == int(data.get("material_count") or 0) else "available"
+            ),
         }
 
     def get_table_data(
@@ -270,7 +330,11 @@ class OptimizedDashboardQueries:
         scope_where, scope_params = self._scope_where(aavid, target_uid)
         sql = f"""
             WITH Scope AS (
-                SELECT l.*,t.account_uid,t.plan_name,a.account_name
+                SELECT l.*,t.account_uid,t.plan_name,a.account_name,
+                       {_zero_display_eligible()} AS zero_display_eligible,
+                       CASE WHEN json_valid(t.capability_json) THEN json_extract(t.capability_json,'$.material_metric_evidence.requested_fields') END AS requested_metric_fields,
+                       {_report_metric_source()} AS report_metric_source,
+                       {_metric_contract_since()} AS metric_contract_since
                 FROM pmc_promotion_material_latest l
                 INNER JOIN promotion_target t ON t.target_uid=l.target_uid
                 INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid
@@ -282,7 +346,7 @@ class OptimizedDashboardQueries:
                 FROM pmc_material_metric_snapshot s
                 INNER JOIN Scope sc ON sc.target_uid=s.target_uid
                                    AND sc.material_id=s.material_id
-                WHERE s.account_username=?
+                WHERE s.account_username=? AND s.collected_at>=sc.metric_contract_since
                 GROUP BY s.target_uid,s.material_id
             ), BaselineChoice AS (
                 SELECT target_uid,material_id,COALESCE(before_id,after_id) AS baseline_id
@@ -341,6 +405,15 @@ class OptimizedDashboardQueries:
                 product_ids = []
             if not isinstance(product_ids, list):
                 product_ids = []
+            display_zero_fields = []
+            if row.get("zero_display_eligible"):
+                try:
+                    requested = json.loads(row.get("requested_metric_fields") or "[]")
+                    if isinstance(requested, list):
+                        display_zero_fields = list(dict.fromkeys(_ZERO_DISPLAY_FIELDS[field] for field in requested
+                                                   if isinstance(field,str) and field in _ZERO_DISPLAY_FIELDS))
+                except (ValueError, TypeError):
+                    pass
             data.append(
                 {
                     "id": str(row.get("material_id") or ""),
@@ -351,6 +424,9 @@ class OptimizedDashboardQueries:
                     "planName": str(row.get("plan_name") or ""),
                     "promotionScene": str(row.get("promotion_scene") or "live"),
                     "planSystem": str(row.get("plan_system") or "unknown"),
+                    "metricRowState": str(row.get("metric_row_state") or "legacy_unknown"),
+                    "displayZeroFields": display_zero_fields,
+                    "metricScopeLabel": REPORT_SCOPE_LABEL if row.get("report_metric_source") else "",
                     "productIds": [str(v) for v in product_ids if str(v or "").strip()],
                     "title": str(row.get("video_name") or "未命名"),
                     "materialStatus": row.get("material_status"),
@@ -440,7 +516,7 @@ class OptimizedDashboardQueries:
         owner = self._owner()
         scope_where, scope_params = self._scope_where(aavid, target_uid)
         rows = self.db.execute(
-            "SELECT COALESCE(SUM(COALESCE(l.stat_cost,0)),0) total_cost,COUNT(*) row_count "
+            "SELECT SUM(l.stat_cost) total_cost,COUNT(*) row_count,COUNT(l.stat_cost) valid_cost_count "
             "FROM pmc_promotion_material_latest l "
             "INNER JOIN promotion_target t ON t.target_uid=l.target_uid "
             "INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -451,11 +527,17 @@ class OptimizedDashboardQueries:
         row = rows[0] if rows else {}
         return {
             "success": True,
-            "totalCost": round(float(row.get("total_cost") or 0), 2),
+            "totalCost": round(float(row["total_cost"]), 2) if row.get("total_cost") is not None else None,
             "rowCount": int(row.get("row_count") or 0),
+            "validCostCount": int(row.get("valid_cost_count") or 0),
+            "missingCostCount": int(row.get("row_count") or 0) - int(row.get("valid_cost_count") or 0),
+            "noReportMaterialCount": state.get("noReportMaterialCount", 0),
+            "zeroDisplayMaterialCount": state.get("zeroDisplayMaterialCount", 0),
+            "reportedMaterialCount": state.get("reportedMaterialCount", 0),
             "batchMinuteKey": None,
             "latestCreatedAt": state.get("newestAt"),
             "dataAgeSeconds": state.get("dataAgeSeconds"),
+            "metricScopeLabel": state.get("metricScopeLabel", ""),
         }
 
     def get_material_history(
@@ -478,6 +560,7 @@ class OptimizedDashboardQueries:
             params.append(target)
         today = datetime.now().strftime("%Y-%m-%d 00:00:00")
         clauses.append("s.collected_at>=?")
+        clauses.append("s.collected_at>=" + "COALESCE((SELECT " + _metric_contract_since() + " FROM promotion_target t WHERE t.target_uid=s.target_uid),'')")
         params.append(today)
         rows = self.db.execute(
             "SELECT s.target_uid,s.material_id,s.collected_at,s.stat_cost,"
@@ -572,6 +655,7 @@ class OptimizedDashboardQueries:
             # ``account_username,collected_at`` is indexed for the all-account
             # dashboard path; bucket_key is still used for five-minute grouping.
             "s.collected_at>=?",
+            "s.collected_at>=" + _metric_contract_since(),
         ]
         params: list[Any] = [owner, owner, today]
         if account_id:
@@ -585,7 +669,11 @@ class OptimizedDashboardQueries:
             "WITH scoped AS ("
             " SELECT s.id,s.target_uid,s.material_id,s.bucket_key,s.collected_at,"
             " COALESCE(s.stat_cost,0) AS stat_cost,"
-            " COALESCE(s.pay_gmv_include_coupon,0) AS gmv"
+            " COALESCE(s.pay_gmv_include_coupon,0) AS gmv,"
+            " CASE WHEN s.stat_cost IS NULL AND s.metric_row_state<>'not_in_report' THEN 1 ELSE 0 END AS missing_cost,"
+            " CASE WHEN s.pay_gmv_include_coupon IS NULL AND s.metric_row_state<>'not_in_report' THEN 1 ELSE 0 END AS missing_gmv,"
+            " CASE WHEN s.stat_cost IS NOT NULL THEN 1 ELSE 0 END AS known_cost,"
+            " CASE WHEN s.pay_gmv_include_coupon IS NOT NULL THEN 1 ELSE 0 END AS known_gmv"
             " FROM pmc_material_metric_snapshot s"
             " INNER JOIN promotion_target t ON t.target_uid=s.target_uid"
             " INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid"
@@ -603,17 +691,27 @@ class OptimizedDashboardQueries:
             " stat_cost-COALESCE(LAG(stat_cost) OVER ("
             " PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_cost,"
             " gmv-COALESCE(LAG(gmv) OVER ("
-            " PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_gmv"
+            " PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_gmv,"
+            " missing_cost-COALESCE(LAG(missing_cost) OVER (PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_missing_cost,"
+            " missing_gmv-COALESCE(LAG(missing_gmv) OVER (PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_missing_gmv,"
+            " known_cost-COALESCE(LAG(known_cost) OVER (PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_known_cost,"
+            " known_gmv-COALESCE(LAG(known_gmv) OVER (PARTITION BY target_uid,material_id ORDER BY bucket_key),0) AS delta_known_gmv"
             " FROM dedup WHERE rn=1"
             "), bucketed AS ("
             " SELECT bucket_key,SUM(delta_cost) AS delta_cost,"
-            " SUM(delta_gmv) AS delta_gmv FROM changes GROUP BY bucket_key"
+            " SUM(delta_gmv) AS delta_gmv,SUM(delta_missing_cost) AS delta_missing_cost,"
+            " SUM(delta_missing_gmv) AS delta_missing_gmv,SUM(delta_known_cost) AS delta_known_cost,"
+            " SUM(delta_known_gmv) AS delta_known_gmv FROM changes GROUP BY bucket_key"
             "), running AS ("
             " SELECT bucket_key,"
             " SUM(delta_cost) OVER (ORDER BY bucket_key) AS total_cost,"
-            " SUM(delta_gmv) OVER (ORDER BY bucket_key) AS total_gmv"
+            " SUM(delta_gmv) OVER (ORDER BY bucket_key) AS total_gmv,"
+            " SUM(delta_missing_cost) OVER (ORDER BY bucket_key) AS missing_cost,"
+            " SUM(delta_missing_gmv) OVER (ORDER BY bucket_key) AS missing_gmv,"
+            " SUM(delta_known_cost) OVER (ORDER BY bucket_key) AS known_cost,"
+            " SUM(delta_known_gmv) OVER (ORDER BY bucket_key) AS known_gmv"
             " FROM bucketed"
-            ") SELECT bucket_key,total_cost,total_gmv FROM running"
+            ") SELECT bucket_key,total_cost,total_gmv,missing_cost,missing_gmv,known_cost,known_gmv FROM running"
             " ORDER BY bucket_key DESC LIMIT ?",
             (*params, limit),
             fetch=True,
@@ -628,15 +726,15 @@ class OptimizedDashboardQueries:
                 observed = datetime.strptime(bucket, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
-            cost = float(row.get("total_cost") or 0)
-            amount = float(row.get("total_gmv") or 0)
+            cost = None if row.get("missing_cost") or not row.get("known_cost") else _optional_float(row.get("total_cost"))
+            amount = None if row.get("missing_gmv") or not row.get("known_gmv") else _optional_float(row.get("total_gmv"))
             result.append(
                 {
                     "time": observed.strftime("%m-%d %H:%M"),
                     "timestamp": int(observed.timestamp() * 1000),
-                    "cost": round(cost, 4),
-                    "roi": round(amount / cost, 4) if cost > 0 else 0.0,
-                    "amount": round(amount, 4),
+                    "cost": round(cost, 4) if cost is not None else None,
+                    "roi": None if cost is None or amount is None else round(amount / cost, 4) if cost > 0 else 0.0,
+                    "amount": round(amount, 4) if amount is not None else None,
                 }
             )
 
@@ -646,8 +744,8 @@ class OptimizedDashboardQueries:
         scope_where, scope_params = self._scope_where(account_id, target_id)
         latest_rows = self.db.execute(
             "SELECT MAX(l.collected_at) AS collected_at,"
-            "SUM(COALESCE(l.stat_cost,0)) AS total_cost,"
-            "SUM(COALESCE(l.pay_gmv_include_coupon,0)) AS total_gmv "
+            "CASE WHEN SUM(CASE WHEN l.stat_cost IS NULL AND l.metric_row_state<>'not_in_report' THEN 1 ELSE 0 END)=0 THEN SUM(l.stat_cost) ELSE NULL END AS total_cost,"
+            "CASE WHEN SUM(CASE WHEN l.pay_gmv_include_coupon IS NULL AND l.metric_row_state<>'not_in_report' THEN 1 ELSE 0 END)=0 THEN SUM(l.pay_gmv_include_coupon) ELSE NULL END AS total_gmv "
             "FROM pmc_promotion_material_latest l "
             "INNER JOIN promotion_target t ON t.target_uid=l.target_uid "
             "INNER JOIN qianchuan_account a ON a.account_uid=t.account_uid "
@@ -663,14 +761,14 @@ class OptimizedDashboardQueries:
             except ValueError:
                 observed = None
             if observed is not None:
-                cost = float(latest.get("total_cost") or 0)
-                amount = float(latest.get("total_gmv") or 0)
+                cost = _optional_float(latest.get("total_cost"))
+                amount = _optional_float(latest.get("total_gmv"))
                 point = {
                     "time": observed.strftime("%m-%d %H:%M"),
                     "timestamp": int(observed.timestamp() * 1000),
-                    "cost": round(cost, 4),
-                    "roi": round(amount / cost, 4) if cost > 0 else 0.0,
-                    "amount": round(amount, 4),
+                    "cost": round(cost, 4) if cost is not None else None,
+                    "roi": None if cost is None or amount is None else round(amount / cost, 4) if cost > 0 else 0.0,
+                    "amount": round(amount, 4) if amount is not None else None,
                 }
                 if result and result[-1]["time"] == point["time"]:
                     result[-1] = point

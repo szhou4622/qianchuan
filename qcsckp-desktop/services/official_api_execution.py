@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
@@ -25,6 +26,7 @@ from services.qianchuan_open_api.normalizers import (
     text_id,
 )
 from services.qianchuan_open_api.runtime import get_official_api_service
+from utils.sqlite_store import SQLiteStore
 
 
 CONTROL_TASK_NAME_MAX_LENGTH = 50
@@ -36,11 +38,35 @@ class _ExistingExecutionIntent(RuntimeError):
         super().__init__("该执行已有持久化提交记录，禁止重复提交")
 
 
+def _capture_submission_authorization():
+    from services.qianchuan_open_api.token_provider import get_authorization_identity
+    identity = get_authorization_identity()
+    # Unconfigured, injected clients used by isolated tests have no grant.
+    # A grant appearing later is still a context change, never permission to
+    # execute a task that was prepared without that authorization.
+    return dict(identity) if identity.get("app_id") or str(identity.get("auth_generation") or "").startswith("development-") else None
+
+
+@contextmanager
+def _submission_authorization_guard(expected):
+    from services.qianchuan_open_api.token_provider import authorization_identity_guard, AuthorizationContextChanged
+    if expected is None:
+        if _capture_submission_authorization() is not None:
+            raise AuthorizationContextChanged()
+        yield
+    else:
+        with authorization_identity_guard(expected):
+            yield
+
+
+_CAPTURE_AUTHORIZATION = object()
+
+
 class _SubmissionAttempt:
     """Own the send boundary; local bookkeeping cannot negate platform acceptance."""
     def __init__(self, *, task_uid, action_type, aavid, ad_id, intent_key,
                  verify_payload, control_task_id="", submission_claim=None,
-                 pre_submit_check=None):
+                 pre_submit_check=None, expected_authorization=_CAPTURE_AUTHORIZATION):
         from services.qianchuan_session import current_session_owner
         self.owner = str(current_session_owner() or "").strip().casefold()
         self.task_uid, self.action_type = str(task_uid), str(action_type)
@@ -49,6 +75,9 @@ class _SubmissionAttempt:
         self.control_task_id = str(control_task_id or "")
         self.claim = dict(submission_claim or {})
         self.pre_submit_check = pre_submit_check
+        self.authorization = (_capture_submission_authorization()
+                              if expected_authorization is _CAPTURE_AUTHORIZATION
+                              else expected_authorization)
         self.phase = "not_sent"
         self.reserved = False
 
@@ -57,17 +86,22 @@ class _SubmissionAttempt:
         from services.qianchuan_session import current_session_owner
         if str(current_session_owner() or "").strip().casefold() != self.owner:
             raise _StopSubmissionBlocked("提交账户已变化")
-        if self.pre_submit_check is not None:
-            reason = self.pre_submit_check()
-            if reason:
-                raise _StopSubmissionBlocked(str(reason))
-        row, reserved = reserve_execution_intent(
-            task_uid=self.task_uid, action_type=self.action_type,
-            aavid=self.aavid, ad_id=self.ad_id, control_task_id=self.control_task_id,
-            idempotency_key=self.intent_key, verify_payload=self.verify_payload,
-            submission_claim=self.claim or None, submission_phase="sending",
-            account_username=self.owner,
-        )
+        with _submission_authorization_guard(self.authorization):
+            self._check_local_selection()
+            if self.pre_submit_check is not None:
+                reason = self.pre_submit_check()
+                if reason:
+                    raise _StopSubmissionBlocked(str(reason))
+            if _capture_submission_authorization() != self.authorization:
+                raise _StopSubmissionBlocked("千川授权在提交检查期间变化，未提交")
+            self._check_local_selection()
+            row, reserved = reserve_execution_intent(
+                task_uid=self.task_uid, action_type=self.action_type,
+                aavid=self.aavid, ad_id=self.ad_id, control_task_id=self.control_task_id,
+                idempotency_key=self.intent_key, verify_payload=self.verify_payload,
+                submission_claim=self.claim or None, submission_phase="sending",
+                account_username=self.owner,
+            )
         if not reserved:
             raise _ExistingExecutionIntent(row)
         self.reserved = True
@@ -79,17 +113,45 @@ class _SubmissionAttempt:
         from services.qianchuan_session import current_session_owner
         if str(current_session_owner() or "").strip().casefold() != self.owner:
             raise _StopSubmissionBlocked("提交账户已变化")
-        if self.pre_submit_check is not None:
-            reason = self.pre_submit_check()
-            if reason:
-                raise _StopSubmissionBlocked(str(reason))
-        authorize_execution_followup(
-            self.intent_key, str(getattr(self, "reservation_uid", "")), str(step),
-            account_username=self.owner, submission_claim=self.claim or None,
-        )
+        with _submission_authorization_guard(self.authorization):
+            self._check_local_selection()
+            if self.pre_submit_check is not None:
+                reason = self.pre_submit_check()
+                if reason:
+                    raise _StopSubmissionBlocked(str(reason))
+            if _capture_submission_authorization() != self.authorization:
+                raise _StopSubmissionBlocked("千川授权在后续提交检查期间变化，未提交")
+            self._check_local_selection()
+            authorize_execution_followup(
+                self.intent_key, str(getattr(self, "reservation_uid", "")), str(step),
+                account_username=self.owner, submission_claim=self.claim or None,
+            )
         self.verify_payload["attempted_steps"] = list(dict.fromkeys(
             list(self.verify_payload.get("attempted_steps") or []) + [str(step)]
         ))
+
+    def _check_local_selection(self):
+        if self.authorization is None:
+            return
+        # Rules and confirmation tasks always refer to a stored plan. A
+        # direct manual adapter call with no local selection remains subject
+        # to its immutable authorization but has no selection to inherit.
+        rows = SQLiteStore().execute(
+            "SELECT t.enabled,t.monitor_eligible,t.retarget_eligible,t.stop_eligible,"
+            "t.automation_write_blocked,a.enabled AS account_enabled,a.directory_selected "
+            "FROM promotion_target t JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+            "AND a.aavid=t.aadvid WHERE lower(a.owner_username)=? AND t.aadvid=? AND t.ad_id=?",
+            (self.owner, text_id(self.aavid), text_id(self.ad_id)), fetch=True,
+        ) or []
+        if not rows:
+            if self.claim or self.verify_payload.get("target_uid"):
+                raise _StopSubmissionBlocked("当前千川授权下的监控计划已移除")
+            return
+        eligibility = "stop_eligible" if self.action_type == "stop" else "retarget_eligible"
+        if not any(row.get("enabled") and row.get("account_enabled") and row.get("directory_selected")
+                   and row.get("monitor_eligible") and row.get(eligibility) and not row.get("automation_write_blocked")
+                   for row in rows):
+            raise _StopSubmissionBlocked("千川账户或监控计划已移除、停用或待重新核验，未提交")
 
     def reconcile(self, *, response=None, error=""):
         from services.official_api_reconciliation import (
@@ -609,6 +671,61 @@ def _public_api_error(exc: BaseException) -> str:
     return message + (f"（{'，'.join(details)}）" if details else "")
 
 
+def _chengfang_scope_key(scope: Mapping[str, Any]) -> tuple[str, ...]:
+    from services.chengfang_material_metrics import DATA_PERIOD
+    if (not isinstance(scope, Mapping)
+            or scope.get("metric_scope") != "chengfang_anchor_material"
+            or scope.get("attribution") != "unique_plan_in_complete_catalog"
+            or scope.get("data_period") != DATA_PERIOD
+            or str(scope.get("ecp_app_id") or "") != "1"):
+        raise _StopSubmissionBlocked("乘方素材指标缺少已验证的唯一计划归属")
+    values = tuple(str(scope.get(key) or "").strip()
+                   for key in ("advertiser_id", "ad_id", "anchor_id", "ecp_app_id", "data_period"))
+    if any(not value.isdigit() for value in values[:4]):
+        raise _StopSubmissionBlocked("乘方素材指标归属标识不完整")
+    return values
+
+
+def _current_chengfang_metric_proof(target_uid: str, *, aavid: Any, ad_id: Any) -> dict[str, Any]:
+    """Load today's collected attribution without reusing a mere update time."""
+    from services.qianchuan_session import current_session_owner
+    from services.chengfang_material_metrics import SOURCE
+    owner = str(current_session_owner() or "").strip().casefold()
+    rows = SQLiteStore().execute(
+        "SELECT t.*,a.owner_username,a.enabled AS account_enabled,a.directory_selected "
+        "FROM promotion_target t JOIN qianchuan_account a ON a.account_uid=t.account_uid "
+        "AND a.aavid=t.aadvid WHERE t.target_uid=? AND lower(a.owner_username)=?",
+        (target_uid, owner), fetch=True,
+    ) or []
+    target = rows[0] if rows else {}
+    if (not owner or not target or not target.get("enabled") or not target.get("account_enabled")
+            or not target.get("directory_selected") or not target.get("monitor_eligible")
+            or not target.get("retarget_eligible") or target.get("automation_write_blocked")
+            or target.get("promotion_scene") != "live" or target.get("plan_system") != "chengfang"
+            or str(target.get("aadvid") or "") != text_id(aavid)
+            or str(target.get("ad_id") or "") != text_id(ad_id)):
+        raise _StopSubmissionBlocked("乘方素材指标所属账户或监控计划已变化")
+    try:
+        capability = json.loads(str(target.get("capability_json") or "{}"))
+        trace = capability.get("material_metric_evidence") or {}
+        scope = capability.get("material_metric_scope") or {}
+        observed_at = datetime.strptime(str(trace.get("observed_at") or ""), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, AttributeError):
+        raise _StopSubmissionBlocked("乘方素材指标归属或采集时间缺失，请等待新一轮采集") from None
+    today, now = datetime.now().strftime("%Y-%m-%d"), datetime.now()
+    contract = str(capability.get("material_metric_contract") or "")
+    if (capability.get("material_metric_source") != SOURCE or trace.get("source") != SOURCE
+            or not capability.get("material_sync_complete")
+            or not contract.startswith("chengfang_anchor_report_v1:")
+            or trace.get("stat_date") != today
+            or not timedelta(0) <= now - observed_at <= timedelta(minutes=10)):
+        raise _StopSubmissionBlocked("乘方素材指标来源不明确或已过期，请等待新一轮采集")
+    key = _chengfang_scope_key(scope)
+    if key[:2] != (text_id(aavid), text_id(ad_id)) or scope.get("start_date") != today or scope.get("end_date") != today:
+        raise _StopSubmissionBlocked("乘方素材指标账户、计划或统计日期不一致")
+    return {"owner": owner, "contract": contract, "scope_key": key, "stat_date": today}
+
+
 class OfficialApiRetargetingService:
     def __init__(self, full_config: Optional[Mapping[str, Any]] = None) -> None:
         self.full_config = dict(full_config or {})
@@ -694,6 +811,11 @@ class OfficialApiRetargetingService:
                 True,
             )
         try:
+            expected_authorization = _capture_submission_authorization()
+            scoped_chengfang = bool(target_uid) and promotion_scene == "live" and normalize_plan_system(plan_system) == "chengfang"
+            frozen_proof = await asyncio.to_thread(
+                _current_chengfang_metric_proof, str(target_uid), aavid=aavid, ad_id=ad_id,
+            ) if scoped_chengfang else None
             plan_detail = await asyncio.to_thread(
                 _check_plan,
                 service,
@@ -712,6 +834,15 @@ class OfficialApiRetargetingService:
             # official scope immediately before POST.
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = end_date
+            if frozen_proof is not None:
+                _reports, _request_ids, fresh_scope = await asyncio.to_thread(
+                    service.list_chengfang_live_material_report, aavid, ad_id,
+                    start_date=start_date, end_date=end_date,
+                    metrics=["stat_cost_for_roi2"], plan_detail=plan_detail,
+                )
+                if (_chengfang_scope_key(fresh_scope) != frozen_proof["scope_key"]
+                        or fresh_scope.get("start_date") != start_date or fresh_scope.get("end_date") != end_date):
+                    raise _StopSubmissionBlocked("乘方素材指标归属已变化，未提交追投，请等待重新采集")
             materials, _ = await asyncio.to_thread(
                 service.list_plan_materials,
                 aavid,
@@ -729,13 +860,29 @@ class OfficialApiRetargetingService:
                 if not _material_is_writable(current.get(mid) or {}):
                     raise RuntimeError(f"素材 {mid} 的投放或审核状态未明确可用，已禁止追投")
 
+            def final_metric_check():
+                if pre_submit_check is not None:
+                    reason = pre_submit_check()
+                    if reason:
+                        return reason
+                if frozen_proof is not None and _current_chengfang_metric_proof(
+                    str(target_uid), aavid=aavid, ad_id=ad_id,
+                ) != frozen_proof:
+                    raise _StopSubmissionBlocked("乘方素材指标口径在提交前变化，请使用最新采集生成的新提醒")
+                return ""
+
+            if frozen_proof is not None:
+                final_metric_check()
+
             intent_key = intent_key or control_task_name
             attempt = prepare_submission_gate(
                 task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
                 action_type="retarget", aavid=aavid, ad_id=ad_id, intent_key=intent_key,
-                submission_claim=submission_claim, pre_submit_check=pre_submit_check,
+                submission_claim=submission_claim, pre_submit_check=final_metric_check,
+                expected_authorization=expected_authorization,
                 verify_payload={
                     "aavid": aavid, "ad_id": ad_id, "promotion_scene": promotion_scene,
+                    "target_uid": str(target_uid or ""),
                     "material_ids": mids, "task_name": control_task_name,
                     "budget": str(budget), "duration": str(duration) if duration is not None else "",
                     "execution_uid": intent_key,

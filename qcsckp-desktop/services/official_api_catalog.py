@@ -112,6 +112,8 @@ def add_authorized_account(aavid: Any) -> dict[str, Any]:
     if not aid.isdigit():
         return {"success": False, "code": "invalid_aavid", "message": "请选择有效的千川账户"}
 
+    owner, token_path = _authorization_context()
+    identity = get_authorization_identity(token_path, owner_username=owner)
     rows, evidence = get_official_api_service().list_business_accounts()
     selected = next(
         (row for row in rows if str(row.get("advertiser_id") or "").strip() == aid),
@@ -125,14 +127,17 @@ def add_authorized_account(aavid: Any) -> dict[str, Any]:
             "evidence": evidence,
         }
 
-    account = ensure_qianchuan_account(
-        aid,
-        account_name=str(selected.get("advertiser_name") or ""),
-        owner_username=_owner_key(),
-        directory_selected=True,
-        seen=True,
-        allow_reactivate_removed=True,
-    )
+    # An account-picker response may finish after Clear or a different OAuth grant.
+    with authorization_identity_guard(identity, token_path):
+        account = ensure_qianchuan_account(
+            aid,
+            account_name=str(selected.get("advertiser_name") or ""),
+            owner_username=owner,
+            directory_selected=True,
+            seen=True,
+            allow_reactivate_removed=True,
+            selection_authorization=identity,
+        )
     sync = start_official_api_catalog_sync(account.get("account_uid") or aid)
     return {
         "success": True,
@@ -206,9 +211,19 @@ def _sync_account(
         account_progress_percent=5,
     )
     business_accounts, account_evidence = service.list_business_accounts()
+    # r22 had no selection/grant binding. A complete fresh grant can still
+    # prove that an old selection is no longer accessible. Never infer removal
+    # from an incomplete account response.
+    context = current_collection_context()
+    identity = getattr(context, "catalog_authorization_identity", None) if context else None
+    if identity and identity.get("app_id") and account_evidence.get("complete"):
+        from services.official_api_authorization import reconcile_selected_authorized_accounts
+        reconcile_selected_authorized_accounts(identity, business_accounts, account_evidence, db=db)
     authorized = {str(row.get("advertiser_id") or ""): row for row in business_accounts}
     official_account = authorized.get(aavid)
     if not official_account:
+        if identity and account_evidence.get("complete"):
+            return {"complete": True, "removed_from_current_grant": True, "count": 0, "classes": {}}
         raise RuntimeError("该账户不在当前官方 API 授权链中")
     if official_account:
         _catalog_local_call(ensure_qianchuan_account,

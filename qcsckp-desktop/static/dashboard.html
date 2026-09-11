@@ -1141,10 +1141,25 @@
         function formatFreshness(state) {
             const age = Number(state && state.dataAgeSeconds);
             if (!state || !state.newestAt) return { text: '尚无采集数据', cls: 'text-slate-500' };
-            if (!Number.isFinite(age)) return { text: `最后采集 ${state.newestAt}`, cls: 'text-slate-400' };
+            if (state.collectionStatus === 'failed') return { text: '采集异常 · 保留上次数据', cls: 'text-rose-400' };
+            if (Number.isFinite(age) && age > 10 * 60) return { text: `数据延迟 · ${Math.floor(age / 60)}分钟前`, cls: 'text-rose-400' };
+            if (state.collectionStatus === 'collecting') return { text: '正在采集', cls: 'text-amber-400' };
+            if (state.metricQuality === 'missing') return { text: '报表返回指标缺失', cls: 'text-amber-400' };
+            if (state.metricQuality === 'all_zero') return { text: '本轮消耗均为0 · 待核对指标', cls: 'text-amber-400' };
+            if (!Number.isFinite(age)) return { text: '采集时间待确认', cls: 'text-slate-400' };
             if (age <= 5 * 60) return { text: `数据正常 · ${Math.max(0, Math.floor(age / 60))}分钟前`, cls: 'text-emerald-400' };
             if (age <= 10 * 60) return { text: `等待下一轮 · ${Math.floor(age / 60)}分钟前`, cls: 'text-amber-400' };
             return { text: `数据延迟 · ${Math.floor(age / 60)}分钟前`, cls: 'text-rose-400' };
+        }
+
+        function freshnessDetails(state) {
+            if (!state || !state.newestAt) return '';
+            const details = [`最后成功采集：${state.newestAt}`];
+            if (state.metricQuality === 'sparse_report') {
+                details.push(`${Number(state.reportedMaterialCount || 0)}条有报表，${Number(state.noReportMaterialCount || 0)}条无当日记录`);
+                if (state.zeroDisplayMaterialCount > 0) details.push(`${state.zeroDisplayMaterialCount}条仅按0展示，原始数据保留为空`);
+            }
+            return details.join('；');
         }
 
         async function checkDashboardDataVersion(force = false) {
@@ -1160,12 +1175,18 @@
                 if (element) {
                     element.className = `ml-auto text-[11px] tabular-nums shrink-0 ${freshness.cls}`;
                     element.textContent = freshness.text;
-                    element.title = state && state.newestAt ? `最后成功采集：${state.newestAt}` : '';
+                    element.title = freshnessDetails(state);
                 }
                 const version = String((state && state.dataVersion) || '');
-                if (force || version !== dashboardDataVersion) {
+                // Display-only zeros expire even when no new material row was written.
+                const displayVersion = JSON.stringify([
+                    selectedDashboardAavid, selectedDashboardTargetUid,
+                    Number((state && state.zeroDisplayMaterialCount) || 0),
+                ]);
+                if (force || version !== dashboardDataVersion || displayVersion !== dashboardDisplayVersion) {
                     dashboardDataVersion = version;
                     await queryAndUpdateData(true);
+                    dashboardDisplayVersion = displayVersion;
                 }
             } catch (error) {
                 console.error('检查大屏数据版本失败', error);
@@ -1238,6 +1259,7 @@
         let selectedDashboardAavid = '';
         let selectedDashboardTargetUid = '';
         let dashboardDataVersion = '';
+        let dashboardDisplayVersion = '';
         let dashboardRefreshInFlight = false;
         let dashboardForcedRefreshPending = false;
         let dashboardScopeGeneration = 0;
@@ -2079,6 +2101,8 @@
                             aadvid: String(mat.aadvid ?? ''),
                             accountName: String(mat.accountName ?? mat.account_name ?? ''),
                             planName: String(mat.planName ?? mat.plan_name ?? ''),
+                            metricScopeLabel: String(mat.metricScopeLabel ?? ''),
+                            displayZeroFields: Array.isArray(mat.displayZeroFields) ? mat.displayZeroFields : [],
                             title,
                             isAigc,
                             videoType,
@@ -2161,7 +2185,12 @@
                 );
                 if (result && result.success) {
                     return {
-                        totalCost: Number(result.totalCost ?? 0) || 0,
+                        totalCost: optionalMetricNumber(result.totalCost),
+                        missingCostCount: Number(result.missingCostCount || 0),
+                        noReportMaterialCount: Number(result.noReportMaterialCount || 0),
+                        zeroDisplayMaterialCount: Number(result.zeroDisplayMaterialCount || 0),
+                        reportedMaterialCount: Number(result.reportedMaterialCount || 0),
+                        metricScopeLabel: String(result.metricScopeLabel || ''),
                         rowCount: Number(result.rowCount ?? 0) || 0,
                         batchMinuteKey: result.batchMinuteKey ?? null,
                         latestCreatedAt: result.latestCreatedAt ?? null
@@ -2176,6 +2205,7 @@
 
         /** 金额展示：≥1 亿用「亿」，≥1 万用「万」，否则原样两位小数（最长约 ¥1222.23 万） */
         function formatYuanCompact(yuan) {
+            if (yuan === null || yuan === undefined || yuan === '') return '--';
             const n = Number(yuan);
             if (!Number.isFinite(n)) return '--';
             if (n >= 1e8) {
@@ -2195,6 +2225,13 @@
             const data = await fetchLatestCrawlCostSum(hours, scope);
             if (generation !== dashboardScopeGeneration) return;
             const countLabel = (n) => `总统计 ${n} 条素材`;
+            metaEl.title = ['当前为视频素材合计，不包含直播画面', data?.metricScopeLabel,
+                data?.noReportMaterialCount > 0 ? `${data.noReportMaterialCount}条无当日记录` : '',
+                data?.zeroDisplayMaterialCount > 0 ? `${data.zeroDisplayMaterialCount}条仅按0展示，原始数据保留为空` : '',
+                data?.missingCostCount > 0 ? `${data.missingCostCount}条原始消耗为空，仅合计有效值` : '',
+                data?.totalCost === 0 ? '本轮合计为0，待核对原始指标' : '',
+            ].filter(Boolean).join('；');
+            valEl.title = metaEl.title;
 
             if (!data) {
                 valEl.textContent = '--';
@@ -2206,9 +2243,9 @@
                 valEl.textContent = formatYuanCompact(0);
                 return;
             }
-            valEl.textContent = formatYuanCompact(data.totalCost);
-            if (data.totalCost === 0) {
-                metaEl.textContent = `${countLabel(data.rowCount)} · 官方API本轮指标为0`;
+            valEl.textContent = formatYuanCompact(data.totalCost == null && data.rowCount > 0 && data.zeroDisplayMaterialCount === data.rowCount ? 0 : data.totalCost);
+            if (data.missingCostCount > Number(data.noReportMaterialCount || 0)) {
+                metaEl.textContent = `${countLabel(data.rowCount)} · 指标不完整`;
             }
         }
 
@@ -2331,7 +2368,14 @@
             const tbody = document.getElementById('materialTable');
             tbody.innerHTML = '';
 
-            data.forEach((item, index) => {
+            data.forEach((original, index) => {
+                const item = { ...original };
+                const displayFields = ['currentCost','netRoi','netAmount','hourRefundRate','overallPayRoi','overallAmount','netSettleRate','netOrderCount','overallOrderCount','overallShowCount','overallClickCount','overallCtr','overallConversionRate'];
+                const requestedZeros = Array.isArray(original.displayZeroFields) ? original.displayZeroFields : [];
+                const showingZero = displayFields.some(key => requestedZeros.includes(key) && item[key] == null);
+                for (const key of displayFields) {
+                    if (requestedZeros.includes(key) && item[key] == null) item[key] = 0;
+                }
                 // 流速颜色逻辑
                 const velocityValue = parseFloat(item.velocity) || 0;
                 let velocityColorClass;
@@ -2348,7 +2392,8 @@
                 // 注意：table 的 <tr> 左边框在不同浏览器/渲染器下可能不生效
                 // 选中竖条改为加在第一列 <td> 上，保证每行都稳定显示
                 row.className = `hover:bg-slate-800/80 transition-colors cursor-pointer ${velocityValue > VELOCITY_CONFIG.threshold ? 'row-highlight bg-rose-950/10' : ''} ${isSelected ? 'bg-blue-900/30' : ''}`;
-                row.onclick = function() { selectMaterial(item); };
+                row.onclick = function() { selectMaterial(original); };
+                row.title = [item.metricScopeLabel, showingZero ? '本轮完整报表无该素材记录，按0展示；原始记录仍保留为空' : ''].filter(Boolean).join('；');
 
                 // 视频类型标签
                 const videoTypeTagMap = {

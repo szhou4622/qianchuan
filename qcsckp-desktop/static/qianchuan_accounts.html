@@ -164,7 +164,7 @@
       message(r?.message||'打开官方授权页失败',!r?.success);
       if(r?.success)watchApiAuthorization();
     }catch(e){message('启动官方授权失败：'+String(e?.message||e),true)}
-    finally{apiAuthStarting=false;$('authorizeApi').disabled=false;await loadApiConfig()}
+    finally{apiAuthStarting=false;$('authorizeApi').disabled=false;await loadApiConfig();await load()}
   }
 
   function stopApiAuthorizationWatch(){
@@ -204,7 +204,8 @@
   }
 
   async function clearApiConfig(){
-    if(!window.confirm('确定清除本机的 App ID、App Secret 和授权令牌吗？'))return;
+    if(!window.confirm('确定清除本机的 App ID、App Secret、授权令牌和已添加的千川账户吗？账户监控及未提交的确认任务会停止；历史数据、软件激活、飞书绑定和策略内容保留。'))return;
+    stopApiAuthorizationWatch();
     const a=await waitApi();const r=await a.clearQianchuanOfficialApiConfig();
     message(r?.message||'清除 API 配置失败',!r?.success);
     $('oeAppId').value='';$('oeAppSecret').value='';await loadApiConfig();await load();

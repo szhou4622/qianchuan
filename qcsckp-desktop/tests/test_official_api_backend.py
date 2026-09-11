@@ -569,7 +569,8 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             [row["target_uid"] for row in _fair_order_targets(targets)],
         )
 
-    def test_same_account_allows_two_parallel_targets(self):
+    @patch("services.official_api_collection.collection_lifecycle.resource_pressure", return_value={"critical": False})
+    def test_same_account_allows_two_parallel_targets(self, _resource_pressure):
         _reset_adaptive_collection_state_for_tests()
         active = 0
         max_active = 0
@@ -2113,7 +2114,8 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
             [row["target_uid"] for row in result["results"]],
         )
 
-    def test_rate_limit_failure_is_isolated_and_retried_early(self):
+    @patch("services.official_api_collection.collection_lifecycle.resource_pressure", return_value={"critical": False})
+    def test_rate_limit_failure_is_isolated_and_retried_early(self, _resource_pressure):
         store = Mock()
         _reset_adaptive_collection_state_for_tests()
         try:
@@ -2158,7 +2160,8 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
         finally:
             _reset_adaptive_collection_state_for_tests()
 
-    def test_repeated_rate_limit_uses_exponential_account_backoff(self):
+    @patch("services.official_api_collection.collection_lifecycle.resource_pressure", return_value={"critical": False})
+    def test_repeated_rate_limit_uses_exponential_account_backoff(self, _resource_pressure):
         store = Mock()
         _reset_adaptive_collection_state_for_tests()
         try:
@@ -2182,6 +2185,27 @@ class OfficialApiCollectionMetricTests(unittest.TestCase):
                     interval_seconds=300,
                 )
             self.assertEqual(240, result["retry_seconds"])
+        finally:
+            _reset_adaptive_collection_state_for_tests()
+
+
+    def test_critical_memory_prevents_collection_before_account_rate_limit(self):
+        _reset_adaptive_collection_state_for_tests()
+        try:
+            with patch("services.official_api_collection.collection_lifecycle.resource_pressure",
+                       return_value={"critical": True, "commit_percent": 99}), patch(
+                "services.official_api_collection._ACTIVE_TARGET_UIDS", set()
+            ), patch("services.official_api_collection.collect_target") as collect_one, patch(
+                "services.official_api_collection.patch_target_sync_state"
+            ) as patch_state:
+                result = _collect_target_safely(
+                    {"target_uid": "memory-pressure-target", "aadvid": "memory-account"},
+                    db=Mock(config={"database": ":memory:"}), interval_seconds=300)
+            self.assertEqual("resource_pressure", result["error_kind"])
+            self.assertEqual(30, result["retry_seconds"])
+            self.assertTrue(result["deferred"])
+            collect_one.assert_not_called()
+            self.assertEqual("resource_pressure", patch_state.call_args.kwargs["status"])
         finally:
             _reset_adaptive_collection_state_for_tests()
 

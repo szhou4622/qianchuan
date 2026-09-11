@@ -137,8 +137,10 @@ def disconnect_configuration() -> dict[str, Any]:
         clear_api_configuration(path, owner_username=owner)
         current = {"owner_username": owner, "app_id": "", "auth_generation": "unconfigured"}
         event = _announce({"authorization_identity": current, "previous_authorization_identity": previous,
-                           "authorization_changed": previous != current, "authorization_event": "disconnected"})
-        return {"success": True, **event, "configured": False, "authorized": False,
-                "message": "本机千川 API 配置已清除"}
+                           "authorization_changed": True, "authorization_event": "disconnected"})
+        warning = event.get("authorization_notification_warning")
+        return {"success": not bool(warning), **event, "configured": False, "authorized": False,
+                "message": ("API 凭证已清除，但账户清理未完成，请重新点击清除本机配置" if warning else
+                            "本机千川 API 配置及已添加账户已清除，历史数据保留；请重新授权并添加账户")}
     except Exception as exc:
         return {"success": False, "message": str(exc)}
