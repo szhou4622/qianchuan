@@ -560,7 +560,7 @@ def query_pmc_retargeting_runs_page(
     tbl = "pmc_retargeting_run"
     # video_type：取最新状态表中与流水同素材+同广告主的一条（与大盘口径一致）
     fields = (
-        "id, aavid, ad_id, material_id, material_name, strategy_name, started_at, ended_at, duration_ms, status, step, message, "
+        "id, aavid, ad_id, material_id, material_name, strategy_name, started_at, ended_at, duration_ms, status, execution_state, step, message, "
         "retargeting_method, optimization_goal, regulate_task_id, trigger_source, created_at, "
         "(SELECT m.video_type FROM pmc_promotion_material_latest m "
         "WHERE m.material_id = pmc_retargeting_run.material_id AND m.aadvid = pmc_retargeting_run.aavid "
@@ -582,6 +582,9 @@ def query_pmc_retargeting_runs_page(
             if st in (-1, 1):
                 where_parts.append("status = ?")
                 params.append(st)
+                if st == 1:
+                    where_parts.append("COALESCE(execution_state,'') NOT IN ('submitted_verifying','submitted','verifying','unknown_requires_review','result_unknown')")
+                    where_parts.append("COALESCE(step,'') NOT IN ('submitted_verifying','submitted','verifying','unknown_requires_review','result_unknown')")
         except (TypeError, ValueError):
             pass
 

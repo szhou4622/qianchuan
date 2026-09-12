@@ -2918,12 +2918,20 @@ def _loop(interval_seconds: int, epoch: Optional[str] = None) -> None:
     backfill_context = None
     backfill_job = None
     next_backfill_schedule = 0.0
+    resource_recovery_pending = False
+    last_pressure_report = 0.0
     while not _STOP.is_set() and epoch == collection_lifecycle.generation():
         claimed: list[dict[str, Any]] = []
         try:
             collection_lifecycle.heartbeat("running")
-            if collection_lifecycle.resource_pressure().get("critical"):
+            pressure = collection_lifecycle.resource_pressure()
+            if pressure.get("critical"):
+                resource_recovery_pending = True
                 collection_lifecycle.heartbeat("resource_pressure")
+                if time.monotonic() - last_pressure_report >= 30:
+                    from services.operation_diagnostics import record
+                    record("collection_resource_wait", resource_pressure=pressure, retry_after_seconds=30)
+                    last_pressure_report = time.monotonic()
                 _STOP.wait(5)
                 continue
             store = SQLiteStore()
@@ -2960,9 +2968,13 @@ def _loop(interval_seconds: int, epoch: Optional[str] = None) -> None:
                 )
             claimed = _claim_collection_jobs(
                 db=store,
-                limit=max(1, _adaptive_worker_limit(COLLECTION_MAX_WORKERS)),
+                limit=1 if resource_recovery_pending else max(1, _adaptive_worker_limit(COLLECTION_MAX_WORKERS)),
             )
             if claimed:
+                from services.operation_diagnostics import record
+                for job in claimed:
+                    record("collection_started", target_uid=job.get("target_uid"), planned_at=job.get("due_at"),
+                           started_at=job.get("last_started_at"), serial_recovery=resource_recovery_pending)
                 owner_at_claim = _owner_key()
                 result = run_collection_cycle(
                     db=store,
@@ -2990,7 +3002,12 @@ def _loop(interval_seconds: int, epoch: Optional[str] = None) -> None:
                         ),
                     }
                     _finish_collection_job(job, item, db=store)
-            if not claimed and backfill_future is None:
+                    record("collection_finished", target_uid=target_uid, success=item.get("success"),
+                           reason=item.get("error_kind"), retry_seconds=item.get("retry_seconds"))
+                if resource_recovery_pending and any(item.get("success") for item in by_target.values()):
+                    resource_recovery_pending = False
+                    record("collection_resource_recovered")
+            if not claimed and backfill_future is None and not resource_recovery_pending:
                 background_jobs = _claim_collection_jobs(db=store, limit=1, kind="material_backfill")
                 if background_jobs:
                     backfill_job = background_jobs[0]

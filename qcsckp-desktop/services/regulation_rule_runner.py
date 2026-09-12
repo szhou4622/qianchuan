@@ -191,7 +191,16 @@ def _stop_strategy_was_invalidated(error: str) -> bool:
     }
 
 
-def _revalidate_stop_candidate(
+def _revalidate_stop_candidate(*args, **kwargs):
+    result = _revalidate_stop_candidate_impl(*args, **kwargs)
+    if result[3]:
+        from services.operation_diagnostics import record
+        record("stop_skipped", target_uid=kwargs.get("target_uid"), task_id=kwargs.get("assist_task_id"),
+               reason=result[3], category="candidate_revalidation")
+    return result
+
+
+def _revalidate_stop_candidate_impl(
     db: SQLiteStore,
     *,
     original_strategy: Dict[str, Any],
@@ -1102,10 +1111,12 @@ def _send_auto_stop_submitted_notification(
 
 
 async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
+    from services.operation_diagnostics import record
     _log_sched = regulation_log_tag(scheduler=True)
     await _process_approved_stop_tasks(db)
     cfg = load_rule_regulation_config()
     if not cfg.get("enabled"):
+        record("stop_scan_skipped", reason="rules_disabled")
         logger.info("%s 未启用 enabled，跳过本轮", _log_sched)
         return
 
@@ -1117,6 +1128,7 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
     cycle_owner = str(current_session_owner() or "").strip().casefold()
     session_gate = automation_session_ready(cycle_owner)
     if not cycle_owner or not session_gate.get("ready"):
+        record("stop_scan_skipped", reason="session_not_ready")
         logger.warning(
             "%s 千川主登录会话不可用，本轮自动停投已跳过",
             _log_sched,
@@ -1130,6 +1142,7 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
     period = str(cfg.get("trigger_query_period") or "1h").strip() or "1h"
     strategies = cfg.get("strategies")
     if not isinstance(strategies, list) or not strategies:
+        record("stop_scan_skipped", reason="no_strategies")
         logger.warning("%s strategies 为空", _log_sched)
         return
 
@@ -1155,6 +1168,7 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
            if target_uids is not None else {}),
     )
     if not resp.get("success"):
+        record("stop_scan_skipped", reason="candidate_query_failed", message=resp.get("message"))
         logger.warning("%s get_roi2_assist_table_data 失败: %s", _log_sched, resp.get("message"))
         return
 
@@ -1184,6 +1198,9 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
         rows = filtered_rows
 
     query_at = _beijing_now_str()
+    from services.operation_diagnostics import record
+    record("stop_scan", candidate_count=len(rows), strategy_count=len(strategies),
+           reason="no_candidates" if not rows else "evaluating", query_at=query_at)
     assist_sort_by = resp.get("sortBy") or "stat_cost_for_roi2_assist"
 
     max_p = MAX_STRATEGY_PARALLEL
@@ -1284,6 +1301,10 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                 evaluation = build_trigger_evaluation_snapshot_roi2_assist(
                     trigger, row
                 )
+                if evaluated_rows <= 30:
+                    record("stop_evaluation", target_uid=row.get("target_uid"), task_id=row.get("assist_task_id"),
+                           strategy_id=st.get("id"), evaluation=evaluation,
+                           metrics_observed_at=row.get("metrics_observed_at"), platform_status=row.get("ad_delivery_name"))
                 for group in evaluation.get("groups") or []:
                     for condition in group.get("conditions") or []:
                         if condition.get("actual") is None:
@@ -1306,7 +1327,10 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                 missing_metrics or "无",
             )
             if not hit_rows:
+                record("stop_summary", strategy_id=st.get("id"), candidate_count=evaluated_rows,
+                       hit_count=0, missing_metrics=missing_metrics, reason="not_hit")
                 return
+            record("stop_summary", strategy_id=st.get("id"), candidate_count=evaluated_rows, hit_count=len(hit_rows))
             if _shadow_mode_enabled():
                 logger.warning(
                     "%s 影子模式命中%s个调控任务，仅记录判断，不发飞书卡片且不执行停投 task_ids=%s",
@@ -1423,6 +1447,8 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                             assist_row=row,
                         )
                         if cycle_state.get("blocked"):
+                            record("stop_skipped", target_uid=target_uid, task_id=assist_task_id,
+                                   reason=cycle_state.get("reason"), category="cycle_lock")
                             logger.info(
                                 "%s 当前调控周期不可再停投，幂等跳过 "
                                 "reason=%s target=%s assist_task_id=%s",
@@ -1463,6 +1489,8 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                                 )
                             )
                             if not target_matches:
+                                record("stop_skipped", target_uid=target_uid, task_id=assist_task_id,
+                                       reason="target_mismatch")
                                 now = _beijing_now_str()
                                 _insert_regulation_run(
                                     db,
@@ -1510,6 +1538,8 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                                 )
                             )
                             if not assist_ready:
+                                record("stop_skipped", target_uid=target_uid, task_id=assist_task_id,
+                                       reason=assist_error, category="metrics_unavailable")
                                 logger.warning(
                                     "%s 当前计划的调控任务同步状态不可用，本轮不执行：%s "
                                     "target=%s assist_task_id=%s",
@@ -1528,6 +1558,8 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                                 )
                             )
                             if not capability_ok:
+                                record("stop_skipped", target_uid=target_uid, task_id=assist_task_id,
+                                       reason=capability_error, category="capability_blocked")
                                 logger.warning(
                                     "%s 当前计划的停投能力证据无效，本轮不执行：%s "
                                     "target=%s assist_task_id=%s",
@@ -1692,6 +1724,8 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
                                     ),
                                 )
                                 if revalidate_error:
+                                    record("stop_skipped", target_uid=target_uid, task_id=assist_task_id,
+                                           reason=revalidate_error, category="final_preflight")
                                     logger.warning(
                                         "%s 取得浏览器锁后复核失败，已取消停投：%s "
                                         "target=%s assist_task_id=%s",
@@ -2014,7 +2048,10 @@ async def main_loop(interval_sec: Optional[int] = None) -> None:
                 if full_scan:
                     next_rule_cycle_at = time.monotonic() + max(60, int(sec))
                 if ready:
+                    from services.operation_diagnostics import record
+                    record("stop_scan_started", full_scan=full_scan, target_uids=scope, interval_seconds=sec)
                     await run_one_cycle(db, target_uids=scope)
+                    record("stop_scan_finished", target_uids=scope)
             else:
                 # 卡片点击只负责本地入队；独立短轮询让确认停投不必等待
                 # 下一次十分钟规则扫描。

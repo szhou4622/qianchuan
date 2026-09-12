@@ -184,6 +184,14 @@ class Api:
 
                 session = official_api_session_status()
                 collection_queue = get_collection_queue_health(db=self.db)
+                from services.collection_lifecycle import resource_pressure
+                pressure = resource_pressure()
+                if pressure.get("critical"):
+                    for target in targets:
+                        if target.get("enabled") and target.get("monitor_eligible"):
+                            target["collection_health"] = "resource_pressure"
+                            target["resource_wait"] = {**pressure, "retry_after_seconds": 30,
+                                                       "next_due_at": target.get("next_due_at")}
             else:
                 session = session_status()
                 collection_queue = {}

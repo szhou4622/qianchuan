@@ -4630,7 +4630,7 @@ class OfficialApiBackendTests(unittest.TestCase):
                             "task_name": "策略1-timeout",
                             "material_ids": ["7675637085972447295"],
                             "budget": "100",
-                            "duration": "",
+                            "duration": None,
                         }
                     ),
                 },

@@ -270,6 +270,7 @@
     const phases={plan_verification:'正在核验计划',scanning_active_materials:'正在扫描投放中素材',updating_metrics:'正在更新指标',materials:'正在采集素材',http_send:'正在读取接口',pagination_page_complete:'分页读取中',pagination_rescan:'快照变化，完整重采中',pagination_page_recheck:'失败页单次复核中',pagination_complete:'分页完整，等待提交'};
     const labels={auth_required:'API授权已失效，请重新授权',permission_denied:'接口权限不足，请核对授权',resource_pressure:'系统提交内存不足，等待资源恢复',deadline:'本轮采集已超时，迟到结果不入库',backoff:'接口限流等待',rate_limited:'接口限流等待',error:raw==='pagination_error'?'分页异常，已保留上次数据':'素材采集未完成，保留上次数据',queued:'等待采集'};
     let label=health==='collecting'?(phases[phase]||'采集中'):labels[health]||'';
+    if(p.resource_wait?.critical){health='resource_pressure';label='系统内存压力，采集等待';}
     if(health==='error'&&(raw==='worker_unavailable'||failureKind==='worker_unavailable'))label='采集工作线程暂不可用，等待恢复';
     if(health==='error'&&(raw==='collection_cancelled'||failureKind==='collection_cancelled'))label='本轮采集已取消，等待重新排队';
     if(health==='collecting'&&Number(progress.page)>0)label+=` · 第 ${Number(progress.page)} 页`;
@@ -393,6 +394,11 @@
     document.querySelectorAll('[data-save]').forEach(btn=>btn.onclick=()=>saveAccount(btn.closest('.card')));
     document.querySelectorAll('[data-remove]').forEach(btn=>btn.onclick=()=>removeAccount(btn.closest('.card')));
     document.querySelectorAll('[data-refresh-account]').forEach(btn=>btn.onclick=()=>discover(btn.dataset.refreshAccount||'',btn));
+    for(const p of data.targets||[]){
+      if(!p.resource_wait?.critical)continue;
+      const input=Array.from(document.querySelectorAll('[data-target]')).find(el=>el.dataset.target===p.target_uid);
+      if(input)input.closest('.plan').title=`系统提交内存 ${p.resource_wait.commit_percent}% · 余量 ${p.resource_wait.commit_headroom_mb}MB；最近成功 ${p.last_sync_at||'无'}；数据年龄 ${p.last_lag_seconds??'未知'}秒；计划时间 ${p.resource_wait.next_due_at||'未知'}；30秒后再次检查资源`;
+    }
     document.querySelectorAll('[data-account-plan-search]').forEach(input=>input.oninput=()=>{
       const panel=input.closest('.plans-panel');
       const query=String(input.value||'').trim().toLowerCase();

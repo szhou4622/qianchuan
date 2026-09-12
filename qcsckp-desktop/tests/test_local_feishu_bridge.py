@@ -550,7 +550,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
                 (task_uid,),
             )
             self.assertTrue(actual_bridge._deliver_outbox_once())
-        outbox = store.select_one("feishu_outbox", where={"task_uid": task_uid, "operation": "update_card"})
+        outbox = store.execute("SELECT * FROM feishu_outbox WHERE task_uid=? AND operation='update_card' ORDER BY id DESC LIMIT 1", (task_uid,), fetch=True)[0]
         reconciliation = store.select_one(
             "execution_reconciliation",
             where={"reconciliation_uid": "stop-card-update-failed"},
@@ -558,7 +558,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
         self.assertEqual("failed", outbox["status"])
         self.assertEqual("failed", reconciliation["card_update_state"])
 
-    def test_latest_card_delivery_supersedes_old_failure_for_same_target(self):
+    def test_unversioned_card_receipt_cannot_prove_latest_result_was_sent(self):
         store = SQLiteStore(database=self.db_path)
         store.insert(
             "execution_reconciliation",
@@ -595,7 +595,7 @@ class LocalFeishuTaskTests(unittest.TestCase):
             "execution_reconciliation",
             where={"reconciliation_uid": "delivery-latest"},
         )
-        self.assertEqual("sent", row["card_update_state"])
+        self.assertEqual("unknown", row["card_update_state"])
 
     def test_natural_expiry_is_a_distinct_local_terminal_state(self):
         created = bridge.create_local_stop_task(self._stop_payload())

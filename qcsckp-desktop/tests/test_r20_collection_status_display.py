@@ -89,6 +89,8 @@ class AccountCollectionDisplayTests(unittest.TestCase):
             const d=collectionDisplay({last_status:'collecting',last_error:'OLD',collection_progress:{phase:'http_send',page:24,rescan_count:1}});
             assert.ok(d.label.includes('24'));assert.ok(d.label.includes('重采 1'));assert.strictEqual(d.warning,false);assert.ok(!d.lines.join().includes('OLD'));
             assert.ok(collectionDisplay({collection_health:'resource_pressure'}).label.includes('提交内存'));
+            const waiting=collectionDisplay({last_status:'ok',collection_health:'healthy',resource_wait:{critical:true,commit_percent:98.4}});
+            assert.strictEqual(waiting.health,'resource_pressure');assert.ok(waiting.label.includes('采集等待'));assert.ok(waiting.warning);
             assert.ok(collectionDisplay({collection_health:'deadline'}).label.includes('迟到结果不入库'));
             for(const status of ['worker_unavailable','collection_cancelled']){
               const d=collectionDisplay({last_status:status,collection_health:'error'});

@@ -1360,7 +1360,10 @@
             );
         }
 
-        function runsFmtStatus(st) {
+        function runsFmtStatus(st, row = {}) {
+            const state = row.execution_state || row.step;
+            if (['submitted_verifying','submitted','verifying'].includes(state)) return '<span>已提交，正在核验</span>';
+            if (['unknown_requires_review','result_unknown'].includes(state)) return '<span class="runs-st-err">结果待核对</span>';
             if (st === 1) return '<span class="runs-st-ok">成功</span>';
             return '<span class="runs-st-err">失败</span>';
         }
@@ -1506,7 +1509,8 @@
             return '<span class="runs-detail-tri">' + esc(String(ts)) + '</span>';
         }
 
-        function runsFmtStatusDetail(st) {
+        function runsFmtStatusDetail(st, row = {}) {
+            if (['submitted_verifying','submitted','verifying','unknown_requires_review','result_unknown'].includes(row.execution_state || row.step)) return runsFmtStatus(st, row);
             if (st === 1) {
                 return '<span class="runs-detail-st-txt runs-detail-st-txt--ok">成功</span>';
             }
@@ -1571,7 +1575,7 @@
                 runsDetailCell('素材类型', runsFmtVideoTypeModal(d.video_type)) +
                 '</div>' +
                 '<div class="runs-detail-row">' +
-                runsDetailCell('状态', runsFmtStatusDetail(d.status)) +
+                runsDetailCell('状态', runsFmtStatusDetail(d.status, d)) +
                 runsDetailCell('阶段', runsFmtStepDetail(d.step)) +
                 runsDetailCell('返回消息', msgHtml) +
                 '</div>' +
@@ -1824,7 +1828,7 @@
                     runsCopyIdCell(r.material_id, '素材ID已复制到剪贴板') +
                     runsMaterialNameCell(r.material_name) +
                     '<td class="p-2">' + runsFmtVideoType(r.video_type) + '</td>' +
-                    '<td class="p-2">' + runsFmtStatus(r.status) + '</td>' +
+                    '<td class="p-2">' + runsFmtStatus(r.status, r) + '</td>' +
                     '<td class="p-2">' + runsFmtMethod(r.retargeting_method) + '</td>' +
                     '<td class="p-2">' + runsFmtOg(r.optimization_goal) + '</td>' +
                     runsCopyIdCell(r.regulate_task_id, '调控ID已复制到剪贴板') +

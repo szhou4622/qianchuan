@@ -32,6 +32,13 @@ from utils.sqlite_store import SQLiteStore
 CONTROL_TASK_NAME_MAX_LENGTH = 50
 
 
+def _preflight_read(context, action, *args, **kwargs):
+    from services.qianchuan_open_api.collection_context import use_collection_context
+    with use_collection_context(context):
+        context.check_active("execution_preflight")
+        return action(*args, **kwargs)
+
+
 class _ExistingExecutionIntent(RuntimeError):
     def __init__(self, row: Mapping[str, Any]):
         self.row = dict(row)
@@ -811,13 +818,17 @@ class OfficialApiRetargetingService:
                 True,
             )
         try:
+            from services.qianchuan_open_api.collection_context import CollectionContext
+            from services.operation_diagnostics import record
+            preflight = CollectionContext(300, progress_callback=lambda event: record(
+                "retarget_preflight", target_uid=target_uid, progress=event))
             expected_authorization = _capture_submission_authorization()
             scoped_chengfang = bool(target_uid) and promotion_scene == "live" and normalize_plan_system(plan_system) == "chengfang"
             frozen_proof = await asyncio.to_thread(
                 _current_chengfang_metric_proof, str(target_uid), aavid=aavid, ad_id=ad_id,
             ) if scoped_chengfang else None
             plan_detail = await asyncio.to_thread(
-                _check_plan,
+                _preflight_read, preflight, _check_plan,
                 service,
                 aavid=aavid,
                 ad_id=ad_id,
@@ -836,7 +847,7 @@ class OfficialApiRetargetingService:
             start_date = end_date
             if frozen_proof is not None:
                 _reports, _request_ids, fresh_scope = await asyncio.to_thread(
-                    service.list_chengfang_live_material_report, aavid, ad_id,
+                    _preflight_read, preflight, service.list_chengfang_live_material_report, aavid, ad_id,
                     start_date=start_date, end_date=end_date,
                     metrics=["stat_cost_for_roi2"], plan_detail=plan_detail,
                 )
@@ -844,13 +855,14 @@ class OfficialApiRetargetingService:
                         or fresh_scope.get("start_date") != start_date or fresh_scope.get("end_date") != end_date):
                     raise _StopSubmissionBlocked("乘方素材指标归属已变化，未提交追投，请等待重新采集")
             materials, _ = await asyncio.to_thread(
-                service.list_plan_materials,
+                _preflight_read, preflight, service.list_plan_materials,
                 aavid,
                 ad_id,
                 start_date=start_date,
                 end_date=end_date,
                 fields=[],
                 delivery_only=True,
+                parallel_workers=3,
             )
             current = {text_id(item.get("material_id")): item for item in materials}
             missing = [mid for mid in mids if mid not in current]
@@ -861,6 +873,7 @@ class OfficialApiRetargetingService:
                     raise RuntimeError(f"素材 {mid} 的投放或审核状态未明确可用，已禁止追投")
 
             def final_metric_check():
+                preflight.check_active("before_create_post")
                 if pre_submit_check is not None:
                     reason = pre_submit_check()
                     if reason:
@@ -875,6 +888,10 @@ class OfficialApiRetargetingService:
                 final_metric_check()
 
             intent_key = intent_key or control_task_name
+            from services.qianchuan_open_api.service import build_material_control_task_body
+            creation_request = build_material_control_task_body(
+                advertiser_id=aavid, ad_id=ad_id, marketing_goal=_goal(promotion_scene), name=control_task_name,
+                budget=budget, duration=duration, material_ids=mids, extra=extra)
             attempt = prepare_submission_gate(
                 task_uid=str(reconciliation_task_uid or execution_uid or intent_key),
                 action_type="retarget", aavid=aavid, ad_id=ad_id, intent_key=intent_key,
@@ -884,7 +901,9 @@ class OfficialApiRetargetingService:
                     "aavid": aavid, "ad_id": ad_id, "promotion_scene": promotion_scene,
                     "target_uid": str(target_uid or ""),
                     "material_ids": mids, "task_name": control_task_name,
-                    "budget": str(budget), "duration": str(duration) if duration is not None else "",
+                    "budget": str(budget), "duration": str(duration) if duration is not None else None,
+                    "creation_request": creation_request,
+                    "verification_contract": 2,
                     "execution_uid": intent_key,
                 },
             )
@@ -947,7 +966,8 @@ class OfficialApiRetargetingService:
             return RetargetingRunResult(
                 success=bool(pending),
                 message=("追投提交结果待核验，已禁止重复提交，正在只读核验"
-                         if pending else _public_api_error(exc)),
+                         if pending else "素材列表变化，未提交追投；请等待重新采集后生成新提醒"
+                         if getattr(exc, "code", "") == "client_order_drift" else _public_api_error(exc)),
                 step="submitted_verifying" if pending else "official_api",
                 detail=json.dumps({"submission_phase": attempt.phase if attempt else "not_sent",
                                    "error": _public_api_error(exc),

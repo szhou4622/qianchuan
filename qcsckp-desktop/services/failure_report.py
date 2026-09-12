@@ -367,10 +367,17 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
                 rows = _rows(
                     conn,
                     "SELECT " + ",".join(wanted)
-                    + " FROM feishu_outbox WHERE status IN ('queued','sending','failed') "
+                    + ",payload_json FROM feishu_outbox WHERE operation='update_card' OR status IN ('queued','sending','failed','unknown') "
                     "ORDER BY rowid DESC LIMIT 100",
                 )
-                report["feishu_outbox"] = [sanitize(row) for row in rows]
+                report["feishu_outbox"] = []
+                for row in rows:
+                    try:
+                        payload = json.loads(row.pop("payload_json", "") or "{}")
+                    except (ValueError, TypeError):
+                        payload = {}
+                    row["receipt"] = {key: payload.get(key) for key in ("business_version", "content_sha256")}
+                    report["feishu_outbox"].append(sanitize(row))
         if _table_exists(conn, "promotion_target"):
             _append_metric_evidence(conn, report)
             fields = "target_uid,aadvid,ad_id,promotion_scene,plan_system,platform_status,last_status,last_error,last_sync_at,updated_at"
@@ -389,6 +396,11 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
         conn.close()
     if current_database:
         try:
+            from services.operation_diagnostics import read_events
+            events = list(reversed(read_events()))
+            priority = [e for e in events if e.get("kind") in {"stop_skipped", "stop_scan_skipped", "collection_resource_wait"}]
+            normal = [e for e in events if e.get("kind") not in {"stop_skipped", "stop_scan_skipped", "collection_resource_wait"}]
+            report["operation_evidence"] = [sanitize(event) for event in (priority[:100] + normal[:100])]
             report["runtime_health"] = _current_process_health(live_targets)
         except Exception as exc:
             report["runtime_health"] = {"scope": "current_process", "available": False, "error_type": type(exc).__name__}

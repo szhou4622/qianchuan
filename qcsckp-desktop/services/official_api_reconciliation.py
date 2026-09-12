@@ -619,15 +619,18 @@ def _finish_locked(
         else:
             run_update = store.execute(
                 "UPDATE pmc_retargeting_run SET status=?,execution_state=?,step=?,message=?,detail=?,ended_at=? "
-                "WHERE execution_uid=? AND execution_state='submitted_verifying'",
+                "WHERE execution_uid=? AND (execution_state='submitted_verifying' OR "
+                "(execution_state='unknown_requires_review' AND ?=1))",
                 (
                     1 if succeeded else -1,
                     "confirmed_succeeded" if succeeded else status,
                     "confirmed_succeeded" if succeeded else status,
-                    "官方 API 追投已核验成功" if succeeded else "官方 API 追投核验失败，请人工检查",
+                    "官方 API 追投已核验成功" if succeeded else "官方 API 追投结果无法确认，请人工检查"
+                    if status == "unknown_requires_review" else "官方 API 追投核验失败，请人工检查",
                     str(error or "")[:4000],
                     now,
                     run_task_uid,
+                    1 if data.get("duration_repair") else 0,
                 ),
             )
             if int(run_update or 0) != 1:
@@ -730,6 +733,7 @@ def _finish_locked(
             "platform_status": verified_status,
             "control_cycle_key": str(data.get("control_cycle_key") or ""),
             "verification": dict(verified or {}),
+            "duration_repair": bool(data.get("duration_repair")),
         }
         stop_observer_count = 0
         if is_stop and final_result["control_cycle_key"]:
@@ -936,6 +940,42 @@ def _retry(store: SQLiteStore, row: Mapping[str, Any], error: str) -> None:
     )
 
 
+def recover_duration_mismatches(owner: str, *, db: SQLiteStore) -> int:
+    """One read-only recovery per proven historical execution; keep the POST lock."""
+    from services.retarget_verification_contract import (
+        DURATION_ERROR, creation_evidence, is_durationless_control,
+    )
+    count = 0
+    with db.transaction() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = db.execute(
+            "SELECT * FROM execution_reconciliation WHERE account_username=? AND action_type='retarget' "
+            "AND status='unknown_requires_review' AND last_error=? AND COALESCE(control_task_id,'')<>'' "
+            "AND json_valid(payload_json) "
+            "AND COALESCE(json_extract(payload_json,'$.duration_repair.version'),0)<>1 ORDER BY id LIMIT 100",
+            (owner, DURATION_ERROR), fetch=True, connection=connection) or []
+        for row in rows:
+            data = _payload(row.get("payload_json"))
+            if data.get("duration") != "":
+                continue
+            body = creation_evidence(db, row, data)
+            if not is_durationless_control(body, data):
+                continue
+            data["duration_repair"] = {"version": 1, "started_at": _now(),
+                "previous_status": row["status"], "previous_attempt_count": row["attempt_count"],
+                "previous_error": row["last_error"], "previous_terminal_result": data.get("terminal_result")}
+            data.update(duration=None, creation_request=body, verification_contract=2,
+                        finalization_pending=False)
+            data.pop("terminal_result", None)
+            changed = db.execute(
+                "UPDATE execution_reconciliation SET status='submitted',attempt_count=0,next_attempt_at=?,"
+                "lease_owner=NULL,lease_expires_at=NULL,confirmed_at=NULL,payload_json=?,updated_at=? "
+                "WHERE reconciliation_uid=? AND status='unknown_requires_review'",
+                (_now(), _json(data), _now(), row["reconciliation_uid"]), connection=connection)
+            count += int(changed or 0)
+    return count
+
+
 def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
     row = dict(row)
     data = _payload(row.get("payload_json"))
@@ -986,6 +1026,7 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
                 if int(changed or 0) != 1:
                     raise RuntimeError("对账任务租约已经变化，本轮结果已丢弃")
                 row["control_task_id"] = task_id
+            from services.retarget_verification_contract import verification_duration
             verified = _verify_control_task(
                 service,
                 aavid=row.get("aavid"),
@@ -994,7 +1035,7 @@ def _verify_one(store: SQLiteStore, row: Mapping[str, Any]) -> None:
                 task_id=task_id,
                 material_ids=data.get("material_ids") or [],
                 budget=data.get("budget"),
-                duration=data.get("duration"),
+                duration=verification_duration(store, row, data),
             )
         elif action_type == "stop":
             from services.official_api_execution import (
@@ -1053,6 +1094,7 @@ def _loop() -> None:
                 continue
             if time.monotonic() - last_replay >= 5:
                 recover_interrupted_submissions(owner, db=store)
+                recover_duration_mismatches(owner, db=store)
                 replay_terminal_reconciliations(owner, db=store)
                 last_replay = time.monotonic()
             row = _claim_one(store, owner)

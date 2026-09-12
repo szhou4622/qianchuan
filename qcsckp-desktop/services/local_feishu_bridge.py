@@ -594,6 +594,24 @@ def _set_reconciliation_card_update_state(task_uid: str, state: str) -> None:
         logger.exception("更新飞书卡片对账状态失败 task=%s", uid)
 
 
+def _card_result_version(row: Dict[str, Any]) -> str:
+    data = {key: row.get(key) for key in (
+        "status", "result_message", "result_detail", "regulate_task_id", "result_json")}
+    payload = _loads(row.get("payload_json"), {})
+    data["payload"] = {k:v for k,v in payload.items() if not k.startswith('delivery_')}
+    return hashlib.sha256(_json(data).encode("utf-8")).hexdigest()
+
+
+def _standalone_result_version(store, owner, task_uid):
+    results = store.execute("SELECT status,payload_json FROM execution_reconciliation "
+                            "WHERE account_username=? AND task_uid=? ORDER BY id",
+                            (owner, task_uid), fetch=True) or []
+    if not results or any(r.get('status') not in {'confirmed_succeeded','confirmed_failed','unknown_requires_review'} for r in results):
+        return ''
+    return hashlib.sha256(_json([(r['status'], _loads(r.get('payload_json'), {}).get('terminal_result'))
+                                for r in results]).encode()).hexdigest()
+
+
 def _refresh_reconciliation_card_update_state(
     store: SQLiteStore,
     account_username: str,
@@ -603,7 +621,7 @@ def _refresh_reconciliation_card_update_state(
     if not uid:
         return
     rows = store.execute(
-        "SELECT o.status,o.message_id FROM feishu_outbox o JOIN ("
+        "SELECT o.status,o.message_id,o.operation,o.payload_json FROM feishu_outbox o JOIN ("
         "SELECT operation,receive_type,receive_id,message_id,MAX(id) AS latest_id "
         "FROM feishu_outbox WHERE account_username=? AND task_uid=? "
         "GROUP BY operation,receive_type,receive_id,message_id) latest "
@@ -611,7 +629,39 @@ def _refresh_reconciliation_card_update_state(
         (_account_key(account_username), uid),
         fetch=True,
     ) or []
-    related = [str(row.get("status") or "") for row in rows]
+    task = _task_row(uid, account_username) or {}
+    messages = _loads(task.get("card_messages_json"), [])
+    expected_ids = {str(m.get("message_id")) for m in messages if isinstance(m, dict) and m.get("message_id")}
+    updates = store.execute(
+        "SELECT * FROM feishu_outbox WHERE account_username=? AND task_uid=? "
+        "AND operation='update_card' AND status<>'superseded' ORDER BY id DESC", (_account_key(account_username), uid), fetch=True) or []
+    newest = {}
+    for update in updates:
+        newest.setdefault(str(update.get("message_id") or ""), update)
+    version = _card_result_version(task)
+    related = []
+    for mid in expected_ids:
+        update = newest.get(mid) or {}
+        receipt = _loads(update.get("payload_json"), {})
+        state = str(update.get("status") or "unknown")
+        if state not in {"sent", "queued", "sending", "failed", "unknown"}:
+            state = "unknown"
+        if state == "sent" and (receipt.get("business_version") != version or not receipt.get("content_sha256")):
+            state = "unknown"
+        related.append(state)
+    if not related:
+        standalone_version = _standalone_result_version(store, _account_key(account_username), uid) if not task else ''
+        for entry in rows:
+            payload = _loads(entry.get('payload_json'), {})
+            if entry.get('operation') != 'send_card' or not standalone_version:
+                continue
+            state = str(entry.get('status') or 'unknown')
+            if state == 'sent' and (not entry.get('message_id') or not payload.get('content_sha256')
+                                    or payload.get('business_version') != standalone_version):
+                state = 'unknown'
+            related.append(state)
+        if not related:
+            related = ["queued" if any(r.get("status") in {"queued", "sending"} for r in rows) else "unknown"]
     state = (
         "unknown"
         if "unknown" in related
@@ -2608,27 +2658,49 @@ class LocalFeishuBridge:
                 build_local_task_card(_task_payload(row), expanded=expanded),
                 ensure_ascii=False,
             )
+            version = _card_result_version(row)
+            receipt = {"task_uid": task_uid, "expanded": expanded, "business_version": version,
+                       "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+            receipt_uid = hashlib.sha256((self.account_username + "|patch|" + message_id + "|" +
+                                         version + "|" + receipt["content_sha256"]).encode()).hexdigest()
+            prior_receipt = store.select_one("feishu_outbox", where={"outbox_uid": receipt_uid}) or {}
+            attempt_count = max(int((queued_row or {}).get("attempt_count") or 0),
+                                int(prior_receipt.get("attempt_count") or 0))
+            store.insert_or_update("feishu_outbox", {
+                "outbox_uid": receipt_uid, "account_username": self.account_username,
+                "operation": "update_card", "task_uid": task_uid, "message_id": message_id,
+                "payload_json": _json(receipt), "status": "sending", "updated_at": _dt(_now()),
+                "attempt_count": attempt_count,
+                "lease_owner": _OUTBOX_LEASE_OWNER, "lease_expires_at": _dt(_now() + timedelta(seconds=60)),
+            }, unique_fields=["outbox_uid"])
             try:
                 self._request(
                     "PATCH", "/im/v1/messages/" + quote(message_id, safe=""),
                     payload={"content": content},
                 )
             except Exception:
-                if queued_row is None:
-                    self._queue_outbox(
-                        operation="update_card", message_id=message_id,
-                        payload={"content": content, "task_uid": task_uid,
-                                 "expanded": expanded},
-                    )
+                store.execute("UPDATE feishu_outbox SET status=?,lease_owner=NULL,lease_expires_at=NULL,"
+                              "next_attempt_at=?,last_error='卡片PATCH失败',updated_at=? WHERE outbox_uid=?",
+                              ("failed" if attempt_count >= _MAX_DELIVERY_ATTEMPTS else "queued",
+                               _dt(_now() + timedelta(seconds=2)), _dt(_now()), receipt_uid))
+                self._outbox_wake.set()
                 raise
+            store.execute("UPDATE feishu_outbox SET status='sent',sent_at=?,updated_at=?,last_error='',"
+                          "lease_owner=NULL,lease_expires_at=NULL WHERE outbox_uid=?",
+                          (_dt(_now()), _dt(_now()), receipt_uid))
             store.execute(
                 "UPDATE feishu_outbox SET status='superseded',lease_owner=NULL,"
                 "lease_expires_at=NULL,updated_at=? WHERE account_username=? "
                 "AND operation='update_card' AND message_id=? AND outbox_uid<>? "
                 "AND status IN ('queued','sending','failed')",
                 (_dt(_now()), self.account_username, message_id,
-                 str((queued_row or {}).get("outbox_uid") or "")),
+                 receipt_uid),
             )
+            latest_row = _task_row(task_uid, self.account_username) or {}
+            if _card_result_version(latest_row) != version:
+                self._queue_outbox(operation="update_card", message_id=message_id,
+                                   payload={"task_uid": task_uid, "expanded": expanded,
+                                            "business_version": _card_result_version(latest_row)})
             return True
 
     def _deliver_outbox_once(self, *, outbox_uid: str = "") -> bool:
@@ -2745,14 +2817,10 @@ class LocalFeishuBridge:
                     except Exception:
                         logger.warning("卡片已送达，最新状态更新已进入重试 task=%s", task_uid)
             elif operation == "update_card":
-                self._patch_latest_task_card(task_uid, str(row.get("message_id") or ""),
-                                             expanded=bool(payload.get("expanded")), queued_row=row)
-                store.execute(
-                    "UPDATE feishu_outbox SET status='sent',lease_owner=NULL,lease_expires_at=NULL,"
-                    "last_error='',sent_at=?,updated_at=? WHERE outbox_uid=? AND status='sending' "
-                    "AND lease_owner=? AND fencing_token=?",
-                    (_dt(_now()), _dt(_now()), row["outbox_uid"], _OUTBOX_LEASE_OWNER, token),
-                )
+                patched = self._patch_latest_task_card(task_uid, str(row.get("message_id") or ""),
+                                                      expanded=bool(payload.get("expanded")), queued_row=row)
+                if not patched:
+                    raise FeishuApiError("卡片任务或更新领取资格已变化，未确认送达")
             else:
                 raise FeishuApiError("未知飞书发件箱操作")
             _refresh_reconciliation_card_update_state(store, self.account_username, task_uid)
@@ -2833,6 +2901,7 @@ class LocalFeishuBridge:
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         store = SQLiteStore(database=DB_FILE)
         local = _task_row(task_uid, self.account_username) if task_uid else None
+        business_version = _card_result_version(local) if local else _standalone_result_version(store, self.account_username, task_uid)
         expires_at = str((local or {}).get("expires_at") or _dt(_now() + timedelta(minutes=50)))
         prepared: List[Tuple[str, str, str]] = []
         # Generic notifications preserve their List[actual receipt] contract:
@@ -2844,6 +2913,7 @@ class LocalFeishuBridge:
                 data = {"delivery_protocol": _INITIAL_DELIVERY_PROTOCOL, "task_uid": task_uid,
                         "delivery_stage": delivery_stage, "delivery_uuid": uuid.uuid4().hex,
                         "frozen_content": content, "content_sha256": content_hash,
+                        "business_version": business_version,
                         "first_attempt_at": "", "expires_at": expires_at}
                 connection.execute(
                     "INSERT OR IGNORE INTO feishu_outbox(outbox_uid,account_username,operation,"
@@ -2894,10 +2964,7 @@ class LocalFeishuBridge:
             except Exception as exc:
                 logger.warning("[飞书长连接] 更新卡片失败 task=%s: %s", task_uid, exc)
                 queued = True
-        _set_reconciliation_card_update_state(
-            task_uid,
-            "queued" if queued else "sent" if attempted else "failed",
-        )
+        _refresh_reconciliation_card_update_state(SQLiteStore(database=DB_FILE), self.account_username, task_uid)
 
     def send_test_card(self) -> Dict[str, Any]:
         try:
@@ -5019,6 +5086,7 @@ def finalize_reconciled_local_task(
     if not row:
         return {"success": False, "message": "本地任务不存在"}
     final_result = dict(result or {})
+    duration_repair_requested = bool(final_result.get("duration_repair"))
     payload = _loads(row.get("payload_json"), {})
     if not isinstance(payload, dict):
         payload = {}
@@ -5045,14 +5113,21 @@ def finalize_reconciled_local_task(
             if str(final_result.get("step") or "") in {"unknown_requires_review", "result_unknown"}
             else "failed"
         )
-    if str(row.get("status") or "") in TERMINAL_STATUSES:
+    repair_allowed = False
+    if duration_repair_requested and row.get("status") == "unknown_requires_review":
+        repairs = SQLiteStore(database=DB_FILE).execute(
+            "SELECT payload_json FROM execution_reconciliation WHERE task_uid=? AND account_username=? "
+            "AND status='confirmed_succeeded'",
+            (task_uid, row.get("account_username")), fetch=True) or []
+        repair_allowed = any(_loads(r.get("payload_json"), {}).get("duration_repair") for r in repairs)
+    if str(row.get("status") or "") in TERMINAL_STATUSES and not repair_allowed:
         matches = str(row.get("status") or "") == expected
         if matches and _MANAGER.account == _account_key(row.get("account_username")):
             bridge = _MANAGER.bridge()
             if bridge:
                 _EVENT_EXECUTOR.submit(bridge.update_task_cards, task_uid)
         return {"success": matches}
-    if str(row.get("status") or "") != "verifying":
+    if str(row.get("status") or "") != "verifying" and not repair_allowed:
         return {"success": False, "message": "任务不在核验状态"}
     now_text = _dt(_now())
     conn = _db()
@@ -5060,7 +5135,8 @@ def finalize_reconciled_local_task(
         updated = conn.execute(
             "UPDATE local_retarget_task SET status=?,active_dedupe_key=NULL,"
             "claim_expires_at=NULL,result_message=?,result_detail=?,regulate_task_id=?,"
-            "result_json=?,finished_at=?,updated_at=? WHERE task_uid=? AND status='verifying'",
+            "result_json=?,finished_at=?,updated_at=? WHERE task_uid=? AND "
+            "(status='verifying' OR (status='unknown_requires_review' AND ?=1))",
             (
                 expected,
                 str(message or "")[:1000],
@@ -5070,6 +5146,7 @@ def finalize_reconciled_local_task(
                 now_text,
                 now_text,
                 task_uid,
+                int(repair_allowed),
             ),
         )
         conn.commit()
