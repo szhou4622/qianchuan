@@ -592,7 +592,7 @@ def official_api_catalog_status() -> dict[str, Any]:
 
 
 def _catalog_scheduler_loop(interval_seconds: int) -> None:
-    # 软件启动时先对用户主动添加的账户刷新一次；之后每30分钟增量刷新。
+    # 软件启动时先对用户主动添加的账户刷新一次；之后默认每5分钟刷新。
     while not _SCHEDULER_STOP.is_set():
         try:
             start_official_api_catalog_sync()
@@ -602,7 +602,7 @@ def _catalog_scheduler_loop(interval_seconds: int) -> None:
         _SCHEDULER_STOP.wait(max(60, int(interval_seconds)))
 
 
-def start_official_api_catalog_scheduler(interval_seconds: int = 1800) -> threading.Thread:
+def start_official_api_catalog_scheduler(interval_seconds: int = 300) -> threading.Thread:
     global _SCHEDULER_THREAD
     with _SCHEDULER_LOCK:
         if _SCHEDULER_THREAD and _SCHEDULER_THREAD.is_alive():
