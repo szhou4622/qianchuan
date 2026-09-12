@@ -169,6 +169,18 @@ class _SubmissionAttempt:
         request_uid = str(getattr(response, "request_uid", "") or "")
         request_id = str(getattr(response, "request_id", "") or "")
         try:
+            from services.operation_diagnostics import record
+            record("platform_submission", stage=self.phase,
+                   reason_code=("platform_accepted" if self.phase == "accepted" else "result_unknown"),
+                   task_uid=self.task_uid, execution_uid=self.intent_key,
+                   target_uid=self.verify_payload.get("target_uid"), aavid=self.aavid, ad_id=self.ad_id,
+                   request_id=request_id, control_task_id=self.control_task_id,
+                   request={key: self.verify_payload.get(key) for key in (
+                       "promotion_scene", "task_name", "material_ids", "budget", "duration",
+                       "creation_request", "verification_contract")})
+        except Exception:
+            pass
+        try:
             enqueue_execution_reconciliation(
                 task_uid=self.task_uid, action_type=self.action_type,
                 aavid=self.aavid, ad_id=self.ad_id, control_task_id=self.control_task_id,

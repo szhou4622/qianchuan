@@ -6,6 +6,7 @@ import json
 import platform
 import re
 import sqlite3
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,7 +27,8 @@ _ID_KEYS = {
     "material_ids", "task_id", "control_task_id", "regulate_task_id",
     "anchor_id", "aweme_id", "aweme_uid", "account_uid", "target_uid",
     "receive_id", "open_id", "user_id", "chat_id", "code_id", "task_uid",
-    "run_uid",
+    "run_uid", "execution_uid", "incident_uid", "evidence_id", "group_uid",
+    "strategy_id", "message_id",
 }
 _NAME_KEYS = {
     "account_name", "advertiser_name", "plan_name", "material_name",
@@ -39,6 +41,7 @@ _MESSAGE_KEYS = {
 _LONG_ID = re.compile(r"(?<!\d)\d{12,}(?!\d)")
 _URL = re.compile(r"https?://[^\s\"']+", re.I)
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:\\[^\r\n\"']+")
+_QUERY_ERRORS: ContextVar[list[dict[str, str]]] = ContextVar("failure_report_query_errors", default=[])
 
 
 def _digest(value: Any) -> str:
@@ -164,7 +167,10 @@ def _trace_evidence(value: Any) -> dict[str, Any]:
 def _rows(conn: sqlite3.Connection, query: str, params=()) -> list[dict[str, Any]]:
     try:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        errors = list(_QUERY_ERRORS.get())
+        errors.append({"error_type": type(exc).__name__, "query_fingerprint": _digest(query)})
+        _QUERY_ERRORS.set(errors)
         return []
 
 
@@ -255,7 +261,7 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
 
     report: dict[str, Any] = {
         "schema": "qcsckp-failure-report-v1",
-        "report_revision": 4,
+        "report_revision": 5,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "application": {
             "version": IDENTITY.get("version"),
@@ -291,7 +297,12 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
         "target_errors": [],
         "diagnostic_events": [],
         "runtime_health": {"scope": "not_collected"},
+        "summary": {"status": "not_collected"},
+        "incidents": [],
+        "comparisons": [],
+        "coverage": {},
     }
+    _QUERY_ERRORS.set([])
     path = Path(db_path)
     current_database = path.resolve() == Path(DB_FILE).resolve()
     live_targets: list[dict[str, Any]] = []
@@ -318,11 +329,19 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
             audits = _rows(conn, "SELECT " + audit_fields + " FROM qianchuan_api_audit ORDER BY id DESC LIMIT 200")
             failures = _rows(conn, "SELECT " + audit_fields + " FROM qianchuan_api_audit WHERE status IN ('failed','unknown','incomplete') ORDER BY id DESC LIMIT 100")
             def audit_rows(rows):
-                return [sanitize({
-                    **{k: row.get(k) for k in ("endpoint", "method", "aavid", "ad_id", "task_id", "request_id", "error_code", "status", "created_at")},
-                    "request": _parse_json(row.get("request_summary_json")),
-                    "response": _parse_json(row.get("response_summary_json")),
-                }) for row in reversed(rows)]
+                result = []
+                for row in reversed(rows):
+                    request = _parse_json(row.get("request_summary_json"))
+                    response = _parse_json(row.get("response_summary_json"))
+                    result.append(sanitize({
+                        **{k: row.get(k) for k in ("endpoint", "method", "aavid", "ad_id", "task_id", "request_id", "error_code", "status", "created_at")},
+                        "request": {key: request.get(key) for key in ("query", "body") if key in request},
+                        "response": {key: response.get(key) for key in (
+                            "code", "message", "help_message", "verification_error", "pagination",
+                            "attempt", "page_attempt", "http_attempt", "sent_at", "elapsed_ms",
+                        ) if key in response},
+                    }))
+                return result
             report["api_recent"] = audit_rows(audits)
             report["api_failures"] = audit_rows(failures)
         if _table_exists(conn, "local_retarget_task"):
@@ -468,7 +487,22 @@ def build_failure_report(*, db_path: str = DB_FILE) -> dict[str, Any]:
                 events.close()
     except (OSError, sqlite3.Error):
         report["diagnostic_events"] = [{"read_error": True}]
-    return report
+    try:
+        from services.failure_report_v5 import build_sections, enforce_size
+        incident_conn = sqlite3.connect(uri, uri=True, timeout=5)
+        incident_conn.row_factory = sqlite3.Row
+        incident_conn.execute("PRAGMA query_only=ON")
+        try:
+            v5 = build_sections(conn=incident_conn, sanitize=sanitize, current_database=current_database)
+        finally:
+            incident_conn.close()
+    except Exception as exc:
+        v5 = {"summary": {"status": "assembly_failed", "error_type": type(exc).__name__},
+              "incidents": [], "comparisons": [], "coverage": {"assembly_error": True}}
+    report.update(v5)
+    report.setdefault("coverage", {})["legacy_query_errors"] = _QUERY_ERRORS.get()
+    from services.failure_report_v5 import enforce_size
+    return enforce_size(report)
 
 
 def failure_report_json(*, db_path: str = DB_FILE) -> str:

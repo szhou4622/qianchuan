@@ -548,6 +548,16 @@ def _finish_locked(
     )
     if int(changed or 0) != 1:
         return False
+    try:
+        from services.operation_diagnostics import record
+        record("platform_verification", stage="platform_verified",
+               reason_code=status, task_uid=row.get("task_uid"),
+               execution_uid=data.get("execution_uid"), request_id=row.get("request_id"),
+               control_task_id=row.get("control_task_id"), aavid=row.get("aavid"), ad_id=row.get("ad_id"),
+               verified=dict(verified or {}), error_type=(type(error).__name__ if isinstance(error, BaseException) else ""),
+               error=str(error or ""), finished_at=now)
+    except Exception:
+        pass
     is_stop = str(row.get("action_type") or "retarget") == "stop"
     request_uid = str(data.get("request_uid") or "")
     if request_uid:

@@ -419,6 +419,8 @@ async def _execute_grouped_task(
                 "material_name": materials[0].get("material_name") or "",
                 "retarget_groups": [],
                 "group_index": index + 1,
+                "group_uid": str(group.get("group_uid") or f"group-{index + 1}"),
+                "execution_uid": f"{task.get('task_uid')}:group:{index + 1}",
                 "parent_task_uid": str(task.get("task_uid") or ""),
             }
             group_tasks.append(group_task)
@@ -477,6 +479,17 @@ async def _execute_grouped_task(
                 "result": result,
             }
         )
+        try:
+            from services.operation_diagnostics import record
+            record("retarget_group_result", stage="group_result",
+                   reason_code=str(result.get("step") or ("succeeded" if result.get("success") else "failed")),
+                   task_uid=task.get("task_uid"), execution_uid=group_task.get("execution_uid"),
+                   group_uid=group_task.get("group_uid"), group_index=index,
+                   material_ids=[item.get("material_id") for item in group_task.get("materials") or []],
+                   success=bool(result.get("success")), regulate_task_ids=ids,
+                   message=result.get("message"))
+        except Exception:
+            pass
     succeeded_count = sum(1 for result in group_results if result["success"])
     all_succeeded = succeeded_count == len(group_results)
     pending_verification = any(
@@ -511,7 +524,7 @@ async def _execute_grouped_task(
     }
 
 
-def _validate_task(
+def _validate_task_impl(
     task: Dict[str, Any],
     db: SQLiteStore,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
@@ -851,6 +864,31 @@ def _validate_task(
             if rate_limit_should_skip(db, material_id, ws, mc, target_uid):
                 raise RuntimeError(f"素材 {material_id} 已达到全局追投次数上限")
     return cfg, strategy, [rows_by_id[item["material_id"]] for item in materials]
+
+
+def _validate_task(
+    task: Dict[str, Any],
+    db: SQLiteStore,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    try:
+        result = _validate_task_impl(task, db)
+    except BaseException as exc:
+        try:
+            from services.retarget_diagnostics import revalidation
+            revalidation(task, db, error=exc,
+                         group_uid=str(task.get("group_uid") or ""),
+                         execution_uid=str(task.get("execution_uid") or ""))
+        except Exception:
+            pass
+        raise
+    try:
+        from services.retarget_diagnostics import revalidation
+        revalidation(task, db, rows=result[2],
+                     group_uid=str(task.get("group_uid") or ""),
+                     execution_uid=str(task.get("execution_uid") or ""))
+    except Exception:
+        pass
+    return result
 
 
 def _validate_budget_increase_task(
@@ -1631,6 +1669,17 @@ async def run_worker_loop() -> None:
                     else ("succeeded" if result.get("success") else "failed")
                 )
             )
+            try:
+                from services.operation_diagnostics import record
+                record("retarget_execution_result", stage="execution_result",
+                       reason_code=str(result.get("step") or final_status), task_uid=task_uid,
+                       execution_uid=str(result.get("execution_uid") or task.get("execution_uid") or task_uid),
+                       success=bool(result.get("success")), final_status=final_status,
+                       regulate_task_id=result.get("regulate_task_id"),
+                       regulate_task_ids=result.get("regulate_task_ids") or [],
+                       group_results=result.get("group_results") or [], message=result.get("message"))
+            except Exception:
+                pass
             _save_local_task(db, task_uid, final_status, result, task)
             final_report = await asyncio.to_thread(
                 report_retarget_task,

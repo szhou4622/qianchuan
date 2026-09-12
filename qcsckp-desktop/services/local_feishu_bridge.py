@@ -2684,10 +2684,24 @@ class LocalFeishuBridge:
                               ("failed" if attempt_count >= _MAX_DELIVERY_ATTEMPTS else "queued",
                                _dt(_now() + timedelta(seconds=2)), _dt(_now()), receipt_uid))
                 self._outbox_wake.set()
+                try:
+                    from services.operation_diagnostics import record
+                    record("feishu_delivery", stage="card_update_queued", reason_code="patch_failed",
+                           task_uid=task_uid, message_id=message_id, business_version=version,
+                           content_sha256=receipt["content_sha256"])
+                except Exception:
+                    pass
                 raise
             store.execute("UPDATE feishu_outbox SET status='sent',sent_at=?,updated_at=?,last_error='',"
                           "lease_owner=NULL,lease_expires_at=NULL WHERE outbox_uid=?",
                           (_dt(_now()), _dt(_now()), receipt_uid))
+            try:
+                from services.operation_diagnostics import record
+                record("feishu_delivery", stage="card_update_sent", reason_code="receipt_confirmed",
+                       task_uid=task_uid, message_id=message_id, business_version=version,
+                       content_sha256=receipt["content_sha256"])
+            except Exception:
+                pass
             store.execute(
                 "UPDATE feishu_outbox SET status='superseded',lease_owner=NULL,"
                 "lease_expires_at=NULL,updated_at=? WHERE account_username=? "
@@ -4107,6 +4121,11 @@ def _create_local_retarget_task_for(
             raise
     finally:
         conn.close()
+    try:
+        from services.retarget_diagnostics import card_issued
+        card_issued(task_uid, payload)
+    except Exception:
+        pass
     _wake_delivery(bridge)
     return {
         "success": True, "duplicate": False,
@@ -4468,6 +4487,12 @@ def _handle_local_stop_card_action(
             conn.rollback()
             return {"success": False, "message": "停投任务状态已经变化"}
         conn.commit()
+        try:
+            from services.retarget_diagnostics import card_action
+            card_action(task_uid, action + "_committed", payload if action == "approve" else _loads(row.get("payload_json"), {}),
+                        committed=True)
+        except Exception:
+            pass
         return {"success": True, "message": message, "update": True}
     finally:
         conn.close()
@@ -4505,6 +4530,13 @@ def handle_local_card_action(
         }
     if not secrets.compare_digest(str(row.get("action_nonce") or ""), str(nonce or "")):
         return {"success": False, "message": "卡片任务校验失败"}
+    if str(row.get("action_type") or "retarget") == "retarget" and action != "view":
+        try:
+            from services.retarget_diagnostics import card_action
+            card_action(task_uid, action, _loads(row.get("payload_json"), {}),
+                        material_id=material_id, group_uid=group_uid)
+        except Exception:
+            pass
     expires = _parse_dt(row.get("expires_at"))
     if expires and expires <= _now() and str(row.get("status")) in ACTIVE_STATUSES:
         action_label = (
@@ -4757,6 +4789,11 @@ def handle_local_card_action(
                     ),
                 )
                 conn.commit()
+                try:
+                    from services.retarget_diagnostics import card_action
+                    card_action(task_uid, "approve_committed", payload, committed=True)
+                except Exception:
+                    pass
                 return {
                     "success": True,
                     "message": "已确认追加预算，工具将重新复核最新预算、消耗和ROI后执行",
@@ -4873,6 +4910,12 @@ def handle_local_card_action(
             )
             message = "本次提醒已结束，不会追投"
         conn.commit()
+        try:
+            from services.retarget_diagnostics import card_action
+            card_action(task_uid, action + "_committed", payload if action == "approve" else _loads(current["payload_json"], {}),
+                        committed=True)
+        except Exception:
+            pass
         return {"success": True, "message": message, "update": True}
     finally:
         conn.close()

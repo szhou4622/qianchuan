@@ -1886,6 +1886,21 @@ async def run_one_cycle(db: SQLiteStore, *, target_uids=None) -> None:
             if not hit_rows:
                 return
 
+            try:
+                from services.operation_diagnostics import record
+                record("retarget_rule_match", stage="rule_matched", reason_code="candidate_matched",
+                       action_mode=action_mode, target_uid=target_uid,
+                       aavid=target.get("aadvid"), ad_id=target.get("ad_id"),
+                       strategy_id=st.get("id"), strategy_hash=_strategy_fingerprint(st),
+                       promotion_scene=promotion_scene, plan_system=plan_system,
+                       query_at=query_at, material_ids=[str(row.get("id") or "") for row in hit_rows[:20]],
+                       evaluations=[{"material_id": str(row.get("id") or ""),
+                                     "evaluation": build_trigger_evaluation_snapshot(trigger, row),
+                                     "observed_at": row.get("periodEndTime") or row.get("createdAt")}
+                                    for row in hit_rows[:20]])
+            except Exception:
+                pass
+
             if action_mode == "card_confirm":
                 aavid_raw = target.get("aadvid")
                 aavid = str(aavid_raw).strip() if aavid_raw is not None else ""
