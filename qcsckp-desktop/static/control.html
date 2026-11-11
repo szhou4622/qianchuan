@@ -162,10 +162,11 @@
                         </div>
                         <label class="block w-full max-w-2xl">
                             <div class="text-xs text-slate-400 mb-1">浏览器程序路径（可选）</div>
-                            <p class="text-[11px] text-slate-500 mb-1.5 leading-relaxed">默认使用本机Google Chrome和工具独立会话，不读取日常Chrome资料。仅在高级排错时手动修改。</p>
+                            <p class="text-[11px] text-slate-500 mb-1.5 leading-relaxed">留空自动检测本机Google Chrome，使用工具独立会话。如已安装但未检测到，请在Chrome地址栏打开 chrome://version，复制「可执行文件路径」填入此处，然后重新启动采集。</p>
                             <input id="cfgBrowserExecutable" type="text" autocomplete="off" spellcheck="false"
                                    class="w-full rounded-lg bg-slate-950/40 border border-slate-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500/60 font-mono"
                                    placeholder="选填，完整路径" />
+                            <p id="cfgScrapeSaveStatus" role="status" aria-live="polite" class="text-[11px] text-slate-400 mt-1.5"></p>
                         </label>
                         <div class="w-full max-w-2xl rounded-xl border border-slate-700/70 bg-slate-950/25 px-4 py-3">
                             <div class="grid grid-cols-1 md:grid-cols-[9rem_1fr] gap-x-4 gap-y-2 text-xs">
@@ -173,6 +174,8 @@
                                 <div id="runtimeBrowserName" class="text-slate-200">正在检测</div>
                                 <div class="text-slate-500">实际程序路径</div>
                                 <div id="runtimeBrowserPath" class="text-slate-300 font-mono break-all">正在检测</div>
+                                <div class="text-slate-500">浏览器检测提示</div>
+                                <div id="runtimeBrowserMessage" class="text-slate-400 whitespace-pre-line break-all"></div>
                                 <div class="text-slate-500">当前阶段</div>
                                 <div id="runtimeBrowserPhase" class="text-slate-200">未运行</div>
                                 <div class="text-slate-500">千川登录状态</div>
@@ -475,29 +478,10 @@
                 activeMaterialCount: Number(st?.activeMaterialCount) || 0,
             };
 
-            const browser = st?.browser || {};
+            renderBrowserStatus(st?.browser || {}, lastStatusSnapshot.officialApiMode);
             const login = st?.qianchuanLogin || {};
-            const browserName = document.getElementById('runtimeBrowserName');
-            const browserPath = document.getElementById('runtimeBrowserPath');
-            const browserPhase = document.getElementById('runtimeBrowserPhase');
             const loginStatus = document.getElementById('runtimeLoginStatus');
             const cookieTime = document.getElementById('runtimeCookieTime');
-            if (browserName) {
-                browserName.textContent = lastStatusSnapshot.officialApiMode
-                    ? '官方 API 模式（无需 Chrome）'
-                    : browser.available === false
-                    ? '未检测到Google Chrome'
-                    : (browser.name || 'Google Chrome');
-                browserName.className = lastStatusSnapshot.officialApiMode
-                    ? 'text-emerald-400'
-                    : browser.available === false
-                    ? 'text-rose-400'
-                    : (browser.is_chrome === false ? 'text-amber-400' : 'text-emerald-400');
-            }
-            if (browserPath) browserPath.textContent = lastStatusSnapshot.officialApiMode
-                ? '不启动本地浏览器'
-                : (browser.path || '未检测到可用程序');
-            if (browserPhase) browserPhase.textContent = browser.phase || '未运行';
             if (loginStatus) {
                 loginStatus.textContent = login.status || '尚未检测';
                 loginStatus.className = login.cookie_saved ? 'text-emerald-400' : 'text-amber-400';
@@ -603,21 +587,63 @@
             }
         }
 
+        function renderBrowserStatus(browser, officialApiMode) {
+            const name = document.getElementById('runtimeBrowserName');
+            const path = document.getElementById('runtimeBrowserPath');
+            const phase = document.getElementById('runtimeBrowserPhase');
+            const message = document.getElementById('runtimeBrowserMessage');
+            if (name) {
+                name.textContent = browser.available === false
+                    ? '未检测到Google Chrome'
+                    : (browser.name || 'Google Chrome') + (officialApiMode ? '（用于账户授权）' : '');
+                name.className = browser.available === false ? 'text-rose-400' : 'text-emerald-400';
+            }
+            if (path) path.textContent = browser.path || '未检测到可用程序';
+            if (phase) phase.textContent = officialApiMode
+                ? 'API 采集无需 Chrome；账户授权需要 Chrome'
+                : (browser.phase || '未运行');
+            if (message) {
+                message.textContent = browser.message || (browser.available ? '已检测到可用 Chrome' : '');
+                message.className = browser.available === false
+                    ? 'text-rose-400 whitespace-pre-line break-all' : 'text-slate-400';
+            }
+        }
+
+        let scrapeSaveQueue = Promise.resolve();
+        let scrapeSaveGeneration = 0;
+
+        function showScrapeSaveStatus(message, failed = false) {
+            const el = document.getElementById('cfgScrapeSaveStatus');
+            if (!el) return;
+            el.textContent = message;
+            el.className = failed ? 'text-[11px] text-rose-400 mt-1.5' : 'text-[11px] text-emerald-400 mt-1.5';
+        }
+
         async function syncScrapePanelToBackend() {
-            const api = await waitForApi();
-            if (!api || !api.setScrapeServicePanelConfig) return;
             const interval_seconds = Math.max(5, getIntervalFromUI());
             const headless_poll = getHeadlessPollFromUI();
             const fetch_assist_tasks = getFetchAssistTasksFromUI();
             const browser_executable_path = getBrowserExecutableFromUI();
-            try {
-                await api.setScrapeServicePanelConfig(
-                    interval_seconds,
-                    headless_poll,
-                    fetch_assist_tasks,
-                    browser_executable_path
-                );
-            } catch (_) {}
+            const generation = ++scrapeSaveGeneration;
+            showScrapeSaveStatus('正在保存设置…');
+            const save = async () => {
+                try {
+                    const api = await waitForApi();
+                    if (!api || !api.setScrapeServicePanelConfig) throw new Error('未连接到桌面端，设置未保存');
+                    const result = await api.setScrapeServicePanelConfig(
+                        interval_seconds, headless_poll, fetch_assist_tasks, browser_executable_path
+                    );
+                    if (!result || result.success !== true) throw new Error(result?.message || '保存请求未成功');
+                    if (generation === scrapeSaveGeneration) showScrapeSaveStatus('设置已保存；浏览器路径在下次启动采集或账户授权时生效');
+                    return true;
+                } catch (error) {
+                    if (generation === scrapeSaveGeneration) showScrapeSaveStatus('设置保存失败：' + String(error?.message || error), true);
+                    return false;
+                }
+            };
+            const pending = scrapeSaveQueue.then(save, save);
+            scrapeSaveQueue = pending;
+            return pending;
         }
 
         function refreshIntervalStepButtonsState() {
@@ -860,6 +886,7 @@
             }
             const interval = getIntervalFromUI();
             const headlessPoll = getHeadlessPollFromUI();
+            if (!await syncScrapePanelToBackend()) return;
             let st;
             try {
                 st = await api.startService(interval, headlessPoll);
@@ -888,7 +915,7 @@
             if (!api) return;
             const newInterval = getIntervalFromUI();
             if (newInterval >= 5) {
-                await syncScrapePanelToBackend();
+                if (!await syncScrapePanelToBackend()) return;
                 if (api.setServiceInterval) {
                     await api.setServiceInterval(newInterval);
                 }

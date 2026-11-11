@@ -45,6 +45,7 @@ from services.promotion_capability import (
     check_target_capability,
 )
 from utils.common import require_executable_path
+from services.control_panel_config import effective_browser_executable_path
 from utils.log import logger
 
 
@@ -657,8 +658,15 @@ class QianChuanRetargetingService:
         if self.browser and self.context and self.page:
             return
 
+        exe = require_executable_path(effective_browser_executable_path(self._opt.browser_executable_path))
+        try:
+            await self._start_browser(exe)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start_browser(self, exe: str) -> None:
         self._playwright = await async_playwright().start()
-        exe = require_executable_path(self._opt.browser_executable_path)
         self.browser = await self._playwright.chromium.launch(
             headless=self._opt.headless,
             chromium_sandbox=False,
@@ -689,20 +697,21 @@ class QianChuanRetargetingService:
         self.page = await self.context.new_page()
 
     async def close(self) -> None:
-        if self.browser:
-            try:
-                await self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
+        browser, self.browser = self.browser, None
+        playwright, self._playwright = self._playwright, None
         self.context = None
         self.page = None
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            logger.warning("关闭追投浏览器失败，继续释放浏览器驱动")
+        finally:
+            if playwright:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    logger.warning("释放追投浏览器驱动失败")
 
     # ---------- 校验 ----------
 

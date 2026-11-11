@@ -232,11 +232,13 @@ def open_oauth_authorization_browser(url: str, state: str) -> bool:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
+            from services.control_panel_config import effective_browser_executable_path
             from utils.common import require_executable_path
 
+            browser_path = require_executable_path(effective_browser_executable_path())
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(
-                    executable_path=require_executable_path(),
+                    executable_path=browser_path,
                     headless=False,
                     args=["--start-maximized"],
                 )

@@ -1389,13 +1389,15 @@ class Api:
     def getRuleRetargetingConfig(self):
         """读取 data/rule_retargeting.json（规范化后返回）。"""
         from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
+        from services.control_panel_config import effective_browser_executable_path
 
         from .rule_retargeting_config import load_rule_retargeting_config
 
         c = load_rule_retargeting_config()
         out = dict(c)
         stored = configured_chrome_path_or_empty(out.get("browser_executable_path"))
-        out["browser_executable_path"] = stored if stored else default_browser_executable_hint()
+        out["browser_executable_path"] = stored
+        out["browser_effective_path"] = effective_browser_executable_path(stored) or default_browser_executable_hint()
         out["success"] = True
         return out
 
@@ -1547,6 +1549,7 @@ class Api:
     def getRuleRegulationConfig(self):
         """读取 data/rule_regulation.json（规则化停投，规范化后返回）。"""
         from utils.common import configured_chrome_path_or_empty, default_browser_executable_hint
+        from services.control_panel_config import effective_browser_executable_path
 
         from .rule_regulation_config import load_rule_regulation_config
         from .promotion_targets import get_promotion_target
@@ -1567,7 +1570,8 @@ class Api:
         if strategies:
             out["strategies"] = strategies
         stored = configured_chrome_path_or_empty(out.get("browser_executable_path"))
-        out["browser_executable_path"] = stored if stored else default_browser_executable_hint()
+        out["browser_executable_path"] = stored
+        out["browser_effective_path"] = effective_browser_executable_path(stored) or default_browser_executable_hint()
         out["success"] = True
         return out
 

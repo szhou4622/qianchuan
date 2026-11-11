@@ -1131,7 +1131,10 @@
         document.getElementById('btnHeadful').classList.toggle('seg-btn-active', !hl);
         document.getElementById('btnHeadless').classList.toggle('seg-btn-active', hl);
         const rgBx = document.getElementById('rgBrowserExecutable');
-        if (rgBx) rgBx.value = (data.browser_executable_path != null) ? String(data.browser_executable_path) : '';
+        if (rgBx) {
+            rgBx.value = (data.browser_executable_path != null) ? String(data.browser_executable_path) : '';
+            rgBx.placeholder = data.browser_effective_path ? '继承：' + data.browser_effective_path : '留空继承服务控制中的公共路径';
+        }
 
         strategyRenameIndex = null;
         const legacyRootStop = data.regulation_stop_action;

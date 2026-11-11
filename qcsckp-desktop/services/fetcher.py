@@ -25,7 +25,7 @@ from config import (
 )
 from utils.clean_promotion import clean_pmc_promotion_data, clean_pmc_roi2_assist_task_data
 from utils.common import require_executable_path, build_qianchuan_url
-from services.control_panel_config import load_scrape_service_config
+from services.control_panel_config import effective_browser_executable_path, load_scrape_service_config
 from services.plan_system import normalize_plan_system
 from services.product_scene_adapter import extract_product_scene_snapshot
 from utils.log import logger
@@ -173,13 +173,15 @@ class QianChuanFetcher:
         self._assist_response_seen: bool = False
     async def _init_browser(self):
         """初始化浏览器"""
+        browser_path = require_executable_path(effective_browser_executable_path())
+        try:
+            await self._start_browser(browser_path)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start_browser(self, browser_path: str):
         self.playwright = await async_playwright().start()
-
-        # 获取浏览器路径（服务控制页可配置；空或无效文件则 require_executable_path 回退 Edge/Chrome）
-        scrape_cfg = load_scrape_service_config()
-        raw_exe = (scrape_cfg.get("browser_executable_path") or "").strip()
-        browser_path = require_executable_path(raw_exe if raw_exe else None)
-
         # 使用反检测配置启动浏览器
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
@@ -2438,12 +2440,21 @@ class QianChuanFetcher:
 
     async def close(self):
         """关闭浏览器"""
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
+        browser, self.browser = self.browser, None
+        playwright, self.playwright = self.playwright, None
+        self.context = None
+        self.page = None
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            logger.warning("关闭采集浏览器失败，继续释放浏览器驱动")
+        finally:
+            if playwright:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    logger.warning("释放采集浏览器驱动失败")
 
 
 def build_qianchuan_url_by_params(

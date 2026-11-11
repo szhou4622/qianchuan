@@ -376,7 +376,8 @@ class JSApiBridgeTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("st.officialApiMode", page)
         self.assertIn("状态：正常监控", page)
-        self.assertIn("官方 API 模式（无需 Chrome）", page)
+        self.assertIn("API 采集无需 Chrome；账户授权需要 Chrome", page)
+        self.assertIn('id="runtimeBrowserMessage"', page)
 
     def test_dashboard_no_longer_exposes_inaccurate_assist_panel(self):
         page = (

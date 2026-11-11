@@ -203,6 +203,18 @@ def load_scrape_service_config() -> Dict[str, Any]:
         }
 
 
+def effective_browser_executable_path(override: Optional[str] = None) -> Optional[str]:
+    """会话覆盖路径 → 服务控制公共路径 → 自动检测（None）。"""
+    from utils.common import configured_chrome_path_or_empty
+
+    selected = configured_chrome_path_or_empty(override)
+    if selected:
+        return selected
+    return configured_chrome_path_or_empty(
+        load_scrape_service_config().get("browser_executable_path")
+    ) or None
+
+
 def save_scrape_service_config(
     *,
     interval_seconds: Optional[int] = None,

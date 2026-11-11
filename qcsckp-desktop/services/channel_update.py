@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import shutil
@@ -9,15 +10,34 @@ import subprocess
 import sys
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from release_identity import CHANNEL
 
 
+def native_path(path):
+    """Use extended Windows paths for I/O without changing system policy."""
+    value = os.path.abspath(os.fspath(path))
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        value = "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+    return Path(value)
+
+
+def _powershell_helper_command(helper, context, *, skip_restart=False):
+    literal=lambda value: "'" + str(native_path(value)).replace("'", "''") + "'"
+    command=("$ErrorActionPreference='Stop';"
+        "[AppContext]::SetSwitch('Switch.System.IO.UseLegacyPathHandling',$false);"
+        "[AppContext]::SetSwitch('Switch.System.IO.BlockLongPaths',$false);"
+        "& ([ScriptBlock]::Create([IO.File]::ReadAllText(" + literal(helper) + ")))"
+        " -ContextFile " + literal(context) + (" -SkipRestart" if skip_restart else ""))
+    encoded=base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    return ["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-EncodedCommand",encoded]
+
+
 def validate_payload(payload, channel=CHANNEL):
-    payload = Path(payload)
+    payload = native_path(payload).resolve()
     manifest = json.loads((payload / "PACKAGE-MANIFEST.json").read_text(encoding="utf-8-sig"))
     if manifest.get("app_name") != "QCSCKP" or manifest.get("channel") != channel:
         raise ValueError("安装包渠道不匹配，已停止更新")
@@ -42,13 +62,22 @@ def validate_payload(payload, channel=CHANNEL):
 
 
 def safe_extract(archive, target):
-    target=Path(target).resolve()
-    with zipfile.ZipFile(archive) as z:
+    target=native_path(target).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(native_path(archive)) as z:
         total=sum(i.file_size for i in z.infolist())
         if total>3*1024**3 or shutil.disk_usage(target.parent).free<total*2+64*1024**2:
             raise ValueError("安装包过大或空间不足")
         for item in z.infolist():
-            dest=(target/item.filename.replace("\\","/")).resolve()
+            name=item.filename.replace("\\","/")
+            parts=PurePosixPath(name).parts
+            if (not name or name.startswith("/") or PureWindowsPath(name).drive or ".." in parts
+                    or any(part in {"", "."} for part in name.rstrip("/").split("/"))
+                    or "\x00" in name or (os.name == "nt" and any(
+                        any(char in part for char in '<>:"|?*') or part.rstrip(" .") != part
+                        for part in parts))):
+                raise ValueError("安装包包含无效路径")
+            dest=(target/name).resolve()
             if not dest.is_relative_to(target) or ((item.external_attr>>16)&0o170000)==0o120000:
                 raise ValueError("安装包包含越界路径或链接")
         z.extractall(target)
@@ -67,10 +96,10 @@ def run_update(download_url, expected_sha256):
     parsed=urlparse(download_url)
     if parsed.scheme!="https" or parsed.hostname!="update.dadaozixun.com" or len(expected_sha256)!=64:
         return {"success":False,"message":"更新地址或校验值无效"}
-    root=Path(sys.executable).resolve().parent
+    root=native_path(sys.executable).resolve().parent
     if not (root/"bin").is_dir() or Path(sys.executable).name!="QCSCKP.exe":
         return {"success":False,"message":"程序目录身份校验失败"}
-    stage=root/".qcsckp-update"/uuid.uuid4().hex
+    stage=native_path(root/".qcsckp-update"/uuid.uuid4().hex)
     try:
         stage.mkdir(parents=True,exist_ok=False)
         archive=stage/"package.zip"
@@ -87,12 +116,13 @@ def run_update(download_url, expected_sha256):
             raise ValueError("安装包 SHA256 校验失败")
         payload=safe_extract(archive,stage/"unpacked")
         validate_payload(payload)
-        helper=Path(sys._MEIPASS)/"apply_channel_update.ps1"
+        helper=native_path(Path(sys._MEIPASS)/"apply_channel_update.ps1")
         shutil.copy2(helper,stage/"apply.ps1")
         context={"root":str(root),"payload":str(payload),"stage":str(stage),"old_pid":os.getpid()}
         (stage/"context.json").write_text(json.dumps(context),encoding="utf-8")
-        subprocess.Popen(["powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
-            "-File",str(stage/"apply.ps1"),"-ContextFile",str(stage/"context.json")],
+        # PS 5.1 may reject a long -File argument before the helper can enable
+        # process-local .NET path handling. Read it explicitly through extended I/O.
+        subprocess.Popen(_powershell_helper_command(stage/"apply.ps1",stage/"context.json"),
             creationflags=subprocess.CREATE_NO_WINDOW,close_fds=True)
         return {"success":True,"message":"安装包已校验，正在安全退出后更新；旧版备份将保留", "restart_scheduled":True}
     except Exception as exc:

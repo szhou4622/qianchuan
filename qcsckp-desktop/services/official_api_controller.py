@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Any
 
 from config import LOGS_DIR
+from services.control_panel_config import effective_browser_executable_path
+from utils.common import browser_runtime_info
 from services.official_api_catalog import (
     official_api_catalog_status,
     official_api_session_status,
@@ -48,6 +50,11 @@ class OfficialApiController:
         session = official_api_session_status()
         catalog = official_api_catalog_status()
         available = bool(session.get("available"))
+        try:
+            browser_info = browser_runtime_info(effective_browser_executable_path())
+        except Exception as exc:
+            browser_info = {"available": False, "name": "Google Chrome", "path": "",
+                            "is_chrome": False, "message": str(exc)}
         try:
             collection = get_collection_queue_health()
         except Exception as exc:
@@ -95,11 +102,8 @@ class OfficialApiController:
             "collectionHealth": collection,
             "catalog": catalog,
             "browser": {
-                "available": False,
-                "name": "不使用浏览器",
-                "path": "",
-                "phase": "官方 API 模式",
-                "is_chrome": False,
+                **browser_info,
+                "phase": "API 采集无需 Chrome；账户授权需要 Chrome",
             },
             "qianchuanLogin": {
                 "status": str(session.get("message") or "官方 API 尚未授权"),

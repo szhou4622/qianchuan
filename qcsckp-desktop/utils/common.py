@@ -4,8 +4,77 @@ import os
 import sys
 import datetime
 import json
+import shutil
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, unquote, urlencode, quote
+
+
+def _normalize_browser_path(value: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(value.strip().strip('"'))))
+
+
+def _windows_chrome_registry_paths() -> List[str]:
+    """App Paths 记录实际安装位置，兼容用户安装和不同位数的注册表视图。"""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    paths = []
+    key_name = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (0, winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, key_name, 0, winreg.KEY_READ | view) as key:
+                    value, _ = winreg.QueryValueEx(key, None)
+                if isinstance(value, str) and value.strip():
+                    paths.append(value)
+            except OSError:
+                continue
+    return paths
+
+
+def _chrome_candidates() -> List[str]:
+    if sys.platform == "darwin":
+        return [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    paths = []
+    if sys.platform == "win32":
+        paths.extend(_windows_chrome_registry_paths())
+        for variable, suffix in (
+            ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+            ("ProgramW6432", "Google/Chrome/Application/chrome.exe"),
+            ("ProgramFiles", "Google/Chrome/Application/chrome.exe"),
+            ("ProgramFiles(x86)", "Google/Chrome/Application/chrome.exe"),
+        ):
+            root = os.environ.get(variable)
+            if root:
+                paths.append(os.path.join(root, suffix))
+    paths.extend([
+        os.path.expanduser("~/AppData/Local/Google/Chrome/Application/chrome.exe"),
+        "C:/Program Files/Google/Chrome/Application/chrome.exe",
+        "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+    ])
+    for command in ("chrome.exe", "chrome"):
+        path = shutil.which(command)
+        if path:
+            paths.append(path)
+    return paths
+
+
+def _find_installed_chrome() -> str:
+    seen = set()
+    for candidate in _chrome_candidates():
+        path = _normalize_browser_path(candidate)
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.basename(path).lower() in {"chrome.exe", "google chrome"} and os.path.isfile(path):
+            return path
+    return ""
+
 
 def require_executable_path(browser_path: str = None) -> str:
     """
@@ -23,29 +92,22 @@ def require_executable_path(browser_path: str = None) -> str:
     """
 
     if browser_path:
-        p = os.path.abspath(os.path.expanduser(browser_path.strip()))
+        p = _normalize_browser_path(browser_path)
         filename = os.path.basename(p).lower()
         if os.path.isfile(p) and filename in {"chrome.exe", "google chrome"}:
             return p
         # 升级前界面会预填 Edge。保留旧配置文件，但运行时忽略它并重新探测 Chrome。
-        if os.path.isfile(p) and filename in {"msedge.exe", "microsoft edge"}:
-            browser_path = None
-        else:
+        # Chrome 升级、迁移或旧版预填路径失效后，重新查找已安装的 Chrome。
+        if filename not in {"chrome.exe", "google chrome", "msedge.exe", "microsoft edge"}:
             raise FileNotFoundError(
                 "手动配置的路径不是有效的Google Chrome程序，请重新选择chrome.exe。"
             )
 
-    # macOS：仅查找 Google Chrome（.app 内二进制）
+    detected = _find_installed_chrome()
+    if detected:
+        return detected
+
     if sys.platform == "darwin":
-        mac_chrome_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            os.path.expanduser(
-                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            ),
-        ]
-        for chrome_path in mac_chrome_paths:
-            if os.path.isfile(chrome_path):
-                return chrome_path
         raise FileNotFoundError(
             "未检测到 Google Chrome。\n"
             "请在 macOS 上安装 Google Chrome（推荐置于「应用程序」），\n"
@@ -53,56 +115,33 @@ def require_executable_path(browser_path: str = None) -> str:
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         )
 
-    # Chrome浏览器常见路径
-    chrome_paths = [
-        os.path.expanduser(r'~/AppData/Local/Google/Chrome/Application/chrome.exe'),
-        r'C:/Program Files/Google/Chrome/Application/chrome.exe',
-        r'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
-    ]
-    for chrome_path in chrome_paths:
-        if os.path.exists(chrome_path):
-            return chrome_path
-
     raise FileNotFoundError(
         "未检测到Google Chrome浏览器可执行文件。\n"
-        "请安装Google Chrome并确保其位于标准目录，或在高级设置中手动选择chrome.exe。"
+        "如已安装，请在Chrome地址栏打开 chrome://version，复制「可执行文件路径」，\n"
+        "填入「服务控制」的「浏览器程序路径」后重新启动采集。\n"
+        "如未安装，请先安装Google Chrome。"
     )
 
 
 def default_browser_executable_hint() -> str:
     """
-    服务控制页预填：优先返回本机已存在的浏览器路径；否则返回兜底路径字符串（不抛错，仅作界面展示参考）。
+    服务控制页预填真实检测结果；未找到时留空，避免保存不存在的默认路径。
     """
-    if sys.platform == "darwin":
-        mac_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            os.path.expanduser(
-                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            ),
-        ]
-        for p in mac_paths:
-            if os.path.isfile(p):
-                return p
-        return mac_paths[0]
-
-    if sys.platform != "win32":
+    if sys.platform not in {"darwin", "win32"}:
         return ""
-
-    chrome_paths = [
-        os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for p in chrome_paths:
-        if os.path.isfile(p):
-            return os.path.normpath(p)
-    return os.path.normpath(chrome_paths[0])
+    return _find_installed_chrome()
 
 
 def configured_chrome_path_or_empty(value: Any) -> str:
-    """旧版保存过 Edge 路径时返回空，让界面和运行流程自动切换到 Chrome。"""
+    """忽略旧 Edge 或已失效的 Chrome 路径，让界面重新探测。"""
     path = str(value or "").strip()
-    if os.path.basename(path).lower() in {"msedge.exe", "microsoft edge"}:
+    if not path:
+        return ""
+    path = _normalize_browser_path(path)
+    filename = os.path.basename(path).lower()
+    if filename in {"msedge.exe", "microsoft edge"}:
+        return ""
+    if filename in {"chrome.exe", "google chrome"} and not os.path.isfile(path):
         return ""
     return path
 

@@ -10,7 +10,7 @@ param(
 function Get-CriticalReleasePaths {
     param([Parameter(Mandatory=$true)][string]$ReleaseDir)
     $required = @(
-        "QCSCKP.exe", "VERSION.txt", "bin\python312.dll", "bin\release.json",
+        "QCSCKP.exe", "VERSION.txt", "bin\package-layout.json", "bin\python312.dll", "bin\release.json",
         "bin\DEFAULT-CONFIG.json", "bin\apply_channel_update.ps1",
         "bin\static\index.html", "bin\static\license.html",
         "bin\pythonnet\runtime\Python.Runtime.dll",
@@ -95,11 +95,15 @@ $licenseManagementPage = Join-Path $staticDir "license_management.html"
 $usageFile = Join-Path $scriptDir "README-Windows.txt"
 $diagnosticLauncher = Join-Path $scriptDir "QCSCKP-Startup-Diagnostics.cmd"
 $licenseRepairLauncher = Join-Path $scriptDir "QCSCKP-License-Repair.cmd"
+$unpackScript = Join-Path $scriptDir 'QCSCKP-Unpack.ps1'
+$unpackLauncher = Join-Path $scriptDir 'QCSCKP-Unpack.cmd'
 $privacyVerifier = Join-Path $scriptDir "verify_release_privacy.py"
 $runtimeArchiveVerifier = Join-Path $scriptDir "verify_runtime_archive.py"
+$layoutVerifier = Join-Path $scriptDir 'verify_release_layout.py'
+$hooksDir = Join-Path $scriptDir 'hooks'
 $runtimeManifestSource = Join-Path $projectRoot "services\runtime_supervisor.py"
 
-foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $licenseRepairLauncher, $privacyVerifier, $runtimeArchiveVerifier, $runtimeManifestSource)) {
+foreach ($required in @($python, $pyinstaller, $entry, $icon, $staticDir, $contactConfig, $contactHttp, $contactFallback, $licenseClient, $deviceIdentity, $licenseStorage, $licenseManager, $licensePage, $licenseManagementPage, $usageFile, $diagnosticLauncher, $licenseRepairLauncher, $unpackScript, $unpackLauncher, $privacyVerifier, $runtimeArchiveVerifier, $layoutVerifier, $hooksDir, $runtimeManifestSource)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required build input does not exist: $required"
     }
@@ -147,6 +151,7 @@ $pyinstallerArgs = @(
     "--windowed",
     "--onedir",
     "--contents-directory", "bin",
+    "--additional-hooks-dir", $hooksDir,
     "--name", $appName,
     "--icon", $icon,
     "--add-data", "$staticDir;static",
@@ -160,8 +165,6 @@ $pyinstallerArgs = @(
     "--hidden-import", "clr",
     "--hidden-import", "pythonnet",
     "--hidden-import", "clr_loader",
-    "--collect-all", "lark_oapi",
-    "--collect-all", "baseopensdk",
     "--collect-all", "pystray",
     "--collect-all", "PIL",
     "--collect-data", "certifi",
@@ -195,7 +198,8 @@ finally {
 }
 
 $builtDir = Join-Path $distRoot $appName
-$releaseName = "$appName-v$Version-$Channel-r$BuildRevision-Windows-x64"
+$releaseName = "$appName-r$BuildRevision"
+$archiveName = "$appName-v$Version-$Channel-r$BuildRevision-Windows-x64"
 $releaseDir = Join-Path $distRoot $releaseName
 if (-not (Test-Path -LiteralPath $builtDir)) {
     throw "PyInstaller output directory was not found: $builtDir"
@@ -220,6 +224,19 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item -LiteralPath $usageFile -Destination (Join-Path $releaseDir "README-Windows.txt") -Force
 Copy-Item -LiteralPath $diagnosticLauncher -Destination (Join-Path $releaseDir "QCSCKP-Startup-Diagnostics.cmd") -Force
 Copy-Item -LiteralPath $licenseRepairLauncher -Destination (Join-Path $releaseDir "QCSCKP-License-Repair.cmd") -Force
+foreach ($unpackFile in @($unpackScript,$unpackLauncher)) {
+    if ($unpackFile -eq $unpackLauncher) {
+        $template = [IO.File]::ReadAllText($unpackLauncher)
+        $payload = [IO.File]::ReadAllText($unpackScript)
+        $standaloneLauncher = $template.Replace('@@POWERSHELL_PAYLOAD@@',$payload)
+        foreach ($destinationRoot in @($releaseDir,$outputRoot)) {
+            [IO.File]::WriteAllText((Join-Path $destinationRoot 'QCSCKP-Unpack.cmd'),$standaloneLauncher,[Text.UTF8Encoding]::new($false))
+        }
+    } else {
+        Copy-Item -LiteralPath $unpackFile -Destination $releaseDir
+        Copy-Item -LiteralPath $unpackFile -Destination $outputRoot
+    }
+}
 
 foreach ($writableDir in @("data", "logs", "temp")) {
     New-Item -ItemType Directory -Path (Join-Path $releaseDir $writableDir) -Force | Out-Null
@@ -262,6 +279,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "Release privacy cleanup or verification failed with exit code $LASTEXITCODE"
 }
 
+& $python -B $layoutVerifier $releaseDir --report (Join-Path $releaseDir 'bin\package-layout.json')
+if ($LASTEXITCODE -ne 0) { throw 'Release layout verification failed.' }
+
 $criticalFiles = @(Get-CriticalReleaseHashes -ReleaseDir $releaseDir)
 $packageManifest = [ordered]@{
     app_name = "QCSCKP"
@@ -284,6 +304,19 @@ if (-not (Test-Path -LiteralPath $exePath)) {
     throw "The built executable was not found: $exePath"
 }
 
+# Execute the actual frozen importer and retained driver, without activation,
+# real authorization, daily Chrome profiles or the user's data directory.
+$probeReport = Join-Path $outputRoot 'PACKAGED-RUNTIME-PROBE.json'
+$probeProcess = Start-Process -FilePath $exePath -WorkingDirectory $releaseDir -WindowStyle Hidden -PassThru -ArgumentList @('--verify-package-runtime',('"{0}"' -f $probeReport))
+if (!$probeProcess.WaitForExit(90000)) {
+    Stop-Process -Id $probeProcess.Id -Force -ErrorAction SilentlyContinue
+    throw 'Packaged runtime probe timed out.'
+}
+if ($probeProcess.ExitCode -ne 0 -or !(Test-Path -LiteralPath $probeReport) -or
+    !(Get-Content -LiteralPath $probeReport -Raw -Encoding UTF8 | ConvertFrom-Json).success) {
+    throw 'Packaged runtime SDK or Chrome verification failed.'
+}
+
 if ($SkipArchive) {
     Write-Output "RELEASE_DIR=$releaseDir"
     Write-Output "EXE_PATH=$exePath"
@@ -291,7 +324,7 @@ if ($SkipArchive) {
     return
 }
 
-$zipPath = Join-Path $outputRoot "$releaseName.zip"
+$zipPath = Join-Path $outputRoot "$archiveName.zip"
 Push-Location $distRoot
 try {
     & tar.exe -a -c -f $zipPath $releaseName

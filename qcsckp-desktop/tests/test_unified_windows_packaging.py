@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = ROOT / "packaging/windows/build_windows.ps1"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("pwsh")
 REQUIRED = (
-    "QCSCKP.exe", "VERSION.txt", "bin/python312.dll", "bin/release.json",
+    "QCSCKP.exe", "VERSION.txt", "bin/package-layout.json", "bin/python312.dll", "bin/release.json",
     "bin/DEFAULT-CONFIG.json", "bin/apply_channel_update.ps1", "bin/static/index.html",
     "bin/static/license.html", "bin/pythonnet/runtime/Python.Runtime.dll",
     "bin/clr_loader/ffi/dlls/amd64/ClrLoader.dll",
@@ -159,6 +159,19 @@ foreach($function in $functions) { Invoke-Expression $function.Extent.Text }
             result = self.run_helper(root)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("Critical release file is missing", result.stderr)
+
+    def test_required_files_can_be_installed_by_legacy_fixed_name_updaters(self):
+        # r31/r34 replace these top-level names only. New mandatory files must
+        # live in bin/runtime rather than becoming an unknown root-level name.
+        legacy_names = {'QCSCKP.exe', 'bin', 'runtime', 'VERSION.txt', 'README-Windows.txt',
+                        'QCSCKP-Startup-Diagnostics.cmd', 'QCSCKP-License-Repair.cmd'}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.seed(root)
+            result = self.run_helper(root)
+            self.assertEqual(0, result.returncode, result.stderr)
+            for row in json.loads(result.stdout):
+                self.assertIn(row['path'].split('/')[0], legacy_names)
 
 
 if __name__ == "__main__":

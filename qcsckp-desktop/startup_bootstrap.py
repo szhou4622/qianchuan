@@ -892,5 +892,13 @@ def main() -> int:
         lease.close()
 
 
+def _entrypoint() -> int:
+    if "--verify-package-runtime" in sys.argv[1:]:
+        from services.packaged_runtime_probe import main as probe_main
+        index = sys.argv.index("--verify-package-runtime")
+        return probe_main(sys.argv[index + 1:])
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entrypoint())
